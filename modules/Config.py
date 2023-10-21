@@ -8,22 +8,14 @@ from modules.Console import console
 
 yaml = YAML()
 
-general_schema = """
+available_bot_modes = ['manual', 'spin', 'starters', 'fishing']
+
+general_schema = f"""
 type: object
 properties:
     bot_mode:
         type: string
-        enum:
-            - manual
-            - spin
-            - starters
-            - fishing
-            - debug_battle
-            - debug_daycare
-            - debug_main_callbacks
-            - debug_symbols
-            - debug_tasks
-            - debug_trainer
+        enum: {available_bot_modes}
     coords:
         type: object
         properties:
@@ -53,15 +45,15 @@ properties:
     starter:
         type: string
         enum:
-            - treecko
-            - torchic
-            - mudkip
-            - bulbasaur
-            - charmander
-            - squirtle
-            - chikorita
-            - totodile
-            - cyndaquil
+            - Treecko
+            - Torchic
+            - Mudkip
+            - Bulbasaur
+            - Charmander
+            - Squirtle
+            - Chikorita
+            - Totodile
+            - Cyndaquil
     fossil:
         type: string
         enum:
@@ -130,10 +122,6 @@ logging_schema = """
                     - verbose
                     - basic
                     - disable
-    backup_stats:
-        type: integer
-        minimum: 0
-
 """
 
 battle_schema = """
@@ -343,6 +331,8 @@ properties:
             toggle_unthrottled: {type: string}
             reset: {type: string}
             exit: {type: string}
+            save_state: {type: string}
+            toggle_stepping_mode: {type: string}
 """
 
 schemas = {
@@ -387,7 +377,7 @@ def LoadConfig(file_name: str, schema: str) -> dict:
             result = LoadConfigFile(file_path, schema)
 
     if result is None:
-        console.print('[bold red]Could not find any config file named {}.[/]'.format(file_name))
+        console.print(f"[bold red]Could not find any config file named {file_name}.[/]")
         sys.exit(1)
 
     return result
@@ -411,7 +401,7 @@ def LoadConfigFile(file_path: Path, schema: str) -> dict:
             return config
     except:
         console.print_exception(show_locals=True)
-        console.print('[bold red]Config file {} is invalid![/]'.format(str(file_path)))
+        console.print(f"[bold red]Config file {str(file_path)} is invalid![/]")
         sys.exit(1)
 
 
@@ -434,11 +424,12 @@ def LoadConfigFromDirectory(path: Path, allow_missing_files=False) -> None:
         if file_path.is_file():
             config[key] = LoadConfigFile(file_path, schemas[key])
         elif not allow_missing_files:
-            console.print('[bold red]Expected a config file {} could not be found.[/]'.format(str(file_path)))
+            console.print(f"[bold red]Expected a config file {str(file_path)} could not be found.[/]")
             sys.exit(1)
 
 
 previous_bot_mode: str = ''
+
 
 def ToggleManualMode() -> None:
     """
@@ -453,6 +444,12 @@ def ToggleManualMode() -> None:
     else:
         previous_bot_mode = config['general']['bot_mode']
         config['general']['bot_mode'] = 'manual'
+
+
+def SetBotMode(new_bot_mode) -> None:
+    global previous_bot_mode
+    config['general']['bot_mode'] = new_bot_mode
+    previous_bot_mode = ''
 
 
 def ForceManualMode() -> None:
