@@ -26,7 +26,7 @@ from modules.Menuing import (
     SwitchPokemonActive,
     StartMenuNavigator,
     BaseMenuNavigator,
-    PokemonPartyMenuNavigator,
+    PokemonPartyMenuNavigator, BattlePartyMenuNavigator,
 )
 from modules.Pokemon import type_list, GetParty, GetOpponent
 
@@ -182,7 +182,7 @@ class BattleAction(BaseMenuNavigator):
     def choose_mon(self):
         while True:
             if self.subnavigator is None:
-                self.subnavigator = PokemonPartyMenuNavigator(idx=self.idx, mode="switch", battle_state=True).step()
+                self.subnavigator = BattlePartyMenuNavigator(idx=self.idx, mode="switch").step()
                 yield
             else:
                 for _ in self.subnavigator:
@@ -201,7 +201,7 @@ class BattleAction(BaseMenuNavigator):
                 SetMessage("Can't find a viable switch-in. Switching to manual mode.")
                 ForceManualMode()
             else:
-                self.subnavigator = PokemonPartyMenuNavigator(idx=mon_to_switch, mode="switch", battle_state=True).step()
+                self.subnavigator = PokemonPartyMenuNavigator(idx=mon_to_switch, mode="switch").step()
         else:
             yield from self.subnavigator
 

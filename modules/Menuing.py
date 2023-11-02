@@ -195,14 +195,13 @@ class StartMenuNavigator(BaseMenuNavigator):
 
 
 class PokemonPartyMenuNavigator(BaseMenuNavigator):
-    def __init__(self, idx: int, mode: str, battle_state: bool = False):
+    def __init__(self, idx: int, mode: str):
         super().__init__()
         self.idx = idx
         self.game = GetROM().game_title
         self.mode = mode
         self.primary_option = None
         self.get_primary_option()
-        self.battle_state = battle_state
 
     def get_primary_option(self):
         if self.mode in ["take_item", "give_item"]:
@@ -264,12 +263,8 @@ class PokemonPartyMenuNavigator(BaseMenuNavigator):
 
     def select_option(self):
         if self.game in ["POKEMON EMER", "POKEMON FIRE", "POKEMON LEAF"]:
-            if self.battle_state:
-                while parse_party_menu()["numActions"] > 3:
+            while parse_party_menu()["numActions"] > 3:
                     yield from PokemonPartySubMenuNavigator(self.primary_option).step()
-                else:
-                    while GetTask("TASK_HANDLESELECTIONMENUINPUT") != {} and GetTask("TASK_HANDLESELECTIONMENUINPUT")['isActive']:
-                        yield from PokemonPartySubMenuNavigator(self.primary_option).step()
         else:
             while "SUB_8089D94" in [task["func"] for task in ParseTasks()] and "SUB_808A060" not in [
                 task["func"] for task in ParseTasks()
@@ -299,6 +294,17 @@ class PokemonPartyMenuNavigator(BaseMenuNavigator):
         else:
             while "SUB_808A060" in [task["func"] for task in ParseTasks()]:
                 yield from PokemonPartySubMenuNavigator(0).step()
+
+
+class BattlePartyMenuNavigator(PokemonPartyMenuNavigator):
+
+    def select_option(self):
+        if self.game in ["POKEMON EMER", "POKEMON FIRE", "POKEMON LEAF"]:
+            while "TASK_HANDLESELECTIONMENUINPUT" in [task["func"] for task in ParseTasks()]:
+                    yield from PokemonPartySubMenuNavigator(self.primary_option).step()
+        else:
+            while "TASK_HANDLEPOPUPMENUINPUT" in [task["func"] for task in ParseTasks()]:
+                yield from PokemonPartySubMenuNavigator(self.primary_option).step()
 
 
 class CheckForPickup(BaseMenuNavigator):
@@ -406,7 +412,7 @@ class CheckForPickup(BaseMenuNavigator):
             case "open_party_menu":
                 self.navigator = self.open_party_menu()
             case "take_mon_item":
-                self.navigator = PokemonPartyMenuNavigator(idx=self.current_mon, mode="take_item", battle_state=False).step()
+                self.navigator = PokemonPartyMenuNavigator(idx=self.current_mon, mode="take_item").step()
             case "return_to_party_menu":
                 self.navigator = self.return_to_party_menu()
             case "exit_to_overworld":
