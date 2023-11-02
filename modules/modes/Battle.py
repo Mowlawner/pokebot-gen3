@@ -17,55 +17,320 @@ from modules.MenuParsers import (
     get_battle_menu,
     switch_requested,
     get_learning_move_cursor_pos,
-    get_learning_mon,
     get_battle_cursor,
     get_learning_move,
 )
 from modules.Menuing import (
     PartyMenuIsOpen,
-    NavigateMenu,
-    SwitchPokemonActive, NavigateStartMenu,
+    PokemonPartySubMenuNavigator,
+    SwitchPokemonActive,
+    StartMenuNavigator,
+    BaseMenuNavigator,
+    PokemonPartyMenuNavigator,
 )
-from modules.Pokemon import pokemon_list, type_list, GetParty, GetOpponent
+from modules.Pokemon import type_list, GetParty, GetOpponent
 
 
-def encounter_pokemon():
-    match GetGameState():
-        case GameState.BATTLE.value | GameState.BATTLE_STARTING.value | GameState.PARTY_MENU.value:
-            if config["battle"]["battle"] and can_battle_happen():
-                battle_opponent = BattleOpponent()
-                while True:
-                    yield from battle_opponent.step()
-            else:
-                while True:
-                    yield from flee_battle()
+class EncounterPokemon:
+    def __init__(self):
+        self.battle_can_happen = can_battle_happen()
+        self.battle = None
 
-        case GameState.GARBAGE_COLLECTION:
-            yield
+    def step(self):
+        while True:
+            match GetGameState():
+                case GameState.BATTLE.value | GameState.BATTLE_STARTING.value | GameState.PARTY_MENU.value:
+                    if config["battle"]["battle"] and self.battle_can_happen:
+                        if self.battle is None:
+                            self.battle = BattleOpponent()
+                        while not self.battle.battle_ended:
+                            yield from self.battle.step()
+                        if config["battle"]["replace_lead_battler"] and not check_lead_can_battle():
+                            lead_switcher = RotatePokemon()
+                            for _ in lead_switcher:
+                                yield _
+                    else:
+                        for _ in flee_battle():
+                            yield _
+
+                case GameState.GARBAGE_COLLECTION:
+                    yield
 
         # TODO
-        #if config['battle']['battle'] and battle_can_happen:
+        # if config['battle']['battle'] and battle_can_happen:
         #    battle_won = BattleOpponent()
         #    # adding this in for lead rotation functionality down the line
         #    replace_battler = not battle_won
-        #if config['battle']['battle'] and battle_can_happen:
+        # if config['battle']['battle'] and battle_can_happen:
         #    replace_battler = replace_battler or not CheckLeadCanBattle()
         #    if config['battle']["replace_lead_battler"] and replace_battler:
         #        RotatePokemon()
-        #if config['battle']["pickup"] and battle_can_happen:
+        # if config['battle']["pickup"] and battle_can_happen:
         #    while GetGameState() != GameState.OVERWORLD and not config['general']['bot_mode'] == 'manual':
         #        continue
         #    if GetGameState() == GameState.OVERWORLD:
         #        CheckForPickup(stats['totals'].get('encounters', 0))
 
+
 def flee_battle():
-    if get_battle_state() == BattleState.ACTION_SELECTION:
-        battle_menu = BattleMenu(3)
-        while True:
+    while GetGameState() == GameState.BATTLE:
+        if get_battle_state() == BattleState.ACTION_SELECTION:
+            battle_menu = BattleMenu(3)
             yield from battle_menu.step()
-    else:
-        GetEmulator().PressButton("B")
-    yield
+        else:
+            GetEmulator().PressButton("B")
+            yield
+
+
+class BattleAction(BaseMenuNavigator):
+    """
+    Menu navigator object for handling battle actions like fighting, switching, or fleeing.
+    """
+
+    def __init__(self, choice: str, idx: int):
+        super().__init__()
+        self.choice = choice
+        self.idx = idx
+        # Extra info is used to hold additional info for help determining, for example, which bag pocket the desired
+        # item is in.
+        self.extra_info = ""
+        self.choice_was_successful = True
+        self.subnavigator = None
+
+    def get_next_func(self):
+        match self.current_step:
+            case "None":
+                self.current_step = "select_action"
+            case "select_action":
+                match self.choice:
+                    case "flee":
+                        self.current_step = "handle_flee"
+                    case "fight":
+                        self.current_step = "choose_move"
+                    case "switch":
+                        self.current_step = "wait_for_party_menu"
+                    case "bag":
+                        SetMessage("Bag not implemented yet. Switching to manual mode.")
+                        ForceManualMode()
+            case "wait_for_party_menu":
+                self.current_step = "choose_mon"
+            case "handle_flee":
+                if not self.choice_was_successful:
+                    self.current_step = "handle_no_escape"
+                else:
+                    self.current_step = "return_to_overworld"
+            case "choose_move" | "choose_mon" | "return_to_overworld":
+                self.current_step = "exit"
+
+    def update_navigator(self):
+        match self.current_step:
+            case "select_action":
+                match self.choice:
+                    case "fight":
+                        index = 0
+                    case "switch":
+                        index = 2
+                    case "bag":
+                        index = 1
+                        SetMessage("Bag not implemented yet. Switching to manual mode.")
+                        ForceManualMode()
+                    case "flee" | _:
+                        index = 3
+                self.navigator = self.select_option(index)
+            case "handle_flee":
+                self.navigator = self.handle_flee()
+            case "choose_move":
+                self.navigator = self.choose_move()
+            case "wait_for_party_menu":
+                self.navigator = self.wait_for_party_menu()
+            case "choose_mon":
+                self.navigator = self.choose_mon()
+            case "handle_no_escape":
+                self.navigator = self.handle_no_escape()
+            case "return_to_overworld":
+                self.navigator = self.return_to_overworld()
+
+    def handle_flee(self):
+        if self.subnavigator is None:
+            self.subnavigator = flee_battle()
+        for _ in self.subnavigator:
+            yield _
+        self.subnavigator = None
+        self.navigator = None
+
+    def choose_move(self):
+        while get_battle_state() == BattleState.MOVE_SELECTION:
+            if 0 > self.idx or self.idx > 3:
+                SetMessage("Invalid move selection. Switching to manual mode...")
+                ForceManualMode()
+            else:
+                if self.subnavigator is None and get_battle_state() == BattleState.OTHER:
+                    yield
+                elif self.subnavigator is None:
+                    select_battle_option = SelectBattleOption(self.idx).step()
+                    self.subnavigator = select_battle_option
+                    yield
+                else:
+                    for _ in self.subnavigator:
+                        yield _
+                    self.subnavigator = None
+                    self.navigator = None
+        else:
+            self.subnavigator = None
+            self.navigator = None
+
+    def choose_mon(self):
+        while True:
+            if self.subnavigator is None:
+                self.subnavigator = PokemonPartyMenuNavigator(idx=self.idx, mode="switch", battle_state=True).step()
+                yield
+            else:
+                for _ in self.subnavigator:
+                    yield _
+                self.navigator = None
+                self.subnavigator = None
+
+    def handle_no_escape(self):
+        if self.subnavigator is None and not PartyMenuIsOpen():
+            while not PartyMenuIsOpen():
+                GetEmulator().PressButton("B")
+                yield
+        elif PartyMenuIsOpen() and self.subnavigator is None:
+            mon_to_switch = get_new_lead()
+            if mon_to_switch is None:
+                SetMessage("Can't find a viable switch-in. Switching to manual mode.")
+                ForceManualMode()
+            else:
+                self.subnavigator = PokemonPartyMenuNavigator(idx=mon_to_switch, mode="switch", battle_state=True).step()
+        else:
+            yield from self.subnavigator
+
+    def return_to_overworld(self):
+        while not GetGameState() == GameState.OVERWORLD:
+            GetEmulator().PressButton("B")
+            yield
+
+    def select_option(self, index):
+        while get_battle_state() == BattleState.ACTION_SELECTION:
+            if self.subnavigator is None:
+                self.subnavigator = SelectBattleOption(index).step()
+            else:
+                for _ in self.subnavigator:
+                    yield _
+                self.subnavigator = None
+                self.navigator = None
+        else:
+            self.subnavigator = None
+            self.navigator = None
+
+    def wait_for_party_menu(self):
+        while get_battle_state() != BattleState.PARTY_MENU:
+            yield
+
+
+class BattleMoveLearner(BaseMenuNavigator):
+    def __init__(self, mon: dict):
+        super().__init__()
+        self.move_to_replace = -1
+        self.mon = mon
+
+    def get_next_func(self):
+        match self.current_step:
+            case "None":
+                self.current_step = "init_learn_move"
+            case "init_learn_move":
+                match config["battle"]["new_move"]:
+                    case "stop":
+                        SetMessage("New move trying to be learned, switching to manual mode...")
+                        ForceManualMode()
+                    case "cancel":
+                        self.current_step = "avoid_learning"
+                    case "learn_best":
+                        self.current_step = "calculate_best"
+                        learning_move = get_learning_move()
+                        self.move_to_replace = calculate_new_move_viability(self.mon, learning_move)
+            case "calculate_best":
+                match self.move_to_replace:
+                    case 4:
+                        self.current_step = "avoid_learning"
+                    case _:
+                        self.current_step = "confirm_learn"
+            case "confirm_learn":
+                self.current_step = "wait_for_move_learn_menu"
+            case "wait_for_move_learn_menu":
+                self.current_step = "navigate_to_move"
+            case "avoid_learning":
+                self.current_step = "wait_for_stop_learning"
+            case "wait_for_stop_learning":
+                self.current_step = "confirm_no_learn"
+            case "navigate_to_move" | "confirm_no_learn":
+                self.current_step = "exit"
+
+    def update_navigator(self):
+        match self.current_step:
+            case "confirm_learn":
+                self.navigator = self.confirm_learn()
+            case "wait_for_move_learn_menu":
+                self.navigator = self.wait_for_move_learn_menu()
+            case "navigate_to_move":
+                self.navigator = self.navigate_move_learn_menu()
+            case "avoid_learning":
+                self.navigator = self.avoid_learning()
+            case "wait_for_stop_learning":
+                self.navigator = self.wait_for_stop_learning()
+            case "confirm_no_learn":
+                self.navigator = self.confirm_no_learn()
+
+    def confirm_learn(self):
+        while get_learn_move_state() == "LEARN_YN":
+            GetEmulator().PressButton("A")
+            yield
+        else:
+            self.navigator = None
+
+    def wait_for_move_learn_menu(self):
+        while not get_learn_move_state() == "MOVE_MENU":
+            yield
+        else:
+            self.navigator = None
+
+    def navigate_move_learn_menu(self):
+        while get_learn_move_state() == "MOVE_MENU":
+            if get_learning_move_cursor_pos() == self.move_to_replace:
+                GetEmulator().PressButton("A")
+                self.navigator = None
+                yield
+            if get_learning_move_cursor_pos() < self.move_to_replace:
+                up_presses = get_learning_move_cursor_pos() + 5 - self.move_to_replace
+                down_presses = self.move_to_replace - get_learning_move_cursor_pos()
+            else:
+                up_presses = get_learning_move_cursor_pos() - self.move_to_replace
+                down_presses = self.move_to_replace - get_learning_move_cursor_pos() + 5
+            if down_presses > up_presses:
+                GetEmulator().PressButton("Up")
+            else:
+                GetEmulator().PressButton("Down")
+            yield
+
+    def avoid_learning(self):
+        while get_learn_move_state() == "LEARN_YN":
+            GetEmulator().PressButton("B")
+            yield
+        else:
+            self.navigator = None
+
+    def wait_for_stop_learning(self):
+        while get_learn_move_state() != "STOP_LEARNING":
+            yield
+        else:
+            self.navigator = None
+
+    def confirm_no_learn(self):
+        while get_learn_move_state() == "STOP_LEARNING":
+            GetEmulator().PressButton("A")
+            yield
+        else:
+            self.navigator = None
 
 
 class BattleOpponent:
@@ -75,193 +340,343 @@ class BattleOpponent:
     """
 
     def __init__(self):
+        """
+        Initializes the battle handler
+        """
         self.battle_ended = False
         self.foe_fainted = GetOpponent()["stats"]["hp"] == 0
         self.prev_battle_state = get_battle_state()
-        self.previous_party = GetParty()
+        self.party = GetParty()
         self.most_recent_leveled_mon_index = -1
+        self.battle_state = BattleState.OTHER
+        self.current_battler = self.party[0]
+        self.num_battlers = ReadSymbol("gBattlersCount", size=1)[0]
+        self.action = None
+        self.choice = None
+        self.idx = None
+        self.battle_action = None
 
-    def step(self):
-        while not self.battle_ended:
-            self.battle_state = get_battle_state()
-            if self.battle_state != self.prev_battle_state:
-                self.prev_battle_state = self.battle_state
+    def update_battle_state(self):
+        """
+        Checks the
+        """
+        self.battle_state = get_battle_state()
+        if self.battle_state != self.prev_battle_state:
+            self.prev_battle_state = self.battle_state
+
+            # In an effort to reduce bot usage, we will only update the party/current battler/foe HP when the battle
+            # state changes. No point checking if the battle state hasn't changed, right?
 
             # check for level ups
-            party = GetParty()
-            if self.previous_party != party:
-                self.most_recent_leveled_mon_index = check_for_level_up(
-                    self.previous_party, party, self.most_recent_leveled_mon_index
-                )
-                self.previous_party = party
+            self.update_party()
 
+            # ensure that the current battler is correct
+            self.update_current_battler()
+
+            # Update the foe's HP too
             self.foe_fainted = GetOpponent()["stats"]["hp"] == 0
 
-            match self.battle_state:
-                case BattleState.OVERWORLD:
-                    self.battle_ended = True
-                case BattleState.EVOLVING:
-                    if config["battle"]["stop_evolution"]:
-                        GetEmulator().PressButton("B")
-                    else:
-                        GetEmulator().PressButton("A")
-                case BattleState.LEARNING:
-                    yield from handle_move_learn(self.most_recent_leveled_mon_index)
-                case BattleState.ACTION_SELECTION.value | BattleState.MOVE_SELECTION.value:
-                    yield from execute_menu_action(determine_battle_menu_action())
-                case BattleState.SWITCH_POKEMON:
-                    yield from handle_battler_faint()
-                case _:
-                    GetEmulator().PressButton("B")
-            yield
+    def update_battle_action(self):
+        """
+        Given the state of the battle, updates the object's action to the proper generator
+        """
+        match self.battle_state:
+            case BattleState.OVERWORLD:
+                self.battle_ended = True
+                return
+            case BattleState.EVOLVING:
+                self.action = self.handle_evolution()
+            case BattleState.LEARNING:
+                self.action = BattleMoveLearner(self.party[self.most_recent_leveled_mon_index]).step()
+            case BattleState.ACTION_SELECTION | BattleState.MOVE_SELECTION:
+                self.action = self.select_option()
+            case BattleState.SWITCH_POKEMON:
+                self.action = self.handle_battler_faint()
 
-        if self.foe_fainted:
-            return True
-        return False
-
-
-def get_move_power(move, ally_types, foe_types, ally_attacks, foe_defenses) -> float:
-    """
-    function to calculate effective power of a move
-
-    """
-    power = move["power"]
-
-    # Ignore banned moves and those with 0 PP
-    if (not is_valid_move(move)) or (move["remaining_pp"] == 0):
-        return 0
-
-    matchups = type_list[move["type"]]
-    category = matchups["category"]
-
-    for foe_type in foe_types:
-        if foe_type in matchups["immunes"]:
-            return 0
-        elif foe_type in matchups["weaknesses"]:
-            power *= 0.5
-        elif foe_type in matchups["strengths"]:
-            power *= 2
-
-    # STAB (same-type attack bonus)
-    if move["type"] in ally_types:
-        power *= 1.5
-
-    # calculating attack/defense effect
-    stat_calc = ally_attacks[category] / foe_defenses[category]
-    power *= stat_calc
-
-    return power
-
-
-def is_valid_move(move: dict) -> bool:
-    return move["name"] not in config["battle"]["banned_moves"] and move["power"] > 0
-
-
-def calculate_new_move_viability(mon: dict, new_move: dict) -> int:
-    """
-    Function that judges the move a Pokémon is trying to learn against its moveset and returns the index of the worst
-    move of the bunch.
-
-    :param mon: The dict containing the Pokémon's info.
-    :param new_move: The move that the mon is trying to learn
-    :return: The index of the move to select.
-    """
-    # exit learning move if new move is banned or has 0 power
-    if new_move["power"] == 0 or new_move["name"] in config["battle"]["banned_moves"]:
-        SetMessage(f"New move has base power of 0, so {mon['name']} will skip learning it.")
-        return 4
-    # get the effective power of each move
-    move_power = []
-    full_moveset = list(mon["moves"])
-    full_moveset.append(new_move)
-    for move in full_moveset:
-        attack_type = move["kind"]
-        match attack_type:
-            case "Physical":
-                attack_bonus = mon["stats"]["attack"]
-            case "Special":
-                attack_bonus = mon["stats"]["spAttack"]
-            case _:
-                attack_bonus = 0
-        power = move["power"] * attack_bonus
-        if move["type"] in mon["type"]:
-            power *= 1.5
-        if move["name"] in config["battle"]["banned_moves"]:
-            power = 0
-        move_power.append(power)
-    # find the weakest move of the bunch
-    weakest_move_power = min(move_power)
-    weakest_move = move_power.index(weakest_move_power)
-    # try and aim for good coverage- it's generally better to have a wide array of move types than 4 moves of the same
-    # type
-    redundant_type_moves = []
-    existing_move_types = {}
-    for move in full_moveset:
-        if move["power"] == 0:
-            continue
-        if move["type"] not in existing_move_types:
-            existing_move_types[move["type"]] = move
+    def select_option(self):
+        while self.choice is None or self.idx is None:
+            self.determine_battle_menu_action()
         else:
-            if not redundant_type_moves:
-                redundant_type_moves.append(existing_move_types[move["type"]])
-            redundant_type_moves.append(move)
-    if weakest_move_power > 0 and redundant_type_moves:
-        redundant_move_power = []
-        for move in redundant_type_moves:
-            attack_type = move["kind"]
-            match attack_type:
-                case "Physical":
-                    attack_bonus = mon["stats"]["attack"]
-                case "Special":
-                    attack_bonus = mon["stats"]["spAttack"]
+            while self.battle_action is None:
+                self.battle_action = BattleAction(choice=self.choice, idx=self.idx).step()
+            else:
+                for _ in self.battle_action:
+                    yield _
+                self.choice = None
+                self.idx = None
+                self.battle_action = None
+                self.action = None
+
+    def handle_evolution(self):
+        while self.battle_state == BattleState.EVOLVING:
+            self.update_battle_state()
+            if config["battle"]["stop_evolution"]:
+                GetEmulator().PressButton("B")
+                yield
+            else:
+                GetEmulator().PressButton("A")
+                yield
+        else:
+            self.action = None
+
+    def step(self):
+        """
+        Used to make the battle handler a generator and iterate through the set of instructions for the battle.
+
+        :return: True if the battle was won, False if the battle was lost.
+        """
+        while not self.battle_ended:
+            # check battle state
+            self.update_battle_state()
+
+            if self.action is None:
+                if self.battle_state == BattleState.OTHER:
+                    GetEmulator().PressButton("B")
+                self.update_battle_action()
+                yield
+            else:
+                for _ in self.action:
+                    yield _
+                self.action = None
+
+    def determine_battle_menu_action(self):
+        """
+        Determines which action to select from the action menu
+
+        :return: an ordered pair containing A) the name of the action to take (fight, switch, flee, etc) and B) the
+        index of the desired choice.
+        """
+        if not config["battle"]["battle"] or not can_battle_happen():
+            self.choice = "flee"
+            self.idx = -1
+        elif config["battle"]["replace_lead_battler"] and self.should_rotate_lead:
+            mon_to_switch = self.get_mon_to_switch()
+            if mon_to_switch is None:
+                self.choice = "flee"
+                self.idx = -1
+            else:
+                self.choice = "switch"
+                self.idx = mon_to_switch
+        else:
+            match config["battle"]["battle_method"]:
+                case "strongest":
+                    move = self.get_strongest_move()
+                    if move == -1:
+                        if config["battle"]["replace_lead_battler"]:
+                            mon_to_switch = self.get_mon_to_switch()
+                            if mon_to_switch is None:
+                                self.choice = "flee"
+                                self.idx = -1
+                            else:
+                                self.choice = "switch"
+                                self.idx = mon_to_switch
+                        else:
+                            self.choice = "flee"
+                            self.idx = -1
+                    else:
+                        self.choice = "fight"
+                        self.idx = move
                 case _:
-                    attack_bonus = 0
-            power = move["power"] * attack_bonus
-            if move["type"] in mon["type"]:
-                power *= 1.5
-            if move["name"] in config["battle"]["banned_moves"]:
-                power = 0
-            redundant_move_power.append(power)
-        weakest_move_power = min(redundant_move_power)
-        weakest_move = full_moveset.index(redundant_type_moves[redundant_move_power.index(weakest_move_power)])
-        SetMessage("Opting to replace a move that has a redundant type so as to maximize coverage.")
-    SetMessage(
-        f"Move to replace is {full_moveset[weakest_move]['name']} with a calculated power of {weakest_move_power}"
-    )
-    return weakest_move
+                    SetMessage("Not yet implemented")
+                    self.choice = "flee"
+                    self.idx = -1
 
+    def update_party(self):
+        """
+        Updates the variable Party in the battle handler.
+        """
+        party = GetParty()
+        if party != self.party:
+            self.most_recent_leveled_mon_index = check_for_level_up(
+                self.party, party, self.most_recent_leveled_mon_index
+            )
+            self.party = party
 
-def find_effective_move(ally: dict, foe: dict) -> dict:
-    """
-    Finds the best move for the ally to use on the foe.
+    def update_current_battler(self):
+        """
+        Determines which Pokémon is battling.
+        """
+        # TODO: someday support double battles maybe idk
+        battler_indices = [
+            int.from_bytes(ReadSymbol("gBattlerPartyIndexes", size=12)[2 * i : 2 * i + 2], "little")
+            for i in range(self.num_battlers)
+        ]
+        if len(self.party) == 1:
+            self.current_battler = self.party[0]
+        self.current_battler = [self.party[battler_indices[i * 2]] for i in range(self.num_battlers // 2)][0]
 
-    :param ally: The Pokémon being used to battle.
-    :param foe: The Pokémon being battled.
-    :return: A dictionary containing the name of the move to use, the move's index, and the effective power of the move.
-    """
-    move_power = []
-    foe_types = pokemon_list[foe["name"]]["type"]
-    foe_defenses = {
-        "physical": foe["stats"]["defense"],
-        "special": foe["stats"]["spDefense"],
-    }
-    ally_types = pokemon_list[ally["name"]]["type"]
-    ally_attacks = {
-        "physical": foe["stats"]["attack"],
-        "special": foe["stats"]["spAttack"],
-    }
+    def get_mon_to_switch(self, show_messages=True) -> int | None:
+        """
+        Figures out which Pokémon should be switched out for the current active Pokémon.
 
-    # calculate power of each possible move
-    for i, move in enumerate(ally["moves"]):
-        move_power.append(get_move_power(move, ally_types, foe_types, ally_attacks, foe_defenses))
+        :param show_messages: Whether to display the message that Pokémon have usable moves or hit points, and whether
+        Pokémon seem to be fit to fight.
+        :return: the index of the Pokémon to switch with the active Pokémon
+        """
+        match config["battle"]["switch_strategy"]:
+            case "first_available":
+                for i in range(len(self.party)):
+                    if self.party[i] == self.current_battler or self.party[i]["isEgg"]:
+                        continue
+                    # check to see that the party member has enough HP to be subbed out
+                    elif self.party[i]["stats"]["hp"] / self.party[i]["stats"]["maxHP"] > 0.2:
+                        if show_messages:
+                            SetMessage(f"Pokémon {self.party[i]['name']} has more than 20% hp!")
+                        for move in self.party[i]["moves"]:
+                            if (
+                                move["power"] > 0
+                                and move["remaining_pp"] > 0
+                                and move["name"] not in config["battle"]["banned_moves"]
+                                and move["kind"] in ["Physical", "Special"]
+                            ):
+                                if show_messages:
+                                    SetMessage(f"Pokémon {self.party[i]['name']} has usable moves!")
+                                return i
+                if show_messages:
+                    SetMessage("No Pokémon seem to be fit to fight.")
 
-    # calculate best move and return info
-    best_move_index = move_power.index(max(move_power))
-    return {
-        "name": ally["moves"][best_move_index]["name"],
-        "index": best_move_index,
-        "power": max(move_power),
-    }
+    @staticmethod
+    def is_valid_move(move: dict) -> bool:
+        return (
+            move["name"] not in config["battle"]["banned_moves"]
+            and move["power"] > 0
+            and move["kind"] in ["Physical", "Special"]
+        )
+
+    def get_move_power(self, move, battler, target):
+        """
+        Calculates the effective power of a move.
+
+        :param move: The move in question
+        :param battler: The Pokémon using the move
+        :param target: The Pokémon that the move is targeting
+        :return: The effective power of the move given the battler and target Pokémon
+        """
+        power = move["power"]
+
+        # Ignore banned moves and moves that have no PP remaining
+        if (not self.is_valid_move(move)) or (move["remaining_pp"] == 0):
+            return 0
+
+        # Determine type effectiveness.
+        matchups = type_list[move["type"]]
+
+        for target_type in target["type"]:
+            if target_type is not None:
+                if target_type in matchups["immunes"]:
+                    return 0
+                elif target_type in matchups["weaknesses"]:
+                    power *= 0.5
+                elif target_type in matchups["strengths"]:
+                    power *= 2
+
+        # Factor in STAB
+        if move["type"] in battler["type"]:
+            power *= 1.5
+
+        # Determine how each Pokémon's stats affect the damage
+        match move["kind"]:
+            case "Physical":
+                stat_calc = battler["stats"]["attack"] / target["stats"]["defense"]
+            case "Special":
+                stat_calc = battler["stats"]["spAttack"] / target["stats"]["spDefense"]
+            case _:
+                return 0
+        return power * stat_calc
+
+    def find_effective_move(self, ally: dict, foe: dict) -> dict:
+        """
+        Finds the best move for the ally to use on the foe.
+
+        :param ally: The Pokémon being used to battle.
+        :param foe: The Pokémon being battled.
+        :return: A dictionary containing the name of the move to use, the move's index, and the effective power of the move.
+        """
+        # calculate power of each possible move
+        move_power = [self.get_move_power(move, ally, foe) for i, move in enumerate(ally["moves"])]
+
+        # calculate best move and return info
+        best_move_index = move_power.index(max(move_power))
+        return {
+            "name": ally["moves"][best_move_index]["name"],
+            "index": best_move_index,
+            "power": max(move_power),
+        }
+
+    def get_strongest_move(self) -> int:
+        """
+        Function that determines the strongest move to use given the current battler and the current
+        """
+        if self.num_battlers > 2:
+            SetMessage("Double battle detected, not yet implemented. Switching to manual mode...")
+            ForceManualMode()
+        else:
+            current_opponent = GetOpponent()
+            move = self.find_effective_move(self.current_battler, current_opponent)
+            if move["power"] == 0:
+                SetMessage("Lead Pokémon has no effective moves to battle the foe!")
+                return -1
+
+            SetMessage(
+                f"Best move against {current_opponent['name']} is {move['name']}, effective power: {move['power']:.2f}"
+            )
+            return move["index"]
+
+    @property
+    def should_rotate_lead(self) -> bool:
+        """
+        Determines whether the battle engine should swap out the lead Pokémon.
+        """
+        battler_health_percentage = self.current_battler["stats"]["hp"] / self.current_battler["stats"]["maxHP"]
+        return battler_health_percentage < 0.2
+
+    # TODO
+    def handle_battler_faint(self):
+        """
+        function that handles lead battler fainting
+        """
+        SetMessage("Lead Pokémon fainted!")
+        match config["battle"]["faint_action"]:
+            case "stop":
+                SetMessage("Switching to manual mode...")
+                ForceManualMode()
+            case "flee":
+                while get_battle_state() not in [BattleState.OVERWORLD, BattleState.PARTY_MENU]:
+                    GetEmulator().PressButton("B")
+                    yield
+                if get_battle_state() == BattleState.PARTY_MENU:
+                    SetMessage("Couldn't flee. Switching to manual mode...")
+                    ForceManualMode()
+                else:
+                    while not GetGameState() == GameState.OVERWORLD:
+                        GetEmulator().PressButton("B")
+                        yield
+                    return False
+            case "rotate":
+                party = GetParty()
+                if sum([mon["stats"]["hp"] for mon in party]) == 0:
+                    SetMessage("All Pokémon have fainted. Switching to manual mode...")
+                    ForceManualMode()
+                while get_battle_state() != BattleState.PARTY_MENU:
+                    GetEmulator().PressButton("A")
+                    yield
+                new_lead = self.get_mon_to_switch()
+                if new_lead is None:
+                    SetMessage("No viable pokemon to switch in!")
+                    faint_action_default = str(config["battle"]["faint_action"])
+                    config["battle"]["faint_action"] = "flee"
+                    self.handle_battler_faint()
+                    config["battle"]["faint_action"] = faint_action_default
+                    return False
+                switcher = send_out_pokemon(new_lead)
+                for i in switcher:
+                    yield i
+                while get_battle_state() in (BattleState.SWITCH_POKEMON, BattleState.PARTY_MENU):
+                    GetEmulator().PressButton("A")
+                    yield
+            case _:
+                SetMessage("Invalid faint_action option. Switching to manual mode...")
+                ForceManualMode()
 
 
 def get_battle_state() -> BattleState:
@@ -376,105 +791,10 @@ def get_learn_move_state() -> str:
         return "NO"
 
 
-def get_current_battler() -> list:
-    """
-    Determines which Pokémon is battling
-    """
-    match GetROM().game_title:
-        case "POKEMON RUBY" | "POKEMON SAPP":
-            # this tells us which pokemon from our party are battling. 0 represents a pokemon in the party who isn't battling, and also the pokemon at index 0 :(
-            battler_indices = [
-                int.from_bytes(ReadSymbol("gBattlerPartyIndexes", size=12)[2 * i : 2 * i + 2], "little")
-                for i in range(len(GetParty()))
-            ]
-            # this tells us how many pokemon are battling (2 for single battle, 4 for double) which allows us to get the pokemon info for the party members currently participating in the battle
-            num_battlers = ReadSymbol("gBattlersCount", size=1)[0]
-            # If we only have one party member, it's obviously the current battler so don't do the calcs for who's in battle
-            if len(GetParty()) == 1:
-                return GetParty()
-            current_battlers = [GetParty()[battler_indices[i * 2]] for i in range(num_battlers // 2)]
-            return current_battlers
-        case "POKEMON EMER" | "POKEMON FIRE" | "POKEMON LEAF":
-            # this tells us which pokemon from our party are battling. 0 represents a pokemon in the party who isn't battling, and also the pokemon at index 0 :(
-            battler_indices = [
-                int.from_bytes(ReadSymbol("gBattlerPartyIndexes", size=12)[2 * i : 2 * i + 2], "little")
-                for i in range(len(GetParty()))
-            ]
-            # this tells us how many pokemon are battling (2 for single battle, 4 for double) which allows us to get the pokemon info for the party members currently participating in the battle
-            num_battlers = ReadSymbol("gBattlersCount", size=1)[0]
-            # If we only have one party member, it's obviously the current battler so don't do the calcs for who's in battle
-            if len(GetParty()) == 1:
-                return GetParty()
-            current_battlers = [GetParty()[battler_indices[i * 2]] for i in range(num_battlers // 2)]
-            return current_battlers
-
-
-def get_strongest_move() -> int:
-    """
-    Function that determines the strongest move to use given the current battler and the current
-    """
-    current_battlers = get_current_battler()
-    if len(current_battlers) > 1:
-        SetMessage("Double battle detected, not yet implemented. Switching to manual mode...")
-        ForceManualMode()
-    else:
-        current_battler = current_battlers[0]
-        current_opponent = GetOpponent()
-        move = find_effective_move(current_battler, current_opponent)
-        if move["power"] == 0:
-            SetMessage("Lead Pokémon has no effective moves to battle the foe!")
-            return -1
-
-        SetMessage(f"Best move against {current_opponent['name']} is {move['name']}, effective power: {move['power']:.2f}")
-        return move["index"]
-
-
-def get_mon_to_switch(active_mon: int, show_messages=True) -> int:
-    """
-    Figures out which Pokémon should be switched out for the current active Pokémon.
-
-    :param active_mon: the party index of the Pokémon that is being replaced.
-    :param show_messages: Whether to display the message that Pokémon have usable moves or hit points, and whether
-    Pokémon seem to be fit to fight.
-    :return: the index of the Pokémon to switch with the active Pokémon
-    """
-    party = GetParty()
-    match config["battle"]["switch_strategy"]:
-        case "first_available":
-            for i in range(len(party)):
-                if party[i] == active_mon or party[i]["isEgg"]:
-                    continue
-                # check to see that the party member has enough HP to be subbed out
-                elif party[i]["stats"]["hp"] / party[i]["stats"]["maxHP"] > 0.2:
-                    if show_messages:
-                        SetMessage(f"Pokémon {party[i]['name']} has more than 20% hp!")
-                    for move in party[i]["moves"]:
-                        if (
-                            move["power"] > 0
-                            and move["remaining_pp"] > 0
-                            and move["name"] not in config["battle"]["banned_moves"]
-                            and move["kind"] in ["Physical", "Special"]
-                        ):
-                            if show_messages:
-                                SetMessage(f"Pokémon {party[i]['name']} has usable moves!")
-                            return i
-            if show_messages:
-                SetMessage("No Pokémon seem to be fit to fight.")
-
-
-def should_rotate_lead() -> bool:
-    """
-    Determines whether the battle engine should swap out the lead pokemon.
-    """
-    battler = get_current_battler()[0]
-    battler_health_percentage = battler["stats"]["hp"] / battler["stats"]["maxHP"]
-    return battler_health_percentage < 0.2
-
-
 # TODO
 def send_out_pokemon(index):
     """
-    Navigates from the party menu to the index of the desired pokemon
+    Navigates from the party menu to the index of the desired Pokémon
     """
     # options are the entire length of the party plus a cancel option
     cursor_positions = len(GetParty()) + 1
@@ -508,7 +828,7 @@ def send_out_pokemon(index):
                     break
                 yield
             while "TASK_HANDLESELECTIONMENUINPUT" in [task["func"] for task in ParseTasks()]:
-                NavigateMenu("SHIFT")
+                yield from PokemonPartySubMenuNavigator("SHIFT").step()
         case _:
             for i in range(60):
                 if "TASK_HANDLEPOPUPMENUINPUT" not in [task["func"] for task in ParseTasks()]:
@@ -558,7 +878,7 @@ def switch_out_pokemon(index):
             GetEmulator().PressButton("A")
             yield
         while GetTask("TASK_HANDLESELECTIONMENUINPUT") != {} and GetTask("TASK_HANDLESELECTIONMENUINPUT")["isActive"]:
-            NavigateMenu("SWITCH")
+            yield from PokemonPartySubMenuNavigator("SWITCH").step()
         while get_party_menu_cursor_pos()["action"] != 8:
             GetEmulator().PressButton("A")
             yield
@@ -583,7 +903,7 @@ def switch_out_pokemon(index):
             "SUB_808A060" in [task["func"] for task in ParseTasks()]
             or "HANDLEPARTYMENUSWITCHPOKEMONINPUT" in [task["func"] for task in ParseTasks()]
         ):
-            NavigateMenu("SWITCH")
+            yield from PokemonPartySubMenuNavigator("SWITCH").step()
             yield
         while SwitchPokemonActive():
             if get_party_menu_cursor_pos()["slot_id_2"] != 0:
@@ -611,63 +931,90 @@ def switch_out_pokemon(index):
         yield
 
 
-# TODO
-def handle_battler_faint():
+def calculate_new_move_viability(mon: dict, new_move: dict) -> int:
     """
-    function that handles lead battler fainting
+    Function that judges the move a Pokémon is trying to learn against its moveset and returns the index of the worst
+    move of the bunch.
+
+    :param mon: The Pokémon that is trying to learn a move
+    :param new_move: The move that the mon is trying to learn
+    :return: The index of the move to select.
     """
-    SetMessage("Lead Pokémon fainted!")
-    match config["battle"]["faint_action"]:
-        case "stop":
-            SetMessage("Switching to manual mode...")
-            ForceManualMode()
-        case "flee":
-            while get_battle_state() not in [BattleState.OVERWORLD, BattleState.PARTY_MENU]:
-                GetEmulator().PressButton("B")
-                yield
-            if get_battle_state() == BattleState.PARTY_MENU:
-                SetMessage("Couldn't flee. Switching to manual mode...")
-                ForceManualMode()
-            else:
-                while not GetGameState() == GameState.OVERWORLD:
-                    GetEmulator().PressButton("B")
-                    yield
-                return False
-        case "rotate":
-            party = GetParty()
-            if sum([mon["stats"]["hp"] for mon in party]) == 0:
-                SetMessage("All Pokémon have fainted. Switching to manual mode...")
-                ForceManualMode()
-            while get_battle_state() != BattleState.PARTY_MENU:
-                GetEmulator().PressButton("A")
-                yield
-            new_lead = get_mon_to_switch(get_current_battler()[0])
-            if new_lead is None:
-                SetMessage("No viable pokemon to switch in!")
-                faint_action_default = str(config["battle"]["faint_action"])
-                config["battle"]["faint_action"] = "flee"
-                handle_battler_faint()
-                config["battle"]["faint_action"] = faint_action_default
-                return False
-            send_out_pokemon(new_lead)
-            while get_battle_state() in (BattleState.SWITCH_POKEMON, BattleState.PARTY_MENU):
-                GetEmulator().PressButton("A")
-                yield
-        case _:
-            SetMessage("Invalid faint_action option. Switching to manual mode...")
-            ForceManualMode()
+
+    # exit learning move if new move is banned or has 0 power
+    if new_move["power"] == 0 or new_move["name"] in config["battle"]["banned_moves"]:
+        SetMessage(f"New move has base power of 0, so {mon['name']} will skip learning it.")
+        return 4
+    # get the effective power of each move
+    move_power = []
+    full_moveset = list(mon["moves"])
+    full_moveset.append(new_move)
+    for move in full_moveset:
+        attack_type = move["kind"]
+        match attack_type:
+            case "Physical":
+                attack_bonus = mon["stats"]["attack"]
+            case "Special":
+                attack_bonus = mon["stats"]["spAttack"]
+            case _:
+                attack_bonus = 0
+        power = move["power"] * attack_bonus
+        if move["type"] in mon["type"]:
+            power *= 1.5
+        if move["name"] in config["battle"]["banned_moves"]:
+            power = 0
+        move_power.append(power)
+    # find the weakest move of the bunch
+    weakest_move_power = min(move_power)
+    weakest_move = move_power.index(weakest_move_power)
+    # try and aim for good coverage- it's generally better to have a wide array of move types than 4 moves of the same
+    # type
+    redundant_type_moves = []
+    existing_move_types = {}
+    for move in full_moveset:
+        if move["power"] == 0:
+            continue
+        if move["type"] not in existing_move_types:
+            existing_move_types[move["type"]] = move
+        else:
+            if not redundant_type_moves:
+                redundant_type_moves.append(existing_move_types[move["type"]])
+            redundant_type_moves.append(move)
+    if weakest_move_power > 0 and redundant_type_moves:
+        redundant_move_power = []
+        for move in redundant_type_moves:
+            attack_type = move["kind"]
+            match attack_type:
+                case "Physical":
+                    attack_bonus = mon["stats"]["attack"]
+                case "Special":
+                    attack_bonus = mon["stats"]["spAttack"]
+                case _:
+                    attack_bonus = 0
+            power = move["power"] * attack_bonus
+            if move["type"] in mon["type"]:
+                power *= 1.5
+            if move["name"] in config["battle"]["banned_moves"]:
+                power = 0
+            redundant_move_power.append(power)
+        weakest_move_power = min(redundant_move_power)
+        weakest_move = full_moveset.index(redundant_type_moves[redundant_move_power.index(weakest_move_power)])
+        SetMessage("Opting to replace a move that has a redundant type so as to maximize coverage.")
+    SetMessage(
+        f"Move to replace is {full_moveset[weakest_move]['name']} with a calculated power of {weakest_move_power}"
+    )
+    return weakest_move
 
 
-# TODO
 def check_for_level_up(old_party: list[dict], new_party: list[dict], leveled_mon) -> int:
     """
     Compares the previous party state to the most recently gathered party state, and returns the index of the first
-    pokemon whose level is higher in the new party state.
+    Pokémon whose level is higher in the new party state.
 
     :param old_party: The previous party state
     :param new_party: The most recent party state
-    :param leveled_mon: The index of the pokemon that was most recently leveled before this call.
-    :return: The first index where a pokemon's level is higher in the new party than the old one.
+    :param leveled_mon: The index of the Pokémon that was most recently leveled before this call.
+    :return: The first index where a Pokémon's level is higher in the new party than the old one.
     """
     if len(old_party) != len(new_party):
         SetMessage("Party length has changed. Assuming a pokemon was just caught.")
@@ -682,49 +1029,24 @@ def can_battle_happen() -> bool:
     Determines whether the bot can battle with the state of the current party
     :return: True if the party is capable of having a battle, False otherwise
     """
-    first_suitable_battler = get_mon_to_switch(-1, show_messages=False)
-    if first_suitable_battler is None:
-        return False
-    return True
-
-
-def determine_battle_menu_action() -> tuple:
-    """
-    Determines which action to select from the action menu
-
-    :return: a tuple containing 1. the action to take, 2. the move to use if so desired, 3. the index of the pokemon to
-    switch to if so desired.
-    """
-    if not config["battle"]["battle"] or not can_battle_happen():
-        return "RUN", -1, -1
-    elif config["battle"]["replace_lead_battler"] and should_rotate_lead():
-        mon_to_switch = get_mon_to_switch(get_current_battler()[0])
-        if mon_to_switch is None:
-            return "RUN", -1, -1
-        return "SWITCH", -1, mon_to_switch
-    else:
-        match config["battle"]["battle_method"]:
-            case "strongest":
-                move = get_strongest_move()
-                if move == -1:
-                    if config["battle"]["replace_lead_battler"]:
-                        mon_to_switch = get_mon_to_switch(get_current_battler()[0])
-                        if mon_to_switch is None:
-                            return "RUN", -1, -1
-                        return "SWITCH", -1, mon_to_switch
-                    action = "RUN"
-                else:
-                    action = "FIGHT"
-                return action, move, -1
-            case _:
-                SetMessage("Not yet implemented")
-                return "RUN", -1, -1
+    party = GetParty()
+    for mon in party:
+        if mon["stats"]["hp"] / mon["stats"]["maxHP"] > 0.2 and not mon["isEgg"]:
+            for move in mon["moves"]:
+                if (
+                    move["power"] > 0
+                    and move["name"] not in config["battle"]["banned_moves"]
+                    and move["remaining_pp"] > 0
+                ):
+                    return True
+    return False
 
 
 class BattleMenu:
     def __init__(self, index: int):
         self.index: int = index
         if not 0 <= self.index <= 3:
+            print(f"Invalid index of {self.index}")
             return
         self.battle_state = get_battle_state()
         match self.battle_state:
@@ -733,6 +1055,7 @@ class BattleMenu:
             case BattleState.MOVE_SELECTION:
                 self.cursor_type = "gMoveSelectionCursor"
             case _:
+                print(f"Error getting cursor type. Battle state is {self.battle_state}")
                 return
 
     def step(self):
@@ -756,10 +1079,6 @@ class BattleMenu:
 class SelectBattleOption:
     """
     Takes a desired battle menu option, navigates to it, and presses it.
-
-    :param desired_option: The desired index for the selection. For the base battle menu, 0 will be FIGHT, 1 will be
-    BAG, 2 will be PKMN, and 3 will be RUN.
-     options.
     """
 
     def __init__(self, index: int):
@@ -784,92 +1103,10 @@ class SelectBattleOption:
                 case 1:
                     GetEmulator().PressButton("Up")
             yield
-        if get_battle_cursor(self.cursor_type) == self.index and get_battle_state() == self.battle_state:
-            GetEmulator().PressButton("A")
-        yield
-
-
-# TODO
-def handle_move_learn(leveled_mon: int):
-    match config["battle"]["new_move"]:
-        case "stop":
-            SetMessage("New move trying to be learned, switching to manual mode...")
-            ForceManualMode()
-        case "cancel":
-            while GetGameState() != GameState.OVERWORLD:
-                if get_learn_move_state() != "STOP_LEARNING":
-                    GetEmulator().PressButton("B")
-                else:
-                    GetEmulator().PressButton("A")
-                yield
-        case "learn_best":
-            if GetGameState() == GameState.BATTLE:
-                learning_mon = GetParty()[leveled_mon]
-            else:
-                learning_mon = get_learning_mon()
-            learning_move = get_learning_move()
-            worst_move = calculate_new_move_viability(learning_mon, learning_move)
-            if worst_move == 4:
-                while get_learn_move_state() == "LEARN_YN":
-                    GetEmulator().PressButton("B")
-                    yield
-
-                # for i in range(60):
-                #    if get_learn_move_state() != "STOP_LEARNING":
-                #        GetEmulator().RunSingleFrame()  # TODO bad (needs to be refactored so main loop advances frame)
-                #    else:
-                #        break
-
-                while get_learn_move_state() == "STOP_LEARNING":
-                    GetEmulator().PressButton("A")
-                    yield
-            else:
-                while get_learn_move_state() == "LEARN_YN":
-                    GetEmulator().PressButton("A")
-                    yield
-
-                # for i in range(60):
-                #    if not get_learn_move_state() == "MOVE_MENU":
-                #        GetEmulator().RunSingleFrame()  # TODO bad (needs to be refactored so main loop advances frame)
-                #    else:
-                #        break
-
-                navigate_move_learn_menu(worst_move)
-
-                while get_learn_move_state() == "STOP_LEARNING":
-                    GetEmulator().PressButton("B")
-                    yield
-
-            while get_battle_state() == BattleState.LEARNING and get_learn_move_state() not in [
-                "MOVE_MENU",
-                "LEARN_YN",
-                "STOP_LEARNING",
-            ]:
-                GetEmulator().PressButton("B")
-                yield
-
-
-# TODO
-def navigate_move_learn_menu(index):
-    """
-    Function that handles navigation of the move learning menu
-
-    :param index: the move to select (usually for forgetting a move)
-    """
-    while get_learn_move_state() == "MOVE_MENU":
-        if get_learning_move_cursor_pos() < index:
-            up_presses = get_learning_move_cursor_pos() + 5 - index
-            down_presses = index - get_learning_move_cursor_pos()
         else:
-            up_presses = get_learning_move_cursor_pos() - index
-            down_presses = index - get_learning_move_cursor_pos() + 5
-        if down_presses > up_presses:
-            GetEmulator().PressButton("Up")
-        else:
-            GetEmulator().PressButton("Down")
-        if get_learning_move_cursor_pos() == index:
-            GetEmulator().PressButton("A")
-        yield
+            while get_battle_cursor(self.cursor_type) == self.index and get_battle_state() == self.battle_state:
+                GetEmulator().PressButton("A")
+                yield
 
 
 # TODO
@@ -877,7 +1114,7 @@ def execute_menu_action(decision: tuple):
     """
     Given a decision made by the battle engine, executes the desired action.
 
-    :param decision: The output of determine_battle_menu_action, containing an action, move index, and pokemon index.
+    :param decision: The output of determine_battle_menu_action, containing an action, move index, and Pokémon index.
     """
     action, move, pokemon = decision
     match action:
@@ -888,16 +1125,16 @@ def execute_menu_action(decision: tuple):
             if 0 > move or move > 3:
                 SetMessage("Invalid move selection. Switching to manual mode...")
                 ForceManualMode()
-            while True:
+            else:
                 match get_battle_state():
                     case BattleState.ACTION_SELECTION:
                         select_battle_option = SelectBattleOption(0).step()
-                        while True:
-                            yield from select_battle_option
+                        for _ in select_battle_option:
+                            yield
                     case BattleState.MOVE_SELECTION:
                         select_battle_option = SelectBattleOption(move).step()
-                        while True:
-                            yield from select_battle_option
+                        for _ in select_battle_option:
+                            yield
                     case _:
                         GetEmulator().PressButton("B")
                 yield
@@ -914,7 +1151,9 @@ def execute_menu_action(decision: tuple):
                 select_battle_option = SelectBattleOption(2)
                 while not get_battle_state() == BattleState.PARTY_MENU:
                     yield from select_battle_option.step()
-                send_out_pokemon(pokemon)
+                switcher = send_out_pokemon(pokemon)
+                for _ in switcher:
+                    yield
             return
 
 
@@ -925,25 +1164,49 @@ def check_lead_can_battle():
     """
     lead = GetParty()[0]
     lead_has_moves = False
-    for move in lead['moves']:
-        if (
-            move['power'] > 0 and
-            move['name'] not in config['battle']['banned_moves'] and
-            move['remaining_pp'] > 0
-        ):
+    for move in lead["moves"]:
+        if move["power"] > 0 and move["name"] not in config["battle"]["banned_moves"] and move["remaining_pp"] > 0:
             lead_has_moves = True
             break
-    lead_has_hp = lead['stats']['hp'] > .2 * lead['stats']['maxHP']
+    lead_has_hp = lead["stats"]["hp"] > 0.2 * lead["stats"]["maxHP"]
     return lead_has_hp and lead_has_moves
+
+
+def get_new_lead() -> int | None:
+    """
+    Determines which Pokémon to put at the head of the party
+
+    :return: the index of the Pokémon to put at the head of the party
+    """
+    party = GetParty()
+    for i in range(len(party)):
+        mon = party[i]
+        if mon["isEgg"]:
+            continue
+        # check to see that the party member has enough HP to be subbed out
+        elif mon["stats"]["hp"] / mon["stats"]["maxHP"] > 0.2:
+            for move in mon["moves"]:
+                if (
+                    move["power"] > 0
+                    and move["remaining_pp"] > 0
+                    and move["name"] not in config["battle"]["banned_moves"]
+                    and move["kind"] in ["Physical", "Special"]
+                ):
+                    return i
+    return None
 
 
 # TODO
 def RotatePokemon():
-    new_lead = get_mon_to_switch(0)
+    new_lead = get_new_lead()
     if new_lead is not None:
-        NavigateStartMenu("POKEMON")
+        yield from StartMenuNavigator("POKEMON").step()
         for i in range(30):
             if GetGameState() != GameState.PARTY_MENU:
-                GetEmulator().PressButton('A')
+                GetEmulator().PressButton("A")
                 yield
-        send_out_pokemon(new_lead)
+        switcher = send_out_pokemon(new_lead)
+        for _ in switcher:
+            yield
+    else:
+        ForceManualMode()

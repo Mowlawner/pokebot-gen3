@@ -314,7 +314,7 @@ def PrintStats(pokemon: dict) -> NoReturn:
         console.print_exception(show_locals=True)
 
 
-def LogEncounter(pokemon: dict) -> NoReturn:
+def LogEncounter(pokemon: dict) -> None:
     global stats, encounter_log, encounter_timestamps, session_pokemon, session_encounters
 
     try:

@@ -1,11 +1,22 @@
+import sys
 from enum import Enum
 
+from modules.Config import config
+from modules.Console import console
 from modules.Gui import GetEmulator
 from modules.Memory import GetTask, GetGameState, GameState
+from modules.Menuing import CheckForPickup
 from modules.Pokemon import OpponentChanged, GetOpponent
-from modules.Stats import LogEncounter
+from modules.Stats import LogEncounter, stats
 from modules.Trainer import trainer, RunningStates, TileTransitionStates
-from modules.modes.Battle import encounter_pokemon
+from modules.modes.Battle import EncounterPokemon, check_lead_can_battle
+
+timer = 30
+from time import time
+import cProfile
+import pstats
+import io
+import os
 
 
 class TaskFishing(Enum):
@@ -30,6 +41,12 @@ class TaskFishing(Enum):
 class ModeSpin:
     def __init__(self):
         self.clockwise = ["Up", "Right", "Down", "Left"]
+        self.pickup_counter = 0
+        self.pickup_check = CheckForPickup(self.pickup_counter)
+        self.encounter = None
+        self.rotated_lead = False
+        self.should_rotate_lead = False
+
 
     def get_next_direction(self, current_direction):
         current_index = self.clockwise.index(current_direction)
@@ -38,16 +55,30 @@ class ModeSpin:
 
     def step(self):
         while True:
-            if trainer.GetRunningState() == RunningStates.NOT_MOVING:
+            if (
+                trainer.GetRunningState() == RunningStates.NOT_MOVING
+                and (
+                    (config["cheats"]["pickup"] and self.pickup_counter > 0)
+                    or self.pickup_counter == config["battle"]["pickup_check_frequency"]
+                )
+                and config["battle"]["pickup"]
+            ):
+                if self.pickup_check.current_step != "exit":
+                    yield from self.pickup_check.step()
+                else:
+                    self.pickup_counter = 0
+            elif trainer.GetRunningState() == RunningStates.NOT_MOVING:
                 GetEmulator().PressButton(self.get_next_direction(trainer.GetFacingDirection()))
             elif trainer.GetTileTransitionState() == TileTransitionStates.CENTERING:
                 if GetGameState() in [GameState.BATTLE, GameState.PARTY_MENU]:
                     if OpponentChanged():
                         LogEncounter(GetOpponent())
+                        self.pickup_counter += 1
+                        self.pickup_check = CheckForPickup(self.pickup_counter)
+                        self.encounter = EncounterPokemon()
                         continue
                     else:
-                        while True:
-                            yield from encounter_pokemon()
+                        yield from self.encounter.step()
             yield
 
 
@@ -70,6 +101,6 @@ class ModeFishing:
                         continue
                     else:
                         while True:
-                            yield from encounter_pokemon()
+                            yield from EncounterPokemon()
                 GetEmulator().PressButton("Select")
             yield
