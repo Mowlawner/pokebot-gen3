@@ -24,6 +24,15 @@ from .persistence import (
     deserialize_event,
     serialize_event,
 )
+from .projection import (
+    CampaignProjection,
+    ObservedBattle,
+    ObservedCampaignState,
+    ObservedEvent,
+    ObservedPokemon,
+    load_campaign_projection,
+    reduce_events,
+)
 
 __all__ = [
     "BattleSnapshot",
@@ -46,4 +55,11 @@ __all__ = [
     "JsonEventStore",
     "serialize_event",
     "deserialize_event",
+    "CampaignProjection",
+    "ObservedBattle",
+    "ObservedCampaignState",
+    "ObservedEvent",
+    "ObservedPokemon",
+    "load_campaign_projection",
+    "reduce_events",
 ]
