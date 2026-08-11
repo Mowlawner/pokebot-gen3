@@ -16,6 +16,7 @@ from .snapshots import (
     StoragePokemonSnapshot,
     get_nuzlocke_snapshot,
 )
+from .runtime import NuzlockeRuntime
 
 __all__ = [
     "BattleSnapshot",
@@ -32,4 +33,5 @@ __all__ = [
     "StorageSnapshot",
     "StoragePokemonSnapshot",
     "get_nuzlocke_snapshot",
+    "NuzlockeRuntime",
 ]

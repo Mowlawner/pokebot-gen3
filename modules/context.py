@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from modules.modes import BotListener, BotMode
     from modules.profiles import Profile
     from modules.roms import ROM
+    from modules.nuzlocke.runtime import NuzlockeRuntime
     from modules.stats import StatsDatabase
 
 
@@ -44,6 +45,7 @@ class BotContext:
 
         self.emulator: Optional["LibmgbaEmulator"] = None
         self.gui: Optional["PokebotGui"] = None
+        self.nuzlocke_runtime: Optional["NuzlockeRuntime"] = None
         self.profile: Optional["Profile"] = None
         self.stats: Optional["StatsDatabase"] = None
         self.debug: bool = False
