@@ -17,6 +17,13 @@ from .snapshots import (
     get_nuzlocke_snapshot,
 )
 from .runtime import NuzlockeRuntime
+from .persistence import (
+    EventStoreCorruptionError,
+    EventStoreError,
+    JsonEventStore,
+    deserialize_event,
+    serialize_event,
+)
 
 __all__ = [
     "BattleSnapshot",
@@ -34,4 +41,9 @@ __all__ = [
     "StoragePokemonSnapshot",
     "get_nuzlocke_snapshot",
     "NuzlockeRuntime",
+    "EventStoreError",
+    "EventStoreCorruptionError",
+    "JsonEventStore",
+    "serialize_event",
+    "deserialize_event",
 ]

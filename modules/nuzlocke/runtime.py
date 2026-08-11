@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable
+from uuid import uuid4
 from typing import TYPE_CHECKING
 
 from .events import Event, NuzlockeEventObserver
@@ -21,8 +22,16 @@ if TYPE_CHECKING:
 class NuzlockeRuntime:
     """Feed one snapshot per application frame and expose each event once."""
 
-    def __init__(self, snapshot_provider: Callable[[], NuzlockeSnapshot] = get_nuzlocke_snapshot) -> None:
+    def __init__(
+        self,
+        snapshot_provider: Callable[[], NuzlockeSnapshot] = get_nuzlocke_snapshot,
+        event_sink: Callable[[Event, str], None] | None = None,
+        session_id: str | None = None,
+    ) -> None:
         self._snapshot_provider = snapshot_provider
+        self._event_sink = event_sink
+        self._session_id = session_id or str(uuid4())
+        self._event_sequence = 0
         self._observer = NuzlockeEventObserver()
         self._events: Deque[Event] = deque()
         self._subscribers: list[Callable[[Event], None]] = []
@@ -39,14 +48,24 @@ class NuzlockeRuntime:
         if self._last_frame is not None and current.frame < self._last_frame:
             self._observer = NuzlockeEventObserver()
             self._events.clear()
+            self._session_id = str(uuid4())
+            self._event_sequence = 0
 
         self._last_frame = current.frame
         events = self._observer.observe(current)
         self._events.extend(events)
         for event in events:
+            self._event_sequence += 1
+            if self._event_sink is not None:
+                self._event_sink(event, self._session_id)
             for subscriber in tuple(self._subscribers):
                 subscriber(event)
         return events
+
+    @property
+    def session_id(self) -> str:
+        """Identifier for this emulator timeline, including reset boundaries."""
+        return self._session_id
 
     def subscribe(self, consumer: Callable[[Event], None]) -> Callable[[], None]:
         """Register a synchronous consumer and return its unsubscribe action."""

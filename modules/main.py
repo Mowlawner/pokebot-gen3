@@ -12,6 +12,7 @@ from modules.state_cache import state_cache
 from modules.stats import StatsDatabase
 from modules.tasks import get_global_script_context, get_tasks
 from modules.nuzlocke.runtime import NuzlockeRuntime
+from modules.nuzlocke.persistence import JsonEventStore
 
 # Contains a queue of tasks that should be run the next time a frame completes.
 # This is currently used by the HTTP server component (which runs in a separate thread) to trigger things
@@ -57,6 +58,7 @@ def main_loop() -> None:
         plugin_profile_loaded(context.profile)
 
         context.stats = StatsDatabase(context.profile)
+        nuzlocke_event_store = JsonEventStore(context.profile.path / "nuzlocke_events.json")
 
         if context.config.http.http_server.enable:
             from modules.web.http import start_http_server
@@ -67,7 +69,7 @@ def main_loop() -> None:
             )
 
         context.bot_listeners = get_bot_listeners(context.rom)
-        context.nuzlocke_runtime = NuzlockeRuntime()
+        context.nuzlocke_runtime = NuzlockeRuntime(event_sink=nuzlocke_event_store)
         previous_frame_info: FrameInfo | None = None
 
         while True:
@@ -102,7 +104,7 @@ def main_loop() -> None:
             if previous_frame_info is not None and previous_frame_info.frame_count > frame_info.frame_count:
                 state_cache.reset()
                 context.bot_listeners = get_bot_listeners(context.rom)
-                context.nuzlocke_runtime = NuzlockeRuntime()
+                context.nuzlocke_runtime = NuzlockeRuntime(event_sink=nuzlocke_event_store)
 
             # Capture normalized state at the application frame boundary,
             # before the emulator advances. This is passive and independent of
