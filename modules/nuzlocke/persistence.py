@@ -21,6 +21,7 @@ from typing import Any, Iterable
 from .events import (
     BattleEnded,
     BattleStarted,
+    PokemonCaptured,
     Event,
     GameStateChanged,
     MapChanged,
@@ -29,6 +30,7 @@ from .events import (
     StorageChanged,
     WhiteoutOccurred,
 )
+from .identity import PokemonIdentity
 
 SCHEMA_VERSION = 1
 _EVENT_TYPES = {
@@ -36,6 +38,7 @@ _EVENT_TYPES = {
     for cls in (
         BattleEnded,
         BattleStarted,
+        PokemonCaptured,
         GameStateChanged,
         MapChanged,
         PartyChanged,
@@ -85,6 +88,10 @@ def _decode(value: Any) -> Any:
             current = getattr(current, part)
         return current[value["name"]]
     if isinstance(value, dict):
+        if set(value) == {"personality_value", "original_trainer_id", "original_trainer_secret_id"}:
+            return PokemonIdentity(
+                value["personality_value"], value["original_trainer_id"], value["original_trainer_secret_id"]
+            )
         return {key: _decode(item) for key, item in value.items()}
     return value
 

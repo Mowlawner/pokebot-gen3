@@ -17,7 +17,7 @@ from .snapshots import (
     get_nuzlocke_snapshot,
 )
 from .identity import PokemonIdentity
-from .events import PokemonStorageLocation, StorageChanged
+from .events import PokemonCaptured, PokemonStorageLocation, StorageChanged
 from .runtime import NuzlockeRuntime
 from .persistence import (
     EventStoreCorruptionError,
@@ -34,6 +34,14 @@ from .projection import (
     ObservedPokemon,
     load_campaign_projection,
     reduce_events,
+)
+from .rules import (
+    NuzlockeCampaignState,
+    NuzlockeRulesProjection,
+    LocationEncounter,
+    RuleViolation,
+    load_rules,
+    reduce_rules,
 )
 
 __all__ = [
@@ -53,6 +61,7 @@ __all__ = [
     "PokemonIdentity",
     "PokemonStorageLocation",
     "StorageChanged",
+    "PokemonCaptured",
     "get_nuzlocke_snapshot",
     "NuzlockeRuntime",
     "EventStoreError",
@@ -67,4 +76,10 @@ __all__ = [
     "ObservedPokemon",
     "load_campaign_projection",
     "reduce_events",
+    "NuzlockeCampaignState",
+    "NuzlockeRulesProjection",
+    "LocationEncounter",
+    "RuleViolation",
+    "load_rules",
+    "reduce_rules",
 ]

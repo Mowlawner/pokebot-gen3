@@ -30,6 +30,8 @@ class BattleStarted:
     is_wild: bool
     is_double: bool
     own_pokemon_identities: tuple[PokemonIdentity, ...] = ()
+    opponent_pokemon_identities: tuple[PokemonIdentity, ...] = ()
+    location: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +43,22 @@ class BattleEnded:
     is_wild: bool
     is_double: bool
     own_pokemon_identities: tuple[PokemonIdentity, ...] = ()
+    opponent_pokemon_identities: tuple[PokemonIdentity, ...] = ()
+    location: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PokemonCaptured:
+    """Generic observation that a Pokémon was captured.
+
+    Capture detection is game/application specific.  Producers must emit this
+    only when they have a reliable capture signal; the rules layer never
+    guesses from party or PC movement.
+    """
+
+    frame: int
+    identity: PokemonIdentity
+    location: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +121,7 @@ class GameStateChanged:
 Event = (
     BattleStarted
     | BattleEnded
+    | PokemonCaptured
     | MapChanged
     | PartyChanged
     | PokemonFainted
@@ -183,6 +202,8 @@ class NuzlockeEventObserver:
                     battle.is_wild,
                     battle.is_double,
                     tuple(p.identity for p in battle.own_active if p.identity is not None),
+                    tuple(p.identity for p in battle.opponent_active if p.identity is not None),
+                    _map(snapshot),
                 )
             )
         elif snapshot.battle_available and snapshot.battle is None and self._previous_ready_battle is not None:
@@ -196,6 +217,8 @@ class NuzlockeEventObserver:
                     battle.is_wild,
                     battle.is_double,
                     tuple(p.identity for p in battle.own_active if p.identity is not None),
+                    tuple(p.identity for p in battle.opponent_active if p.identity is not None),
+                    _map(self._previous_ready_battle),
                 )
             )
 

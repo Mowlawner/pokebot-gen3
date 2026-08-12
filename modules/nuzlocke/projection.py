@@ -19,6 +19,7 @@ from .events import (
     GameStateChanged,
     MapChanged,
     PartyChanged,
+    PokemonCaptured,
     PokemonFainted,
     StorageChanged,
     WhiteoutOccurred,
@@ -75,6 +76,7 @@ class ObservedCampaignState:
     observed_pokemon: tuple[ObservedPokemon, ...] = ()
     observed_faints: tuple[PokemonFainted, ...] = ()
     observed_whiteouts: tuple[ObservedEvent, ...] = ()
+    observed_captures: tuple[PokemonCaptured, ...] = ()
 
 
 def _event_key(event: Event, session_id: str | None) -> str:
@@ -119,6 +121,7 @@ class CampaignProjection:
                 MapChanged,
                 PartyChanged,
                 PokemonFainted,
+                PokemonCaptured,
                 StorageChanged,
                 WhiteoutOccurred,
                 GameStateChanged,
@@ -207,6 +210,8 @@ class CampaignProjection:
                 if old
                 else state.observed_pokemon + (replacement,)
             )
+        elif isinstance(event, PokemonCaptured):
+            changes["observed_captures"] = state.observed_captures + (event,)
         elif isinstance(event, StorageChanged):
             locations = dict((identity, (box, slot)) for identity, box, slot in (state.pc_locations or ()))
             for location in event.left:
