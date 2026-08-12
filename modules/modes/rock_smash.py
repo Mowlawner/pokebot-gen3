@@ -151,10 +151,10 @@ class RockSmashMode(BotMode):
         )
 
         if get_player_avatar().map_group_and_number in (
-            MapRSE.ROUTE121_SAFARI_ZONE_ENTRANCE,
-            MapRSE.SAFARI_ZONE_SOUTH,
-            MapRSE.SAFARI_ZONE_NORTHEAST,
-            MapRSE.SAFARI_ZONE_SOUTHEAST,
+                MapRSE.ROUTE121_SAFARI_ZONE_ENTRANCE,
+                MapRSE.SAFARI_ZONE_SOUTH,
+                MapRSE.SAFARI_ZONE_NORTHEAST,
+                MapRSE.SAFARI_ZONE_SOUTHEAST,
         ):
             assert_save_game_exists("There is no saved game. Cannot soft reset.")
             assert_boxes_or_party_can_fit_pokemon(check_in_saved_game=True)
@@ -248,13 +248,13 @@ class RockSmashMode(BotMode):
 
                     def is_near_entrance_door():
                         return (
-                            get_player_avatar().map_group_and_number == MapRSE.SAFARI_ZONE_SOUTH
-                            and get_player_avatar().local_coordinates in ((32, 33), (32, 34))
+                                get_player_avatar().map_group_and_number == MapRSE.SAFARI_ZONE_SOUTH
+                                and get_player_avatar().local_coordinates in ((32, 33), (32, 34))
                         )
 
                     if is_near_entrance_door() or (
-                        get_player_avatar().map_group_and_number == MapRSE.SAFARI_ZONE_SOUTH
-                        and get_global_script_context().is_active
+                            get_player_avatar().map_group_and_number == MapRSE.SAFARI_ZONE_SOUTH
+                            and get_global_script_context().is_active
                     ):
                         while is_near_entrance_door() or get_global_script_context().is_active:
                             yield
@@ -432,8 +432,8 @@ class RockSmashMode(BotMode):
             "Route121_SafariZoneEntrance_EventScript_TryEnterSafariZone", "A"
         )
         while (
-            get_player_avatar().local_coordinates != (32, 35)
-            or get_player_avatar().tile_transition_state != TileTransitionState.NOT_MOVING
+                get_player_avatar().local_coordinates != (32, 35)
+                or get_player_avatar().tile_transition_state != TileTransitionState.NOT_MOVING
         ):
             yield
 

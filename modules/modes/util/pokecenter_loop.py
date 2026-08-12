@@ -50,9 +50,9 @@ class PokecenterLoopController:
                 [learned_move.move.base_power for learned_move in lead_pokemon.moves if learned_move is not None]
             )
             if (
-                lead_pokemon.current_hp <= 0
-                or lead_knows_damaging_moves
-                or not self.battle_strategy().party_can_battle()
+                    lead_pokemon.current_hp <= 0
+                    or lead_knows_damaging_moves
+                    or not self.battle_strategy().party_can_battle()
             ):
                 self._needs_healing = True
 
@@ -67,7 +67,7 @@ class PokecenterLoopController:
 
         effective_encounters = get_effective_encounter_rates_for_current_map()
         if (not current_location.is_surfable and len(effective_encounters.land_encounters) == 0) or (
-            current_location.is_surfable and len(effective_encounters.surf_encounters) == 0
+                current_location.is_surfable and len(effective_encounters.surf_encounters) == 0
         ):
             raise BotModeError(
                 "Currently, no encounters can happen on this map. This might be due to active Repel, or because this map simply doesn't have any."
@@ -108,9 +108,9 @@ class PokecenterLoopController:
 
             def activity_stop_condition() -> bool:
                 return (
-                    self._needs_healing
-                    or self._leave_pokemon_center
-                    or (stop_condition is not None and stop_condition())
+                        self._needs_healing
+                        or self._leave_pokemon_center
+                        or (stop_condition is not None and stop_condition())
                 )
 
             if activity == "fish":

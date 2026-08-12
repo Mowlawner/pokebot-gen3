@@ -85,7 +85,7 @@ def _get_targeted_encounter() -> Encounter | None:
             entry
             for entry in encounters
             if entry.map == (targeted_tile.map_group, targeted_tile.map_number)
-            and entry.coordinates == targeted_tile.local_position
+               and entry.coordinates == targeted_tile.local_position
         ),
         None,
     )

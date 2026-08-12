@@ -64,7 +64,7 @@ def _get_targeted_encounter() -> tuple[MapFRLG | MapRSE, tuple[int, int], str] |
             entry
             for entry in encounters
             if entry[0] == (targeted_tile.map_group, targeted_tile.map_number)
-            and entry[1] == targeted_tile.local_position
+               and entry[1] == targeted_tile.local_position
         ),
         None,
     )
@@ -113,16 +113,16 @@ class StaticGiftResetsMode(BotMode):
             if save_data.get_event_flag("RECEIVED_LAVARIDGE_EGG"):
                 raise BotModeError("You have already received the Wynaut egg in your saved game.")
         if (
-            context.rom.is_emerald
-            and encounter[2] in ["Wynaut", "Togepi"]
-            and not any(
-                pokemon.ability.name
-                in [
-                    "Flame Body",
-                    "Magma Armor",
-                ]
-                for pokemon in save_data.get_party()
-            )
+                context.rom.is_emerald
+                and encounter[2] in ["Wynaut", "Togepi"]
+                and not any(
+            pokemon.ability.name
+            in [
+                "Flame Body",
+                "Magma Armor",
+            ]
+            for pokemon in save_data.get_party()
+        )
         ):
             console.print("[bold yellow]WARNING: None of your Pokémon has the Flame Body / Magma Armor ability.[/]")
             console.print("[yellow]Hatching will take twice as long this way.[/]")

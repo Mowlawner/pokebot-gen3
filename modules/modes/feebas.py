@@ -6,7 +6,7 @@ from modules.context import context
 from modules.items import get_item_by_name, get_item_bag
 from modules.map import get_map_data
 from modules.map_data import MapRSE
-from modules.player import get_player, get_player_avatar, AvatarFlags, get_player_location
+from modules.player import get_player, get_player_avatar, AvatarFlags
 from modules.pokemon_party import get_party
 from . import BattleAction
 from ._asserts import assert_player_has_poke_balls, assert_boxes_or_party_can_fit_pokemon
@@ -98,7 +98,7 @@ def _get_fishing_spots() -> FishingSpotList:
 
 
 def _get_nearest_accessible_neighbour(
-    target_coordinates: tuple[int, int], current_position: tuple[int, int]
+        target_coordinates: tuple[int, int], current_position: tuple[int, int]
 ) -> tuple[tuple[int, int], str]:
     candidates = (
         (target_coordinates[0], target_coordinates[1] - 1, "Down"),
@@ -128,9 +128,9 @@ class FeebasMode(BotMode):
     @staticmethod
     def is_selectable() -> bool:
         return (
-            context.rom.is_rse
-            and get_player_avatar().map_group_and_number in (MapRSE.ROUTE119,)
-            and AvatarFlags.Surfing in get_player_avatar().flags
+                context.rom.is_rse
+                and get_player_avatar().map_group_and_number in (MapRSE.ROUTE119,)
+                and AvatarFlags.Surfing in get_player_avatar().flags
         )
 
     def __init__(self):
@@ -184,9 +184,9 @@ class FeebasMode(BotMode):
             yield from register_key_item(get_item_by_name("Old Rod"))
 
         if (
-            item_bag.quantity_of(get_item_by_name("Old Rod")) == 0
-            and item_bag.quantity_of(get_item_by_name("Good Rod")) == 0
-            and get_item_by_name("Super Rod") == 0
+                item_bag.quantity_of(get_item_by_name("Old Rod")) == 0
+                and item_bag.quantity_of(get_item_by_name("Good Rod")) == 0
+                and get_item_by_name("Super Rod") == 0
         ):
             raise BotModeError("Error: You cannot use this mode without having a fishing rod.")
 

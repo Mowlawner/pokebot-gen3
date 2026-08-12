@@ -82,7 +82,7 @@ class BattleListener(BotListener):
 
     def handle_frame(self, bot_mode: BotMode, frame: FrameInfo):
         if (not self._in_battle or self._reported_end_of_battle) and (
-            frame.game_state in self.battle_states or frame.task_is_active("Task_BattleStart")
+                frame.game_state in self.battle_states or frame.task_is_active("Task_BattleStart")
         ):
             self._in_battle = True
             self._reported_start_of_battle = False
@@ -130,11 +130,11 @@ class BattleListener(BotListener):
             self._current_action = action
 
         elif (
-            self._in_battle
-            and self._reported_start_of_battle
-            and get_game_state() not in self.battle_states
-            and not frame.task_is_active("Task_BattleStart")
-            and get_last_battle_outcome() != BattleOutcome.InProgress
+                self._in_battle
+                and self._reported_start_of_battle
+                and get_game_state() not in self.battle_states
+                and not frame.task_is_active("Task_BattleStart")
+                and get_last_battle_outcome() != BattleOutcome.InProgress
         ):
             outcome = get_last_battle_outcome()
             if not self._reported_end_of_battle:
@@ -146,13 +146,13 @@ class BattleListener(BotListener):
                     context.stats.log_end_of_battle(outcome, self._active_wild_encounter)
 
             if (
-                get_game_state_symbol() != "CB2_RETURNTOFIELD"
-                and get_game_state_symbol() != "CB2_RETURNTOFIELDLOCAL"
-                and "Task_ReturnToFieldNoScript" not in frame.active_tasks
-                and "Task_ReturnToFieldContinueScriptPlayMapMusic" not in frame.active_tasks
-                and "task_mpl_807E3C8" not in frame.active_tasks
-                and len(get_map_objects()) > 0
-                and player_avatar_is_standing_still()
+                    get_game_state_symbol() != "CB2_RETURNTOFIELD"
+                    and get_game_state_symbol() != "CB2_RETURNTOFIELDLOCAL"
+                    and "Task_ReturnToFieldNoScript" not in frame.active_tasks
+                    and "Task_ReturnToFieldContinueScriptPlayMapMusic" not in frame.active_tasks
+                    and "task_mpl_807E3C8" not in frame.active_tasks
+                    and len(get_map_objects()) > 0
+                    and player_avatar_is_standing_still()
             ):
                 self._in_battle = False
                 if outcome == BattleOutcome.NoSafariBallsLeft:
@@ -179,7 +179,6 @@ class BattleListener(BotListener):
 
             if self._was_starting_to_become_visible:
                 if is_finally_visible:
-
                     def report_visible():
                         # First, run the `on_wild_encounter_visible()` callbacks -- which might
                         # introduce some delay, so we want to wait for that.
@@ -215,13 +214,13 @@ class BattleListener(BotListener):
             )
 
         if (
-            get_game_state() != GameState.BATTLE
-            and not get_global_script_context().is_active
-            and player_avatar_is_standing_still()
+                get_game_state() != GameState.BATTLE
+                and not get_global_script_context().is_active
+                and player_avatar_is_standing_still()
         ):
             if context.bot_mode_instance is not None and (
-                len(result.party_indices_with_stolen_items) > 0
-                or (should_check_for_pickup() and context.bot_mode_instance.on_pickup_threshold_reached())
+                    len(result.party_indices_with_stolen_items) > 0
+                    or (should_check_for_pickup() and context.bot_mode_instance.on_pickup_threshold_reached())
             ):
                 yield from self.retrieve_held_items(result)
             if strategy.choose_new_lead_after_battle() is not None:
@@ -236,10 +235,10 @@ class BattleListener(BotListener):
         pokemon_with_picked_up_item = []
         for pokemon in get_party():
             if (
-                not pokemon.is_egg
-                and pokemon.ability.name == "Pickup"
-                and (held_item := pokemon.held_item) is not None
-                and held_item.name in pickup_item_names
+                    not pokemon.is_egg
+                    and pokemon.ability.name == "Pickup"
+                    and (held_item := pokemon.held_item) is not None
+                    and held_item.name in pickup_item_names
             ):
                 pokemon_with_picked_up_item.append(pokemon.index)
 
@@ -288,13 +287,13 @@ class BattleListener(BotListener):
 class TrainerApproachListener(BotListener):
     def handle_frame(self, bot_mode: BotMode, frame: FrameInfo):
         if frame.game_state == GameState.OVERWORLD and (
-            self.handle_trainer_approach.__qualname__ not in frame.controller_stack
-            and (
-                frame.script_is_active("EventScript_TrainerApproach")
-                or frame.script_is_active("EventScript_DoTrainerBattleFromApproach")
-                or frame.script_is_active("EventScript_StartTrainerBattle")
-                or frame.script_is_active("EventScript_DoTrainerBattle")
-            )
+                self.handle_trainer_approach.__qualname__ not in frame.controller_stack
+                and (
+                        frame.script_is_active("EventScript_TrainerApproach")
+                        or frame.script_is_active("EventScript_DoTrainerBattleFromApproach")
+                        or frame.script_is_active("EventScript_StartTrainerBattle")
+                        or frame.script_is_active("EventScript_DoTrainerBattle")
+                )
         ):
             bot_mode.on_spotted_by_trainer()
             context.controller_stack.append(self.handle_trainer_approach())
@@ -345,9 +344,9 @@ class FishingListener(BotListener):
 class PokenavListener(BotListener):
     def handle_frame(self, bot_mode: BotMode, frame: FrameInfo):
         if (
-            frame.game_state == GameState.OVERWORLD
-            and frame.task_is_active("ExecuteMatchCall")
-            and self.ignore_call.__qualname__ not in frame.controller_stack
+                frame.game_state == GameState.OVERWORLD
+                and frame.task_is_active("ExecuteMatchCall")
+                and self.ignore_call.__qualname__ not in frame.controller_stack
         ):
             context.stats.log_pokenav_call()
             bot_mode.on_pokenav_call()
@@ -357,8 +356,8 @@ class PokenavListener(BotListener):
     @debug.track
     def ignore_call(self):
         while task_is_active("ExecuteMatchCall") or (
-            get_global_script_context().is_active
-            and "Route104_EventScript_SailToDewfordDadCalls" not in get_global_script_context().stack
+                get_global_script_context().is_active
+                and "Route104_EventScript_SailToDewfordDadCalls" not in get_global_script_context().stack
         ):
             context.emulator.press_button("B")
             yield
@@ -382,7 +381,7 @@ class EggHatchListener(BotListener):
         is_handling_hatch = self.handle_hatching_egg.__qualname__ in frame.controller_stack
 
         if frame.game_state in [GameState.OVERWORLD, GameState.EGG_HATCH] and (
-            not is_handling_hatch and frame.script_is_active(self._script_name)
+                not is_handling_hatch and frame.script_is_active(self._script_name)
         ):
             self._reported_hatched_egg = False
             self._hatching_party_index = unpack_uint16(read_symbol("gSpecialVar_0x8004"))
@@ -443,9 +442,9 @@ class RepelListener(BotListener):
 
     def handle_frame(self, bot_mode: BotMode, frame: FrameInfo):
         if (
-            frame.game_state == GameState.OVERWORLD
-            and frame.script_is_active(self._script_name)
-            and self.handle_repel_expiration_message.__qualname__ not in frame.controller_stack
+                frame.game_state == GameState.OVERWORLD
+                and frame.script_is_active(self._script_name)
+                and self.handle_repel_expiration_message.__qualname__ not in frame.controller_stack
         ):
             context.controller_stack.append(self.handle_repel_expiration_message(bot_mode))
 
@@ -472,17 +471,17 @@ class PoisonListener(BotListener):
 
     def handle_frame(self, bot_mode: BotMode, frame: FrameInfo):
         if (
-            frame.game_state == GameState.OVERWORLD
-            and frame.script_is_active(self._script_name)
-            and self.handle_fainting_message.__qualname__ not in frame.controller_stack
+                frame.game_state == GameState.OVERWORLD
+                and frame.script_is_active(self._script_name)
+                and self.handle_fainting_message.__qualname__ not in frame.controller_stack
         ):
             party = get_party()
             for index in range(len(party)):
                 pokemon = party[index]
                 if (
-                    pokemon.is_valid
-                    and pokemon.current_hp == 0
-                    and pokemon.status_condition in (StatusCondition.Poison, StatusCondition.BadPoison)
+                        pokemon.is_valid
+                        and pokemon.current_hp == 0
+                        and pokemon.status_condition in (StatusCondition.Poison, StatusCondition.BadPoison)
                 ):
                     bot_mode.on_pokemon_fainted_due_to_poison(pokemon, index)
             context.controller_stack.append(self.handle_fainting_message())
@@ -498,13 +497,13 @@ class PoisonListener(BotListener):
 class WhiteoutListener(BotListener):
     def handle_frame(self, bot_mode: BotMode, frame: FrameInfo):
         if (
-            frame.game_state == GameState.WHITEOUT
-            or (frame.game_state == GameState.OVERWORLD and frame.task_is_active("Task_RushInjuredPokemonToCenter"))
-            or frame.script_is_active("EventScript_FieldWhiteOut")
-            or frame.script_is_active("EventScript_FieldWhiteOutNoMoney")
-            or frame.script_is_active("EventScript_FieldWhiteOutHasMoney")
-            or frame.script_is_active("EventScript_FieldWhiteOutFade")
-            or frame.script_is_active("EventScript_1A14CA")
+                frame.game_state == GameState.WHITEOUT
+                or (frame.game_state == GameState.OVERWORLD and frame.task_is_active("Task_RushInjuredPokemonToCenter"))
+                or frame.script_is_active("EventScript_FieldWhiteOut")
+                or frame.script_is_active("EventScript_FieldWhiteOutNoMoney")
+                or frame.script_is_active("EventScript_FieldWhiteOutHasMoney")
+                or frame.script_is_active("EventScript_FieldWhiteOutFade")
+                or frame.script_is_active("EventScript_1A14CA")
         ) and self.handle_whiteout_dialogue.__qualname__ not in frame.controller_stack:
             context.controller_stack.append(self.handle_whiteout_dialogue(bot_mode))
 
@@ -512,11 +511,11 @@ class WhiteoutListener(BotListener):
     def handle_whiteout_dialogue(self, bot_mode: BotMode):
         context.emulator.reset_held_buttons()
         while (
-            "EventScript_FieldWhiteOut" in get_global_script_context().stack
-            or "EventScript_FieldWhiteOutNoMoney" in get_global_script_context().stack
-            or "EventScript_FieldWhiteOutHasMoney" in get_global_script_context().stack
-            or "EventScript_FieldWhiteOutFade" in get_global_script_context().stack
-            or "EventScript_1A14CA" in get_global_script_context().stack
+                "EventScript_FieldWhiteOut" in get_global_script_context().stack
+                or "EventScript_FieldWhiteOutNoMoney" in get_global_script_context().stack
+                or "EventScript_FieldWhiteOutHasMoney" in get_global_script_context().stack
+                or "EventScript_FieldWhiteOutFade" in get_global_script_context().stack
+                or "EventScript_1A14CA" in get_global_script_context().stack
         ):
             context.emulator.press_button("B")
             yield
@@ -566,14 +565,14 @@ class SafariZoneListener(BotListener):
 
     def handle_frame(self, bot_mode: BotMode, frame: FrameInfo):
         if (
-            frame.game_state == GameState.OVERWORLD
-            and get_player_avatar().map_group_and_number in self._safari_zone_maps
-            and self.handle_safari_zone_timeout.__qualname__ not in frame.controller_stack
+                frame.game_state == GameState.OVERWORLD
+                and get_player_avatar().map_group_and_number in self._safari_zone_maps
+                and self.handle_safari_zone_timeout.__qualname__ not in frame.controller_stack
         ):
             if frame.script_is_active("SafariZone_EventScript_TimesUp") or frame.script_is_active("gUnknown_081C3448"):
                 context.controller_stack.append(self.handle_safari_zone_timeout(bot_mode, "steps"))
             if frame.script_is_active("SafariZone_EventScript_OutOfBalls") or frame.script_is_active(
-                "gUnknown_081C3459"
+                    "gUnknown_081C3459"
             ):
                 context.controller_stack.append(self.handle_safari_zone_timeout(bot_mode, "Safari balls"))
 
@@ -588,8 +587,8 @@ class SafariZoneListener(BotListener):
 
         local_coordinates_after_leaving = (9, 4) if context.rom.is_rse else (4, 4)
         while (
-            get_player_avatar().local_coordinates != local_coordinates_after_leaving
-            or get_player_avatar().tile_transition_state != TileTransitionState.NOT_MOVING
+                get_player_avatar().local_coordinates != local_coordinates_after_leaving
+                or get_player_avatar().tile_transition_state != TileTransitionState.NOT_MOVING
         ):
             context.emulator.press_button("B")
             yield

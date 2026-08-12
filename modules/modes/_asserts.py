@@ -53,7 +53,7 @@ def assert_saved_on_map(expected_locations: SavedMapLocation | list[SavedMapLoca
         start_offset = 0x9E0
     for index in range(16):
         offset = start_offset + index * 0x24
-        object_event = ObjectEvent(save_data.sections[1][offset : offset + 0x24])
+        object_event = ObjectEvent(save_data.sections[1][offset: offset + 0x24])
         if "isPlayer" in object_event.flags:
             player_object_event = object_event
             break
@@ -78,7 +78,7 @@ def assert_saved_on_map(expected_locations: SavedMapLocation | list[SavedMapLoca
 
 
 def assert_registered_item(
-    expected_items: str | list[str], error_message: str, check_in_saved_game: bool = False
+        expected_items: str | list[str], error_message: str, check_in_saved_game: bool = False
 ) -> None:
     """
     Raises an exception if the given item is not registered (for the Select button.)
@@ -99,7 +99,7 @@ def assert_registered_item(
 
 
 def assert_has_pokemon_with_any_move(
-    moves: list[str], error_message: str, check_in_saved_game: bool = False, with_pp_remaining: bool = False
+        moves: list[str], error_message: str, check_in_saved_game: bool = False, with_pp_remaining: bool = False
 ) -> None:
     """
     Raises an exception if the player has no Pokémon that knows any of the given move in their
@@ -128,7 +128,7 @@ def assert_has_pokemon_with_any_move(
 
 
 def assert_item_exists_in_bag(
-    expected_items: str | list[str] | tuple[str], error_message: str, check_in_saved_game: bool = False
+        expected_items: str | list[str] | tuple[str], error_message: str, check_in_saved_game: bool = False
 ) -> None:
     """
     Raises an exception if the player does not have the given item in their bag.
@@ -223,7 +223,7 @@ def assert_party_has_damaging_move(error_message: str, check_in_saved_game: bool
 
 
 def assert_pokemon_in_party_slot(
-    species_name: str, slot: int, error_message: str, check_in_saved_game: bool = False
+        species_name: str, slot: int, error_message: str, check_in_saved_game: bool = False
 ) -> None:
     """
     Raises an exception if the pokemon specified is not in the party slot required

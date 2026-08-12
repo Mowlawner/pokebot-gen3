@@ -31,8 +31,8 @@ def _current_encounter_table_helps_with_target(pokemon: Pokemon, target_evs: Sta
         for stat in _list_of_stats:
             if encounter.species.ev_yield[stat] > 0:
                 if (
-                    pokemon.evs[stat] < target_evs[stat]
-                    and pokemon.evs[stat] + encounter.species.ev_yield[stat] <= target_evs[stat]
+                        pokemon.evs[stat] < target_evs[stat]
+                        and pokemon.evs[stat] + encounter.species.ev_yield[stat] <= target_evs[stat]
                 ):
                     return True
                 else:
@@ -128,8 +128,8 @@ class EVTrainMode(BotMode):
     def on_battle_ended(self, outcome: "BattleOutcome") -> None:
         lead_pokemon = get_party()[0]
         if (
-            not DefaultBattleStrategy().pokemon_can_battle(lead_pokemon)
-            or lead_pokemon.status_condition is not StatusCondition.Healthy
+                not DefaultBattleStrategy().pokemon_can_battle(lead_pokemon)
+                or lead_pokemon.status_condition is not StatusCondition.Healthy
         ):
             self._go_healing = True
 

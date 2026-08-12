@@ -6,7 +6,6 @@ from modules.map import get_map_data, get_map_data_for_current_position, get_pla
 from modules.map_data import MapFRLG, MapRSE
 from modules.map_path import calculate_path, Waypoint, PathFindingError, Direction, WaypointAction
 from modules.memory import GameState, get_game_state
-from modules.roms import ROMLanguage
 from modules.player import (
     RunningState,
     AcroBikeState,
@@ -17,8 +16,8 @@ from modules.player import (
     player_is_at,
     get_player_location,
     AvatarFlags,
-    PlayerAvatar,
 )
+from modules.roms import ROMLanguage
 from modules.tasks import get_global_script_context, task_is_active
 from .sleep import wait_for_n_frames
 from .._interface import BotModeError
@@ -56,9 +55,9 @@ def walk_to(destination_coordinates: tuple[int, int], run: bool = True) -> Gener
             break
 
         if (avatar.running_state == RunningState.NOT_MOVING and avatar.acro_bike_state == AcroBikeState.NORMAL) or (
-            context.rom.is_frlg
-            and avatar.tile_transition_state in [TileTransitionState.CENTERING, TileTransitionState.NOT_MOVING]
-            and "Std_MsgboxSign" in get_global_script_context().stack
+                context.rom.is_frlg
+                and avatar.tile_transition_state in [TileTransitionState.CENTERING, TileTransitionState.NOT_MOVING]
+                and "Std_MsgboxSign" in get_global_script_context().stack
         ):
             if destination_coordinates[0] < avatar.local_coordinates[0]:
                 context.emulator.hold_button("Left")
@@ -113,7 +112,7 @@ class TimedOutTryingToReachWaypointError(BotModeError):
 
 @debug.track
 def follow_waypoints(
-    path: Iterable[Waypoint | None], run: bool = True, final_facing_direction: Direction | None = None
+        path: Iterable[Waypoint | None], run: bool = True, final_facing_direction: Direction | None = None
 ) -> Generator:
     """
     Follows a given set of waypoints.
@@ -249,15 +248,15 @@ def follow_waypoints(
                     yield from unmount_bicycle()
                     yield
                 elif (
-                    waypoint.action is WaypointAction.MachBikeMount
-                    and AvatarFlags.OnMachBike not in get_player_avatar().flags
+                        waypoint.action is WaypointAction.MachBikeMount
+                        and AvatarFlags.OnMachBike not in get_player_avatar().flags
                 ):
                     from .higher_level_actions import mount_bicycle
 
                     yield from mount_bicycle()
                 elif (
-                    waypoint.action is WaypointAction.AcroBikeMount
-                    and AvatarFlags.OnAcroBike not in get_player_avatar().flags
+                        waypoint.action is WaypointAction.AcroBikeMount
+                        and AvatarFlags.OnAcroBike not in get_player_avatar().flags
                 ):
                     from .higher_level_actions import mount_bicycle
 
@@ -279,10 +278,10 @@ def follow_waypoints(
                 else:
                     context.emulator.hold_button(waypoint.walking_direction)
                     if (
-                        run
-                        and not waypoint.is_water_tile
-                        and not AvatarFlags.OnAcroBike in get_player_avatar().flags
-                        and not AvatarFlags.Underwater in get_player_avatar().flags
+                            run
+                            and not waypoint.is_water_tile
+                            and not AvatarFlags.OnAcroBike in get_player_avatar().flags
+                            and not AvatarFlags.Underwater in get_player_avatar().flags
                     ):
                         context.emulator.hold_button("B")
             else:
@@ -312,13 +311,13 @@ def follow_waypoints(
 
 @debug.track
 def navigate_to(
-    map: tuple[int, int] | MapFRLG | MapRSE,
-    coordinates: tuple[int, int],
-    run: bool = True,
-    avoid_encounters: bool = True,
-    avoid_scripted_events: bool = True,
-    expecting_script: bool = False,
-    final_facing_direction: Direction | None = None,
+        map: tuple[int, int] | MapFRLG | MapRSE,
+        coordinates: tuple[int, int],
+        run: bool = True,
+        avoid_encounters: bool = True,
+        avoid_scripted_events: bool = True,
+        expecting_script: bool = False,
+        final_facing_direction: Direction | None = None,
 ) -> Generator:
     """
     Tries to walk the player to a given location while circumventing obstacles.
@@ -434,9 +433,9 @@ def walk_one_tile(direction: str, run: bool = True) -> Generator:
 
     # Wait for player to come to a full stop.
     while (
-        not player_avatar_is_standing_still()
-        or get_player_avatar().running_state != RunningState.NOT_MOVING
-        or get_player_avatar().tile_transition_state != TileTransitionState.NOT_MOVING
+            not player_avatar_is_standing_still()
+            or get_player_avatar().running_state != RunningState.NOT_MOVING
+            or get_player_avatar().tile_transition_state != TileTransitionState.NOT_MOVING
     ):
         yield
 
@@ -470,9 +469,9 @@ def ensure_facing_direction(facing_direction: str | Direction | tuple[int, int])
             return
 
         if (
-            get_game_state() == GameState.OVERWORLD
-            and avatar.tile_transition_state == TileTransitionState.NOT_MOVING
-            and avatar.running_state == RunningState.NOT_MOVING
+                get_game_state() == GameState.OVERWORLD
+                and avatar.tile_transition_state == TileTransitionState.NOT_MOVING
+                and avatar.running_state == RunningState.NOT_MOVING
         ):
             context.emulator.press_button(facing_direction)
 
@@ -481,11 +480,11 @@ def ensure_facing_direction(facing_direction: str | Direction | tuple[int, int])
 
 @debug.track
 def run_in_circle(
-    on_map: tuple[int, int] | MapRSE | MapFRLG,
-    bottom_left: tuple[int, int],
-    top_right: tuple[int, int],
-    clockwise: bool = True,
-    exit_condition: Callable[[], bool] | None = None,
+        on_map: tuple[int, int] | MapRSE | MapFRLG,
+        bottom_left: tuple[int, int],
+        top_right: tuple[int, int],
+        clockwise: bool = True,
+        exit_condition: Callable[[], bool] | None = None,
 ):
     """
     Function name is lying: This actually makes the character run in a _square_

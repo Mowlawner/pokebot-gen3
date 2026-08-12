@@ -216,7 +216,8 @@ class ForcePokenavCallListener(BotListener):
     def handle_frame(self, bot_mode: BotMode, frame: FrameInfo):
         match_call_state = read_symbol("sMatchCallState")
         new_match_call_state = (
-            pack_uint32(get_clock_time().total_minutes() - 30) + match_call_state[4:6] + b"\x70" + match_call_state[7:8]
+                pack_uint32(get_clock_time().total_minutes() - 30) + match_call_state[4:6] + b"\x70" + match_call_state[
+            7:8]
         )
         write_symbol("sMatchCallState", new_match_call_state)
 

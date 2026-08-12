@@ -590,8 +590,8 @@ class PuzzleSolverMode(BotMode):
                     yield from navigate_to(MapFRLG.SEVEN_ISLAND_SEVAULT_CANYON_TANOBY_KEY, (5, 11))
                     yield from walk_one_tile("Up")
                     while (
-                        "SevenIsland_SevaultCanyon_TanobyKey_EventScript_PuzzleSolved"
-                        not in get_global_script_context().stack
+                            "SevenIsland_SevaultCanyon_TanobyKey_EventScript_PuzzleSolved"
+                            not in get_global_script_context().stack
                     ):
                         context.emulator.press_button("Up")
                         yield

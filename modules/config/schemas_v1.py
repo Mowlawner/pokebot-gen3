@@ -110,15 +110,15 @@ class Discord(BaseConfig):
 
     def is_anything_enabled(self) -> bool:
         return (
-            self.rich_presence
-            or self.shiny_pokemon_encounter.enable
-            or self.blocked_shiny_encounter.enable
-            or self.pokemon_encounter_milestones.enable
-            or self.shiny_pokemon_encounter_milestones.enable
-            or self.total_encounter_milestones.enable
-            or self.phase_summary.enable
-            or self.anti_shiny_pokemon_encounter.enable
-            or self.custom_filter_pokemon_encounter.enable
+                self.rich_presence
+                or self.shiny_pokemon_encounter.enable
+                or self.blocked_shiny_encounter.enable
+                or self.pokemon_encounter_milestones.enable
+                or self.shiny_pokemon_encounter_milestones.enable
+                or self.total_encounter_milestones.enable
+                or self.phase_summary.enable
+                or self.anti_shiny_pokemon_encounter.enable
+                or self.custom_filter_pokemon_encounter.enable
         )
 
 

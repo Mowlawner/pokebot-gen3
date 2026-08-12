@@ -132,9 +132,9 @@ class DiscordPlugin(BotPlugin):
 
         # Discord shiny Pokémon encountered
         if (
-            not already_reported_pokemon
-            and context.config.discord.shiny_pokemon_encounter.enable
-            and encounter.value is EncounterValue.Shiny
+                not already_reported_pokemon
+                and context.config.discord.shiny_pokemon_encounter.enable
+                and encounter.value is EncounterValue.Shiny
         ):
             already_reported_pokemon = True
             send_discord_message(
@@ -144,7 +144,7 @@ class DiscordPlugin(BotPlugin):
                     title=f"Shiny {encounter.type.verb}!",
                     description=pokemon_label(encounter),
                     fields=pokemon_fields(opponent, species_stats)
-                    | phase_summary_fields(opponent, shiny_phase, global_stats),
+                           | phase_summary_fields(opponent, shiny_phase, global_stats),
                     thumbnail=get_shiny_sprite(opponent),
                     colour="ffd242",
                     image=encounter.gif_path,
@@ -153,9 +153,9 @@ class DiscordPlugin(BotPlugin):
 
         # Discord shiny on block list encountered
         if (
-            not already_reported_pokemon
-            and context.config.discord.blocked_shiny_encounter.enable
-            and encounter.value is EncounterValue.ShinyOnBlockList
+                not already_reported_pokemon
+                and context.config.discord.blocked_shiny_encounter.enable
+                and encounter.value is EncounterValue.ShinyOnBlockList
         ):
             already_reported_pokemon = True
             send_discord_message(
@@ -165,7 +165,7 @@ class DiscordPlugin(BotPlugin):
                     title=f"(Blocked) Shiny {encounter.type.verb}",
                     description=pokemon_label(encounter),
                     fields=pokemon_fields(opponent, species_stats, short=True)
-                    | phase_summary_fields(opponent, shiny_phase, global_stats),
+                           | phase_summary_fields(opponent, shiny_phase, global_stats),
                     thumbnail=get_shiny_sprite(opponent),
                     colour="808080",
                 ),
@@ -173,8 +173,8 @@ class DiscordPlugin(BotPlugin):
 
         # Discord Pokémon encounter milestones
         if (
-            context.config.discord.pokemon_encounter_milestones.enable
-            and species_stats.total_encounters % context.config.discord.pokemon_encounter_milestones.interval == 0
+                context.config.discord.pokemon_encounter_milestones.enable
+                and species_stats.total_encounters % context.config.discord.pokemon_encounter_milestones.interval == 0
         ):
             send_discord_message(
                 webhook_config=context.config.discord.pokemon_encounter_milestones,
@@ -188,9 +188,9 @@ class DiscordPlugin(BotPlugin):
 
         # Discord shiny Pokémon encounter milestones
         if (
-            context.config.discord.shiny_pokemon_encounter_milestones.enable
-            and opponent.is_shiny
-            and species_stats.shiny_encounters % context.config.discord.shiny_pokemon_encounter_milestones.interval == 0
+                context.config.discord.shiny_pokemon_encounter_milestones.enable
+                and opponent.is_shiny
+                and species_stats.shiny_encounters % context.config.discord.shiny_pokemon_encounter_milestones.interval == 0
         ):
             send_discord_message(
                 webhook_config=context.config.discord.shiny_pokemon_encounter_milestones,
@@ -204,8 +204,8 @@ class DiscordPlugin(BotPlugin):
 
         # Discord total encounter milestones
         if (
-            context.config.discord.total_encounter_milestones.enable
-            and global_stats.totals.total_encounters % context.config.discord.total_encounter_milestones.interval == 0
+                context.config.discord.total_encounter_milestones.enable
+                and global_stats.totals.total_encounters % context.config.discord.total_encounter_milestones.interval == 0
         ):
             embed_thumbnail = random.choice(
                 [
@@ -239,15 +239,15 @@ class DiscordPlugin(BotPlugin):
         # Discord phase encounter notifications
         phase_encounters = global_stats.totals.phase_encounters
         if (
-            context.config.discord.phase_summary.enable
-            and not opponent.is_shiny
-            and (
+                context.config.discord.phase_summary.enable
+                and not opponent.is_shiny
+                and (
                 phase_encounters == context.config.discord.phase_summary.first_interval
                 or (
-                    phase_encounters > context.config.discord.phase_summary.first_interval
-                    and phase_encounters % context.config.discord.phase_summary.consequent_interval == 0
+                        phase_encounters > context.config.discord.phase_summary.first_interval
+                        and phase_encounters % context.config.discord.phase_summary.consequent_interval == 0
                 )
-            )
+        )
         ):
             send_discord_message(
                 webhook_config=context.config.discord.phase_summary,
@@ -266,7 +266,7 @@ class DiscordPlugin(BotPlugin):
                     title=f"Anti-Shiny {encounter.type.verb}!",
                     description=pokemon_label(encounter),
                     fields=pokemon_fields(opponent, species_stats)
-                    | phase_summary_fields(opponent, shiny_phase, global_stats),
+                           | phase_summary_fields(opponent, shiny_phase, global_stats),
                     thumbnail=get_anti_shiny_sprite(opponent),
                     colour="000000",
                 ),
@@ -274,9 +274,9 @@ class DiscordPlugin(BotPlugin):
 
         # Discord Pokémon matching custom filter encountered
         if (
-            not already_reported_pokemon
-            and context.config.discord.custom_filter_pokemon_encounter.enable
-            and encounter.value is EncounterValue.CustomFilterMatch
+                not already_reported_pokemon
+                and context.config.discord.custom_filter_pokemon_encounter.enable
+                and encounter.value is EncounterValue.CustomFilterMatch
         ):
             already_reported_pokemon = True
             send_discord_message(
@@ -285,7 +285,7 @@ class DiscordPlugin(BotPlugin):
                 embed=DiscordMessageEmbed(
                     description=pokemon_label(encounter),
                     fields=pokemon_fields(opponent, species_stats)
-                    | phase_summary_fields(opponent, shiny_phase, global_stats),
+                           | phase_summary_fields(opponent, shiny_phase, global_stats),
                     thumbnail=get_regular_sprite(opponent),
                     colour="6a89cc",
                     image=encounter.gif_path,
@@ -294,9 +294,9 @@ class DiscordPlugin(BotPlugin):
 
         # Discord TCG cards
         if (
-            context.config.discord.tcg_cards.enable
-            and context.config.logging.tcg_cards
-            and encounter.tcg_card_path is not None
+                context.config.discord.tcg_cards.enable
+                and context.config.logging.tcg_cards
+                and encounter.tcg_card_path is not None
         ):
             send_discord_message(
                 webhook_config=context.config.discord.tcg_cards,

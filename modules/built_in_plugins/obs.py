@@ -5,13 +5,13 @@
 # OBS hotkeys: https://github.com/obsproject/obs-studio/blob/master/libobs/obs-hotkeys.h
 import base64
 import time
+from datetime import datetime
 from pathlib import Path
 from queue import Queue
 from threading import Thread
 from typing import TYPE_CHECKING, Generator
 
 import obsws_python as obs
-from datetime import datetime
 
 from modules.console import console
 from modules.context import context

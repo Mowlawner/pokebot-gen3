@@ -74,7 +74,8 @@ def fly_to(destination: Union[FlyDestinationRSE, FlyDestinationFRLG]) -> Generat
 
     # Wait for region map to load.
     while (
-        get_game_state_symbol() not in ("CB2_FLYMAP", "CB2_REGIONMAP", "CB2_FLYREGIONMAP") or get_map_cursor() is None
+            get_game_state_symbol() not in ("CB2_FLYMAP", "CB2_REGIONMAP",
+                                            "CB2_FLYREGIONMAP") or get_map_cursor() is None
     ):
         yield
 
@@ -156,9 +157,9 @@ def spin(stop_condition: Callable[[], bool] | None = None, counter_clockwise: bo
     while True:
         avatar = get_player_avatar()
         if (
-            get_game_state() == GameState.OVERWORLD
-            and avatar.tile_transition_state == TileTransitionState.NOT_MOVING
-            and avatar.running_state == RunningState.NOT_MOVING
+                get_game_state() == GameState.OVERWORLD
+                and avatar.tile_transition_state == TileTransitionState.NOT_MOVING
+                and avatar.running_state == RunningState.NOT_MOVING
         ):
             if stop_condition is not None and stop_condition():
                 return
@@ -621,10 +622,10 @@ def dive():
         raise BotModeError("Cannot dive because the player is already underwater.")
 
     if get_map_data_for_current_position().tile_type not in (
-        "Deep Water",
-        "Interior Deep Water",
-        "Semi-Deep Water",
-        "Sootopolis Deep Water",
+            "Deep Water",
+            "Interior Deep Water",
+            "Semi-Deep Water",
+            "Sootopolis Deep Water",
     ):
         raise BotModeError("Cannot dive because the player is not on a deep water tile.")
 

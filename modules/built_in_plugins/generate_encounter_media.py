@@ -62,7 +62,6 @@ class GifGeneratorListener(BotListener):
             os.replace(directory / (file_name + ".tmp"), directory / file_name)
 
         if not self._video_was_enabled_before:
-
             def disable_video_again():
                 context.video = False
 

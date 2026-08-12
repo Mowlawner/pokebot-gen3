@@ -24,12 +24,12 @@ with open("flags.c", "w") as outfile:
             name, value = match.groups()
 
             if (
-                name.startswith("NUM_")
-                or (name.endswith("_START") and name != "FLAG_SYS_TV_START")
-                or name.endswith("_END")
-                or name.endswith("_COUNT")
-                or re.match(r"^FLAG_0x[0-9A-Fa-f]+$", name)
-                or re.match(r"^FLAG_UNUSED_0x[0-9A-Fa-f]+$", name)
+                    name.startswith("NUM_")
+                    or (name.endswith("_START") and name != "FLAG_SYS_TV_START")
+                    or name.endswith("_END")
+                    or name.endswith("_COUNT")
+                    or re.match(r"^FLAG_0x[0-9A-Fa-f]+$", name)
+                    or re.match(r"^FLAG_UNUSED_0x[0-9A-Fa-f]+$", name)
             ):
                 continue
 

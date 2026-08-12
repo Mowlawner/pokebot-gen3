@@ -232,9 +232,9 @@ class FrameInfo:
 
     def game_state_changed_from(self, game_state_to_check: "GameState") -> bool:
         return (
-            self.game_state_changed()
-            and self.previous_frame is not None
-            and self.previous_frame.game_state == game_state_to_check
+                self.game_state_changed()
+                and self.previous_frame is not None
+                and self.previous_frame.game_state == game_state_to_check
         )
 
     def task_is_active(self, task_name: str) -> bool:

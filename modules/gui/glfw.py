@@ -1,9 +1,9 @@
 import threading
 from typing import TYPE_CHECKING
 
-import glfw
 from OpenGL.GL import *
 
+import glfw
 from mgba import ffi
 from modules.context import context
 from modules.game import set_rom
@@ -11,7 +11,6 @@ from modules.libmgba import LibmgbaEmulator
 
 if TYPE_CHECKING:
     from pokebot import StartupSettings
-
 
 WIDTH = 240
 HEIGHT = 160
@@ -162,7 +161,7 @@ class GlfwGui:
 
     def _on_frame(self):
         if (
-            context.emulator.get_speed_factor() == 1
-            or context.emulator._performance_tracker.time_since_last_render() >= (1 / 60) * 1_000_000_000
+                context.emulator.get_speed_factor() == 1
+                or context.emulator._performance_tracker.time_since_last_render() >= (1 / 60) * 1_000_000_000
         ):
             context.emulator._performance_tracker.track_render()

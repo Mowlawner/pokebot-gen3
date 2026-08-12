@@ -113,8 +113,8 @@ class DaycareMode(BotMode):
             self._use_bike = True
         elif context.rom.is_rse:
             if (
-                get_item_storage().quantity_of(get_item_by_name("Mach Bike")) > 0
-                or get_item_storage().quantity_of(get_item_by_name("Acro Bike")) > 0
+                    get_item_storage().quantity_of(get_item_by_name("Mach Bike")) > 0
+                    or get_item_storage().quantity_of(get_item_by_name("Acro Bike")) > 0
             ):
                 raise BotModeError("Your bicycle is stored in the PC storage system. Please go and get it.")
 
@@ -171,12 +171,12 @@ class DaycareMode(BotMode):
             party_indices_to_release = []
             for index, pokemon in enumerate(get_party()):
                 if (
-                    index != 0
-                    and not pokemon.is_egg
-                    and pokemon.level_met == 0
-                    and pokemon.level == 5
-                    and pokemon.exp_fraction_to_next_level == 0
-                    and not judge_encounter(pokemon).is_of_interest
+                        index != 0
+                        and not pokemon.is_egg
+                        and pokemon.level_met == 0
+                        and pokemon.level == 5
+                        and pokemon.exp_fraction_to_next_level == 0
+                        and not judge_encounter(pokemon).is_of_interest
                 ):
                     party_indices_to_release.append(index)
             return party_indices_to_release

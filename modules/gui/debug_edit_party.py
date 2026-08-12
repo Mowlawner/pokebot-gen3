@@ -488,8 +488,8 @@ class PokemonEditFrame:
             level_button.configure(text=f"Level: {self._level.get()}")
             if self._level.get() < 100 and self._species is not None:
                 exp_needed_until_next_level = (
-                    self._species.level_up_type.get_experience_needed_for_level(self._level.get() + 1)
-                    - self._experience.get()
+                        self._species.level_up_type.get_experience_needed_for_level(self._level.get() + 1)
+                        - self._experience.get()
                 )
                 exp_left.configure(text=f"({exp_needed_until_next_level:,} Exp. until level-up)")
             else:
