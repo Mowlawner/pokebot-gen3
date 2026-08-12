@@ -126,33 +126,72 @@ class NuzlockeEventObserver:
 
     def __init__(self) -> None:
         self._previous: NuzlockeSnapshot | None = None
+        self._previous_battle: NuzlockeSnapshot | None = None
+        self._previous_ready_battle: NuzlockeSnapshot | None = None
+        self._previous_map: NuzlockeSnapshot | None = None
+        self._previous_game_state: NuzlockeSnapshot | None = None
+        self._previous_party: NuzlockeSnapshot | None = None
         self._fainted: set[tuple[Any, ...]] = set()
 
     def observe(self, snapshot: NuzlockeSnapshot) -> tuple[Event, ...]:
         previous = self._previous
         self._previous = snapshot
         if previous is None:
+            self._remember_available(snapshot)
             return ()
 
         events: list[Event] = []
-        if previous.battle is None and snapshot.battle is not None:
+        previous_battle = self._previous_battle
+        if (
+            snapshot.battle_available
+            and snapshot.battle is not None
+            and snapshot.battle.ready
+            and self._previous_ready_battle is None
+            and (
+                previous_battle is None
+                or previous_battle.battle is None
+                or not previous_battle.battle.ready
+            )
+        ):
             battle = snapshot.battle
             events.append(BattleStarted(snapshot.frame, battle.battle_type, battle.is_trainer, battle.is_wild, battle.is_double))
-        elif previous.battle is not None and snapshot.battle is None:
-            battle = previous.battle
+        elif (
+            snapshot.battle_available
+            and snapshot.battle is None
+            and self._previous_ready_battle is not None
+        ):
+            battle = self._previous_ready_battle.battle
             events.append(BattleEnded(snapshot.frame, battle.outcome, battle.battle_type, battle.is_trainer, battle.is_wild, battle.is_double))
 
-        old_map, new_map = _map(previous), _map(snapshot)
-        if old_map != new_map:
+        previous_map = self._previous_map
+        old_map, new_map = (_map(previous_map) if previous_map else None), _map(snapshot)
+        if snapshot.player_available and previous_map is not None and old_map != new_map:
             events.append(MapChanged(snapshot.frame, old_map, new_map))
 
-        if previous.game_state != snapshot.game_state:
-            events.append(GameStateChanged(snapshot.frame, previous.game_state, snapshot.game_state))
-        if previous.game_state != snapshot.game_state and getattr(snapshot.game_state, "name", None) == "WHITEOUT":
+        previous_state = self._previous_game_state
+        if snapshot.game_state_available and previous_state is not None and previous_state.game_state != snapshot.game_state:
+            events.append(GameStateChanged(snapshot.frame, previous_state.game_state, snapshot.game_state))
+        if snapshot.game_state_available and previous_state is not None and previous_state.game_state != snapshot.game_state and getattr(snapshot.game_state, "name", None) == "WHITEOUT":
             events.append(WhiteoutOccurred(snapshot.frame))
 
-        events.extend(self._party_events(previous, snapshot))
+        if snapshot.party_available and self._previous_party is not None:
+            events.extend(self._party_events(self._previous_party, snapshot))
+        self._remember_available(snapshot)
         return tuple(events)
+
+    def _remember_available(self, snapshot: NuzlockeSnapshot) -> None:
+        if snapshot.battle_available:
+            self._previous_battle = snapshot
+            if snapshot.battle is not None and snapshot.battle.ready:
+                self._previous_ready_battle = snapshot
+            elif snapshot.battle is None:
+                self._previous_ready_battle = None
+        if snapshot.player_available:
+            self._previous_map = snapshot
+        if snapshot.game_state_available:
+            self._previous_game_state = snapshot
+        if snapshot.party_available:
+            self._previous_party = snapshot
 
     def _party_events(self, previous: NuzlockeSnapshot, snapshot: NuzlockeSnapshot) -> list[Event]:
         old = previous.party

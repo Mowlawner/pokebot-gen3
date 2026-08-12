@@ -137,7 +137,7 @@ class PokemonStorage:
         }
 
 
-def get_pokemon_storage() -> PokemonStorage:
+def get_pokemon_storage() -> PokemonStorage | None:
     if state_cache.pokemon_storage.age_in_frames == 0:
         return state_cache.pokemon_storage.value
 
@@ -146,6 +146,14 @@ def get_pokemon_storage() -> PokemonStorage:
         length = get_symbol("gPokemonStorage")[1]
     else:
         offset, length = get_symbol("gPokemonStorage")
+
+    # Pointer-backed game structures are not present before a save/game has
+    # been initialized.  This is the same unavailable-data contract used by
+    # get_save_block(), get_map_cursor(), and get_naming_screen_data().
+    # In particular, do not pass address zero to the emulator: zero is not a
+    # valid GBA memory address and is distinct from readable empty storage.
+    if offset == 0:
+        return None
 
     pokemon_storage = PokemonStorage(offset, context.emulator.read_bytes(offset, length))
     state_cache.pokemon_storage = pokemon_storage
