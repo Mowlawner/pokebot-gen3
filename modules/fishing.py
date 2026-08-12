@@ -41,7 +41,7 @@ class FishingAttempt:
         return {
             "rod": self.rod.name,
             "result": self.result.name,
-            "encounter": self.encounter.to_dict() if self.encounter is not None else None,
+            "encounter": (self.encounter.to_dict() if self.encounter is not None else None),
         }
 
 

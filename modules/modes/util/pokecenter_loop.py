@@ -5,7 +5,10 @@ from modules.battle_strategies import BattleStrategy, DefaultBattleStrategy
 from modules.context import context
 from modules.debug import debug
 from modules.encounter import EncounterInfo, handle_encounter
-from modules.map import get_map_data_for_current_position, get_effective_encounter_rates_for_current_map
+from modules.map import (
+    get_map_data_for_current_position,
+    get_effective_encounter_rates_for_current_map,
+)
 from modules.map_data import MapFRLG, get_map_enum
 from modules.modes import BotModeError, BattleAction
 from modules.modes.util import (
@@ -78,7 +81,11 @@ class PokecenterLoopController:
         find_closest_pokemon_center(current_location)
 
     @debug.track
-    def run(self, stop_condition: Optional[Callable[[], bool]] = None, activity: Literal["spin", "fish"] = "spin"):
+    def run(
+        self,
+        stop_condition: Optional[Callable[[], bool]] = None,
+        activity: Literal["spin", "fish"] = "spin",
+    ):
         encounter_spot = get_map_data_for_current_position()
         pokemon_center = find_closest_pokemon_center(encounter_spot)
 

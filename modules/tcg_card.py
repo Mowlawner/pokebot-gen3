@@ -40,7 +40,11 @@ def draw_text(
 
     # Draw text shadow
     draw.text(
-        xy=(coords[0] + (size / 15), coords[1] + (size / 15)), text=text, fill=shadow_colour, font=font, anchor=anchor
+        xy=(coords[0] + (size / 15), coords[1] + (size / 15)),
+        text=text,
+        fill=shadow_colour,
+        font=font,
+        anchor=anchor,
     )
 
     # Draw text
@@ -85,12 +89,18 @@ def generate_tcg_card(pokemon_data: bytes, location: str = "") -> Path | None:
         card.paste(name_plate, (67, 58), mask=name_plate)
 
         # Primary type
-        type_1 = resize_image(Image.open(get_sprites_path() / "types" / f"{pokemon.species.types[0]}.png"), 2)
+        type_1 = resize_image(
+            Image.open(get_sprites_path() / "types" / f"{pokemon.species.types[0]}.png"),
+            2,
+        )
         card.paste(type_1, (480, 74), mask=type_1)
 
         # Secondary type
         if len(pokemon.species.types) > 1:
-            type_2 = resize_image(Image.open(get_sprites_path() / "types" / f"{pokemon.species.types[1]}.png"), 2)
+            type_2 = resize_image(
+                Image.open(get_sprites_path() / "types" / f"{pokemon.species.types[1]}.png"),
+                2,
+            )
             card.paste(type_2, (480, 46), mask=type_2)
 
         draw = ImageDraw.Draw(card)
@@ -117,7 +127,13 @@ def generate_tcg_card(pokemon_data: bytes, location: str = "") -> Path | None:
             card.paste(shiny, (567, 55), mask=shiny)
 
         # Name text
-        draw = draw_text(draw, text=pokemon.species_name_for_stats, coords=(192, 78), size=30, anchor="mm")
+        draw = draw_text(
+            draw,
+            text=pokemon.species_name_for_stats,
+            coords=(192, 78),
+            size=30,
+            anchor="mm",
+        )
 
         # Nat dex number
         draw = draw_text(
@@ -156,7 +172,12 @@ def generate_tcg_card(pokemon_data: bytes, location: str = "") -> Path | None:
                     move_power = str(pokemon.hidden_power_damage)
 
                 draw = draw_text(
-                    draw, text=move_name, coords=(130, 480 + (i * 80)), size=30, shadow_colour="#000", anchor="lm"
+                    draw,
+                    text=move_name,
+                    coords=(130, 480 + (i * 80)),
+                    size=30,
+                    shadow_colour="#000",
+                    anchor="lm",
                 )
                 draw = draw_text(
                     draw,
@@ -218,7 +239,10 @@ def generate_tcg_card(pokemon_data: bytes, location: str = "") -> Path | None:
         sprite = Image.open(get_sprites_path() / "pokemon" / sprite_type / f"{species_name_safe}.png")
         card.paste(
             sprite,
-            (int(425 - (sprite.width / 2)), int(250 - (sprite.height - (sprite.height - sprite.getbbox()[3])))),
+            (
+                int(425 - (sprite.width / 2)),
+                int(250 - (sprite.height - (sprite.height - sprite.getbbox()[3]))),
+            ),
             mask=sprite,
         )
 
@@ -236,7 +260,11 @@ def generate_tcg_card(pokemon_data: bytes, location: str = "") -> Path | None:
             player_file = f"{get_player().gender}_FRLG.png"
 
         player = resize_image(Image.open(tcg_sprites / "player" / player_file), 2)
-        card.paste(player, (int(180 - (player.width / 2)), int(329 - player.height)), mask=player)
+        card.paste(
+            player,
+            (int(180 - (player.width / 2)), int(329 - player.height)),
+            mask=player,
+        )
 
         # Portrait IVs
         ivs = Image.open(tcg_sprites / "ivs.png")
@@ -291,10 +319,34 @@ def generate_tcg_card(pokemon_data: bytes, location: str = "") -> Path | None:
         )
 
         # Game text box
-        draw = draw_text(draw, text=f"Nature: {pokemon.nature.name}", coords=(525, 360), size=30, anchor="rm")
-        draw = draw_text(draw, text=f"Ability: {pokemon.ability.name}", coords=(525, 395), size=30, anchor="rm")
-        draw = draw_text(draw, text=f"OT: {pokemon.original_trainer.name}", coords=(95, 360), size=30, anchor="lm")
-        draw = draw_text(draw, text=f"OTID: {pokemon.original_trainer.id:05}", coords=(95, 395), size=30, anchor="lm")
+        draw = draw_text(
+            draw,
+            text=f"Nature: {pokemon.nature.name}",
+            coords=(525, 360),
+            size=30,
+            anchor="rm",
+        )
+        draw = draw_text(
+            draw,
+            text=f"Ability: {pokemon.ability.name}",
+            coords=(525, 395),
+            size=30,
+            anchor="rm",
+        )
+        draw = draw_text(
+            draw,
+            text=f"OT: {pokemon.original_trainer.name}",
+            coords=(95, 360),
+            size=30,
+            anchor="lm",
+        )
+        draw = draw_text(
+            draw,
+            text=f"OTID: {pokemon.original_trainer.id:05}",
+            coords=(95, 395),
+            size=30,
+            anchor="lm",
+        )
 
         # Exp bar
         draw.rectangle((386, 321, 386 + ((pokemon.ivs.sum() / 186) * 128), 324), fill="#42CEFF")

@@ -1,16 +1,23 @@
 import struct
 from typing import Generator
 
+from modules.context import context
 from modules.items import get_item_by_name, get_item_bag, get_pokeblocks
 from modules.player import get_player_avatar
 from modules.roms import ROMLanguage
-from modules.context import context
 from . import BotModeError
 from ._interface import BotMode
 from .util import scroll_to_item_in_bag
 from ..gui.multi_select_window import Selection, ask_for_choice_scroll
 from ..map_data import MapRSE
-from ..memory import get_game_state, GameState, get_game_state_symbol, read_symbol, unpack_uint32, unpack_uint16
+from ..memory import (
+    get_game_state,
+    GameState,
+    get_game_state_symbol,
+    read_symbol,
+    unpack_uint32,
+    unpack_uint16,
+)
 from ..runtime import get_sprites_path
 
 
@@ -79,7 +86,9 @@ class BerryBlendMode(BotMode):
                 raise BotModeError("Player does not have any berries.")
 
             berry_choice = ask_for_choice_scroll(
-                berry_choices, window_title="Select a berry to blender...", options_per_row=3
+                berry_choices,
+                window_title="Select a berry to blender...",
+                options_per_row=3,
             )
 
             if berry_choice is None:

@@ -16,6 +16,8 @@ from .snapshots import (
     StoragePokemonSnapshot,
     get_nuzlocke_snapshot,
 )
+from .identity import PokemonIdentity
+from .events import PokemonStorageLocation, StorageChanged
 from .runtime import NuzlockeRuntime
 from .persistence import (
     EventStoreCorruptionError,
@@ -48,6 +50,9 @@ __all__ = [
     "PokemonSnapshot",
     "StorageSnapshot",
     "StoragePokemonSnapshot",
+    "PokemonIdentity",
+    "PokemonStorageLocation",
+    "StorageChanged",
     "get_nuzlocke_snapshot",
     "NuzlockeRuntime",
     "EventStoreError",

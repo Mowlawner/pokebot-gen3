@@ -253,7 +253,8 @@ class DiscordPlugin(BotPlugin):
                 webhook_config=context.config.discord.phase_summary,
                 content=f"💀 The current phase has reached {phase_encounters:,} encounters!",
                 embed=DiscordMessageEmbed(
-                    fields=phase_summary_fields(opponent, shiny_phase, global_stats), colour="d70040"
+                    fields=phase_summary_fields(opponent, shiny_phase, global_stats),
+                    colour="d70040",
                 ),
             )
 

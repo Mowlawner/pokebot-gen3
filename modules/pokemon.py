@@ -377,7 +377,7 @@ class Move:
             affected_by_snatch=data["affected_by_snatch"],
             usable_with_mirror_move=data["usable_with_mirror_move"],
             affected_by_kings_rock=data["affected_by_kings_rock"],
-            tm_hm=get_item_by_name(data["tm_hm"]) if data["tm_hm"] is not None else None,
+            tm_hm=(get_item_by_name(data["tm_hm"]) if data["tm_hm"] is not None else None),
         )
 
 
@@ -435,7 +435,12 @@ class StatsValues:
 
     @classmethod
     def calculate(
-        cls, species: "Species", ivs: "StatsValues", evs: "StatsValues", nature: "Nature", level: int
+        cls,
+        species: "Species",
+        ivs: "StatsValues",
+        evs: "StatsValues",
+        nature: "Nature",
+        level: int,
     ) -> "StatsValues":
         """
         Re-calculates the current effective stats of a Pokémon. This is needed for boxed
@@ -682,7 +687,10 @@ class SpeciesMoveLearnset:
     def from_dict(cls, data: dict):
         return SpeciesMoveLearnset(
             level_up=[
-                SpeciesLevelUpMove(level=data["level_up"][move_id], move=get_move_by_index(int(move_id)))
+                SpeciesLevelUpMove(
+                    level=data["level_up"][move_id],
+                    move=get_move_by_index(int(move_id)),
+                )
                 for move_id in data["level_up"]
             ],
             tm_hm=[
@@ -1065,7 +1073,9 @@ class Pokemon:
         return LearnedMove(move=move, total_pp=total_pp, pp=pp, pp_ups=pp_bonuses)
 
     @property
-    def moves(self) -> tuple[LearnedMove | None, LearnedMove | None, LearnedMove | None, LearnedMove | None]:
+    def moves(
+        self,
+    ) -> tuple[LearnedMove | None, LearnedMove | None, LearnedMove | None, LearnedMove | None]:
         return self.move(0), self.move(1), self.move(2), self.move(3)
 
     def knows_move(self, move: str | Move, with_pp_remaining: bool = False):
@@ -1116,7 +1126,10 @@ class Pokemon:
 
     @property
     def pokerus_status(self) -> PokerusStatus:
-        return PokerusStatus(strain=self._decrypted_data[68] >> 4, days_remaining=self._decrypted_data[68] & 0b0111)
+        return PokerusStatus(
+            strain=self._decrypted_data[68] >> 4,
+            days_remaining=self._decrypted_data[68] & 0b0111,
+        )
 
     @property
     def ability(self) -> Ability:

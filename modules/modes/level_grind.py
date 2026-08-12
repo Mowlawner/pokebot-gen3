@@ -107,7 +107,10 @@ class LevelGrindMode(BotMode):
                     f"Level only first one\nin party ({party_lead_pokemon.species_name_for_stats})",
                     get_sprite(party_lead_pokemon),
                 ),
-                Selection("Level-balance all\nparty Pokémon", get_sprites_path() / "items" / "Rare Candy.png"),
+                Selection(
+                    "Level-balance all\nparty Pokémon",
+                    get_sprites_path() / "items" / "Rare Candy.png",
+                ),
             ],
             "What to level?",
         )

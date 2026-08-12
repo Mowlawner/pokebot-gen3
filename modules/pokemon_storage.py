@@ -4,7 +4,7 @@ from functools import cached_property
 from modules.context import context
 from modules.game import decode_string, get_symbol
 from modules.memory import read_symbol, unpack_uint32
-from modules.pokemon import Pokemon, Species
+from modules.pokemon import Pokemon, Species, parse_pokemon
 from modules.state_cache import state_cache
 
 
@@ -97,8 +97,8 @@ class PokemonStorage:
             slots = []
             for slot_index in range(30):
                 offset = pokemon_offset + (slot_index * 80)
-                pokemon = Pokemon(self._data[offset : offset + 80])
-                if not pokemon.is_empty:
+                pokemon = parse_pokemon(self._data[offset : offset + 80])
+                if pokemon is not None:
                     slots.append(PokemonStorageSlot(slot_index, pokemon))
 
             boxes.append(PokemonStorageBox(box_index, name, wallpaper_id, slots))
@@ -137,7 +137,7 @@ class PokemonStorage:
         }
 
 
-def get_pokemon_storage() -> PokemonStorage:
+def get_pokemon_storage() -> PokemonStorage | None:
     if state_cache.pokemon_storage.age_in_frames == 0:
         return state_cache.pokemon_storage.value
 
@@ -146,6 +146,14 @@ def get_pokemon_storage() -> PokemonStorage:
         length = get_symbol("gPokemonStorage")[1]
     else:
         offset, length = get_symbol("gPokemonStorage")
+
+    # Pointer-backed game structures are not present before a save/game has
+    # been initialized.  This is the same unavailable-data contract used by
+    # get_save_block(), get_map_cursor(), and get_naming_screen_data().
+    # In particular, do not pass address zero to the emulator: zero is not a
+    # valid GBA memory address and is distinct from readable empty storage.
+    if offset == 0:
+        return None
 
     pokemon_storage = PokemonStorage(offset, context.emulator.read_bytes(offset, length))
     state_cache.pokemon_storage = pokemon_storage

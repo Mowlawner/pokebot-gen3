@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from enum import Enum
 
 from modules.nuzlocke.events import MapChanged
@@ -33,6 +34,20 @@ def snapshot(frame: int, map_number: int = 2) -> NuzlockeSnapshot:
 
 
 class TestNuzlockeRuntime(unittest.TestCase):
+    def test_unavailable_startup_snapshot_is_safe(self):
+        runtime = NuzlockeRuntime()
+        startup = replace(
+            snapshot(1),
+            game_state=None,
+            player_available=False,
+            party_available=False,
+            inventory_available=False,
+            pc_available=False,
+            battle_available=False,
+            game_state_available=False,
+        )
+        self.assertEqual(runtime.update(startup), ())
+
     def test_provider_is_called_once_per_update_and_events_are_delivered_once(self):
         snapshots = iter((snapshot(1), snapshot(2, 3), snapshot(3, 3)))
         calls = 0

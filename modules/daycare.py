@@ -22,7 +22,10 @@ class DaycareCompatibility(IntEnum):
 
         # The 'undiscovered' egg group cannot be bred.
         if egg_groups1[0] == "no-eggs" or egg_groups2[0] == "no-eggs":
-            return DaycareCompatibility.Incompatible, 'At least one of the Pokémon is in the "Undiscovered" egg group'
+            return (
+                DaycareCompatibility.Incompatible,
+                'At least one of the Pokémon is in the "Undiscovered" egg group',
+            )
 
         # Breeding with Ditto is special.
         if egg_groups1[0] == "Ditto" or egg_groups2[0] == "Ditto":
@@ -38,7 +41,10 @@ class DaycareCompatibility(IntEnum):
 
         # Basic biology.
         if gender1 is None or gender2 is None:
-            return DaycareCompatibility.Incompatible, "At least one of the Pokémon is genderless"
+            return (
+                DaycareCompatibility.Incompatible,
+                "At least one of the Pokémon is genderless",
+            )
 
         if gender1 == gender2:
             return DaycareCompatibility.Incompatible, "Pokémon have the same gender"

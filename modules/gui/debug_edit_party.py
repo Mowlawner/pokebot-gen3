@@ -47,7 +47,12 @@ class PartyEditMenu:
         self.notebook.grid(sticky="NWES", padx=5, pady=5)
         # self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_change)
 
-        self.save_button = ttk.Button(self.window, text="Save Party", command=self._save_party, style="Accent.TButton")
+        self.save_button = ttk.Button(
+            self.window,
+            text="Save Party",
+            command=self._save_party,
+            style="Accent.TButton",
+        )
         self.save_button.grid(sticky="NE", row=1, column=0, padx=5, pady=5)
 
         self._pokemon_frames = []
@@ -137,10 +142,10 @@ class PokemonEditFrame:
         }
 
         self._moves = (
-            tkinter.StringVar(value=pokemon.moves[0].move.name if pokemon.moves[0] is not None else "(None)"),
-            tkinter.StringVar(value=pokemon.moves[1].move.name if pokemon.moves[1] is not None else "(None)"),
-            tkinter.StringVar(value=pokemon.moves[2].move.name if pokemon.moves[2] is not None else "(None)"),
-            tkinter.StringVar(value=pokemon.moves[3].move.name if pokemon.moves[3] is not None else "(None)"),
+            tkinter.StringVar(value=(pokemon.moves[0].move.name if pokemon.moves[0] is not None else "(None)")),
+            tkinter.StringVar(value=(pokemon.moves[1].move.name if pokemon.moves[1] is not None else "(None)")),
+            tkinter.StringVar(value=(pokemon.moves[2].move.name if pokemon.moves[2] is not None else "(None)")),
+            tkinter.StringVar(value=(pokemon.moves[3].move.name if pokemon.moves[3] is not None else "(None)")),
         )
 
         self._move_pp_spinbox: list[ttk.Spinbox] = []
@@ -183,7 +188,9 @@ class PokemonEditFrame:
                 move = get_move_by_name(selection)
                 moves.append(
                     LearnedMove.create(
-                        move, remaining_pp=self._move_pp_vars[n].get(), pp_ups=self._move_pp_ups_vars[n].get()
+                        move,
+                        remaining_pp=self._move_pp_vars[n].get(),
+                        pp_ups=self._move_pp_ups_vars[n].get(),
                     )
                 )
         if len(moves) == 0:
@@ -195,7 +202,7 @@ class PokemonEditFrame:
             original_pokemon=self._pokemon,
             is_shiny=self._is_shiny_var.get(),
             is_egg=self._is_egg_var.get(),
-            gender=None if self._gender_var.get() not in ("male", "female") else self._gender_var.get(),
+            gender=(None if self._gender_var.get() not in ("male", "female") else self._gender_var.get()),
             nickname=self._nickname_var.get(),
             held_item=held_item,
             has_second_ability=self._ability.current() != 0,
@@ -255,9 +262,14 @@ class PokemonEditFrame:
         label = ttk.Label(species_frame, text="Species:")
         label.grid(sticky="NWES", column=0, row=0)
         self._species_var = tkinter.StringVar(
-            value=species_values[self._pokemon.species.national_dex_number if not self._pokemon.is_empty else 0]
+            value=species_values[(self._pokemon.species.national_dex_number if not self._pokemon.is_empty else 0)]
         )
-        species = ttk.Combobox(species_frame, values=species_values, state="readonly", textvariable=self._species_var)
+        species = ttk.Combobox(
+            species_frame,
+            values=species_values,
+            state="readonly",
+            textvariable=self._species_var,
+        )
         species.grid(column=0, row=1)
         species_frame.grid(sticky="W", column=0, row=0)
 
@@ -358,7 +370,12 @@ class PokemonEditFrame:
 
         for n in range(4):
             move_frame = ttk.LabelFrame(center_box, text=f"Move #{n + 1}:", padding=5)
-            combobox = ttk.Combobox(move_frame, values=move_list, state="readonly", textvariable=self._moves[n])
+            combobox = ttk.Combobox(
+                move_frame,
+                values=move_list,
+                state="readonly",
+                textvariable=self._moves[n],
+            )
             combobox.grid(column=0, row=0, sticky="NW")
             self._moves[n].trace_add("write", on_move_change)
 
@@ -371,7 +388,13 @@ class PokemonEditFrame:
             label = ttk.Label(pp_frame, text="PP:")
             label.grid(column=0, row=0)
 
-            spinbox = ttk.Spinbox(pp_frame, from_=0, to=total_pp, width=3, textvariable=self._move_pp_vars[n])
+            spinbox = ttk.Spinbox(
+                pp_frame,
+                from_=0,
+                to=total_pp,
+                width=3,
+                textvariable=self._move_pp_vars[n],
+            )
             spinbox.grid(column=1, row=0, pady=5)
             self._move_pp_spinbox.append(spinbox)
 
@@ -385,7 +408,13 @@ class PokemonEditFrame:
             label = ttk.Label(pp_up_frame, text="PP Ups:")
             label.grid(column=0, row=0)
 
-            pp_up_spinbox = ttk.Spinbox(pp_up_frame, from_=0, to=3, width=3, textvariable=self._move_pp_ups_vars[n])
+            pp_up_spinbox = ttk.Spinbox(
+                pp_up_frame,
+                from_=0,
+                to=3,
+                width=3,
+                textvariable=self._move_pp_ups_vars[n],
+            )
             pp_up_spinbox.grid(column=1, row=0)
             self._move_pp_ups_vars[n].trace_add("write", on_move_change)
 
@@ -422,7 +451,11 @@ class PokemonEditFrame:
         label = ttk.Label(current_hp_frame, text="Current HP: ")
         label.grid(sticky="NWES", column=0, row=0)
         current_hp = ttk.Spinbox(
-            current_hp_frame, from_=0, to=self._pokemon.stats.hp, width=3, textvariable=self._current_hp_var
+            current_hp_frame,
+            from_=0,
+            to=self._pokemon.stats.hp,
+            width=3,
+            textvariable=self._current_hp_var,
         )
         current_hp.grid(sticky="NWES", column=1, row=0)
         self._total_hp_label = ttk.Label(current_hp_frame, text=f"/{self._pokemon.stats.hp}")
@@ -432,7 +465,13 @@ class PokemonEditFrame:
         friendship_frame = ttk.Frame(right_box)
         friendship_label = ttk.Label(friendship_frame, text="Friendship: ")
         friendship_label.grid(sticky="NWES", column=0, row=0)
-        friendship = ttk.Spinbox(friendship_frame, from_=0, to=255, width=3, textvariable=self._friendship_var)
+        friendship = ttk.Spinbox(
+            friendship_frame,
+            from_=0,
+            to=255,
+            width=3,
+            textvariable=self._friendship_var,
+        )
         friendship.grid(sticky="NWES", column=1, row=0)
         suffix_label = ttk.Label(friendship_frame, text="/255")
         suffix_label.grid(sticky="NWES", column=2, row=0)
@@ -459,10 +498,21 @@ class PokemonEditFrame:
         label = ttk.Label(contest_frame, text="Contest Conditions:")
         label.grid(sticky="W", column=0, row=0)
         n = 1
-        for condition in ["coolness", "beauty", "cuteness", "smartness", "toughness", "feel"]:
+        for condition in [
+            "coolness",
+            "beauty",
+            "cuteness",
+            "smartness",
+            "toughness",
+            "feel",
+        ]:
             ttk.Label(contest_frame, text=condition.title()).grid(sticky="W", column=0, row=n)
             condition_field = ttk.Spinbox(
-                contest_frame, from_=0, to=255, width=3, textvariable=self._contest_conditions[condition]
+                contest_frame,
+                from_=0,
+                to=255,
+                width=3,
+                textvariable=self._contest_conditions[condition],
             )
             condition_field.grid(sticky="W", column=1, row=n, padx=5)
             n += 1
@@ -641,16 +691,33 @@ class PokemonEditFrame:
         label = ttk.Label(first_row, text="Level: ")
         label.grid(sticky="W", column=2, row=0)
         level_entry = ttk.Spinbox(
-            first_row, from_=1, to=100, width=3, textvariable=level, state="readonly", increment=0
+            first_row,
+            from_=1,
+            to=100,
+            width=3,
+            textvariable=level,
+            state="readonly",
+            increment=0,
         )
         level_entry.grid(sticky="W", column=3, row=0)
 
-        radio1 = ttk.Radiobutton(frame, text="Set custom number of Experience", variable=set_type, value="exp")
+        radio1 = ttk.Radiobutton(
+            frame,
+            text="Set custom number of Experience",
+            variable=set_type,
+            value="exp",
+        )
         radio2 = ttk.Radiobutton(
-            frame, text="Set level, with 0 Exp. towards the next level", variable=set_type, value="level_start"
+            frame,
+            text="Set level, with 0 Exp. towards the next level",
+            variable=set_type,
+            value="level_start",
         )
         radio3 = ttk.Radiobutton(
-            frame, text="Set level, with 1 Exp. missing until levelling up", variable=set_type, value="level_end"
+            frame,
+            text="Set level, with 1 Exp. missing until levelling up",
+            variable=set_type,
+            value="level_end",
         )
         radio1.grid(sticky="W", column=0, row=2, padx=5)
         radio2.grid(sticky="W", column=0, row=3, padx=5)

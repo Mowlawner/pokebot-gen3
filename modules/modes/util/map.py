@@ -16,8 +16,16 @@ _closest_pokemon_centers: dict[MapFRLG | MapRSE, list[PokemonCenter]] = {
     MapRSE.ROUTE108: [PokemonCenter.DewfordTown],
     MapRSE.ROUTE109: [PokemonCenter.SlateportCity],
     MapRSE.ROUTE110: [PokemonCenter.SlateportCity, PokemonCenter.MauvilleCity],
-    MapRSE.ROUTE111: [PokemonCenter.MauvilleCity, PokemonCenter.MauvilleCity, PokemonCenter.FallarborTown],
-    MapRSE.ROUTE112: [PokemonCenter.LavaridgeTown, PokemonCenter.MauvilleCity, PokemonCenter.FallarborTown],
+    MapRSE.ROUTE111: [
+        PokemonCenter.MauvilleCity,
+        PokemonCenter.MauvilleCity,
+        PokemonCenter.FallarborTown,
+    ],
+    MapRSE.ROUTE112: [
+        PokemonCenter.LavaridgeTown,
+        PokemonCenter.MauvilleCity,
+        PokemonCenter.FallarborTown,
+    ],
     MapRSE.ROUTE113: [PokemonCenter.FallarborTown],
     MapRSE.ROUTE114: [PokemonCenter.FallarborTown],
     MapRSE.ROUTE115: [PokemonCenter.RustboroCity],

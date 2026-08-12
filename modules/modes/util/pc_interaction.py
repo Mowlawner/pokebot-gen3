@@ -6,7 +6,14 @@ from modules.context import context
 from modules.debug import debug
 from modules.game import decode_string
 from modules.items import Item, get_item_storage, get_item_bag
-from modules.memory import get_game_state, get_game_state_symbol, read_symbol, GameState, unpack_uint32, unpack_uint16
+from modules.memory import (
+    get_game_state,
+    get_game_state_symbol,
+    read_symbol,
+    GameState,
+    unpack_uint32,
+    unpack_uint16,
+)
 from modules.menuing import get_scroll_direction, is_fade_active, scroll_to_item_slot
 from modules.modes import BotModeError
 from modules.modes.util import (
@@ -65,11 +72,20 @@ class PCAction:
 
     @classmethod
     def deposit_pokemon_to_box(cls, pokemon: Pokemon, target_box: int | None = None) -> "PCAction":
-        return cls(PCStorageSection.DepositPokemon, PCStorageActionType.Deposit, pokemon, target_box)
+        return cls(
+            PCStorageSection.DepositPokemon,
+            PCStorageActionType.Deposit,
+            pokemon,
+            target_box,
+        )
 
     @classmethod
     def release_pokemon_from_party(cls, pokemon: Pokemon) -> "PCAction":
-        return cls(PCStorageSection.DepositPokemon, PCStorageActionType.ReleaseFromParty, pokemon)
+        return cls(
+            PCStorageSection.DepositPokemon,
+            PCStorageActionType.ReleaseFromParty,
+            pokemon,
+        )
 
     @classmethod
     def release_pokemon_from_box(cls, pokemon: Pokemon) -> "PCAction":
@@ -77,15 +93,30 @@ class PCAction:
 
     @classmethod
     def withdraw_item(cls, item: Item, quantity: int) -> "PCAction":
-        return cls(PCStorageSection.WithdrawItem, PCStorageActionType.Withdraw, item=item, quantity=quantity)
+        return cls(
+            PCStorageSection.WithdrawItem,
+            PCStorageActionType.Withdraw,
+            item=item,
+            quantity=quantity,
+        )
 
     @classmethod
     def deposit_item(cls, item: Item, quantity: int) -> "PCAction":
-        return cls(PCStorageSection.DepositItem, PCStorageActionType.Deposit, item=item, quantity=quantity)
+        return cls(
+            PCStorageSection.DepositItem,
+            PCStorageActionType.Deposit,
+            item=item,
+            quantity=quantity,
+        )
 
     @classmethod
     def toss_item(cls, item: Item, quantity: int) -> "PCAction":
-        return cls(PCStorageSection.TossItem, PCStorageActionType.Toss, item=item, quantity=quantity)
+        return cls(
+            PCStorageSection.TossItem,
+            PCStorageActionType.Toss,
+            item=item,
+            quantity=quantity,
+        )
 
 
 @dataclass
@@ -477,7 +508,10 @@ def _do_deposit_actions(actions: list[PCAction]) -> Generator:
                 context.emulator.press_button("A")
                 yield
             direction = get_scroll_direction(
-                _get_storage_state().selected_target_box, target_box, total_items=14, horizontal=True
+                _get_storage_state().selected_target_box,
+                target_box,
+                total_items=14,
+                horizontal=True,
             )
             while _get_storage_state().selected_target_box != target_box:
                 context.emulator.press_button(direction)

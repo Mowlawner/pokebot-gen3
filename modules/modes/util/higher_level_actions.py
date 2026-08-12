@@ -4,9 +4,20 @@ from typing import Generator, Union, Callable
 from modules.context import context
 from modules.debug import debug
 from modules.map_data import PokemonCenter
-from modules.memory import get_event_flag, get_game_state_symbol, unpack_uint32, read_symbol, get_game_state, GameState
+from modules.memory import (
+    get_event_flag,
+    get_game_state_symbol,
+    unpack_uint32,
+    read_symbol,
+    get_game_state,
+    GameState,
+)
 from modules.menu_parsers import CursorOptionEmerald, CursorOptionFRLG, CursorOptionRS
-from modules.menuing import PokemonPartyMenuNavigator, StartMenuNavigator, is_fade_active
+from modules.menuing import (
+    PokemonPartyMenuNavigator,
+    StartMenuNavigator,
+    is_fade_active,
+)
 from modules.modes.util.sleep import wait_for_n_frames
 from modules.player import (
     get_player_avatar,
@@ -17,7 +28,12 @@ from modules.player import (
     AvatarFlags,
 )
 from modules.pokemon_party import get_party
-from modules.region_map import FlyDestinationFRLG, FlyDestinationRSE, get_map_cursor, get_map_region
+from modules.region_map import (
+    FlyDestinationFRLG,
+    FlyDestinationRSE,
+    get_map_cursor,
+    get_map_region,
+)
 from modules.tasks import get_task, task_is_active
 from ._util_helper import isolate_inputs
 from .items import scroll_to_item_in_bag, use_item_from_bag
@@ -41,7 +57,11 @@ from ...game import get_symbol_name_before
 from ...items import Item, get_item_bag, ItemPocket, Pokeblock, get_pokeblocks
 from ...map import get_map_objects, get_map_data_for_current_position
 from ...map_path import calculate_path, PathFindingError, Direction
-from ...mart import get_mart_buyable_items, get_mart_buy_menu_scroll_position, get_mart_main_menu_scroll_position
+from ...mart import (
+    get_mart_buyable_items,
+    get_mart_buy_menu_scroll_position,
+    get_mart_main_menu_scroll_position,
+)
 from ...pokeblock_feeder import get_active_pokeblock_feeder_for_location
 
 
@@ -533,10 +553,22 @@ def talk_to_npc(local_object_id: int):
             return
 
         neighbouring_tiles = {
-            "Up": (player_avatar.map_group_and_number, (npc_location[0], npc_location[1] + 1)),
-            "Down": (player_avatar.map_group_and_number, (npc_location[0], npc_location[1] - 1)),
-            "Left": (player_avatar.map_group_and_number, (npc_location[0] + 1, npc_location[1])),
-            "Right": (player_avatar.map_group_and_number, (npc_location[0] - 1, npc_location[1])),
+            "Up": (
+                player_avatar.map_group_and_number,
+                (npc_location[0], npc_location[1] + 1),
+            ),
+            "Down": (
+                player_avatar.map_group_and_number,
+                (npc_location[0], npc_location[1] - 1),
+            ),
+            "Left": (
+                player_avatar.map_group_and_number,
+                (npc_location[0] + 1, npc_location[1]),
+            ),
+            "Right": (
+                player_avatar.map_group_and_number,
+                (npc_location[0] - 1, npc_location[1]),
+            ),
         }
 
         nearest_tile: tuple[tuple[int, int], tuple[int, int]] | None = None
@@ -558,7 +590,10 @@ def talk_to_npc(local_object_id: int):
             raise BotModeError(f"Could not find an empty tile around local object #{local_object_id}")
 
         try:
-            yield from navigate_to(*nearest_tile, final_facing_direction=Direction.from_string(nearest_tile_facing))
+            yield from navigate_to(
+                *nearest_tile,
+                final_facing_direction=Direction.from_string(nearest_tile_facing),
+            )
             yield from ensure_facing_direction(nearest_tile_facing)
         except (PathFindingError, BotModeError):
             pass
@@ -572,7 +607,11 @@ def mount_bicycle():
         return
 
     registered_item = get_player().registered_item
-    if registered_item is not None and registered_item.name in ("Bicycle", "Acro Bike", "Mach Bike"):
+    if registered_item is not None and registered_item.name in (
+        "Bicycle",
+        "Acro Bike",
+        "Mach Bike",
+    ):
         context.emulator.press_button("Select")
         yield
         return
@@ -594,7 +633,11 @@ def unmount_bicycle():
         return
 
     registered_item = get_player().registered_item
-    if registered_item is not None and registered_item.name in ("Bicycle", "Acro Bike", "Mach Bike"):
+    if registered_item is not None and registered_item.name in (
+        "Bicycle",
+        "Acro Bike",
+        "Mach Bike",
+    ):
         context.emulator.press_button("Select")
         yield
         return
@@ -645,7 +688,10 @@ def surface_from_dive():
     if AvatarFlags.Underwater not in get_player_avatar().flags:
         raise BotModeError("Cannot surface from dive because the player is not underwater.")
 
-    if get_map_data_for_current_position().tile_type in ("Underwater Blocked Above", "Seaweed No Surfacing"):
+    if get_map_data_for_current_position().tile_type in (
+        "Underwater Blocked Above",
+        "Seaweed No Surfacing",
+    ):
         raise BotModeError("This tile does not allow surfacing from a dive.")
 
     yield from wait_until_script_is_active(script_name, "B")

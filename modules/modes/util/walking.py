@@ -2,11 +2,20 @@ from typing import Generator, Iterable, Callable
 
 from modules.context import context
 from modules.debug import debug
-from modules.map import get_map_data, get_map_data_for_current_position, get_player_map_object
+from modules.map import (
+    get_map_data,
+    get_map_data_for_current_position,
+    get_player_map_object,
+)
 from modules.map_data import MapFRLG, MapRSE
-from modules.map_path import calculate_path, Waypoint, PathFindingError, Direction, WaypointAction
+from modules.map_path import (
+    calculate_path,
+    Waypoint,
+    PathFindingError,
+    Direction,
+    WaypointAction,
+)
 from modules.memory import GameState, get_game_state
-from modules.roms import ROMLanguage
 from modules.player import (
     RunningState,
     AcroBikeState,
@@ -17,8 +26,8 @@ from modules.player import (
     player_is_at,
     get_player_location,
     AvatarFlags,
-    PlayerAvatar,
 )
+from modules.roms import ROMLanguage
 from modules.tasks import get_global_script_context, task_is_active
 from .sleep import wait_for_n_frames
 from .._interface import BotModeError
@@ -113,7 +122,9 @@ class TimedOutTryingToReachWaypointError(BotModeError):
 
 @debug.track
 def follow_waypoints(
-    path: Iterable[Waypoint | None], run: bool = True, final_facing_direction: Direction | None = None
+    path: Iterable[Waypoint | None],
+    run: bool = True,
+    final_facing_direction: Direction | None = None,
 ) -> Generator:
     """
     Follows a given set of waypoints.
@@ -194,7 +205,10 @@ def follow_waypoints(
                 frames_remaining_until_timeout -= 1
 
             if frames_remaining_until_timeout <= 0:
-                if player_is_at(current_position.map_group_and_number, current_position.local_position):
+                if player_is_at(
+                    current_position.map_group_and_number,
+                    current_position.local_position,
+                ):
                     context.emulator.reset_held_buttons()
                     yield from wait_for_n_frames(16)
                     raise TimedOutTryingToReachWaypointError(waypoint)
@@ -238,7 +252,8 @@ def follow_waypoints(
                         player_location = get_player_location()
                         if last_known_location != player_location:
                             tile_to_north = get_map_data(
-                                player_location[0], (player_location[1][0], player_location[1][1] - 1)
+                                player_location[0],
+                                (player_location[1][0], player_location[1][1] - 1),
                             )
                             if tile_to_north.tile_type != "Muddy Slope":
                                 break
@@ -442,7 +457,9 @@ def walk_one_tile(direction: str, run: bool = True) -> Generator:
 
 
 @debug.track
-def ensure_facing_direction(facing_direction: str | Direction | tuple[int, int]) -> Generator:
+def ensure_facing_direction(
+    facing_direction: str | Direction | tuple[int, int],
+) -> Generator:
     """
     If the player avatar is not already facing a certain direction this will make it turn
     around, so that afterwards it definitely faces the desired direction.
@@ -562,7 +579,9 @@ def run_in_circle(
 
 
 @debug.track
-def wait_for_player_avatar_to_be_controllable(button_to_press: str | None = None) -> Generator:
+def wait_for_player_avatar_to_be_controllable(
+    button_to_press: str | None = None,
+) -> Generator:
     while not player_avatar_is_controllable():
         if button_to_press is not None:
             context.emulator.press_button(button_to_press)
@@ -570,7 +589,9 @@ def wait_for_player_avatar_to_be_controllable(button_to_press: str | None = None
 
 
 @debug.track
-def wait_for_player_avatar_to_be_standing_still(button_to_press: str | None = None) -> Generator:
+def wait_for_player_avatar_to_be_standing_still(
+    button_to_press: str | None = None,
+) -> Generator:
     while not player_avatar_is_standing_still():
         if button_to_press is not None:
             context.emulator.press_button(button_to_press)

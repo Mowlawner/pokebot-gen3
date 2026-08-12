@@ -68,7 +68,8 @@ def assert_saved_on_map(expected_locations: SavedMapLocation | list[SavedMapLoca
 
             if expected_location.facing:
                 saved_facing_coordinates = calculate_targeted_coords(
-                    save_data.get_map_local_coordinates(), player_object_event.facing_direction
+                    save_data.get_map_local_coordinates(),
+                    player_object_event.facing_direction,
                 )
                 if expected_location.local_coordinates == saved_facing_coordinates:
                     return
@@ -78,7 +79,9 @@ def assert_saved_on_map(expected_locations: SavedMapLocation | list[SavedMapLoca
 
 
 def assert_registered_item(
-    expected_items: str | list[str], error_message: str, check_in_saved_game: bool = False
+    expected_items: str | list[str],
+    error_message: str,
+    check_in_saved_game: bool = False,
 ) -> None:
     """
     Raises an exception if the given item is not registered (for the Select button.)
@@ -99,7 +102,10 @@ def assert_registered_item(
 
 
 def assert_has_pokemon_with_any_move(
-    moves: list[str], error_message: str, check_in_saved_game: bool = False, with_pp_remaining: bool = False
+    moves: list[str],
+    error_message: str,
+    check_in_saved_game: bool = False,
+    with_pp_remaining: bool = False,
 ) -> None:
     """
     Raises an exception if the player has no Pokémon that knows any of the given move in their
@@ -128,7 +134,9 @@ def assert_has_pokemon_with_any_move(
 
 
 def assert_item_exists_in_bag(
-    expected_items: str | list[str] | tuple[str], error_message: str, check_in_saved_game: bool = False
+    expected_items: str | list[str] | tuple[str],
+    error_message: str,
+    check_in_saved_game: bool = False,
 ) -> None:
     """
     Raises an exception if the player does not have the given item in their bag.

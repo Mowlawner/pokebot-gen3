@@ -132,11 +132,32 @@ class SaveData:
         data = self.sections[1][offset : offset + data_size]
 
         return ItemBag(
-            data, items_count, key_items_count, poke_balls_count, tms_hms_count, berries_count, encryption_key
+            data,
+            items_count,
+            key_items_count,
+            poke_balls_count,
+            tms_hms_count,
+            berries_count,
+            encryption_key,
         )
 
 
-_section_sizes = [3884, 3968, 3968, 3968, 3848, 3968, 3968, 3968, 3968, 3968, 3968, 3968, 3968, 2000]
+_section_sizes = [
+    3884,
+    3968,
+    3968,
+    3968,
+    3848,
+    3968,
+    3968,
+    3968,
+    3968,
+    3968,
+    3968,
+    3968,
+    3968,
+    2000,
+]
 
 
 def get_save_data() -> SaveData | None:
@@ -148,7 +169,22 @@ def get_save_data() -> SaveData | None:
 
     def get_save_data_block(block_index: int) -> SaveData | None:
         block_offset = 0xE000 if block_index == 1 else 0x0
-        sections = [b"", b"", b"", b"", b"", b"", b"", b"", b"", b"", b"", b"", b"", b""]
+        sections = [
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+        ]
         save_index = -1
         for section_index in range(14):
             section_offset = block_offset + 0x1000 * section_index

@@ -6,7 +6,10 @@ from modules.map import get_map_objects
 from modules.map_data import MapFRLG, MapRSE
 from modules.memory import get_event_flag
 from modules.player import get_player_avatar
-from ._asserts import assert_player_has_poke_balls, assert_boxes_or_party_can_fit_pokemon
+from ._asserts import (
+    assert_player_has_poke_balls,
+    assert_boxes_or_party_can_fit_pokemon,
+)
 from ._interface import BattleAction, BotMode, BotModeError
 from .util import (
     follow_path,

@@ -35,7 +35,13 @@ class ItemPocket(Enum):
 
     @property
     def rse_index(self) -> int:
-        return {self.Items: 0, self.PokeBalls: 1, self.TmsAndHms: 2, self.Berries: 3, self.KeyItems: 4}[self]
+        return {
+            self.Items: 0,
+            self.PokeBalls: 1,
+            self.TmsAndHms: 2,
+            self.Berries: 3,
+            self.KeyItems: 4,
+        }[self]
 
     @property
     def frlg_index(self) -> int:
@@ -552,7 +558,14 @@ def get_item_bag() -> ItemBag:
     data_size = 4 * (items_count + key_items_count + poke_balls_count + tms_hms_count + berries_count)
     data = get_save_block(1, offset=offset, size=data_size)
 
-    item_bag = ItemBag(data, items_count, key_items_count, poke_balls_count, tms_hms_count, berries_count)
+    item_bag = ItemBag(
+        data,
+        items_count,
+        key_items_count,
+        poke_balls_count,
+        tms_hms_count,
+        berries_count,
+    )
     state_cache.item_bag = item_bag
     return item_bag
 

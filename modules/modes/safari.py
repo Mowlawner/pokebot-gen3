@@ -1,20 +1,28 @@
-from typing import Generator, Tuple
 from collections import Counter
+from typing import Generator, Tuple
 
-from modules.context import context
 from modules.battle_state import BattleOutcome
+from modules.context import context
+from modules.gui.multi_select_window import (
+    Selection,
+    ask_for_choice_scroll,
+    ask_for_choice,
+)
+from modules.items import get_item_by_name, get_pokeblocks
 from modules.map_data import MapFRLG, MapRSE, is_safari_map
-from modules.player import get_player, get_player_avatar, TileTransitionState, AvatarFlags
-from modules.pokemon_party import get_party
-from modules.pokemon import get_species_by_name, get_opponent
 from modules.memory import get_event_flag
 from modules.menuing import StartMenuNavigator
+from modules.modes.util.higher_level_actions import (
+    unmount_bicycle,
+    put_pokeblock_in_feeder,
+)
 from modules.modes.util.walking import wait_for_player_avatar_to_be_controllable
-from modules.items import get_item_by_name, get_pokeblocks
-from modules.modes.util.higher_level_actions import unmount_bicycle, put_pokeblock_in_feeder
+from modules.player import get_player, get_player_avatar, TileTransitionState
+from modules.pokemon import get_opponent
+from modules.pokemon_party import get_party
+from modules.runtime import get_sprites_path
 from modules.safari_strategy import (
     SafariPokemon,
-    SafariPokemonRSE,
     SafariHuntingMode,
     SafariHuntingObject,
     RSESafariStrategy,
@@ -25,10 +33,7 @@ from modules.safari_strategy import (
     get_pokeblock_type_counts,
     get_lowest_feel_pokeblock_by_type,
 )
-from modules.runtime import get_sprites_path
 from modules.sprites import get_regular_sprite
-from modules.gui.multi_select_window import Selection, ask_for_choice_scroll, ask_for_choice
-from ._interface import BotMode, BotModeError
 from ._asserts import (
     SavedMapLocation,
     assert_item_exists_in_bag,
@@ -36,6 +41,7 @@ from ._asserts import (
     assert_saved_on_map,
     assert_boxes_or_party_can_fit_pokemon,
 )
+from ._interface import BotMode, BotModeError
 from .util import (
     spin,
     fish,
@@ -197,7 +203,9 @@ class SafariMode(BotMode):
                 yield
 
         yield from self._navigate_and_hunt(
-            safari_pokemon.value.map_location, safari_pokemon.value.tile_location, safari_pokemon.value.mode
+            safari_pokemon.value.map_location,
+            safari_pokemon.value.tile_location,
+            safari_pokemon.value.mode,
         )
 
     def _re_enter_safari_zone(self) -> Generator:
@@ -214,7 +222,10 @@ class SafariMode(BotMode):
         yield from wait_for_player_avatar_to_be_standing_still()
 
     def _navigate_and_hunt(
-        self, target_map: MapFRLG | MapRSE, tile_location: Tuple[int, int], mode: SafariHuntingMode
+        self,
+        target_map: MapFRLG | MapRSE,
+        tile_location: Tuple[int, int],
+        mode: SafariHuntingMode,
     ) -> Generator:
 
         def stop_condition():
@@ -295,7 +306,10 @@ class SafariMode(BotMode):
 
     def _select_pokemon(self, safari_pokemon_list):
         pokemon_choices = [
-            Selection(safari_pokemon.value.species.name, get_regular_sprite(safari_pokemon.value.species))
+            Selection(
+                safari_pokemon.value.species.name,
+                get_regular_sprite(safari_pokemon.value.species),
+            )
             for safari_pokemon in safari_pokemon_list.available_pokemon()
         ]
 
@@ -328,7 +342,10 @@ class SafariMode(BotMode):
     def _select_pokeblock_type(self) -> Generator:
         type_counts = get_pokeblock_type_counts()
         pokeblock_choices = [
-            Selection(f"{type_name} ×{count}", get_sprites_path() / "pokeblocks" / f"{type_name.lower()}.png")
+            Selection(
+                f"{type_name} ×{count}",
+                get_sprites_path() / "pokeblocks" / f"{type_name.lower()}.png",
+            )
             for type_name, count in type_counts
         ]
 

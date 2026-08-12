@@ -59,7 +59,10 @@ class NuggetBridgeMode(BotMode):
                 context.message = f"Bag contains {str(nugget_count)} nuggets.\nTotal value: ₽{nugget_count * 5000:,}"
                 yield from wait_for_player_avatar_to_be_standing_still()
                 yield from navigate_to(MapFRLG.CERULEAN_CITY_POKEMON_CENTER_1F, (7, 8))
-            elif get_player_avatar().map_group_and_number in (MapFRLG.CERULEAN_CITY, MapFRLG.ROUTE24):
+            elif get_player_avatar().map_group_and_number in (
+                MapFRLG.CERULEAN_CITY,
+                MapFRLG.ROUTE24,
+            ):
                 self._has_whited_out = False
                 yield from navigate_to(MapFRLG.ROUTE24, (11, 15))
                 while not self._has_whited_out:

@@ -29,7 +29,10 @@ def run_frlg() -> Generator:
     starter_choice = ask_for_choice(
         [
             Selection("Bulbasaur", get_sprites_path() / "pokemon" / "normal" / "Bulbasaur.png"),
-            Selection("Charmander", get_sprites_path() / "pokemon" / "normal" / "Charmander.png"),
+            Selection(
+                "Charmander",
+                get_sprites_path() / "pokemon" / "normal" / "Charmander.png",
+            ),
             Selection("Squirtle", get_sprites_path() / "pokemon" / "normal" / "Squirtle.png"),
             Selection("Random", get_sprites_path() / "pokemon" / "normal" / "Unown (qm).png"),
         ],
@@ -139,7 +142,11 @@ def run_rse_hoenn(get_active_encounter: Callable[[], EncounterInfo]) -> Generato
             context.emulator.press_button("A")
             yield
 
-        handle_encounter(get_active_encounter(), do_not_log_battle_action=True, disable_auto_catch=True)
+        handle_encounter(
+            get_active_encounter(),
+            do_not_log_battle_action=True,
+            disable_auto_catch=True,
+        )
 
 
 def run_rse_johto(get_active_encounter: Callable[[], EncounterInfo]):

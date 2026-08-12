@@ -5,7 +5,13 @@ from modules.context import context
 from modules.debug import debug
 from modules.game_stats import get_game_stat, GameStat
 from modules.items import Item, get_item_bag, ItemPocket
-from modules.memory import GameState, get_event_flag, get_game_state, read_symbol, unpack_uint16
+from modules.memory import (
+    GameState,
+    get_event_flag,
+    get_game_state,
+    read_symbol,
+    unpack_uint16,
+)
 from modules.menu_parsers import (
     CursorOptionEmerald,
     CursorOptionFRLG,
@@ -391,7 +397,13 @@ class PokemonPartySubMenuNavigator(BaseMenuNavigator):
 
 
 class PokemonPartyMenuNavigator(BaseMenuNavigator):
-    def __init__(self, idx: int, mode: str, cursor_option: IntEnum | None = None, item_to_give: Item | None = None):
+    def __init__(
+        self,
+        idx: int,
+        mode: str,
+        cursor_option: IntEnum | None = None,
+        item_to_give: Item | None = None,
+    ):
         super().__init__()
         self.idx = idx
         self.game = context.rom.game_title
@@ -462,7 +474,9 @@ class PokemonPartyMenuNavigator(BaseMenuNavigator):
     def navigate_to_mon(self):
         party_size = get_party_size()
         direction = get_scroll_direction(
-            min(party_size, get_party_menu_cursor_pos(len(self.party))["slot_id"]), self.idx, total_items=party_size + 1
+            min(party_size, get_party_menu_cursor_pos(len(self.party))["slot_id"]),
+            self.idx,
+            total_items=party_size + 1,
         )
         while get_party_menu_cursor_pos(len(self.party))["slot_id"] != self.idx:
             context.emulator.press_button(direction)

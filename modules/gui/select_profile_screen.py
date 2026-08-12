@@ -6,7 +6,12 @@ from modules.profiles import Profile, list_available_profiles
 
 
 class SelectProfileScreen:
-    def __init__(self, window: Tk, enable_profile_creation_screen: callable, run_profile: callable):
+    def __init__(
+        self,
+        window: Tk,
+        enable_profile_creation_screen: callable,
+        run_profile: callable,
+    ):
         self.window = window
         self.enable_profile_creation_screen = enable_profile_creation_screen
         self.run_profile = run_profile
@@ -42,8 +47,16 @@ class SelectProfileScreen:
         style = ttk.Style()
         style.map(
             "Accent.TButton",
-            foreground=[("!active", "white"), ("active", "white"), ("pressed", "white")],
-            background=[("!active", "green"), ("active", "darkgreen"), ("pressed", "green")],
+            foreground=[
+                ("!active", "white"),
+                ("active", "white"),
+                ("pressed", "white"),
+            ],
+            background=[
+                ("!active", "green"),
+                ("active", "darkgreen"),
+                ("pressed", "green"),
+            ],
         )
         header.grid(row=row, sticky="NEW")
         header.columnconfigure(0, weight=1)
@@ -67,7 +80,10 @@ class SelectProfileScreen:
         container.grid(row=row, sticky="NSEW")
 
         treeview = ttk.Treeview(
-            container, columns=("profile_name", "game", "last_played"), show="headings", selectmode="browse"
+            container,
+            columns=("profile_name", "game", "last_played"),
+            show="headings",
+            selectmode="browse",
         )
         treeview.column("profile_name", width=200)
         treeview.heading("profile_name", text="Profile Name", command=lambda: sort_by("profile_name"))
@@ -162,7 +178,8 @@ class SelectProfileScreen:
                 treeview.heading("game", text=f"Game {arrow}")
             else:
                 available_profiles.sort(
-                    reverse=self._order_descending, key=lambda p: p.last_played or datetime(1, 1, 1, 0, 0, 0)
+                    reverse=self._order_descending,
+                    key=lambda p: p.last_played or datetime(1, 1, 1, 0, 0, 0),
                 )
                 treeview.heading("last_played", text=f"Last Played {arrow}")
 

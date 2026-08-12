@@ -13,7 +13,7 @@ import importlib
 import json
 import os
 import uuid
-from dataclasses import fields, is_dataclass
+from dataclasses import MISSING, fields, is_dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable
@@ -26,14 +26,24 @@ from .events import (
     MapChanged,
     PartyChanged,
     PokemonFainted,
+    StorageChanged,
     WhiteoutOccurred,
 )
 
 SCHEMA_VERSION = 1
-_EVENT_TYPES = {cls.__name__: cls for cls in (
-    BattleEnded, BattleStarted, GameStateChanged, MapChanged, PartyChanged,
-    PokemonFainted, WhiteoutOccurred,
-)}
+_EVENT_TYPES = {
+    cls.__name__: cls
+    for cls in (
+        BattleEnded,
+        BattleStarted,
+        GameStateChanged,
+        MapChanged,
+        PartyChanged,
+        PokemonFainted,
+        WhiteoutOccurred,
+        StorageChanged,
+    )
+}
 
 
 class EventStoreError(Exception):
@@ -47,7 +57,11 @@ class EventStoreCorruptionError(EventStoreError):
 def _encode(value: Any) -> Any:
     if isinstance(value, Enum):
         cls = type(value)
-        return {"__enum__": f"{cls.__module__}:{cls.__qualname__}", "name": value.name, "value": _encode(value.value)}
+        return {
+            "__enum__": f"{cls.__module__}:{cls.__qualname__}",
+            "name": value.name,
+            "value": _encode(value.value),
+        }
     if is_dataclass(value):
         return {field.name: _encode(getattr(value, field.name)) for field in fields(value)}
     if isinstance(value, tuple):
@@ -90,7 +104,13 @@ def deserialize_event(data: dict[str, Any]) -> Event:
     if event_type is None or not isinstance(data["payload"], dict):
         raise EventStoreCorruptionError("Unknown or malformed event type")
     try:
-        return event_type(**{field.name: _decode(data["payload"][field.name]) for field in fields(event_type)})
+        arguments = {}
+        for field in fields(event_type):
+            if field.name in data["payload"]:
+                arguments[field.name] = _decode(data["payload"][field.name])
+            elif field.default is MISSING and field.default_factory is MISSING:
+                raise KeyError(field.name)
+        return event_type(**arguments)
     except (KeyError, TypeError, ValueError, ImportError, AttributeError) as error:
         raise EventStoreCorruptionError("Invalid event payload") from error
 
@@ -126,7 +146,13 @@ class JsonEventStore:
             self._ids = {record["event_id"] for record in records}
         except EventStoreCorruptionError:
             raise
-        except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError) as error:
+        except (
+            OSError,
+            json.JSONDecodeError,
+            AttributeError,
+            TypeError,
+            ValueError,
+        ) as error:
             raise EventStoreCorruptionError(f"Could not load event store: {self.path}") from error
 
     @staticmethod
@@ -147,8 +173,12 @@ class JsonEventStore:
         if event_id in self._ids:
             return False
         record = {
-            "event_id": event_id, "session_id": session, "sequence": len(self._records) + 1,
-            "frame": event.frame, "type": serialized["type"], "payload": serialized["payload"],
+            "event_id": event_id,
+            "session_id": session,
+            "sequence": len(self._records) + 1,
+            "frame": event.frame,
+            "type": serialized["type"],
+            "payload": serialized["payload"],
         }
         self._records.append(record)
         self._ids.add(event_id)
@@ -173,7 +203,14 @@ class JsonEventStore:
     def flush(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(self.path.name + ".tmp")
-        document = json.dumps({"schema_version": SCHEMA_VERSION, "events": self._records}, sort_keys=True, indent=2) + "\n"
+        document = (
+            json.dumps(
+                {"schema_version": SCHEMA_VERSION, "events": self._records},
+                sort_keys=True,
+                indent=2,
+            )
+            + "\n"
+        )
         try:
             with temporary.open("w", encoding="utf-8", newline="\n") as handle:
                 handle.write(document)

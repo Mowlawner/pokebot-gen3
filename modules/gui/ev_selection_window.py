@@ -54,16 +54,28 @@ def ask_for_ev_targets(pokemon: "Pokemon") -> StatsValues:
     Label(window, text="SpD").grid(row=0, column=5)
     Label(window, text="Spe").grid(row=0, column=6)
 
-    for stat in ("hp", "attack", "defence", "special_attack", "special_defence", "speed"):
+    for stat in (
+        "hp",
+        "attack",
+        "defence",
+        "special_attack",
+        "special_defence",
+        "speed",
+    ):
         spinbox = Spinbox(window, from_=0, to=252, increment=4, wrap=True, width=8)
         spinbox.delete(0, last=None)
         spinbox.insert(0, str(pokemon.evs[stat]))
         spinbox.grid(row=1, column=len(spinboxes) + 1, padx=10, pady=3)
         spinboxes.append(spinbox)
 
-    Button(window, text="EV Train", width=20, height=1, bg="lightblue", command=return_selection).grid(
-        row=7, column=3, columnspan=2, pady=15
-    )
+    Button(
+        window,
+        text="EV Train",
+        width=20,
+        height=1,
+        bg="lightblue",
+        command=return_selection,
+    ).grid(row=7, column=3, columnspan=2, pady=15)
 
     while window is not None:
         window.update_idletasks()

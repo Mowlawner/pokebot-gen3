@@ -1,9 +1,9 @@
 import threading
 from typing import TYPE_CHECKING
 
-import glfw
 from OpenGL.GL import *
 
+import glfw
 from mgba import ffi
 from modules.context import context
 from modules.game import set_rom
@@ -11,7 +11,6 @@ from modules.libmgba import LibmgbaEmulator
 
 if TYPE_CHECKING:
     from pokebot import StartupSettings
-
 
 WIDTH = 240
 HEIGHT = 160
@@ -137,7 +136,17 @@ class GlfwGui:
 
             # Upload texture data
             if frame_data is not None:
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, WIDTH, HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, frame_data)
+                glTexImage2D(
+                    GL_TEXTURE_2D,
+                    0,
+                    GL_RGBA,
+                    WIDTH,
+                    HEIGHT,
+                    0,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    frame_data,
+                )
 
             # Draw a fullscreen textured quad
             glEnable(GL_TEXTURE_2D)

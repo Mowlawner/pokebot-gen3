@@ -6,7 +6,11 @@ from typing import TypeAlias
 from modules.context import context
 from modules.map import MapLocation, get_map_all_tiles, get_map_data, get_map_objects
 from modules.map_data import MapFRLG, MapRSE
-from modules.memory import get_event_flag, get_event_flag_by_number, get_event_var_by_number
+from modules.memory import (
+    get_event_flag,
+    get_event_flag_by_number,
+    get_event_var_by_number,
+)
 from modules.pokemon_party import get_party
 
 LocationType: TypeAlias = MapLocation | tuple[tuple[int, int] | MapFRLG | MapRSE, tuple[int, int]]
@@ -70,7 +74,10 @@ class PathTile:
 
     @property
     def global_coordinates(self) -> tuple[int, int]:
-        return self.local_coordinates[0] + self.map.offset[0], self.local_coordinates[1] + self.map.offset[1]
+        return (
+            self.local_coordinates[0] + self.map.offset[0],
+            self.local_coordinates[1] + self.map.offset[1],
+        )
 
 
 @dataclass
@@ -141,7 +148,10 @@ class PathMap:
                                     break
                                 else:
                                     waterfall_to = all_tiles[
-                                        tile_index(waterfall_to.local_position[0], waterfall_to.local_position[1] - 1)
+                                        tile_index(
+                                            waterfall_to.local_position[0],
+                                            waterfall_to.local_position[1] - 1,
+                                        )
                                     ]
                     tile_north = all_tiles[tile_index(tile.local_position[0], tile.local_position[1] - 1)]
                     if tile_north is not None:
@@ -153,7 +163,10 @@ class PathMap:
                                     break
                                 else:
                                     waterfall_to = all_tiles[
-                                        tile_index(waterfall_to.local_position[0], waterfall_to.local_position[1] + 1)
+                                        tile_index(
+                                            waterfall_to.local_position[0],
+                                            waterfall_to.local_position[1] + 1,
+                                        )
                                     ]
                 elif tile.tile_type == "Muddy Slope":
                     tile_south = all_tiles[tile_index(tile.local_position[0], tile.local_position[1] + 1)]
@@ -167,7 +180,8 @@ class PathMap:
                                 else:
                                     muddy_slope_to = all_tiles[
                                         tile_index(
-                                            muddy_slope_to.local_position[0], muddy_slope_to.local_position[1] - 1
+                                            muddy_slope_to.local_position[0],
+                                            muddy_slope_to.local_position[1] - 1,
                                         )
                                     ]
                     tile_north = all_tiles[tile_index(tile.local_position[0], tile.local_position[1] - 1)]
@@ -181,7 +195,8 @@ class PathMap:
                                 else:
                                     muddy_slope_to = all_tiles[
                                         tile_index(
-                                            muddy_slope_to.local_position[0], muddy_slope_to.local_position[1] + 1
+                                            muddy_slope_to.local_position[0],
+                                            muddy_slope_to.local_position[1] + 1,
                                         )
                                     ]
                 elif tile.tile_type in ("Horizontal Rail", "Isolated Horizontal Rail"):
@@ -244,15 +259,36 @@ class PathMap:
                         else:
                             break
                     forced_movement_to = {
-                        Direction.North: (destination.map_group_and_number, destination.local_position, steps),
-                        Direction.East: (destination.map_group_and_number, destination.local_position, steps),
-                        Direction.South: (destination.map_group_and_number, destination.local_position, steps),
-                        Direction.West: (destination.map_group_and_number, destination.local_position, steps),
+                        Direction.North: (
+                            destination.map_group_and_number,
+                            destination.local_position,
+                            steps,
+                        ),
+                        Direction.East: (
+                            destination.map_group_and_number,
+                            destination.local_position,
+                            steps,
+                        ),
+                        Direction.South: (
+                            destination.map_group_and_number,
+                            destination.local_position,
+                            steps,
+                        ),
+                        Direction.West: (
+                            destination.map_group_and_number,
+                            destination.local_position,
+                            steps,
+                        ),
                     }
                 elif tile.tile_type == "Ice":
                     accessible_from_direction = [True, True, True, True]
                     forced_movement_to = {}
-                    for direction in (Direction.North, Direction.East, Direction.South, Direction.West):
+                    for direction in (
+                        Direction.North,
+                        Direction.East,
+                        Direction.South,
+                        Direction.West,
+                    ):
                         steps = 0
                         destination = all_tiles[tile_index(tile.local_position[0], tile.local_position[1])]
                         x, y = destination.local_position
@@ -316,15 +352,21 @@ class PathMap:
                         None,
                         on_enter_event_triggers,
                         warps_to,
-                        waterfall_to.local_position if waterfall_to is not None else None,
-                        muddy_slope_to.local_position if muddy_slope_to is not None else None,
+                        (waterfall_to.local_position if waterfall_to is not None else None),
+                        (muddy_slope_to.local_position if muddy_slope_to is not None else None),
                         forced_movement_to,
                         needs_acro_bike,
                         needs_bunny_hop,
                         cannot_run=(
                             map_data.map_type == "Underwater"
                             or not map_data.is_running_possible
-                            or tile.tile_type in ("Long Grass", "No Running", "Hot Springs", "Fortree Bridge")
+                            or tile.tile_type
+                            in (
+                                "Long Grass",
+                                "No Running",
+                                "Hot Springs",
+                                "Fortree Bridge",
+                            )
                         ),
                     )
                 )
@@ -345,7 +387,10 @@ class PathMap:
         return self.tiles[local_coordinates[1] * self.size[0] + local_coordinates[0]]
 
     def get_global_tile(self, global_coordinates: tuple[int, int]) -> PathTile:
-        local_coordinates = global_coordinates[0] - self.offset[0], global_coordinates[1] - self.offset[1]
+        local_coordinates = (
+            global_coordinates[0] - self.offset[0],
+            global_coordinates[1] - self.offset[1],
+        )
         return self.get_tile(local_coordinates)
 
     def contains_global_coordinates(self, global_coordinates: tuple[int, int]) -> bool:
@@ -368,10 +413,26 @@ class PathMap:
         blockers: list[tuple[MapRSE | MapFRLG, tuple[int, int], str]] = []
         if context.rom.is_emerald:
             blockers = [
-                (MapRSE.SHOAL_CAVE_LOW_TIDE_INNER_ROOM, (31, 8), "RECEIVED_SHOAL_SALT_1"),
-                (MapRSE.SHOAL_CAVE_LOW_TIDE_INNER_ROOM, (14, 26), "RECEIVED_SHOAL_SALT_2"),
-                (MapRSE.SHOAL_CAVE_LOW_TIDE_STAIRS_ROOM, (11, 11), "RECEIVED_SHOAL_SALT_3"),
-                (MapRSE.SHOAL_CAVE_LOW_TIDE_LOWER_ROOM, (18, 2), "RECEIVED_SHOAL_SALT_4"),
+                (
+                    MapRSE.SHOAL_CAVE_LOW_TIDE_INNER_ROOM,
+                    (31, 8),
+                    "RECEIVED_SHOAL_SALT_1",
+                ),
+                (
+                    MapRSE.SHOAL_CAVE_LOW_TIDE_INNER_ROOM,
+                    (14, 26),
+                    "RECEIVED_SHOAL_SALT_2",
+                ),
+                (
+                    MapRSE.SHOAL_CAVE_LOW_TIDE_STAIRS_ROOM,
+                    (11, 11),
+                    "RECEIVED_SHOAL_SALT_3",
+                ),
+                (
+                    MapRSE.SHOAL_CAVE_LOW_TIDE_LOWER_ROOM,
+                    (18, 2),
+                    "RECEIVED_SHOAL_SALT_4",
+                ),
             ]
 
         for blocker in blockers:
@@ -391,7 +452,10 @@ _maps: dict[str, dict[tuple[int, int], PathMap]] = {}
 def _get_connection_for_direction(map_data: MapLocation, direction: str) -> tuple[tuple[int, int], int] | None:
     for connection in map_data.connections:
         if connection.direction == direction:
-            return (connection.destination_map_group, connection.destination_map_number), connection.offset
+            return (
+                connection.destination_map_group,
+                connection.destination_map_number,
+            ), connection.offset
     return None
 
 
@@ -510,7 +574,12 @@ def _find_tile_by_local_coordinates(
 
 class PathFindingError(RuntimeError):
 
-    def __init__(self, message: str, source: LocationType | None = None, destination: LocationType | None = None):
+    def __init__(
+        self,
+        message: str,
+        source: LocationType | None = None,
+        destination: LocationType | None = None,
+    ):
         if source is not None:
             message = message.replace("%SOURCE%", self._debug_tile_name(source))
 
@@ -769,7 +838,15 @@ def calculate_path(
             if node.tile.warps_to and len(result) == 0:
                 warp_map, warp_coords, extra_warp_direction = node.tile.warps_to
                 if extra_warp_direction is not None:
-                    result.append(Waypoint(extra_warp_direction, warp_map, warp_coords, True, node.elevation == 1))
+                    result.append(
+                        Waypoint(
+                            extra_warp_direction,
+                            warp_map,
+                            warp_coords,
+                            True,
+                            node.elevation == 1,
+                        )
+                    )
                     waypoint = Waypoint(
                         direction,
                         node.tile.map.map_group_and_number,
@@ -813,7 +890,16 @@ def calculate_path(
 
     checked_tiles: dict[tuple[int, int, int], PathNode] = {}
     open_queue: PriorityQueue[PathNode] = PriorityQueue()
-    open_queue.put(PathNode(source_tile, source_tile.elevation, None, None, 0, cost_heuristic(source_tile)))
+    open_queue.put(
+        PathNode(
+            source_tile,
+            source_tile.elevation,
+            None,
+            None,
+            0,
+            cost_heuristic(source_tile),
+        )
+    )
 
     while not open_queue.empty():
         node = open_queue.get()
@@ -895,7 +981,11 @@ def calculate_path(
                 muddy_slope_height = abs(neighbour.local_coordinates[1] - neighbour.muddy_slope_to[1])
                 cost += muddy_slope_height
                 neighbour = _find_tile_by_global_coordinates(
-                    (muddy_slope_to.global_coordinates[0], muddy_slope_to.global_coordinates[1] - 2), map_level
+                    (
+                        muddy_slope_to.global_coordinates[0],
+                        muddy_slope_to.global_coordinates[1] - 2,
+                    ),
+                    map_level,
                 )
                 neighbour_coordinates = neighbour.global_coordinates
                 is_muddy_slope = True
@@ -907,7 +997,8 @@ def calculate_path(
                         f"Encountered a negative-length forced movement from {neighbour.local_coordinates} to {neighbour.forced_movement_to[direction]}."
                     )
                 neighbour = _find_tile_by_local_coordinates(
-                    neighbour.forced_movement_to[direction][0], neighbour.forced_movement_to[direction][1]
+                    neighbour.forced_movement_to[direction][0],
+                    neighbour.forced_movement_to[direction][1],
                 )
                 neighbour_coordinates = neighbour.global_coordinates
 
@@ -931,7 +1022,11 @@ def calculate_path(
             else:
                 elevation = neighbour.elevation
 
-            neighbour_key = neighbour_coordinates[0], neighbour_coordinates[1], elevation
+            neighbour_key = (
+                neighbour_coordinates[0],
+                neighbour_coordinates[1],
+                elevation,
+            )
             if neighbour_key not in checked_tiles or checked_tiles[neighbour_key].current_cost > cost:
                 new_node = PathNode(
                     neighbour,

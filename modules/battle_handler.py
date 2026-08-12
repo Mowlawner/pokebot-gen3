@@ -34,7 +34,9 @@ _last_handled_battle_result: HandledBattleResult | None = None
 
 
 @debug.track
-def handle_battle(strategy: BattleStrategy) -> Generator[None, None, HandledBattleResult]:
+def handle_battle(
+    strategy: BattleStrategy,
+) -> Generator[None, None, HandledBattleResult]:
     """
     This is the main battle-handling function that will attempt to finish the
     battle, calling the battle strategy's callbacks whenever a decision is
@@ -53,7 +55,10 @@ def handle_battle(strategy: BattleStrategy) -> Generator[None, None, HandledBatt
 
     while battle_is_active() and context.bot_mode != "Manual":
         instruction = get_current_battle_script_instruction()
-        if get_main_battle_callback() in ("HandleTurnActionSelectionState", "sub_8012324"):
+        if get_main_battle_callback() in (
+            "HandleTurnActionSelectionState",
+            "sub_8012324",
+        ):
             yield from handle_battle_action_selection(strategy)
         elif get_current_battle_script_instruction() == "BattleScript_ItemSteal":
             result = yield from handle_item_stealing()
@@ -75,7 +80,10 @@ def handle_battle(strategy: BattleStrategy) -> Generator[None, None, HandledBatt
             and len(get_party().non_fainted_pokemon) > 0
         ):
             yield from handle_fainted_pokemon(strategy)
-        elif instruction in ("BattleScript_TryNicknameCaughtMon", "BattleScript_CaughtPokemonSkipNewDex"):
+        elif instruction in (
+            "BattleScript_TryNicknameCaughtMon",
+            "BattleScript_CaughtPokemonSkipNewDex",
+        ):
             yield from handle_nickname_caught_pokemon(context.stats.last_encounter)
         else:
             context.emulator.press_button("B")

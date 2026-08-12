@@ -6,7 +6,14 @@ from modules.debug import debug
 from modules.encounter import handle_encounter, EncounterInfo, log_encounter
 from modules.map import get_map_objects, get_map_data_for_current_position
 from modules.map_data import MapFRLG, MapRSE, is_safari_map
-from modules.memory import GameState, get_game_state, get_game_state_symbol, read_symbol, unpack_uint32, unpack_uint16
+from modules.memory import (
+    GameState,
+    get_game_state,
+    get_game_state_symbol,
+    read_symbol,
+    unpack_uint32,
+    unpack_uint16,
+)
 from modules.menuing import (
     MenuWrapper,
     should_check_for_pickup,
@@ -14,7 +21,11 @@ from modules.menuing import (
     take_held_items_from_multiple_party_pokemon,
     get_items_available_for_pickup,
 )
-from modules.player import TileTransitionState, get_player_avatar, player_avatar_is_standing_still
+from modules.player import (
+    TileTransitionState,
+    get_player_avatar,
+    player_avatar_is_standing_still,
+)
 from modules.pokemon import StatusCondition, clear_opponent, get_opponent
 from modules.pokemon_party import get_party
 from modules.tasks import get_global_script_context, task_is_active, get_task
@@ -69,7 +80,11 @@ def _ensure_plugin_hook_will_run(generator: Iterable) -> None:
 
 
 class BattleListener(BotListener):
-    battle_states = (GameState.BATTLE, GameState.BATTLE_STARTING, GameState.BATTLE_ENDING)
+    battle_states = (
+        GameState.BATTLE,
+        GameState.BATTLE_STARTING,
+        GameState.BATTLE_ENDING,
+    )
 
     def __init__(self):
         self._in_battle = False
@@ -227,7 +242,8 @@ class BattleListener(BotListener):
             if strategy.choose_new_lead_after_battle() is not None:
                 if context.bot_mode != "Manual":
                     yield from self.rotate_lead_pokemon(
-                        strategy.choose_new_lead_after_battle(), first_non_fainted_lead_before_battle
+                        strategy.choose_new_lead_after_battle(),
+                        first_non_fainted_lead_before_battle,
                     )
 
     @debug.track
@@ -411,7 +427,10 @@ class EggHatchListener(BotListener):
                         result = yield from plugin_egg_hatched(self._encounter_info)
                         if result is True:
                             do_not_switch_to_manual = True
-                        handle_encounter(self._encounter_info, do_not_switch_to_manual=do_not_switch_to_manual)
+                        handle_encounter(
+                            self._encounter_info,
+                            do_not_switch_to_manual=do_not_switch_to_manual,
+                        )
 
                     _ensure_plugin_hook_will_run(report_hatched())
                     self._reported_hatched_egg = True

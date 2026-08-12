@@ -63,7 +63,12 @@ class Party:
 
     @property
     def non_fainted_pokemon(self) -> list[PartyPokemon]:
-        return list(filter(lambda pokemon: not pokemon.is_egg and pokemon.current_hp > 0, self._pokemon))
+        return list(
+            filter(
+                lambda pokemon: not pokemon.is_egg and pokemon.current_hp > 0,
+                self._pokemon,
+            )
+        )
 
     @property
     def first_non_fainted(self) -> PartyPokemon | None:

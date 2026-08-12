@@ -39,8 +39,16 @@ def _get_targeted_encounter() -> tuple[MapFRLG | MapRSE, tuple[int, int], str] |
             (MapFRLG.SILPH_CO_7F, (0, 7), "Lapras"),
             (MapFRLG.SAFFRON_CITY_DOJO, (5, 3), "Hitmonlee"),
             (MapFRLG.SAFFRON_CITY_DOJO, (7, 3), "Hitmonchan"),
-            (MapFRLG.CINNABAR_ISLAND_POKEMON_LAB_EXPERIMENT_ROOM, (11, 2), "Kanto Fossils"),
-            (MapFRLG.CINNABAR_ISLAND_POKEMON_LAB_EXPERIMENT_ROOM, (13, 4), "Kanto Fossils"),
+            (
+                MapFRLG.CINNABAR_ISLAND_POKEMON_LAB_EXPERIMENT_ROOM,
+                (11, 2),
+                "Kanto Fossils",
+            ),
+            (
+                MapFRLG.CINNABAR_ISLAND_POKEMON_LAB_EXPERIMENT_ROOM,
+                (13, 4),
+                "Kanto Fossils",
+            ),
             (MapFRLG.CELADON_CITY_CONDOMINIUMS_ROOF_ROOM, (7, 3), "Eevee"),
             (MapFRLG.ROUTE4_POKEMON_CENTER_1F, (1, 3), "Magikarp"),
             (MapFRLG.FIVE_ISLAND_WATER_LABYRINTH, (14, 11), "Togepi"),
@@ -162,7 +170,8 @@ class StaticGiftResetsMode(BotMode):
                     raise BotModeError("You need to save the game before using this mode.")
 
         assert_empty_slot_in_party(
-            "This mode requires at least one empty party slot, but your party is full.", check_in_saved_game=True
+            "This mode requires at least one empty party slot, but your party is full.",
+            check_in_saved_game=True,
         )
 
         while context.bot_mode != "Manual":
@@ -181,7 +190,13 @@ class StaticGiftResetsMode(BotMode):
                 yield from wait_until_task_is_not_active("Task_FieldMessageBox", "B")
 
             # Accept the Pokémon
-            if encounter[2] in ["Beldum", "Hitmonchan", "Hitmonlee", "Magikarp", "Wynaut"]:
+            if encounter[2] in [
+                "Beldum",
+                "Hitmonchan",
+                "Hitmonlee",
+                "Magikarp",
+                "Wynaut",
+            ]:
                 if context.rom.is_rse:
                     yield from wait_for_task_to_start_and_finish("Task_HandleYesNoInput", "A")
                     yield from wait_for_task_to_start_and_finish("Task_Fanfare", "B")
@@ -257,4 +272,7 @@ class StaticGiftResetsMode(BotMode):
                 yield from StartMenuNavigator("POKEMON").step()
                 yield from PokemonPartyMenuNavigator(get_party_size() - 1, "summary").step()
 
-                handle_encounter(EncounterInfo.create(get_party()[-1], EncounterType.Gift), disable_auto_catch=True)
+                handle_encounter(
+                    EncounterInfo.create(get_party()[-1], EncounterType.Gift),
+                    disable_auto_catch=True,
+                )

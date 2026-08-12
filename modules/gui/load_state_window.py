@@ -93,7 +93,10 @@ class LoadStateWindow:
             if photo is None:
                 placeholder = PIL.Image.new(mode="RGBA", size=(240, 160))
                 draw = PIL.ImageDraw.Draw(placeholder)
-                draw.rectangle(xy=[(0, 0), (placeholder.width, placeholder.height)], fill="#000000FF")
+                draw.rectangle(
+                    xy=[(0, 0), (placeholder.width, placeholder.height)],
+                    fill="#000000FF",
+                )
                 possible_sprites = [
                     "TM01",
                     "TM02",

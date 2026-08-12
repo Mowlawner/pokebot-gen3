@@ -87,7 +87,10 @@ def generate_placeholder_image(width: int, height: int) -> PIL.Image:
     sprite = PIL.Image.open(choose_random_sprite())
     if sprite.mode != "RGBA":
         sprite = sprite.convert("RGBA")
-    sprite_position = (placeholder.width // 2 - sprite.width // 2, placeholder.height // 2 - sprite.height // 2)
+    sprite_position = (
+        placeholder.width // 2 - sprite.width // 2,
+        placeholder.height // 2 - sprite.height // 2,
+    )
     placeholder.paste(sprite, sprite_position, sprite)
 
     return placeholder

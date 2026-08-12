@@ -6,10 +6,13 @@ from modules.context import context
 from modules.items import get_item_by_name, get_item_bag
 from modules.map import get_map_data
 from modules.map_data import MapRSE
-from modules.player import get_player, get_player_avatar, AvatarFlags, get_player_location
+from modules.player import get_player, get_player_avatar, AvatarFlags
 from modules.pokemon_party import get_party
 from . import BattleAction
-from ._asserts import assert_player_has_poke_balls, assert_boxes_or_party_can_fit_pokemon
+from ._asserts import (
+    assert_player_has_poke_balls,
+    assert_boxes_or_party_can_fit_pokemon,
+)
 from ._interface import BotMode, BotModeError
 from .util import (
     ensure_facing_direction,
@@ -174,7 +177,10 @@ class FeebasMode(BotMode):
         if not get_player_avatar().flags.Surfing:
             raise BotModeError("Player is not surfing, only start this mode while surfing in any water at Route 119.")
 
-        if context.rom.is_emerald and get_party()[0].ability.name not in ["Sticky Hold", "Suction Cups"]:
+        if context.rom.is_emerald and get_party()[0].ability.name not in [
+            "Sticky Hold",
+            "Suction Cups",
+        ]:
             context.message = "Warning: It is recommended to put a Pokémon with the ability Sticky Hold or Suction Cups as the first Pokémon in your party."
 
         item_bag = get_item_bag()

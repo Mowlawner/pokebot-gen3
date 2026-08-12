@@ -114,7 +114,10 @@ class GenerateEncounterMediaPlugin(BotPlugin):
             # Set the TCG card's path so that other plugins can use it.
             encounter.tcg_card_path = cards_dir / file_name
 
-            Thread(target=generate_tcg_card, args=(encounter.pokemon.data, encounter.pokemon.location_met)).start()
+            Thread(
+                target=generate_tcg_card,
+                args=(encounter.pokemon.data, encounter.pokemon.location_met),
+            ).start()
 
         return None
 

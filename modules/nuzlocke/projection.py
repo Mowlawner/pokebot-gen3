@@ -13,10 +13,18 @@ from dataclasses import dataclass, replace
 from typing import Any, Iterable
 
 from .events import (
-    BattleEnded, BattleStarted, Event, GameStateChanged, MapChanged,
-    PartyChanged, PokemonFainted, WhiteoutOccurred,
+    BattleEnded,
+    BattleStarted,
+    Event,
+    GameStateChanged,
+    MapChanged,
+    PartyChanged,
+    PokemonFainted,
+    StorageChanged,
+    WhiteoutOccurred,
 )
 from .persistence import JsonEventStore, deserialize_event, serialize_event
+from .identity import PokemonIdentity
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +36,7 @@ class ObservedPokemon:
     nickname: str
     last_faint_frame: int
     faint_count: int
+    identity: PokemonIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +69,8 @@ class ObservedCampaignState:
     active_battle: ObservedBattle | None = None
     last_battle_end: BattleEnded | None = None
     party_indices: tuple[int, ...] | None = None
+    party_identities: tuple[PokemonIdentity, ...] | None = None
+    pc_locations: tuple[tuple[PokemonIdentity, int, int], ...] | None = None
     last_party_change: ObservedEvent | None = None
     observed_pokemon: tuple[ObservedPokemon, ...] = ()
     observed_faints: tuple[PokemonFainted, ...] = ()
@@ -92,10 +103,27 @@ class CampaignProjection:
     def state(self) -> ObservedCampaignState:
         return self._state
 
-    def apply(self, event: Event, *, session_id: str | None = None,
-              sequence: int | None = None, event_id: str | None = None) -> None:
-        if not isinstance(event, (BattleStarted, BattleEnded, MapChanged, PartyChanged,
-                                  PokemonFainted, WhiteoutOccurred, GameStateChanged)):
+    def apply(
+        self,
+        event: Event,
+        *,
+        session_id: str | None = None,
+        sequence: int | None = None,
+        event_id: str | None = None,
+    ) -> None:
+        if not isinstance(
+            event,
+            (
+                BattleStarted,
+                BattleEnded,
+                MapChanged,
+                PartyChanged,
+                PokemonFainted,
+                StorageChanged,
+                WhiteoutOccurred,
+                GameStateChanged,
+            ),
+        ):
             raise TypeError(f"Unsupported Nuzlocke event: {type(event).__name__}")
         key = event_id or _event_key(event, session_id)
         if key in self._seen:
@@ -111,8 +139,9 @@ class CampaignProjection:
         if session_id is not None and session_id not in sessions:
             sessions = sessions + (session_id,)
         changes = dict(
-            last_event_sequence=actual, last_observed_frame=event.frame,
-            current_session_id=session_id if session_id is not None else state.current_session_id,
+            last_event_sequence=actual,
+            last_observed_frame=event.frame,
+            current_session_id=(session_id if session_id is not None else state.current_session_id),
             known_session_ids=sessions,
         )
         if isinstance(event, MapChanged):
@@ -123,7 +152,11 @@ class CampaignProjection:
             changes["last_game_state_change"] = meta
         elif isinstance(event, BattleStarted):
             changes["active_battle"] = ObservedBattle(
-                event.battle_type, event.is_trainer, event.is_wild, event.is_double, event.frame
+                event.battle_type,
+                event.is_trainer,
+                event.is_wild,
+                event.is_double,
+                event.frame,
             )
         elif isinstance(event, BattleEnded):
             changes["active_battle"] = None
@@ -135,18 +168,54 @@ class CampaignProjection:
                 indices.difference_update(event.left_party_indices)
                 changes["party_indices"] = tuple(sorted(indices))
             changes["last_party_change"] = meta
+            if event.entered_identities or event.left_identities or event.changed_identities:
+                identities = list(state.party_identities or ())
+                identities.extend(event.entered_identities)
+                identities = [identity for identity in identities if identity not in event.left_identities]
+                changes["party_identities"] = tuple(identities)
         elif isinstance(event, PokemonFainted):
             changes["observed_faints"] = state.observed_faints + (event,)
-            old = next((p for p in state.observed_pokemon
-                        if p.personality_value == event.personality_value), None)
-            replacement = ObservedPokemon(
-                event.personality_value, event.species, event.nickname, event.frame,
-                (old.faint_count + 1) if old else 1,
+            old = next(
+                (
+                    p
+                    for p in state.observed_pokemon
+                    if (event.identity is not None and p.identity == event.identity)
+                    or (event.identity is None and p.personality_value == event.personality_value)
+                ),
+                None,
             )
-            changes["observed_pokemon"] = tuple(
-                replacement if p.personality_value == event.personality_value else p
-                for p in state.observed_pokemon
-            ) if old else state.observed_pokemon + (replacement,)
+            replacement = ObservedPokemon(
+                event.personality_value,
+                event.species,
+                event.nickname,
+                event.frame,
+                (old.faint_count + 1) if old else 1,
+                event.identity,
+            )
+            changes["observed_pokemon"] = (
+                tuple(
+                    (
+                        replacement
+                        if (
+                            (event.identity is not None and p.identity == event.identity)
+                            or (event.identity is None and p.personality_value == event.personality_value)
+                        )
+                        else p
+                    )
+                    for p in state.observed_pokemon
+                )
+                if old
+                else state.observed_pokemon + (replacement,)
+            )
+        elif isinstance(event, StorageChanged):
+            locations = dict((identity, (box, slot)) for identity, box, slot in (state.pc_locations or ()))
+            for location in event.left:
+                locations.pop(location.identity, None)
+            for location in event.entered:
+                locations[location.identity] = (location.box, location.slot)
+            for old_location, new_location in event.moved:
+                locations[new_location.identity] = (new_location.box, new_location.slot)
+            changes["pc_locations"] = tuple((identity, box, slot) for identity, (box, slot) in locations.items())
         elif isinstance(event, WhiteoutOccurred):
             changes["observed_whiteouts"] = state.observed_whiteouts + (meta,)
         self._state = replace(state, **changes)
@@ -158,7 +227,12 @@ class CampaignProjection:
         event = deserialize_event({"type": record["type"], "payload": record["payload"]})
         if record["frame"] != event.frame:
             raise ValueError("Event record frame does not match payload")
-        self.apply(event, session_id=record["session_id"], sequence=record["sequence"], event_id=record["event_id"])
+        self.apply(
+            event,
+            session_id=record["session_id"],
+            sequence=record["sequence"],
+            event_id=record["event_id"],
+        )
 
 
 def reduce_events(events: Iterable[Event]) -> ObservedCampaignState:

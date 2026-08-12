@@ -23,7 +23,11 @@ from modules.debug_utilities import (
 from modules.gui.debug_edit_item_bag import run_edit_item_bag_screen
 from modules.gui.debug_edit_party import run_edit_party_screen
 from modules.gui.debug_edit_pokedex import run_edit_pokedex_screen
-from modules.gui.multi_select_window import ask_for_confirmation, ask_for_choice, Selection
+from modules.gui.multi_select_window import (
+    ask_for_confirmation,
+    ask_for_choice,
+    Selection,
+)
 from modules.memory import (
     write_symbol,
     pack_uint16,
@@ -54,7 +58,10 @@ def _create_save_state() -> None:
         extra_chunks.add(b"gbAs", zlib.compress(context.emulator.get_save_state()))
 
         save_game = context.emulator.read_save_data()
-        extra_chunks.add(b"gbAx", pack_uint32(2) + pack_uint32(len(save_game)) + zlib.compress(save_game))
+        extra_chunks.add(
+            b"gbAx",
+            pack_uint32(2) + pack_uint32(len(save_game)) + zlib.compress(save_game),
+        )
 
         screenshot.save(file, format="PNG", pnginfo=extra_chunks)
 
@@ -233,7 +240,9 @@ class DebugMenu(Menu):
     def __init__(self, window: Tk):
         super().__init__(window, tearoff=0)
 
-        def toggleable_listener(listener_class: type[BotListener]) -> tkinter.BooleanVar:
+        def toggleable_listener(
+            listener_class: type[BotListener],
+        ) -> tkinter.BooleanVar:
             var = tkinter.BooleanVar()
 
             def update_handler(*args):
@@ -297,9 +306,18 @@ class DebugMenu(Menu):
         self.add_cascade(label="Give Lead with Ability", menu=ability_menu)
         self.add_separator()
         self.add_checkbutton(label="Infinite Repel", variable=toggleable_listener(InfiniteRepelListener))
-        self.add_checkbutton(label="Infinite Safari Zone", variable=toggleable_listener(InfiniteSafariZoneListener))
-        self.add_checkbutton(label="Force Shiny Encounter", variable=toggleable_listener(ForceShinyEncounterListener))
-        self.add_checkbutton(label="Force PokeNav Call", variable=toggleable_listener(ForcePokenavCallListener))
+        self.add_checkbutton(
+            label="Infinite Safari Zone",
+            variable=toggleable_listener(InfiniteSafariZoneListener),
+        )
+        self.add_checkbutton(
+            label="Force Shiny Encounter",
+            variable=toggleable_listener(ForceShinyEncounterListener),
+        )
+        self.add_checkbutton(
+            label="Force PokeNav Call",
+            variable=toggleable_listener(ForcePokenavCallListener),
+        )
         self.add_separator()
         self.add_command(label="Advance RTC by one hour", command=lambda: _advance_rtc_hours(1))
         self.add_command(label="Advance RTC by one day", command=lambda: _advance_rtc_hours(24))

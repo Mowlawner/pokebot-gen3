@@ -188,7 +188,9 @@ class StateCache:
             self._pokemon_storage.checked()
 
     @property
-    def effective_wild_encounters(self) -> StateCacheItem["EffectiveWildEncounterList | None"]:
+    def effective_wild_encounters(
+        self,
+    ) -> StateCacheItem["EffectiveWildEncounterList | None"]:
         return self._effective_wild_encounters
 
     @effective_wild_encounters.setter

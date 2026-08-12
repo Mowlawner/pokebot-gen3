@@ -5,7 +5,12 @@ from typing import Literal
 from modules.context import context
 from modules.fishing import FishingRod
 from modules.game import get_symbol_name_before
-from modules.memory import unpack_uint16, unpack_uint32, read_symbol, get_callback_for_pointer_symbol
+from modules.memory import (
+    unpack_uint16,
+    unpack_uint32,
+    read_symbol,
+    get_callback_for_pointer_symbol,
+)
 from modules.player import get_player_avatar, AvatarFlags
 from modules.pokemon import (
     Species,
@@ -264,6 +269,15 @@ class BattleState:
 
     @property
     def battling_pokemon(self) -> list["BattlePokemon"]:
+        if self._battler_count > 4:
+            return []
+        if (
+            len(self._battler_party_indexes) < self._battler_count * 2
+            or len(self._battler) < self._battler_count * 0x58
+            or len(self._battler_status3) < self._battler_count * 0x4
+            or len(self._battler_disable_structs) < self._battler_count * 0x1C
+        ):
+            return []
         result = []
         for index in range(self._battler_count):
             result.append(
@@ -361,7 +375,13 @@ class BattleSideTimer:
 
 
 class BattleStateSide:
-    def __init__(self, side: int, battle_state: BattleState, absent_battler_flags: int, timers: bytes):
+    def __init__(
+        self,
+        side: int,
+        battle_state: BattleState,
+        absent_battler_flags: int,
+        timers: bytes,
+    ):
         self._side = side
         self._battle_state = battle_state
         self._absent_battler_flags = absent_battler_flags
@@ -381,14 +401,14 @@ class BattleStateSide:
         battling_pokemon = self._battle_state.battling_pokemon
         result = []
         if self._side == 0:
-            if self._absent_battler_flags & 0b0001 == 0:
+            if self._absent_battler_flags & 0b0001 == 0 and len(battling_pokemon) > 0:
                 result.append(battling_pokemon[0])
             if len(battling_pokemon) > 2 and self._absent_battler_flags & 0b0100 == 0:
                 result.append(battling_pokemon[2])
         else:
-            if self._absent_battler_flags & 0b0010 == 0:
+            if self._absent_battler_flags & 0b0010 == 0 and len(battling_pokemon) > 1:
                 result.append(battling_pokemon[1])
-            if len(battling_pokemon) > 2 and self._absent_battler_flags & 0b1000 == 0:
+            if len(battling_pokemon) > 3 and self._absent_battler_flags & 0b1000 == 0:
                 result.append(battling_pokemon[3])
         return result
 

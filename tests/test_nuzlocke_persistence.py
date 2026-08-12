@@ -5,9 +5,20 @@ from enum import Enum
 from pathlib import Path
 
 from modules.nuzlocke.events import MapChanged
-from modules.nuzlocke.persistence import EventStoreCorruptionError, JsonEventStore, deserialize_event, serialize_event
+from modules.nuzlocke.persistence import (
+    EventStoreCorruptionError,
+    JsonEventStore,
+    deserialize_event,
+    serialize_event,
+)
 from modules.nuzlocke.runtime import NuzlockeRuntime
-from modules.nuzlocke.snapshots import InventorySnapshot, NuzlockeSnapshot, PlayerSnapshot, ProgressionSnapshot, StorageSnapshot
+from modules.nuzlocke.snapshots import (
+    InventorySnapshot,
+    NuzlockeSnapshot,
+    PlayerSnapshot,
+    ProgressionSnapshot,
+    StorageSnapshot,
+)
 
 
 class State(Enum):
@@ -15,7 +26,17 @@ class State(Enum):
 
 
 def snapshot(frame, map_number=2):
-    return NuzlockeSnapshot(frame, "test", State.OVERWORLD, PlayerSnapshot("May", 1, map_number, "MAP", (1, 1), "Down", True), (), InventorySnapshot((), (), ()), None, StorageSnapshot(0, ()), ProgressionSnapshot(()))
+    return NuzlockeSnapshot(
+        frame,
+        "test",
+        State.OVERWORLD,
+        PlayerSnapshot("May", 1, map_number, "MAP", (1, 1), "Down", True),
+        (),
+        InventorySnapshot((), (), ()),
+        None,
+        StorageSnapshot(0, ()),
+        ProgressionSnapshot(()),
+    )
 
 
 class TestNuzlockePersistence(unittest.TestCase):

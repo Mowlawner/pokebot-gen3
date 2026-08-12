@@ -12,7 +12,14 @@ from modules.battle_strategies import BattleStrategy, TurnAction, SafariTurnActi
 from modules.context import context
 from modules.debug import debug
 from modules.items import Item, ItemBattleUse, get_pokeblocks
-from modules.memory import read_symbol, unpack_uint32, get_game_state, GameState, get_game_state_symbol, unpack_uint16
+from modules.memory import (
+    read_symbol,
+    unpack_uint32,
+    get_game_state,
+    GameState,
+    get_game_state_symbol,
+    unpack_uint16,
+)
 from modules.menuing import scroll_to_item_in_bag, scroll_to_party_menu_index
 from modules.pokemon_party import get_party, get_party_size
 
@@ -22,8 +29,15 @@ def handle_battle_action_selection(strategy: BattleStrategy) -> Generator:
     battle_state = get_battle_state()
     previous_battler_index = None
 
-    while battle_is_active() and get_main_battle_callback() in ("HandleTurnActionSelectionState", "sub_8012324"):
-        if get_battle_controller_callback(0) in ("HandleInputChooseAction", "sub_802C098", "bx_battle_menu_t6_2"):
+    while battle_is_active() and get_main_battle_callback() in (
+        "HandleTurnActionSelectionState",
+        "sub_8012324",
+    ):
+        if get_battle_controller_callback(0) in (
+            "HandleInputChooseAction",
+            "sub_802C098",
+            "bx_battle_menu_t6_2",
+        ):
             battler_index = 0
             if battle_state.is_safari_zone_encounter:
                 action, index = strategy.decide_turn_in_safari_zone(battle_state)
@@ -233,7 +247,10 @@ def battle_action_use_move(
         yield
 
     # Choose the 'Fight' option.
-    if get_battle_controller_callback(battler_index) not in ("HandleInputChooseMove", "HandleAction_ChooseMove"):
+    if get_battle_controller_callback(battler_index) not in (
+        "HandleInputChooseMove",
+        "HandleAction_ChooseMove",
+    ):
         yield from scroll_to_battle_action(0)
         yield
         context.emulator.press_button("A")
@@ -244,18 +261,27 @@ def battle_action_use_move(
     # if the Pokémon is completely out of PP. In that case we only get a message saying that
     # Struggle is being used. So we just want to confirm that message and then stop the further
     # execution of this function.
-    if get_battle_controller_callback(battler_index) not in ("HandleInputChooseMove", "HandleAction_ChooseMove"):
+    if get_battle_controller_callback(battler_index) not in (
+        "HandleInputChooseMove",
+        "HandleAction_ChooseMove",
+    ):
         while get_main_battle_callback() in (
             "HandleTurnActionSelectionState",
             "sub_8012324",
-        ) and get_battle_controller_callback(battler_index) not in ("HandleInputChooseMove", "HandleAction_ChooseMove"):
+        ) and get_battle_controller_callback(battler_index) not in (
+            "HandleInputChooseMove",
+            "HandleAction_ChooseMove",
+        ):
             context.emulator.press_button("A")
             yield
         return
 
     # Select move and target
     yield from scroll_to_move(move_index, battler_index > 1)
-    while get_battle_controller_callback(battler_index) in ("HandleInputChooseMove", "HandleAction_ChooseMove"):
+    while get_battle_controller_callback(battler_index) in (
+        "HandleInputChooseMove",
+        "HandleAction_ChooseMove",
+    ):
         context.emulator.press_button("A")
         yield
     if action is TurnAction.UseMove:

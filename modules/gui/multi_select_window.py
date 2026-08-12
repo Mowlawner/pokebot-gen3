@@ -22,7 +22,9 @@ def ask_for_choice(choices: list[Selection], window_title: str = "Choose...") ->
         for index, choice in enumerate(choices):
             console.print(f"  [bold magenta]\\[{index + 1}][/] " + choice.button_label.replace("\n", " "))
         chosen_index = Prompt.ask(
-            "Choose option (number)", show_choices=False, choices=[str(n + 1) for n in range(len(choices))]
+            "Choose option (number)",
+            show_choices=False,
+            choices=[str(n + 1) for n in range(len(choices))],
         )
         return choices[int(chosen_index) - 1].button_label
 
@@ -175,7 +177,9 @@ def ask_for_choice_scroll(
         for index, choice in enumerate(choices):
             console.print(f"  [bold magenta]\\[{index + 1}][/] " + choice.button_label.replace("\n", " "))
         chosen_index = Prompt.ask(
-            "Choose option (number)", show_choices=False, choices=[str(n + 1) for n in range(len(choices))]
+            "Choose option (number)",
+            show_choices=False,
+            choices=[str(n + 1) for n in range(len(choices))],
         )
         return choices[int(chosen_index) - 1].button_label
 

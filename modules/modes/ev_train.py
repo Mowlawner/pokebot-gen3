@@ -3,7 +3,10 @@ from typing import Generator
 from rich.table import Table
 
 from modules.context import context
-from modules.map import get_map_data_for_current_position, get_effective_encounter_rates_for_current_map
+from modules.map import (
+    get_map_data_for_current_position,
+    get_effective_encounter_rates_for_current_map,
+)
 from modules.map_data import get_map_enum
 from modules.modes import BattleAction
 from modules.player import get_player_avatar
@@ -18,7 +21,14 @@ from ..console import console
 from ..encounter import handle_encounter, EncounterInfo
 from ..gui.ev_selection_window import ask_for_ev_targets
 
-_list_of_stats = ("hp", "attack", "defence", "special_attack", "special_defence", "speed")
+_list_of_stats = (
+    "hp",
+    "attack",
+    "defence",
+    "special_attack",
+    "special_defence",
+    "speed",
+)
 
 
 def _is_target_reached(pokemon: Pokemon, target_evs: StatsValues) -> bool:

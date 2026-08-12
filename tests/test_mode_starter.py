@@ -1,4 +1,10 @@
-from tests.utility import BotTestCase, with_save_state, with_frame_timeout, set_next_choice, set_next_rng_seed
+from tests.utility import (
+    BotTestCase,
+    with_save_state,
+    with_frame_timeout,
+    set_next_choice,
+    set_next_rng_seed,
+)
 
 
 class TestStarter(BotTestCase):
@@ -66,7 +72,10 @@ class TestStarter(BotTestCase):
         for _ in starters_mode.run():
             if self.stats.last_encounter is not None:
                 self.assertEqual(expected_species, self.stats.last_encounter.species_name)
-                self.assertTrue(self.stats.last_encounter.is_shiny, "Encountered starter Pokémon was not shiny.")
+                self.assertTrue(
+                    self.stats.last_encounter.is_shiny,
+                    "Encountered starter Pokémon was not shiny.",
+                )
                 self.assertIsInManualMode()
                 return
             yield

@@ -1421,7 +1421,17 @@ class MapRSE(Enum):
 
     @property
     def exists_on_rs(self) -> bool:
-        emerald_only_maps = [(0, 54), (0, 55), (0, 56), (5, 7), (6, 8), (9, 13), (15, 13), (15, 14), (16, 14)]
+        emerald_only_maps = [
+            (0, 54),
+            (0, 55),
+            (0, 56),
+            (5, 7),
+            (6, 8),
+            (9, 13),
+            (15, 13),
+            (15, 14),
+            (16, 14),
+        ]
         return self.value not in emerald_only_maps and (self.value[0] != 26 or self.value[1] <= 11)
 
     @property
@@ -1554,7 +1564,9 @@ class PokemonCenter(Enum):
         return f"PokemonCenter.{self.name}"
 
 
-def get_map_enum(map_group_and_number: tuple[int, int] | MapLocation) -> MapFRLG | MapRSE:
+def get_map_enum(
+    map_group_and_number: tuple[int, int] | MapLocation,
+) -> MapFRLG | MapRSE:
     if isinstance(map_group_and_number, MapLocation):
         map_group_and_number = map_group_and_number.map_group_and_number
 

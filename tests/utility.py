@@ -33,6 +33,9 @@ class MockStatsDatabase:
         self.encounter_rate_at_1x = 0
         self.logged_encounters: list["Encounter"] = []
 
+    def has_encounter_with_personality_value(self, pokemon_personality_value: str) -> bool:
+        return any(encounter.pokemon.personality == pokemon_personality_value for encounter in self.logged_encounters)
+
     def log_encounter(self, encounter_info: "EncounterInfo") -> "Encounter":
         from modules.stats import Encounter
 
@@ -429,7 +432,9 @@ class BotTestCase(unittest.TestCase):
         from modules.context import context
 
         self.assertEqual(
-            "Manual", context.bot_mode, f"Expected bot to be in Manual mode, but it is in {context.bot_mode} mode."
+            "Manual",
+            context.bot_mode,
+            f"Expected bot to be in Manual mode, but it is in {context.bot_mode} mode.",
         )
 
     def assertIsNotInManualMode(self) -> None:

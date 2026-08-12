@@ -4,7 +4,12 @@ from typing import Literal
 
 from modules.context import context
 from modules.game import decode_string
-from modules.map import MapLocation, ObjectEvent, calculate_targeted_coords, get_player_map_object
+from modules.map import (
+    MapLocation,
+    ObjectEvent,
+    calculate_targeted_coords,
+    get_player_map_object,
+)
 from modules.map_data import MapFRLG, MapRSE, get_map_enum
 from modules.memory import (
     get_save_block,
@@ -64,7 +69,12 @@ class FacingDirection(Enum):
 
 
 class PlayerAvatar:
-    def __init__(self, object_event: ObjectEvent, player_avatar_data: bytes, map_group_and_number: bytes):
+    def __init__(
+        self,
+        object_event: ObjectEvent,
+        player_avatar_data: bytes,
+        map_group_and_number: bytes,
+    ):
         self._object_event = object_event
         self._player_avatar_data = player_avatar_data
         self._map_group_and_number = map_group_and_number
@@ -98,7 +108,10 @@ class PlayerAvatar:
         try:
             map_group_and_number = get_save_block(1, 4, 2)
         except Exception:
-            map_group_and_number = self._object_event.map_group, self._object_event.map_num
+            map_group_and_number = (
+                self._object_event.map_group,
+                self._object_event.map_num,
+            )
 
         return MapLocation(
             read_symbol("gMapHeader"),
@@ -118,7 +131,12 @@ class PlayerAvatar:
         targeted_coordinates = calculate_targeted_coords(self.local_coordinates, self.facing_direction)
         open_map = self.map_location
         if 0 <= targeted_coordinates[0] < open_map.map_size[0] and 0 <= targeted_coordinates[1] < open_map.map_size[1]:
-            return MapLocation(read_symbol("gMapHeader"), open_map.map_group, open_map.map_number, targeted_coordinates)
+            return MapLocation(
+                read_symbol("gMapHeader"),
+                open_map.map_group,
+                open_map.map_number,
+                targeted_coordinates,
+            )
 
     @property
     def local_coordinates(self) -> tuple[int, int]:
@@ -167,7 +185,12 @@ class PlayerAvatar:
 
 
 class Player:
-    def __init__(self, save_block_1: bytes, save_block_2: bytes, encryption_key: int | None = None):
+    def __init__(
+        self,
+        save_block_1: bytes,
+        save_block_2: bytes,
+        encryption_key: int | None = None,
+    ):
         self._save_block_1 = save_block_1
         self._save_block_2 = save_block_2
         self._encryption_key = encryption_key
@@ -224,7 +247,7 @@ class Player:
             "secret_id": self.secret_id,
             "money": self.money,
             "coins": self.coins,
-            "registered_item": self.registered_item.name if self.registered_item is not None else None,
+            "registered_item": (self.registered_item.name if self.registered_item is not None else None),
         }
 
 
