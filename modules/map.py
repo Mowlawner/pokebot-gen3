@@ -556,7 +556,10 @@ class MapWarp:
         # There is a special case for 'dynamic warps' that have their destination set
         # in the player's save data.
         if map_group == 127 and map_number == 127:
-            map_group, map_number, warp_id = get_save_block(1, offset=0x14, size=3)
+            dynamic_warp = get_save_block(1, offset=0x14, size=8)
+            warp_id = dynamic_warp[5]
+            map_number = dynamic_warp[6]
+            map_group = dynamic_warp[7]
 
         destination_map = get_map_data((map_group, map_number), (0, 0))
 

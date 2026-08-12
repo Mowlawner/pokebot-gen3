@@ -201,7 +201,8 @@ def is_waiting_for_input() -> bool:
     :return: Whether the game is currently waiting for the A or B button to be pressed in order
              to advance some dialogue or scripted event.
     """
-    if get_global_script_context().native_function_name == "WaitForAorBPress":
+    script_context = get_global_script_context()
+    if script_context is not None and script_context.native_function_name == "WaitForAorBPress":
         return True
 
     if context.rom.is_rs:
@@ -212,4 +213,6 @@ def is_waiting_for_input() -> bool:
         text_printer_data = read_symbol("sTextPrinters", offset=0x1B, size=2)
         text_printer_is_active = text_printer_data[0]
         text_printer_state = text_printer_data[1]
-        return text_printer_is_active and text_printer_state in (2, 3)
+        # ``and`` otherwise returns the integer printer-active flag when it is
+        # zero.  Keep this helper's documented bool contract at the boundary.
+        return bool(text_printer_is_active and text_printer_state in (2, 3))

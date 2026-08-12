@@ -80,7 +80,7 @@ def run_frlg() -> Generator:
         )
 
 
-def run_rse_hoenn(get_active_encounter: Callable[[], EncounterInfo]) -> Generator:
+def run_rse_hoenn(get_active_encounter: Callable[[], EncounterInfo], reset_before_selection: bool = True) -> Generator:
     # Set up: Ask for starter choice because we cannot deduce that from the player location.
     starter_choice = ask_for_choice(
         [
@@ -95,7 +95,8 @@ def run_rse_hoenn(get_active_encounter: Callable[[], EncounterInfo]) -> Generato
         return
 
     while context.bot_mode != "Manual":
-        yield from soft_reset(mash_random_keys=True)
+        if reset_before_selection:
+            yield from soft_reset(mash_random_keys=True)
 
         # Starter bag can be accessed from the right or from the bottom, make sure we are looking
         # at it in either case.
@@ -212,6 +213,11 @@ class StartersMode(BotMode):
 
     @staticmethod
     def is_selectable() -> bool:
+        if context.rom.is_emerald:
+            from .opening import OpeningSequenceState, get_opening_sequence_state
+
+            if get_opening_sequence_state() is OpeningSequenceState.STARTER_SELECTION:
+                return True
         player_avatar = get_player_avatar()
         if context.rom.is_frlg:
             return player_avatar.map_group_and_number == (4, 3)
@@ -227,6 +233,14 @@ class StartersMode(BotMode):
         return BattleAction.CustomAction
 
     def run(self) -> Generator:
+        # A fresh-game opening controller hands off while the starter bag is
+        # already open.  This path intentionally does not require a save state.
+        from .opening import consume_starter_handoff
+
+        if consume_starter_handoff():
+            yield from run_rse_hoenn(lambda: self._active_encounter, reset_before_selection=False)
+            return
+
         assert_save_game_exists("There is no saved game. Cannot soft reset.")
 
         if context.rom.is_frlg:
