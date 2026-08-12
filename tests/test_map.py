@@ -106,14 +106,19 @@ class TestEffectiveEncounterRatesForCurrentMap(unittest.TestCase):
     # assertCountEqual asserts exact equality between elements, which means floating point rounding can cause an
     # otherwise sound test to fail.
     def assertEffectiveEncountersEqual(
-        self, first: list[modules.map.EffectiveWildEncounter], second: list[modules.map.EffectiveWildEncounter]
+        self,
+        first: list[modules.map.EffectiveWildEncounter],
+        second: list[modules.map.EffectiveWildEncounter],
     ):
         for encounter in first:
             found = False
             for m in second:
                 if encounter.species.name != m.species.name:
                     continue
-                self.assertFalse(found, msg=f"Too many encounters in second for species {encounter.species.name}")
+                self.assertFalse(
+                    found,
+                    msg=f"Too many encounters in second for species {encounter.species.name}",
+                )
                 found = True
                 self.assertEqual(
                     encounter.min_level,
@@ -130,10 +135,17 @@ class TestEffectiveEncounterRatesForCurrentMap(unittest.TestCase):
                     m.encounter_rate,
                     msg=f"encounter rates do not match for species {encounter.species.name}",
                 )
-            self.assertTrue(found, msg=f"No matching encounters in second for species {encounter.species.name}")
+            self.assertTrue(
+                found,
+                msg=f"No matching encounters in second for species {encounter.species.name}",
+            )
 
     def setUp(self):
-        context.profile = Profile(ROM("", "", "POKEMON EMER", "", ROMLanguage.English, "", 0), "", datetime.now())
+        context.profile = Profile(
+            ROM("", "", "POKEMON EMER", "", ROMLanguage.English, "", 0),
+            "",
+            datetime.now(),
+        )
 
     def test_route102_plain(self):
         encounters = [

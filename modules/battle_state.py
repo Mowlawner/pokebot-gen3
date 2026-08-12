@@ -5,7 +5,12 @@ from typing import Literal
 from modules.context import context
 from modules.fishing import FishingRod
 from modules.game import get_symbol_name_before
-from modules.memory import unpack_uint16, unpack_uint32, read_symbol, get_callback_for_pointer_symbol
+from modules.memory import (
+    unpack_uint16,
+    unpack_uint32,
+    read_symbol,
+    get_callback_for_pointer_symbol,
+)
 from modules.player import get_player_avatar, AvatarFlags
 from modules.pokemon import (
     Species,
@@ -370,7 +375,13 @@ class BattleSideTimer:
 
 
 class BattleStateSide:
-    def __init__(self, side: int, battle_state: BattleState, absent_battler_flags: int, timers: bytes):
+    def __init__(
+        self,
+        side: int,
+        battle_state: BattleState,
+        absent_battler_flags: int,
+        timers: bytes,
+    ):
         self._side = side
         self._battle_state = battle_state
         self._absent_battler_flags = absent_battler_flags

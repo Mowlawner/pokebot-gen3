@@ -123,7 +123,9 @@ max_client_id: ThreadSafeCounter = ThreadSafeCounter()
 custom_events_queue: Queue[str] = Queue()
 
 
-def add_subscriber(subscribed_topics: list[str]) -> tuple[queue.Queue, callable, ThreadSafeEvent]:
+def add_subscriber(
+    subscribed_topics: list[str],
+) -> tuple[queue.Queue, callable, ThreadSafeEvent]:
     for topic in subscribed_topics:
         if topic not in DataSubscription.all_names():
             raise ValueError(f"Topic '{topic}' does not exist.")
@@ -187,7 +189,9 @@ def run_watcher():
         "party": state_cache.party.frame,
         "pokedex": state_cache.pokedex.frame,
         "opponent": state_cache.opponent.frame,
-        "wild_encounter": context.stats.last_encounter.encounter_id if context.stats.last_encounter is not None else 0,
+        "wild_encounter": (
+            context.stats.last_encounter.encounter_id if context.stats.last_encounter is not None else 0
+        ),
         "fishing_attempt": state_cache.fishing_attempt.frame,
         "player": state_cache.player.frame,
         "player_avatar": state_cache.player_avatar.frame,
@@ -234,7 +238,11 @@ def run_watcher():
                 work_queue.put_nowait(get_player)
             if state_cache.player.frame > previous_game_state["player"]:
                 previous_game_state["player"] = state_cache.player.frame
-                send_message(DataSubscription.Player, data=state_cache.player.value.to_dict(), event_type="Player")
+                send_message(
+                    DataSubscription.Player,
+                    data=state_cache.player.value.to_dict(),
+                    event_type="Player",
+                )
 
         if subscriptions["PlayerAvatar"] > 0:
             if state_cache.player_avatar.age_in_frames > 4:
@@ -256,7 +264,11 @@ def run_watcher():
                 work_queue.put_nowait(get_party)
             if state_cache.party.frame > previous_game_state["party"]:
                 previous_game_state["party"] = state_cache.party.frame
-                send_message(DataSubscription.Party, data=state_cache.party.value.to_list(), event_type="Party")
+                send_message(
+                    DataSubscription.Party,
+                    data=state_cache.party.value.to_list(),
+                    event_type="Party",
+                )
 
         if subscriptions["Pokedex"] > 0:
             if state_cache.pokedex.age_in_seconds > 0:
@@ -265,7 +277,11 @@ def run_watcher():
                 work_queue.put_nowait(get_pokedex)
             if state_cache.pokedex.frame > previous_game_state["pokedex"]:
                 previous_game_state["pokedex"] = state_cache.pokedex.frame
-                send_message(DataSubscription.Pokedex, data=state_cache.pokedex.value.to_dict(), event_type="Pokedex")
+                send_message(
+                    DataSubscription.Pokedex,
+                    data=state_cache.pokedex.value.to_dict(),
+                    event_type="Pokedex",
+                )
 
         if subscriptions["Opponent"] > 0:
             if current_game_state == GameState.BATTLE:
@@ -304,7 +320,11 @@ def run_watcher():
                 )
 
         if subscriptions["GameState"] > 0 and current_game_state != previous_game_state["game_state"]:
-            send_message(DataSubscription.GameState, data=current_game_state.name, event_type="GameState")
+            send_message(
+                DataSubscription.GameState,
+                data=current_game_state.name,
+                event_type="GameState",
+            )
 
         if (subscriptions["Map"] > 0 or subscriptions["MapTile"] > 0) and current_game_state == GameState.OVERWORLD:
             if state_cache.player_avatar.age_in_frames > 4:
@@ -329,7 +349,11 @@ def run_watcher():
                     send_message(DataSubscription.Map, data=data, event_type="MapChange")
                     previous_game_state["map_group_and_number"] = current_map
                 if current_coords != previous_game_state["map_local_coordinates"]:
-                    send_message(DataSubscription.Map, data=current_coords, event_type="MapTileChange")
+                    send_message(
+                        DataSubscription.Map,
+                        data=current_coords,
+                        event_type="MapTileChange",
+                    )
                     previous_game_state["map_local_coordinates"] = current_coords
 
         if subscriptions["MapEncounters"] > 0 and current_game_state is GameState.OVERWORLD:
@@ -340,7 +364,11 @@ def run_watcher():
             if state_cache.effective_wild_encounters.frame > previous_game_state["map_encounters"]:
                 encounters = state_cache.effective_wild_encounters.value
                 previous_game_state["map_encounters"] = state_cache.effective_wild_encounters.frame
-                send_message(DataSubscription.MapEncounters, data=encounters.to_dict(), event_type="MapEncounters")
+                send_message(
+                    DataSubscription.MapEncounters,
+                    data=encounters.to_dict(),
+                    event_type="MapEncounters",
+                )
 
         if subscriptions["PokenavCall"] > 0:
             if (
@@ -350,7 +378,11 @@ def run_watcher():
                 if previous_game_state["pokenav_calls"] < context.stats.current_shiny_phase.pokenav_calls:
                     # Only report a Pokénav call if the number has increased. It will 'decrease' (reset
                     # to 0) when the shiny phase ends.
-                    send_message(DataSubscription.PokenavCall, data=None, event_type="PokenavCall")
+                    send_message(
+                        DataSubscription.PokenavCall,
+                        data=None,
+                        event_type="PokenavCall",
+                    )
                 previous_game_state["pokenav_calls"] = context.stats.current_shiny_phase.pokenav_calls
 
         if subscriptions["BotMode"] > 0 and context.bot_mode != previous_emulator_state["bot_mode"]:
@@ -368,22 +400,36 @@ def run_watcher():
 
             if combined_inputs != previous_emulator_state["inputs"]:
                 previous_emulator_state["inputs"] = combined_inputs
-                send_message(DataSubscription.Inputs, data=inputs_to_strings(combined_inputs), event_type="Inputs")
+                send_message(
+                    DataSubscription.Inputs,
+                    data=inputs_to_strings(combined_inputs),
+                    event_type="Inputs",
+                )
 
         if subscriptions["EmulatorSettings"] > 0:
             if context.emulation_speed != previous_emulator_state["emulation_speed"]:
                 previous_emulator_state["emulation_speed"] = context.emulation_speed
                 send_message(
-                    DataSubscription.EmulatorSettings, data=context.emulation_speed, event_type="EmulationSpeed"
+                    DataSubscription.EmulatorSettings,
+                    data=context.emulation_speed,
+                    event_type="EmulationSpeed",
                 )
 
             if context.audio != previous_emulator_state["audio_enabled"]:
                 previous_emulator_state["audio_enabled"] = context.audio
-                send_message(DataSubscription.EmulatorSettings, data=context.audio, event_type="AudioEnabled")
+                send_message(
+                    DataSubscription.EmulatorSettings,
+                    data=context.audio,
+                    event_type="AudioEnabled",
+                )
 
             if context.video != previous_emulator_state["video_enabled"]:
                 previous_emulator_state["video_enabled"] = context.video
-                send_message(DataSubscription.EmulatorSettings, data=context.video, event_type="VideoEnabled")
+                send_message(
+                    DataSubscription.EmulatorSettings,
+                    data=context.video,
+                    event_type="VideoEnabled",
+                )
 
         if custom_events_queue.qsize() > 0:
             try:

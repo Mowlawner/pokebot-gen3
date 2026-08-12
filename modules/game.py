@@ -67,16 +67,18 @@ def _load_symbols(symbols_file: str, language: ROMLanguage) -> None:
                         if addr is not None:
                             _symbols[label.upper()] = (
                                 addr,
-                                _symbols[label.upper()][1] if label.upper() in _symbols else 0,
+                                (_symbols[label.upper()][1] if label.upper() in _symbols else 0),
                             )
                             _reverse_symbols[addr] = (
                                 label.upper(),
                                 label,
-                                _symbols[label.upper()][1] if label.upper() in _symbols else 0,
+                                (_symbols[label.upper()][1] if label.upper() in _symbols else 0),
                             )
 
 
-def _load_event_flags_and_vars(file_name: str) -> None:  # TODO Japanese ROMs not working
+def _load_event_flags_and_vars(
+    file_name: str,
+) -> None:  # TODO Japanese ROMs not working
     global _event_flags, _reverse_event_flags, _event_vars, _reverse_event_vars
 
     match file_name:
@@ -213,7 +215,9 @@ def set_rom(rom: ROM) -> None:
     set_character_table("japanese" if rom.language is ROMLanguage.Japanese else "international")
 
 
-def set_character_table(character_table: Literal["international", "japanese"] = "international") -> None:
+def set_character_table(
+    character_table: Literal["international", "japanese"] = "international",
+) -> None:
     global _current_character_table
     _prepare_character_tables()
     _current_character_table = (

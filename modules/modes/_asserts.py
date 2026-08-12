@@ -34,9 +34,7 @@ class SavedMapLocation:
     facing: bool = False
 
 
-def assert_saved_on_map(
-    expected_locations: SavedMapLocation | list[SavedMapLocation], error_message: str
-) -> None:
+def assert_saved_on_map(expected_locations: SavedMapLocation | list[SavedMapLocation], error_message: str) -> None:
     """
     Raises an exception if the game has not been saved on the given map.
     :param expected_locations: A location, or list of locations, that the player should be on.
@@ -64,10 +62,7 @@ def assert_saved_on_map(
         expected_locations = [expected_locations]
 
     for expected_location in expected_locations:
-        if (
-            expected_location.map_group_and_number
-            == save_data.get_map_group_and_number()
-        ):
+        if expected_location.map_group_and_number == save_data.get_map_group_and_number():
             if expected_location.local_coordinates is None:
                 return
 
@@ -78,10 +73,7 @@ def assert_saved_on_map(
                 )
                 if expected_location.local_coordinates == saved_facing_coordinates:
                     return
-            elif (
-                expected_location.local_coordinates
-                == save_data.get_map_local_coordinates()
-            ):
+            elif expected_location.local_coordinates == save_data.get_map_local_coordinates():
                 return
     raise BotModeError(error_message)
 
@@ -158,28 +150,18 @@ def assert_item_exists_in_bag(
     if not isinstance(expected_items, (list, tuple)):
         expected_items = [expected_items]
 
-    item_bag = (
-        get_item_bag() if not check_in_saved_game else get_save_data().get_item_bag()
-    )
-    total_quantity = sum(
-        item_bag.quantity_of(get_item_by_name(item)) for item in expected_items
-    )
+    item_bag = get_item_bag() if not check_in_saved_game else get_save_data().get_item_bag()
+    total_quantity = sum(item_bag.quantity_of(get_item_by_name(item)) for item in expected_items)
     if total_quantity == 0:
         if check_in_saved_game:
             item_bag = get_item_bag()
-            total_quantity = sum(
-                item_bag.quantity_of(get_item_by_name(item)) for item in expected_items
-            )
+            total_quantity = sum(item_bag.quantity_of(get_item_by_name(item)) for item in expected_items)
             if total_quantity > 0:
-                error_message += (
-                    _error_message_addendum_if_assert_only_failed_in_saved_game
-                )
+                error_message += _error_message_addendum_if_assert_only_failed_in_saved_game
         raise BotModeError(error_message)
 
 
-def assert_empty_slot_in_party(
-    error_message: str, check_in_saved_game: bool = False
-) -> None:
+def assert_empty_slot_in_party(error_message: str, check_in_saved_game: bool = False) -> None:
     """
     Raises an exception if the player has a full party.
     :param error_message: Error message to display if the assertion fails.
@@ -193,9 +175,7 @@ def assert_empty_slot_in_party(
         raise BotModeError(error_message)
 
 
-def assert_boxes_or_party_can_fit_pokemon(
-    error_message: str | None = None, check_in_saved_game: bool = False
-) -> None:
+def assert_boxes_or_party_can_fit_pokemon(error_message: str | None = None, check_in_saved_game: bool = False) -> None:
     """
     Raises an exception if all boxes are full and there is no empty slot in the player's party,
     i.e. if catching a Pokémon will fail due to lack of space.
@@ -206,28 +186,15 @@ def assert_boxes_or_party_can_fit_pokemon(
     pc_storage_capacity = 30 * 14
 
     if error_message is None:
-        error_message = (
-            "Both the party and all the boxes are full. Cannot catch any more Pokémon."
-        )
+        error_message = "Both the party and all the boxes are full. Cannot catch any more Pokémon."
 
     if check_in_saved_game:
         save_data = get_save_data()
-        if (
-            len(save_data.get_party()) >= 6
-            and save_data.get_pokemon_storage().pokemon_count >= pc_storage_capacity
-        ):
-            if (
-                len(get_party()) < 6
-                or get_pokemon_storage().pokemon_count < pc_storage_capacity
-            ):
-                error_message += (
-                    _error_message_addendum_if_assert_only_failed_in_saved_game
-                )
+        if len(save_data.get_party()) >= 6 and save_data.get_pokemon_storage().pokemon_count >= pc_storage_capacity:
+            if len(get_party()) < 6 or get_pokemon_storage().pokemon_count < pc_storage_capacity:
+                error_message += _error_message_addendum_if_assert_only_failed_in_saved_game
             raise BotModeError(error_message)
-    elif (
-        len(get_party()) >= 6
-        and get_pokemon_storage().pokemon_count >= pc_storage_capacity
-    ):
+    elif len(get_party()) >= 6 and get_pokemon_storage().pokemon_count >= pc_storage_capacity:
         raise BotModeError(error_message)
 
 
@@ -236,43 +203,28 @@ def assert_player_has_poke_balls(check_in_saved_game: bool = False) -> None:
     Raises an exception if the player doesn't have any Pokeballs when starting a catching mode
     or if safari ball threshold is reached.
     """
-    out_of_safari_balls_error = (
-        "You have less than 15 Safari balls left, switching to manual mode..."
-    )
-    out_of_poke_balls_error = (
-        "Out of Poké balls! Better grab more before the next shiny slips away..."
-    )
+    out_of_safari_balls_error = "You have less than 15 Safari balls left, switching to manual mode..."
+    out_of_poke_balls_error = "Out of Poké balls! Better grab more before the next shiny slips away..."
 
     if is_safari_map():
         if get_safari_balls_left() < 15:
             raise BotModeError(out_of_safari_balls_error)
-    elif (
-        check_in_saved_game
-        and get_save_data().get_item_bag().number_of_balls_except_master_ball == 0
-    ):
+    elif check_in_saved_game and get_save_data().get_item_bag().number_of_balls_except_master_ball == 0:
         if get_item_bag().number_of_balls_except_master_ball > 1:
-            raise BotModeError(
-                out_of_poke_balls_error
-                + _error_message_addendum_if_assert_only_failed_in_saved_game
-            )
+            raise BotModeError(out_of_poke_balls_error + _error_message_addendum_if_assert_only_failed_in_saved_game)
         else:
             raise BotModeError(out_of_poke_balls_error)
     elif get_item_bag().number_of_balls_except_master_ball == 0:
         raise BotModeError(out_of_poke_balls_error)
 
 
-def assert_party_has_damaging_move(
-    error_message: str, check_in_saved_game: bool = False
-) -> None:
+def assert_party_has_damaging_move(error_message: str, check_in_saved_game: bool = False) -> None:
     """
     Ensures the party has at least one Pokémon with a usable attacking move.
     Raises a BotModeError if no Pokémon has any attack-capable moves.
     """
     party = get_party() if not check_in_saved_game else get_save_data().get_party()
-    if any(
-        pokemon_has_usable_damaging_move(pokemon) and not pokemon.is_egg
-        for pokemon in party
-    ):
+    if any(pokemon_has_usable_damaging_move(pokemon) and not pokemon.is_egg for pokemon in party):
         return
 
     raise BotModeError(error_message)

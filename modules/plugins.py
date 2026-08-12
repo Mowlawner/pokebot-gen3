@@ -46,7 +46,9 @@ def load_built_in_plugins():
     # to set the `gif_path` and `tcg_card_path` properties on wild encounters so that other plugins
     # can use them.
     if context.config.logging.shiny_gifs or context.config.logging.tcg_cards:
-        from modules.built_in_plugins.generate_encounter_media import GenerateEncounterMediaPlugin
+        from modules.built_in_plugins.generate_encounter_media import (
+            GenerateEncounterMediaPlugin,
+        )
 
         plugins.insert(0, GenerateEncounterMediaPlugin())
 

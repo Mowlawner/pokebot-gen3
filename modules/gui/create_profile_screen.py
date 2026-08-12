@@ -5,7 +5,11 @@ from typing import Union
 import plyer
 from PIL import Image, ImageOps, ImageTk
 
-from modules.profiles import create_profile, list_available_profiles, profile_directory_exists
+from modules.profiles import (
+    create_profile,
+    list_available_profiles,
+    profile_directory_exists,
+)
 from modules.roms import ROM, list_available_roms
 from modules.runtime import get_sprites_path
 from modules.save_import import MigrationError, migrate_save_state
@@ -13,7 +17,12 @@ from modules.version import pokebot_name
 
 
 class CreateProfileScreen:
-    def __init__(self, window: Tk, enable_profile_selection_screen: callable, run_profile: callable):
+    def __init__(
+        self,
+        window: Tk,
+        enable_profile_selection_screen: callable,
+        run_profile: callable,
+    ):
         self.window = window
         self.enable_profile_selection_screen = enable_profile_selection_screen
         self.run_profile = run_profile
@@ -47,7 +56,10 @@ class CreateProfileScreen:
 
     def _show_return_button(self, row: int = 0) -> None:
         button = ttk.Button(
-            self.frame, text="Back to Profile Selection", command=self.enable_profile_selection_screen, cursor="hand2"
+            self.frame,
+            text="Back to Profile Selection",
+            command=self.enable_profile_selection_screen,
+            cursor="hand2",
         )
         button.grid(sticky="NE", row=row)
 
@@ -233,7 +245,13 @@ class CreateProfileScreen:
             "Note that only the original ROMs for Pokémon Ruby, Sapphire, Emerald, FireRed and LeafGreen "
             "are supported by this bot. Any modified ROM will not be detected."
         )
-        message = ttk.Label(group, text=error_message, wraplength=300, foreground="red", padding=(0, 0, 0, 25))
+        message = ttk.Label(
+            group,
+            text=error_message,
+            wraplength=300,
+            foreground="red",
+            padding=(0, 0, 0, 25),
+        )
         message.grid(row=0, column=0, sticky="S")
 
         def handle_button_click() -> None:

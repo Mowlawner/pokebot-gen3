@@ -70,9 +70,7 @@ def _get_targeted_encounter() -> Encounter | None:
                 (31, 6),
                 "Kecleon",
                 lambda: not get_save_data().get_event_flag(
-                    "HIDE_ROUTE_119_KECLEON_1"
-                    if context.rom.is_emerald
-                    else "HIDE_KECLEON_ROUTE119_1"
+                    "HIDE_ROUTE_119_KECLEON_1" if context.rom.is_emerald else "HIDE_KECLEON_ROUTE119_1"
                 ),
             ),
             Encounter(MapRSE.SOUTHERN_ISLAND_INTERIOR, (13, 11), "Latios/Latias"),
@@ -133,11 +131,7 @@ class StaticSoftResetsMode(BotMode):
                 yield from wait_for_n_frames(2)
                 yield from wait_for_task_to_start_and_finish("Task_BattleStart", "B")
             # The first cry happens before the battle starts.
-            yield from wait_for_task_to_start_and_finish(
-                "Task_DuckBGMForPokemonCry", button_to_press="A"
-            )
+            yield from wait_for_task_to_start_and_finish("Task_DuckBGMForPokemonCry", button_to_press="A")
 
             # At the start of the next cry the opponent is fully visible.
-            yield from wait_until_task_is_active(
-                "Task_DuckBGMForPokemonCry", button_to_press="A"
-            )
+            yield from wait_until_task_is_active("Task_DuckBGMForPokemonCry", button_to_press="A")

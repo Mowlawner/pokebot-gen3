@@ -6,7 +6,13 @@ from typing import Generator
 from modules.console import console
 from modules.context import context
 from modules.memory import get_game_state
-from modules.modes import BotMode, BotModeError, FrameInfo, get_bot_listeners, get_bot_mode_by_name
+from modules.modes import (
+    BotMode,
+    BotModeError,
+    FrameInfo,
+    get_bot_listeners,
+    get_bot_mode_by_name,
+)
 from modules.plugins import plugin_profile_loaded, load_built_in_plugins
 from modules.state_cache import state_cache
 from modules.stats import StatsDatabase

@@ -16,7 +16,11 @@ class TestPathfinding(BotTestCase):
     def test_basic_pathfinding(self):
         from modules.map_data import MapRSE, MapFRLG
         from modules.modes.util import navigate_to
-        from modules.player import get_player_location, player_avatar_is_controllable, player_avatar_is_standing_still
+        from modules.player import (
+            get_player_location,
+            player_avatar_is_controllable,
+            player_avatar_is_standing_still,
+        )
 
         if self.rom.is_rse:
             destination = MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_1F, (9, 4)
@@ -39,7 +43,11 @@ class TestPathfinding(BotTestCase):
     def test_will_follow_warps(self):
         from modules.map_data import MapRSE, MapFRLG
         from modules.modes.util import navigate_to
-        from modules.player import get_player_location, player_avatar_is_controllable, player_avatar_is_standing_still
+        from modules.player import (
+            get_player_location,
+            player_avatar_is_controllable,
+            player_avatar_is_standing_still,
+        )
 
         if self.rom.is_rse:
             warp_tile = MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_1F, (2, 2)
@@ -140,7 +148,11 @@ class TestPathfinding(BotTestCase):
         self.assertEqual(get_player_location(), (MapRSE.ROUTE119, (18, 30)))
 
     @with_save_state(
-        ["emerald/on_land_before_water.ss1", "ruby/on_land_before_water.ss1", "firered/on_land_before_water.ss1"]
+        [
+            "emerald/on_land_before_water.ss1",
+            "ruby/on_land_before_water.ss1",
+            "firered/on_land_before_water.ss1",
+        ]
     )
     def test_it_will_go_on_land_after_surfing(self):
         destination = (MapRSE.ROUTE119, (25, 42)) if self.rom.is_rse else (MapFRLG.VIRIDIAN_CITY, (14, 24))
@@ -148,7 +160,11 @@ class TestPathfinding(BotTestCase):
         self.assertEqual(get_player_location(), destination)
 
     @with_save_state(
-        ["emerald/on_water_before_land.ss1", "ruby/on_water_before_land.ss1", "firered/on_water_before_land.ss1"]
+        [
+            "emerald/on_water_before_land.ss1",
+            "ruby/on_water_before_land.ss1",
+            "firered/on_water_before_land.ss1",
+        ]
     )
     def test_it_will_start_to_surf(self):
         destination = (MapRSE.ROUTE119, (21, 42)) if self.rom.is_rse else (MapFRLG.VIRIDIAN_CITY, (14, 27))

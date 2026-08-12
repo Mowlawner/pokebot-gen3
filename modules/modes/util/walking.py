@@ -64,13 +64,9 @@ def walk_to(destination_coordinates: tuple[int, int], run: bool = True) -> Gener
                 yield
             break
 
-        if (
-            avatar.running_state == RunningState.NOT_MOVING
-            and avatar.acro_bike_state == AcroBikeState.NORMAL
-        ) or (
+        if (avatar.running_state == RunningState.NOT_MOVING and avatar.acro_bike_state == AcroBikeState.NORMAL) or (
             context.rom.is_frlg
-            and avatar.tile_transition_state
-            in [TileTransitionState.CENTERING, TileTransitionState.NOT_MOVING]
+            and avatar.tile_transition_state in [TileTransitionState.CENTERING, TileTransitionState.NOT_MOVING]
             and "Std_MsgboxSign" in get_global_script_context().stack
         ):
             if destination_coordinates[0] < avatar.local_coordinates[0]:
@@ -99,24 +95,17 @@ def follow_path(waypoints: Iterable[tuple[int, int]], run: bool = True) -> Gener
     :param run: Whether the player should run (hold down B)
     """
     if get_game_state() != GameState.OVERWORLD:
-        raise RuntimeError(
-            "The game is currently not in the overworld. Cannot navigate."
-        )
+        raise RuntimeError("The game is currently not in the overworld. Cannot navigate.")
 
     # Make sure that the player avatar can actually be controlled/moved right now.
     if not player_avatar_is_controllable():
-        raise RuntimeError(
-            "The player avatar is currently not controllable. Cannot navigate."
-        )
+        raise RuntimeError("The player avatar is currently not controllable. Cannot navigate.")
 
     for waypoint in waypoints:
         yield from walk_to(waypoint, run)
 
     # Wait for player to come to a full stop.
-    while (
-        not player_avatar_is_standing_still()
-        or get_player_avatar().running_state != RunningState.NOT_MOVING
-    ):
+    while not player_avatar_is_standing_still() or get_player_avatar().running_state != RunningState.NOT_MOVING:
         yield
 
 
@@ -127,9 +116,7 @@ class TimedOutTryingToReachWaypointError(BotModeError):
             map_name = MapRSE(waypoint.map).name
         else:
             map_name = MapFRLG(waypoint.map).name
-        message = (
-            f"Did not reach waypoint ({waypoint.coordinates}) @ {map_name} in time."
-        )
+        message = f"Did not reach waypoint ({waypoint.coordinates}) @ {map_name} in time."
         super().__init__(message)
 
 
@@ -158,15 +145,11 @@ def follow_waypoints(
     """
 
     if get_game_state() != GameState.OVERWORLD:
-        raise BotModeError(
-            "The game is currently not in the overworld. Cannot navigate."
-        )
+        raise BotModeError("The game is currently not in the overworld. Cannot navigate.")
 
     # Make sure that the player avatar can actually be controlled/moved right now.
     if not player_avatar_is_controllable():
-        raise BotModeError(
-            "The player avatar is currently not controllable. Cannot navigate."
-        )
+        raise BotModeError("The player avatar is currently not controllable. Cannot navigate.")
 
     # 'Running' means holding B, which on the Acro Bike leads to doing a Wheelie which is actually
     # slower than normal riding. On other bikes it just doesn't do anything, so if we are riding one,
@@ -198,9 +181,7 @@ def follow_waypoints(
         # When in tall grass, that could lead to an encounter starting mid-step which messes up the battle handling.
         # So for the first step, we will add an explicit additional turning step.
         if last_waypoint is None:
-            current_facing_direction = Direction.from_string(
-                get_player_avatar().facing_direction
-            )
+            current_facing_direction = Direction.from_string(get_player_avatar().facing_direction)
             if waypoint.direction != current_facing_direction:
                 yield from ensure_facing_direction(waypoint.direction)
 
@@ -215,14 +196,9 @@ def follow_waypoints(
             else:
                 frames_remaining_until_timeout += 300
         elif waypoint.action is WaypointAction.Waterfall:
-            frames_remaining_until_timeout += (
-                195 + (get_player_location()[0][1] - waypoint.coordinates[1]) * 42
-            )
+            frames_remaining_until_timeout += 195 + (get_player_location()[0][1] - waypoint.coordinates[1]) * 42
 
-        while (
-            not player_is_at(waypoint.map, waypoint.coordinates)
-            or field_effect_is_active
-        ):
+        while not player_is_at(waypoint.map, waypoint.coordinates) or field_effect_is_active:
             player_object = get_player_map_object()
 
             if get_game_state() == GameState.OVERWORLD:
@@ -243,16 +219,9 @@ def follow_waypoints(
             # Only pressing the direction keys during the frame where movement is actually registered can help
             # preventing weird overshoot issues in cases where a listener handles an event (like a battle, PokeNav
             # call, ...)
-            if (
-                player_object is not None
-                and "heldMovementFinished" in player_object.flags
-            ):
+            if player_object is not None and "heldMovementFinished" in player_object.flags:
                 if waypoint.action is WaypointAction.Surf:
-                    surf_task = (
-                        "Task_SurfFieldEffect"
-                        if not context.rom.is_rs
-                        else "sub_8088954"
-                    )
+                    surf_task = "Task_SurfFieldEffect" if not context.rom.is_rs else "sub_8088954"
                     yield from ensure_facing_direction(waypoint.direction)
                     if not field_effect_is_active:
                         if task_is_active(surf_task):
@@ -262,9 +231,7 @@ def follow_waypoints(
                     elif not task_is_active(surf_task):
                         field_effect_is_active = False
                 elif waypoint.action is WaypointAction.Waterfall:
-                    waterfall_task = (
-                        "Task_UseWaterfall" if not context.rom.is_rs else "sub_8086F64"
-                    )
+                    waterfall_task = "Task_UseWaterfall" if not context.rom.is_rs else "sub_8086F64"
                     yield from ensure_facing_direction(waypoint.direction)
                     if not field_effect_is_active:
                         if task_is_active(waterfall_task):
@@ -292,9 +259,7 @@ def follow_waypoints(
                                 break
                         yield
                     context.emulator.release_button("Up")
-                    while (
-                        get_player_avatar().running_state is not RunningState.NOT_MOVING
-                    ):
+                    while get_player_avatar().running_state is not RunningState.NOT_MOVING:
                         yield
                     yield from unmount_bicycle()
                     yield
@@ -319,17 +284,11 @@ def follow_waypoints(
                     from .higher_level_actions import mount_bicycle
 
                     yield from mount_bicycle()
-                    if (
-                        get_player_avatar().acro_bike_state
-                        is not AcroBikeState.HOPPING_WHEELIE
-                    ):
+                    if get_player_avatar().acro_bike_state is not AcroBikeState.HOPPING_WHEELIE:
                         context.emulator.release_button("B")
                         yield
                         context.emulator.hold_button("B")
-                        while (
-                            get_player_avatar().acro_bike_state
-                            is not AcroBikeState.HOPPING_WHEELIE
-                        ):
+                        while get_player_avatar().acro_bike_state is not AcroBikeState.HOPPING_WHEELIE:
                             yield
                     context.emulator.hold_button(waypoint.walking_direction)
                 else:
@@ -350,24 +309,17 @@ def follow_waypoints(
 
     if final_facing_direction is not None:
         context.emulator.reset_held_buttons()
-        while (
-            get_player_avatar().facing_direction != final_facing_direction.button_name
-        ):
+        while get_player_avatar().facing_direction != final_facing_direction.button_name:
             context.emulator.hold_button(final_facing_direction.button_name)
             yield
 
     # Wait for player to come to a full stop.
     context.emulator.reset_held_buttons()
-    while (
-        not player_avatar_is_standing_still()
-        or get_player_avatar().running_state != RunningState.NOT_MOVING
-    ):
+    while not player_avatar_is_standing_still() or get_player_avatar().running_state != RunningState.NOT_MOVING:
         # If we reached the destination tile and the script context is enabled, that probably means
         # that a script has triggered at our destination. In that case, we cease control back to the
         # bot mode immediately.
-        if last_waypoint is None or player_is_at(
-            last_waypoint.map, last_waypoint.coordinates
-        ):
+        if last_waypoint is None or player_is_at(last_waypoint.map, last_waypoint.coordinates):
             if get_global_script_context().is_active:
                 break
         yield
@@ -418,14 +370,8 @@ def navigate_to(
                     (map, coordinates),
                     avoid_encounters=avoid_encounters,
                     avoid_scripted_events=avoid_scripted_events,
-                    has_acro_bike=get_item_bag().quantity_of(
-                        get_item_by_name("Acro Bike")
-                    )
-                    > 0,
-                    has_mach_bike=get_item_bag().quantity_of(
-                        get_item_by_name("Mach Bike")
-                    )
-                    > 0,
+                    has_acro_bike=get_item_bag().quantity_of(get_item_by_name("Acro Bike")) > 0,
+                    has_mach_bike=get_item_bag().quantity_of(get_item_by_name("Mach Bike")) > 0,
                 )
             except PathFindingError as e:
                 raise BotModeError(str(e))
@@ -445,9 +391,7 @@ def navigate_to(
 
     while True:
         try:
-            yield from follow_waypoints(
-                waypoint_generator(), run, final_facing_direction=final_facing_direction
-            )
+            yield from follow_waypoints(waypoint_generator(), run, final_facing_direction=final_facing_direction)
             break
         except TimedOutTryingToReachWaypointError:
             # If we run into a timeout while trying to follow the waypoints, this is likely because of either of
@@ -514,7 +458,7 @@ def walk_one_tile(direction: str, run: bool = True) -> Generator:
 
 @debug.track
 def ensure_facing_direction(
-    facing_direction: str | Direction | tuple[int, int]
+    facing_direction: str | Direction | tuple[int, int],
 ) -> Generator:
     """
     If the player avatar is not already facing a certain direction this will make it turn
@@ -624,9 +568,7 @@ def run_in_circle(
         else:
             waypoint_list = [*east(), *north(), *west(), *south()]
 
-        yield from calculate_path(
-            get_map_data_for_current_position(), (on_map, bottom_left)
-        )
+        yield from calculate_path(get_map_data_for_current_position(), (on_map, bottom_left))
         while True:
             for waypoint in waypoint_list:
                 if exit_condition is not None and exit_condition():

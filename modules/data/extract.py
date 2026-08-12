@@ -307,7 +307,8 @@ def extract_items(english_rom: ROM, localised_roms: dict[str, ROM]) -> list[dict
                 name = decode_string(item_data[:length_of_name])
 
                 description_pointer = int.from_bytes(
-                    item_data[description_pointer_offset : description_pointer_offset + 4], byteorder="little"
+                    item_data[description_pointer_offset : description_pointer_offset + 4],
+                    byteorder="little",
                 )
                 description = read_string(localised_file, description_pointer - 0x0800_0000)
 
@@ -415,7 +416,13 @@ def extract_natures(english_rom: ROM, localised_roms: dict[str, ROM]) -> list[di
         english_file.seek(get_address("gNatureStatTable"))
         for i in range(25):
             modifiers = english_file.read(5)
-            stats_list = ["attack", "defence", "speed", "special_attack", "special_defence"]
+            stats_list = [
+                "attack",
+                "defence",
+                "speed",
+                "special_attack",
+                "special_defence",
+            ]
             for j in range(len(stats_list)):
                 key = f"{stats_list[j]}_modifier"
                 if modifiers[j] == 0:
@@ -706,7 +713,7 @@ def extract_moves(english_rom: ROM, localised_roms: dict[str, ROM], types_list: 
                     "pp": move_data[4],
                     "secondary_accuracy": secondary_accuracy,
                     "target": target_map[move_data[6]],
-                    "priority": move_data[7] if move_data[7] < 0x80 else -1 * (256 - move_data[7]),
+                    "priority": (move_data[7] if move_data[7] < 0x80 else -1 * (256 - move_data[7])),
                     "makes_contact": move_data[8] & 0x01 != 0,
                     "is_sound_move": False,
                     "affected_by_protect": move_data[8] & 0x02 != 0,
@@ -776,7 +783,14 @@ def extract_species(
         "Dragon",
         "No Eggs",
     ]
-    level_up_type_map = ["Medium Fast", "Erratic", "Fluctuating", "Medium Slow", "Fast", "Slow"]
+    level_up_type_map = [
+        "Medium Fast",
+        "Erratic",
+        "Fluctuating",
+        "Medium Slow",
+        "Fast",
+        "Slow",
+    ]
 
     with open(english_rom.file, "rb") as english_file:
         english_file.seek(get_address("gTMHMLearnsets"))
@@ -830,7 +844,10 @@ def extract_species(
             elif item1 == 0:
                 held_items = [(item_list[item2]["name"], 0.05)]
             else:
-                held_items = [(item_list[item1]["name"], 0.5), (item_list[item2]["name"], 0.05)]
+                held_items = [
+                    (item_list[item1]["name"], 0.5),
+                    (item_list[item2]["name"], 0.05),
+                ]
 
             level_up_moves = {}
             offset = 0
@@ -977,7 +994,10 @@ def extract_species(
             elif item1 == 0:
                 held_items = [(item_list[item2]["name"], 0.05)]
             else:
-                held_items = [(item_list[item1]["name"], 0.5), (item_list[item2]["name"], 0.05)]
+                held_items = [
+                    (item_list[item1]["name"], 0.5),
+                    (item_list[item2]["name"], 0.05),
+                ]
 
             species_list[i]["held_items_frlg"] = held_items
 

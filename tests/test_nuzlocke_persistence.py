@@ -49,9 +49,7 @@ class TestNuzlockePersistence(unittest.TestCase):
             self.assertFalse(store.append(event))
             self.assertEqual(store.append_many((MapChanged(2, (1, 3), (1, 4)),)), 1)
             reloaded = JsonEventStore(path)
-            self.assertEqual(
-                reloaded.iter_events(), (event, MapChanged(2, (1, 3), (1, 4)))
-            )
+            self.assertEqual(reloaded.iter_events(), (event, MapChanged(2, (1, 3), (1, 4))))
             self.assertEqual(reloaded.last_sequence(), 2)
 
     def test_sessions_allow_repeated_frames_and_runtime_sink(self):
@@ -69,9 +67,7 @@ class TestNuzlockePersistence(unittest.TestCase):
     def test_schema_and_corruption_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.json"
-            path.write_text(
-                json.dumps({"schema_version": 999, "events": []}), encoding="utf-8"
-            )
+            path.write_text(json.dumps({"schema_version": 999, "events": []}), encoding="utf-8")
             with self.assertRaises(EventStoreCorruptionError):
                 JsonEventStore(path)
             path.write_text('{"schema_version": 1, "events": [', encoding="utf-8")

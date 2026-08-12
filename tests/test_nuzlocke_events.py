@@ -11,15 +11,7 @@ class State(Enum):
 
 class TestNuzlockeEvents(unittest.TestCase):
     @staticmethod
-    def snapshot(
-        *,
-        frame=1,
-        state=State.OVERWORLD,
-        map_id=(1, 2),
-        party=(),
-        battle=None,
-        **availability
-    ):
+    def snapshot(*, frame=1, state=State.OVERWORLD, map_id=(1, 2), party=(), battle=None, **availability):
         from modules.nuzlocke.snapshots import (
             InventorySnapshot,
             NuzlockeSnapshot,
@@ -42,9 +34,7 @@ class TestNuzlockeEvents(unittest.TestCase):
         )
 
     @staticmethod
-    def pokemon(
-        index=0, *, hp=10, fainted=False, species="Poochyena", pv=1, status="none"
-    ):
+    def pokemon(index=0, *, hp=10, fainted=False, species="Poochyena", pv=1, status="none"):
         from modules.nuzlocke.snapshots import PartyPokemonSnapshot
 
         return PartyPokemonSnapshot(
@@ -81,23 +71,16 @@ class TestNuzlockeEvents(unittest.TestCase):
 
         observer = NuzlockeEventObserver()
         observer.observe(self.snapshot())
-        started = observer.observe(
-            self.snapshot(frame=2, state=State.BATTLE, battle=self.battle())
-        )
+        started = observer.observe(self.snapshot(frame=2, state=State.BATTLE, battle=self.battle()))
         self.assertEqual([type(e) for e in started], [BattleStarted, GameStateChanged])
         self.assertEqual(
-            observer.observe(
-                self.snapshot(frame=3, state=State.BATTLE, battle=self.battle())
-            ),
+            observer.observe(self.snapshot(frame=3, state=State.BATTLE, battle=self.battle())),
             (),
         )
         ended = observer.observe(self.snapshot(frame=4, battle=None))
         self.assertIsInstance(ended[0], BattleEnded)
         self.assertEqual(
-            sum(
-                isinstance(e, BattleEnded)
-                for e in observer.observe(self.snapshot(frame=5))
-            ),
+            sum(isinstance(e, BattleEnded) for e in observer.observe(self.snapshot(frame=5))),
             0,
         )
 
@@ -113,31 +96,22 @@ class TestNuzlockeEvents(unittest.TestCase):
         observer = NuzlockeEventObserver()
         party = (self.pokemon(),)
         observer.observe(self.snapshot(party=party))
-        changed = observer.observe(
-            self.snapshot(frame=2, map_id=(1, 3), party=(self.pokemon(hp=9),))
-        )
+        changed = observer.observe(self.snapshot(frame=2, map_id=(1, 3), party=(self.pokemon(hp=9),)))
         self.assertEqual(sum(isinstance(e, MapChanged) for e in changed), 1)
         self.assertEqual(sum(isinstance(e, PartyChanged) for e in changed), 0)
-        fainted = observer.observe(
-            self.snapshot(frame=3, party=(self.pokemon(hp=0, fainted=True),))
-        )
+        fainted = observer.observe(self.snapshot(frame=3, party=(self.pokemon(hp=0, fainted=True),)))
         self.assertEqual(sum(isinstance(e, PokemonFainted) for e in fainted), 1)
         self.assertEqual(
-            observer.observe(
-                self.snapshot(frame=4, party=(self.pokemon(hp=0, fainted=True),))
-            ),
+            observer.observe(self.snapshot(frame=4, party=(self.pokemon(hp=0, fainted=True),))),
             (),
         )
         whiteout = observer.observe(
-            self.snapshot(
-                frame=5, state=State.WHITEOUT, party=(self.pokemon(hp=0, fainted=True),)
-            )
+            self.snapshot(frame=5, state=State.WHITEOUT, party=(self.pokemon(hp=0, fainted=True),))
         )
         self.assertEqual(sum(isinstance(e, WhiteoutOccurred) for e in whiteout), 1)
         self.assertEqual(
             sum(
-                isinstance(e, WhiteoutOccurred)
-                for e in observer.observe(self.snapshot(frame=6, state=State.WHITEOUT))
+                isinstance(e, WhiteoutOccurred) for e in observer.observe(self.snapshot(frame=6, state=State.WHITEOUT))
             ),
             0,
         )
@@ -156,13 +130,9 @@ class TestNuzlockeEvents(unittest.TestCase):
         self.assertEqual(event.entered_party_indices, (1,))
         event = observer.observe(self.snapshot(frame=3, party=(second, first)))[0]
         self.assertTrue(event.reordered)
-        observer.observe(
-            self.snapshot(frame=4, party=(second, self.pokemon(pv=1, hp=9)))
-        )
+        observer.observe(self.snapshot(frame=4, party=(second, self.pokemon(pv=1, hp=9))))
         self.assertEqual(
-            observer.observe(
-                self.snapshot(frame=5, party=(second, self.pokemon(pv=1, hp=9)))
-            ),
+            observer.observe(self.snapshot(frame=5, party=(second, self.pokemon(pv=1, hp=9)))),
             (),
         )
 
@@ -190,7 +160,8 @@ class TestNuzlockeEvents(unittest.TestCase):
             (),
         )
         self.assertEqual(
-            observer.observe(self.snapshot(frame=3, party=party)), (),
+            observer.observe(self.snapshot(frame=3, party=party)),
+            (),
         )
         changed = observer.observe(self.snapshot(frame=4, party=()))
         self.assertTrue(any(isinstance(event, PartyChanged) for event in changed))
@@ -215,9 +186,7 @@ class TestNuzlockeEvents(unittest.TestCase):
             battle_available=False,
         )
         self.assertEqual(observer.observe(unavailable), ())
-        events = observer.observe(
-            self.snapshot(frame=3, state=State.BATTLE, battle=battle)
-        )
+        events = observer.observe(self.snapshot(frame=3, state=State.BATTLE, battle=battle))
         self.assertFalse(any(isinstance(event, BattleEnded) for event in events))
         self.assertFalse(any(isinstance(event, MapChanged) for event in events))
 
@@ -230,9 +199,7 @@ class TestNuzlockeEvents(unittest.TestCase):
         self.assertEqual(observer.observe(available), ())
         self.assertEqual(observer.observe(unavailable), ())
         self.assertEqual(observer.observe(self.snapshot(frame=3)), ())
-        self.assertEqual(
-            observer.observe(self.snapshot(frame=4, pc_available=False)), ()
-        )
+        self.assertEqual(observer.observe(self.snapshot(frame=4, pc_available=False)), ())
         self.assertEqual(observer.observe(self.snapshot(frame=5)), ())
 
     def test_battle_starting_snapshot_does_not_start_battle_twice(self):
@@ -244,20 +211,14 @@ class TestNuzlockeEvents(unittest.TestCase):
             any(
                 isinstance(event, BattleStarted)
                 for event in observer.observe(
-                    self.snapshot(
-                        frame=2, state=State.BATTLE, battle=self.battle(ready=False)
-                    )
+                    self.snapshot(frame=2, state=State.BATTLE, battle=self.battle(ready=False))
                 )
             )
         )
-        started = observer.observe(
-            self.snapshot(frame=3, state=State.BATTLE, battle=self.battle())
-        )
+        started = observer.observe(self.snapshot(frame=3, state=State.BATTLE, battle=self.battle()))
         self.assertEqual(sum(isinstance(event, BattleStarted) for event in started), 1)
         self.assertEqual(
-            observer.observe(
-                self.snapshot(frame=4, state=State.BATTLE, battle=self.battle())
-            ),
+            observer.observe(self.snapshot(frame=4, state=State.BATTLE, battle=self.battle())),
             (),
         )
 
@@ -275,25 +236,19 @@ class TestNuzlockeEvents(unittest.TestCase):
             any(
                 isinstance(event, BattleEnded)
                 for event in observer.observe(
-                    self.snapshot(
-                        frame=2, state=State.BATTLE, battle=self.battle(ready=False)
-                    )
+                    self.snapshot(frame=2, state=State.BATTLE, battle=self.battle(ready=False))
                 )
             )
         )
         self.assertFalse(
             any(
                 isinstance(event, BattleStarted)
-                for event in observer.observe(
-                    self.snapshot(frame=3, state=State.BATTLE, battle=battle)
-                )
+                for event in observer.observe(self.snapshot(frame=3, state=State.BATTLE, battle=battle))
             )
         )
         ended = observer.observe(self.snapshot(frame=4, state=State.OVERWORLD))
         self.assertEqual(sum(isinstance(event, BattleEnded) for event in ended), 1)
-        self.assertEqual(
-            observer.observe(self.snapshot(frame=5, state=State.OVERWORLD)), ()
-        )
+        self.assertEqual(observer.observe(self.snapshot(frame=5, state=State.OVERWORLD)), ())
 
 
 if __name__ == "__main__":

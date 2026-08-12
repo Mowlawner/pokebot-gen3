@@ -149,9 +149,7 @@ class NuzlockeSnapshot:
 
 def _moves(pokemon) -> tuple[MoveSnapshot, ...]:
     return tuple(
-        MoveSnapshot(move.move.name, move.pp, move.total_pp, move.pp_ups)
-        for move in pokemon.moves
-        if move is not None
+        MoveSnapshot(move.move.name, move.pp, move.total_pp, move.pp_ups) for move in pokemon.moves if move is not None
     )
 
 
@@ -222,9 +220,7 @@ def _player() -> tuple[PlayerSnapshot, bool]:
     avatar = get_player_avatar()
     if avatar is None:
         return (
-            PlayerSnapshot(
-                player.name if player else None, None, None, None, None, None, False
-            ),
+            PlayerSnapshot(player.name if player else None, None, None, None, None, None, False),
             False,
         )
     location, coordinates = get_player_location()
@@ -274,16 +270,8 @@ def _battle(game_state: GameState) -> BattleSnapshot | None:
         outcome = "Unknown"
     battling_pokemon = state.battling_pokemon
     battle_ready = len(battling_pokemon) >= 2
-    own_active = (
-        tuple(_battle_pokemon(p) for p in state.own_side.active_battlers)
-        if battle_ready
-        else ()
-    )
-    opponent_active = (
-        tuple(_battle_pokemon(p) for p in state.opponent.active_battlers)
-        if battle_ready
-        else ()
-    )
+    own_active = tuple(_battle_pokemon(p) for p in state.own_side.active_battlers) if battle_ready else ()
+    opponent_active = tuple(_battle_pokemon(p) for p in state.opponent.active_battlers) if battle_ready else ()
     battle_ready = battle_ready and bool(own_active) and bool(opponent_active)
     return BattleSnapshot(
         battle_type=tuple(flag.name for flag in BattleType if flag in battle_type),
@@ -317,10 +305,7 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
         player=player,
         party=tuple(
             PartyPokemonSnapshot(
-                **{
-                    field: getattr(snapshot, field)
-                    for field in PokemonSnapshot.__dataclass_fields__
-                },
+                **{field: getattr(snapshot, field) for field in PokemonSnapshot.__dataclass_fields__},
                 party_index=p.index,
             )
             for p in party or ()
@@ -335,19 +320,14 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
         pc=StorageSnapshot(
             active_box=storage.active_box_index if storage is not None else 0,
             pokemon=tuple(
-                StoragePokemonSnapshot(
-                    box.number, slot.slot_index, _pokemon(slot.pokemon)
-                )
+                StoragePokemonSnapshot(box.number, slot.slot_index, _pokemon(slot.pokemon))
                 for box in (storage.boxes if storage is not None else ())
                 for slot in box.slots
                 if _storage_pokemon_is_readable(slot.pokemon)
             ),
         ),
         progression=ProgressionSnapshot(
-            tuple(
-                NamedFlag(f"BADGE{i:02d}_GET", get_event_flag(f"BADGE{i:02d}_GET"))
-                for i in range(1, 9)
-            )
+            tuple(NamedFlag(f"BADGE{i:02d}_GET", get_event_flag(f"BADGE{i:02d}_GET")) for i in range(1, 9))
         ),
         game_state_available=game_state is not None,
         player_available=player_available,

@@ -8,7 +8,14 @@ import numpy
 
 from modules.context import context
 from modules.game import _event_flags, _event_vars, encode_string
-from modules.items import Item, ItemSlot, get_item_bag, _items_by_index, ItemPocket, get_item_by_name
+from modules.items import (
+    Item,
+    ItemSlot,
+    get_item_bag,
+    _items_by_index,
+    ItemPocket,
+    get_item_by_name,
+)
 from modules.map import get_encounter_affecting_abilities
 from modules.memory import (
     get_event_flag,
@@ -455,7 +462,9 @@ def debug_write_item_bag(
             write_to_save_block(pack_uint16(0), 1, registered_item_offset)
 
 
-def debug_give_test_item_pack(rse_bicycle: Literal["Acro Bike", "Mach Bike"] = "Acro Bike") -> None:
+def debug_give_test_item_pack(
+    rse_bicycle: Literal["Acro Bike", "Mach Bike"] = "Acro Bike",
+) -> None:
     all_the_balls = []
     all_the_tms_hms = []
     all_the_berries = []

@@ -16,7 +16,11 @@ class TestNuzlockeSnapshots(unittest.TestCase):
         self.assertTrue(hasattr(NuzlockeSnapshot, "__dataclass_fields__"))
 
     def test_party_and_player_data_are_normalized(self):
-        from modules.nuzlocke.snapshots import MoveSnapshot, PartyPokemonSnapshot, PlayerSnapshot
+        from modules.nuzlocke.snapshots import (
+            MoveSnapshot,
+            PartyPokemonSnapshot,
+            PlayerSnapshot,
+        )
 
         pokemon = PartyPokemonSnapshot(
             party_index=0,
@@ -36,7 +40,10 @@ class TestNuzlockeSnapshots(unittest.TestCase):
             egg=False,
         )
         player = PlayerSnapshot("May", 3, 4, "ROUTE_101", (8, 9), "Up", True)
-        self.assertEqual((pokemon.species, pokemon.party_index, pokemon.moves[0].pp), ("Treecko", 0, 35))
+        self.assertEqual(
+            (pokemon.species, pokemon.party_index, pokemon.moves[0].pp),
+            ("Treecko", 0, 35),
+        )
         self.assertEqual((player.map_group, player.map_number, player.coordinates), (3, 4, (8, 9)))
 
     def test_battle_absent_and_present_are_explicit(self):

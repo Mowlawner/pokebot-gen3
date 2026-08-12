@@ -16,16 +16,11 @@ class Selection:
     button_enable: bool = True
 
 
-def ask_for_choice(
-    choices: list[Selection], window_title: str = "Choose..."
-) -> str | None:
+def ask_for_choice(choices: list[Selection], window_title: str = "Choose...") -> str | None:
     if context.gui.is_headless:
         console.print(f"\n[bold]{window_title}[/]")
         for index, choice in enumerate(choices):
-            console.print(
-                f"  [bold magenta]\\[{index + 1}][/] "
-                + choice.button_label.replace("\n", " ")
-            )
+            console.print(f"  [bold magenta]\\[{index + 1}][/] " + choice.button_label.replace("\n", " "))
         chosen_index = Prompt.ask(
             "Choose option (number)",
             show_choices=False,
@@ -46,9 +41,7 @@ def ask_for_choice(
         selected_value = value
         window.after(50, remove_window)
 
-    maximum_number_of_lines = 1 + max(
-        choice.button_label.count("\n") for choice in choices
-    )
+    maximum_number_of_lines = 1 + max(choice.button_label.count("\n") for choice in choices)
 
     window_geometry = (len(choices) * 164, 160 + (maximum_number_of_lines * 20))
     window.title(window_title)
@@ -63,9 +56,7 @@ def ask_for_choice(
 
     canvas = Canvas(frame)
     canvas.pack(side="left", fill="both", expand=True)
-    canvas.bind(
-        "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-    )
+    canvas.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
 
     frame = ttk.Frame(canvas, width=window_geometry[1])
     for i in range(len(choices)):
@@ -103,9 +94,7 @@ def ask_for_choice(
     return selected_value
 
 
-def ask_for_confirmation(
-    message: str, window_title: str = "Confirmation"
-) -> bool | None:
+def ask_for_confirmation(message: str, window_title: str = "Confirmation") -> bool | None:
     """
     Displays a confirmation window with the given message and Yes/No buttons.
 
@@ -186,10 +175,7 @@ def ask_for_choice_scroll(
     if context.gui.is_headless:
         console.print(f"\n[bold]{window_title}[/]")
         for index, choice in enumerate(choices):
-            console.print(
-                f"  [bold magenta]\\[{index + 1}][/] "
-                + choice.button_label.replace("\n", " ")
-            )
+            console.print(f"  [bold magenta]\\[{index + 1}][/] " + choice.button_label.replace("\n", " "))
         chosen_index = Prompt.ask(
             "Choose option (number)",
             show_choices=False,
@@ -231,9 +217,7 @@ def ask_for_choice_scroll(
     scrollbar.pack(side="right", fill="y")
 
     canvas.configure(yscrollcommand=scrollbar.set)
-    canvas.bind(
-        "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-    )
+    canvas.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
 
     content_frame = ttk.Frame(canvas)
     canvas.create_window((0, 0), window=content_frame, anchor="nw")

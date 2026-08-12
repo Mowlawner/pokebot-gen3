@@ -96,7 +96,13 @@ class GenerateEncounterMediaPlugin(BotPlugin):
             # Set the GIF's path so that other plugins can use it.
             encounter.gif_path = gif_dir / file_name
 
-            Thread(target=self._listener.save_gif, args=(gif_dir, file_name,),).start()
+            Thread(
+                target=self._listener.save_gif,
+                args=(
+                    gif_dir,
+                    file_name,
+                ),
+            ).start()
             context.bot_listeners.remove(self._listener)
             self._listener = None
 
@@ -122,9 +128,7 @@ class GenerateEncounterMediaPlugin(BotPlugin):
 
         return None
 
-    def on_egg_starting_to_hatch(
-        self, hatching_pokemon: "EncounterInfo"
-    ) -> Generator | None:
+    def on_egg_starting_to_hatch(self, hatching_pokemon: "EncounterInfo") -> Generator | None:
         return self.on_battle_started(hatching_pokemon)
 
     def on_egg_hatched(self, hatched_pokemon: "EncounterInfo") -> Generator | None:

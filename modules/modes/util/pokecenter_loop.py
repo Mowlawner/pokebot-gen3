@@ -30,9 +30,7 @@ class PokecenterLoopController:
         self._needs_healing = False
         self._leave_pokemon_center = False
 
-    def on_battle_started(
-        self, encounter: "EncounterInfo | None"
-    ) -> BattleAction | BattleStrategy | None:
+    def on_battle_started(self, encounter: "EncounterInfo | None") -> BattleAction | BattleStrategy | None:
         if encounter is None:
             return None
 
@@ -52,11 +50,7 @@ class PokecenterLoopController:
             # in the strongest Pokémon immediately to allow the weak Pokémon to gain at least some
             # PP.
             lead_knows_damaging_moves = any(
-                [
-                    learned_move.move.base_power
-                    for learned_move in lead_pokemon.moves
-                    if learned_move is not None
-                ]
+                [learned_move.move.base_power for learned_move in lead_pokemon.moves if learned_move is not None]
             )
             if (
                 lead_pokemon.current_hp <= 0
@@ -75,12 +69,8 @@ class PokecenterLoopController:
             raise BotModeError("There are not encounters on this tile.")
 
         effective_encounters = get_effective_encounter_rates_for_current_map()
-        if (
-            not current_location.is_surfable
-            and len(effective_encounters.land_encounters) == 0
-        ) or (
-            current_location.is_surfable
-            and len(effective_encounters.surf_encounters) == 0
+        if (not current_location.is_surfable and len(effective_encounters.land_encounters) == 0) or (
+            current_location.is_surfable and len(effective_encounters.surf_encounters) == 0
         ):
             raise BotModeError(
                 "Currently, no encounters can happen on this map. This might be due to active Repel, or because this map simply doesn't have any."
@@ -121,9 +111,7 @@ class PokecenterLoopController:
             self._leave_pokemon_center = False
             self._needs_healing = False
 
-            yield from navigate_to(
-                get_map_enum(encounter_spot), encounter_spot.local_position
-            )
+            yield from navigate_to(get_map_enum(encounter_spot), encounter_spot.local_position)
 
             def activity_stop_condition() -> bool:
                 return (

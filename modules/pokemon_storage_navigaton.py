@@ -319,7 +319,18 @@ class StorageCursor:
                     y_without_offset = 0x03003138
                     y_with_offset = 0x03003148
                 case "POKEMON RUBY" | "POKEMON SAPP":
-                    x_pos_bytes = [0x54, 0x6C, 0x84, 0x9C, 0xB4, 0xCC, 0x00, 0x92, 0x68, 0xC0]
+                    x_pos_bytes = [
+                        0x54,
+                        0x6C,
+                        0x84,
+                        0x9C,
+                        0xB4,
+                        0xCC,
+                        0x00,
+                        0x92,
+                        0x68,
+                        0xC0,
+                    ]
                     x_without_offset = 0x030017BE
                     x_with_offset = 0x030017CE
                     y_without_offset = 0x030017BC

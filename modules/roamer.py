@@ -19,7 +19,13 @@ from modules.pokemon import (
 
 
 class Roamer:
-    def __init__(self, data: bytes, location: bytes, trainer_id: int = 0, trainer_secret_id: int = 0):
+    def __init__(
+        self,
+        data: bytes,
+        location: bytes,
+        trainer_id: int = 0,
+        trainer_secret_id: int = 0,
+    ):
         self._data = data
         self._location = location
         self._trainer_id = trainer_id

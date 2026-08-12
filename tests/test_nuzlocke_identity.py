@@ -20,9 +20,7 @@ class TestPokemonIdentity(unittest.TestCase):
             personality_value = 10
             original_trainer = type("Trainer", (), {"id": 20, "secret_id": 30})()
 
-        self.assertEqual(
-            PokemonIdentity.from_pokemon(FakePokemon()), PokemonIdentity(10, 20, 30)
-        )
+        self.assertEqual(PokemonIdentity.from_pokemon(FakePokemon()), PokemonIdentity(10, 20, 30))
         FakePokemon.is_valid = False
         self.assertIsNone(PokemonIdentity.from_pokemon(FakePokemon()))
         FakePokemon.is_valid = True
@@ -119,9 +117,7 @@ class TestPokemonIdentity(unittest.TestCase):
             ),
         )
         projection = CampaignProjection()
-        projection.apply(
-            StorageChanged(1, (PokemonStorageLocation(identity, 0, 1),), ())
-        )
+        projection.apply(StorageChanged(1, (PokemonStorageLocation(identity, 0, 1),), ()))
         projection.apply(event)
         self.assertEqual(projection.state.pc_locations, ((identity, 4, 29),))
 

@@ -238,7 +238,10 @@ def handle_encounter(
             if not repeat_encounter:
                 filter_result = encounter_info.catch_filters_result
                 console.print(f"[pink green]Custom filter triggered for {pokemon.species.name}: '{filter_result}'[/]")
-                alert = "Custom filter triggered!", f"Found a {pokemon.species.name} that matched one of your filters."
+                alert = (
+                    "Custom filter triggered!",
+                    f"Found a {pokemon.species.name} that matched one of your filters.",
+                )
                 if context.config.logging.save_pk3.custom:
                     save_pk3(pokemon)
             is_of_interest = True
@@ -246,7 +249,10 @@ def handle_encounter(
         case EncounterValue.Roamer:
             if not repeat_encounter:
                 console.print(f"[pink yellow]Roaming {pokemon.species.name} found![/]")
-                alert = "Roaming Pokémon found!", f"Encountered a roaming {pokemon.species.name}."
+                alert = (
+                    "Roaming Pokémon found!",
+                    f"Encountered a roaming {pokemon.species.name}.",
+                )
                 # If this is the first time the Roamer is encountered
                 if pokemon.species not in get_pokedex().seen_species and context.config.logging.save_pk3.roamer:
                     save_pk3(pokemon)
@@ -284,7 +290,11 @@ def handle_encounter(
         )
         desktop_notification(title=alert[0], message=alert[1], icon=alert_icon)
 
-    battle_is_active = get_game_state() in (GameState.BATTLE, GameState.BATTLE_STARTING, GameState.BATTLE_ENDING)
+    battle_is_active = get_game_state() in (
+        GameState.BATTLE,
+        GameState.BATTLE_STARTING,
+        GameState.BATTLE_ENDING,
+    )
 
     if is_of_interest:
         if not repeat_encounter and not context.testing:

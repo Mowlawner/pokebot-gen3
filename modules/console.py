@@ -87,7 +87,9 @@ def sv_colour(value: "SpeciesRecord | int | None") -> str:
         return "red"
 
 
-def format_shiny_average(encounter_summary: "EncounterSummary | EncounterTotals") -> str:
+def format_shiny_average(
+    encounter_summary: "EncounterSummary | EncounterTotals",
+) -> str:
     if encounter_summary.shiny_encounters > 0:
         return f"1/{int(encounter_summary.total_encounters / encounter_summary.shiny_encounters):,}"
     else:
@@ -128,7 +130,10 @@ def print_stats(stats: "GlobalStats", encounter: "EncounterInfo") -> None:
         "[bold]Hidden Power[/]",
         f"[{pokemon.hidden_power_type.name.lower()}]{pokemon.hidden_power_type.name} ({pokemon.hidden_power_damage})[/]",
     )
-    pokemon_table.add_row("[bold]Shiny Value[/]", f"[{sv_colour(pokemon.shiny_value)}]{pokemon.shiny_value:,}[/]")
+    pokemon_table.add_row(
+        "[bold]Shiny Value[/]",
+        f"[{sv_colour(pokemon.shiny_value)}]{pokemon.shiny_value:,}[/]",
+    )
     if pokemon.species.name == "Wurmple":
         pokemon_table.add_row("[bold]Evolution[/]", pokemon.wurmple_evolution.title())
 
@@ -162,7 +167,14 @@ def print_stats(stats: "GlobalStats", encounter: "EncounterInfo") -> None:
 
     # EV Yield
     ev_yields = []
-    for stat in ("hp", "attack", "defence", "speed", "special_attack", "special_defence"):
+    for stat in (
+        "hp",
+        "attack",
+        "defence",
+        "speed",
+        "special_attack",
+        "special_defence",
+    ):
         if pokemon.species.ev_yield[stat] > 0:
             stat_name = "HP" if stat == "hp" else stat.replace("_", " ").title()
             ev_yields.append(f"{pokemon.species.ev_yield[stat]} {stat_name}")

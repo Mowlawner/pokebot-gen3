@@ -416,15 +416,27 @@ class LibmgbaEmulator:
             offset = address & 0x3FFFF
             if offset + length > 0x3FFFF:
                 raise RuntimeError("Illegal range: EWRAM only extends from 0x02000000 to 0x0203FFFF")
-            ffi.memmove(result, ffi.cast("char*", self._core._native.memory.wram) + offset, length)
+            ffi.memmove(
+                result,
+                ffi.cast("char*", self._core._native.memory.wram) + offset,
+                length,
+            )
         elif bank == 0x3:
             offset = address & 0x7FFF
             if offset + length > 0x7FFF:
                 raise RuntimeError("Illegal range: IWRAM only extends from 0x03000000 to 0x03007FFF")
-            ffi.memmove(result, ffi.cast("char*", self._core._native.memory.iwram) + offset, length)
+            ffi.memmove(
+                result,
+                ffi.cast("char*", self._core._native.memory.iwram) + offset,
+                length,
+            )
         elif bank >= 0x8:
             offset = address - 0x08000000
-            ffi.memmove(result, ffi.cast("char*", self._core._native.memory.rom) + offset, length)
+            ffi.memmove(
+                result,
+                ffi.cast("char*", self._core._native.memory.rom) + offset,
+                length,
+            )
         else:
             raise RuntimeError(f"Invalid memory address for reading: {hex(address)}")
         return result
@@ -451,7 +463,11 @@ class LibmgbaEmulator:
             offset = address & 0x7FFF
             if offset + length > 0x7FFF:
                 raise RuntimeError("Illegal range: IWRAM only extends from 0x03000000 to 0x03007FFF")
-            ffi.memmove(ffi.cast("char*", self._core._native.memory.iwram) + offset, data, length)
+            ffi.memmove(
+                ffi.cast("char*", self._core._native.memory.iwram) + offset,
+                data,
+                length,
+            )
             return True
         else:
             raise RuntimeError(f"Invalid memory address for writing: {hex(address)}")

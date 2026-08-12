@@ -62,4 +62,9 @@ def get_play_time() -> PlayTime:
              time will not advance anymore.
     """
     save_block_time = get_save_block(2, offset=0x0E, size=0x5)
-    return PlayTime(unpack_uint16(save_block_time[0:2]), save_block_time[2], save_block_time[3], save_block_time[4])
+    return PlayTime(
+        unpack_uint16(save_block_time[0:2]),
+        save_block_time[2],
+        save_block_time[3],
+        save_block_time[4],
+    )

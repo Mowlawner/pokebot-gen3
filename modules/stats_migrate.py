@@ -46,7 +46,10 @@ def migrate_file_based_stats_to_sqlite(
     execute_statement: Callable[[str, any], any],
     commit: Callable[[], None],
 ):
-    console.print("\n[bold green]Migrating old file-based stats to the new database format.[/]", end="")
+    console.print(
+        "\n[bold green]Migrating old file-based stats to the new database format.[/]",
+        end="",
+    )
     console.print("\n==========================================================\n\n", end="")
     console.print("This could take a while, depending on the size of your profile.\n\n", end="")
 
@@ -74,10 +77,14 @@ def migrate_file_based_stats_to_sqlite(
                     n += 1
                     if n % 50 == 0:
                         progress.update(
-                            task, advance=1, description=f"[yellow]Importing encounters from `_old.zip`...[/] ({n})"
+                            task,
+                            advance=1,
+                            description=f"[yellow]Importing encounters from `_old.zip`...[/] ({n})",
                         )
                 progress.update(
-                    task, completed=True, description=f"[yellow]Importing encounters from `_old.zip`...[/] ({n})"
+                    task,
+                    completed=True,
+                    description=f"[yellow]Importing encounters from `_old.zip`...[/] ({n})",
                 )
                 progress.stop_task(task)
             if len(list((profile.path / "stats" / "encounters").glob("*.csv"))) > 0:
@@ -99,7 +106,9 @@ def migrate_file_based_stats_to_sqlite(
                             description=f"[yellow]Importing encounters from Phase CSV files...[/] ({n})",
                         )
                 progress.update(
-                    task, completed=True, description=f"[yellow]Importing encounters from Phase CSV files...[/] ({n})"
+                    task,
+                    completed=True,
+                    description=f"[yellow]Importing encounters from Phase CSV files...[/] ({n})",
                 )
                 progress.stop_task(task)
 
@@ -136,7 +145,11 @@ def migrate_file_based_stats_to_sqlite(
                 update_shiny_phase(current_shiny_phase)
                 execute_statement(
                     "UPDATE shiny_phases SET end_time = ?, shiny_encounter_id = ? WHERE shiny_phase_id = ?",
-                    (encounter.encounter_time, encounter.encounter_id, current_shiny_phase.shiny_phase_id),
+                    (
+                        encounter.encounter_time,
+                        encounter.encounter_id,
+                        current_shiny_phase.shiny_phase_id,
+                    ),
                 )
                 current_shiny_phase = None
                 commit()
@@ -240,11 +253,17 @@ def migrate_file_based_stats_to_sqlite(
                     entry["total_lowest_iv_sum"] = stats.get("lowest_iv_sum", 0)
 
                 # Fix phase_highest_sv
-                if "phase_highest_sv" not in entry or entry["phase_highest_sv"] in ("-", None):
+                if "phase_highest_sv" not in entry or entry["phase_highest_sv"] in (
+                    "-",
+                    None,
+                ):
                     entry["phase_highest_sv"] = stats.get("highest_sv", None)
 
                 # Fix phase_lowest_sv
-                if "phase_lowest_sv" not in entry or entry["phase_lowest_sv"] in ("-", None):
+                if "phase_lowest_sv" not in entry or entry["phase_lowest_sv"] in (
+                    "-",
+                    None,
+                ):
                     entry["phase_lowest_sv"] = stats.get("lowest_sv", None)
 
             # Save back totals.json
@@ -288,11 +307,13 @@ def migrate_file_based_stats_to_sqlite(
                             else entry["total_lowest_sv"]
                         ),
                         total_lowest_sv=entry["total_lowest_sv"],
-                        phase_encounters=entry["phase_encounters"] if "phase_encounters" in entry else 0,
-                        phase_highest_iv_sum=entry["phase_highest_iv_sum"] if "phase_highest_iv_sum" in entry else None,
-                        phase_lowest_iv_sum=entry["phase_lowest_iv_sum"] if "phase_lowest_iv_sum" in entry else None,
-                        phase_highest_sv=entry["phase_highest_sv"] if "phase_highest_sv" in entry else None,
-                        phase_lowest_sv=entry["phase_lowest_sv"] if "phase_lowest_sv" in entry else None,
+                        phase_encounters=(entry["phase_encounters"] if "phase_encounters" in entry else 0),
+                        phase_highest_iv_sum=(
+                            entry["phase_highest_iv_sum"] if "phase_highest_iv_sum" in entry else None
+                        ),
+                        phase_lowest_iv_sum=(entry["phase_lowest_iv_sum"] if "phase_lowest_iv_sum" in entry else None),
+                        phase_highest_sv=(entry["phase_highest_sv"] if "phase_highest_sv" in entry else None),
+                        phase_lowest_sv=(entry["phase_lowest_sv"] if "phase_lowest_sv" in entry else None),
                         last_encounter_time=last_encounter_time,
                     )
                 else:
@@ -349,7 +370,11 @@ def migrate_file_based_stats_to_sqlite(
                 execute_statement(
                     "UPDATE shiny_phases SET start_time = ?, end_time = ?, encounters = ?, snapshot_total_encounters = ?, snapshot_total_shiny_encounters = ?, snapshot_species_encounters = ?, snapshot_species_shiny_encounters = ? WHERE shiny_phase_id = ?",
                     (
-                        min(encounter_time, shiny_phases[0].start_time, previous_end_time),
+                        min(
+                            encounter_time,
+                            shiny_phases[0].start_time,
+                            previous_end_time,
+                        ),
                         encounter_time,
                         entry["snapshot_stats"]["phase_encounters"],
                         entry["snapshot_stats"]["total_encounters"],
@@ -424,7 +449,12 @@ def _get_encounters_from_old_zip(profile: Profile):
         list_of_files: list[tuple[str, datetime]] = []
         for file_entry in zip_file.infolist():
             if not file_entry.is_dir():
-                list_of_files.append((file_entry.filename, datetime(*file_entry.date_time, tzinfo=timezone)))
+                list_of_files.append(
+                    (
+                        file_entry.filename,
+                        datetime(*file_entry.date_time, tzinfo=timezone),
+                    )
+                )
 
         list_of_files.sort(key=lambda e: e[1])
 
@@ -442,7 +472,7 @@ def _get_encounters_from_old_zip(profile: Profile):
                 coordinates=None,
                 bot_mode="Imported from Old ZIP",
                 type=None,
-                outcome=BattleOutcome.Caught if pokemon.is_shiny else BattleOutcome.RanAway,
+                outcome=(BattleOutcome.Caught if pokemon.is_shiny else BattleOutcome.RanAway),
                 pokemon=pokemon,
             )
 
@@ -615,7 +645,7 @@ def _get_encounters_from_phase_csvs(profile: Profile):
                     coordinates=None,
                     bot_mode=f"Imported from Phase CSV ({bot_backend})",
                     type=None,
-                    outcome=BattleOutcome.Caught if pokemon.is_shiny else BattleOutcome.RanAway,
+                    outcome=(BattleOutcome.Caught if pokemon.is_shiny else BattleOutcome.RanAway),
                     pokemon=pokemon,
                 )
 
@@ -956,7 +986,7 @@ def _map_bizhawk_csv_row_to_pokemon_data(pkm: dict) -> Pokemon | None:
         defence=int(pkm["defenseIV"]) if int(pkm["defenseIV"]) <= 31 else 16,
         speed=int(pkm["speedIV"]) if int(pkm["speedIV"]) <= 31 else 16,
         special_attack=int(pkm["spAttackIV"]) if int(pkm["spAttackIV"]) <= 31 else 16,
-        special_defence=int(pkm["spDefenseIV"]) if int(pkm["spDefenseIV"]) <= 31 else 16,
+        special_defence=(int(pkm["spDefenseIV"]) if int(pkm["spDefenseIV"]) <= 31 else 16),
     )
 
     nature = get_nature_by_index(personality_value % 25)

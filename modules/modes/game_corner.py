@@ -10,7 +10,12 @@ from modules.pokemon_party import get_party, get_party_size
 from modules.runtime import get_sprites_path
 from modules.save_data import get_save_data
 from modules.tasks import task_is_active
-from ._asserts import SavedMapLocation, assert_save_game_exists, assert_saved_on_map, assert_empty_slot_in_party
+from ._asserts import (
+    SavedMapLocation,
+    assert_save_game_exists,
+    assert_saved_on_map,
+    assert_empty_slot_in_party,
+)
 from ._interface import BotMode, BotModeError
 from .util import (
     soft_reset,
@@ -41,9 +46,21 @@ class GameCornerMode(BotMode):
         assert_save_game_exists("There is no saved game. Cannot soft reset.")
 
         if context.rom.is_fr:
-            choices = [("Abra", 180), ("Clefairy", 500), ("Dratini", 2800), ("Scyther", 5500), ("Porygon", 9999)]
+            choices = [
+                ("Abra", 180),
+                ("Clefairy", 500),
+                ("Dratini", 2800),
+                ("Scyther", 5500),
+                ("Porygon", 9999),
+            ]
         elif context.rom.is_lg:
-            choices = [("Abra", 120), ("Clefairy", 750), ("Pinsir", 2500), ("Dratini", 4600), ("Porygon", 6500)]
+            choices = [
+                ("Abra", 120),
+                ("Clefairy", 750),
+                ("Pinsir", 2500),
+                ("Dratini", 4600),
+                ("Porygon", 6500),
+            ]
         else:
             raise BotModeError("This mode is not supported on RSE.")
 

@@ -154,7 +154,10 @@ class EmulatorScreen:
         self.window.columnconfigure(1, weight=1)
 
         self.canvas.config(width=self.width * self._scale, height=self.height * self._scale)
-        self.center_of_canvas = (self._scale * self.width // 2, self._scale * self.height // 2)
+        self.center_of_canvas = (
+            self._scale * self.width // 2,
+            self._scale * self.height // 2,
+        )
 
         if not context.video:
             self._generate_placeholder_image()
@@ -192,12 +195,23 @@ class EmulatorScreen:
                     update_back_button()
 
             self._stepping_button = Button(
-                self.window, text="⮞", padx=8, background="red", foreground="white", command=next_step, cursor="hand2"
+                self.window,
+                text="⮞",
+                padx=8,
+                background="red",
+                foreground="white",
+                command=next_step,
+                cursor="hand2",
             )
             self._stepping_button.place(x=32, y=0)
 
             self._back_button = Button(
-                self.window, text="⮜", padx=8, foreground="white", command=previous_step, cursor="hand2"
+                self.window,
+                text="⮜",
+                padx=8,
+                foreground="white",
+                command=previous_step,
+                cursor="hand2",
             )
             self._back_button.place(x=0, y=0)
             update_back_button()

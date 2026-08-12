@@ -63,9 +63,7 @@ def _encode(value: Any) -> Any:
             "value": _encode(value.value),
         }
     if is_dataclass(value):
-        return {
-            field.name: _encode(getattr(value, field.name)) for field in fields(value)
-        }
+        return {field.name: _encode(getattr(value, field.name)) for field in fields(value)}
     if isinstance(value, tuple):
         return [_encode(item) for item in value]
     if isinstance(value, list):
@@ -137,18 +135,12 @@ class JsonEventStore:
     def _load(self) -> None:
         try:
             document = json.loads(self.path.read_text(encoding="utf-8"))
-            if document.get("schema_version") != SCHEMA_VERSION or not isinstance(
-                document.get("events"), list
-            ):
-                raise EventStoreCorruptionError(
-                    "Unsupported or missing event-store schema version"
-                )
+            if document.get("schema_version") != SCHEMA_VERSION or not isinstance(document.get("events"), list):
+                raise EventStoreCorruptionError("Unsupported or missing event-store schema version")
             records = document["events"]
             for record in records:
                 self._validate_record(record)
-            if [record["sequence"] for record in records] != list(
-                range(1, len(records) + 1)
-            ):
+            if [record["sequence"] for record in records] != list(range(1, len(records) + 1)):
                 raise EventStoreCorruptionError("Event sequence is not contiguous")
             self._records = records
             self._ids = {record["event_id"] for record in records}
@@ -161,20 +153,14 @@ class JsonEventStore:
             TypeError,
             ValueError,
         ) as error:
-            raise EventStoreCorruptionError(
-                f"Could not load event store: {self.path}"
-            ) from error
+            raise EventStoreCorruptionError(f"Could not load event store: {self.path}") from error
 
     @staticmethod
     def _validate_record(record: Any) -> None:
         required = {"event_id", "session_id", "sequence", "frame", "type", "payload"}
         if not isinstance(record, dict) or set(record) != required:
             raise EventStoreCorruptionError("Malformed event record")
-        if (
-            not isinstance(record["sequence"], int)
-            or record["sequence"] < 1
-            or not isinstance(record["frame"], int)
-        ):
+        if not isinstance(record["sequence"], int) or record["sequence"] < 1 or not isinstance(record["frame"], int):
             raise EventStoreCorruptionError("Malformed event sequence or frame")
         deserialize_event({"type": record["type"], "payload": record["payload"]})
 
@@ -183,9 +169,7 @@ class JsonEventStore:
         session = session_id or self.session_id
         serialized = serialize_event(event)
         canonical = json.dumps(serialized, sort_keys=True, separators=(",", ":"))
-        event_id = hashlib.sha256(
-            f"{session}\0{event.frame}\0{canonical}".encode()
-        ).hexdigest()
+        event_id = hashlib.sha256(f"{session}\0{event.frame}\0{canonical}".encode()).hexdigest()
         if event_id in self._ids:
             return False
         record = {
@@ -201,19 +185,14 @@ class JsonEventStore:
         self.flush()
         return True
 
-    def append_many(
-        self, events: Iterable[Event], session_id: str | None = None
-    ) -> int:
+    def append_many(self, events: Iterable[Event], session_id: str | None = None) -> int:
         count = 0
         for event in events:
             count += self.append(event, session_id)
         return count
 
     def iter_events(self) -> tuple[Event, ...]:
-        return tuple(
-            deserialize_event({"type": r["type"], "payload": r["payload"]})
-            for r in self._records
-        )
+        return tuple(deserialize_event({"type": r["type"], "payload": r["payload"]}) for r in self._records)
 
     def iter_records(self) -> tuple[dict[str, Any], ...]:
         return tuple(dict(record) for record in self._records)
@@ -247,9 +226,7 @@ class JsonEventStore:
             except OSError:
                 pass
         except OSError as error:
-            raise EventStoreError(
-                f"Could not atomically write event store: {self.path}"
-            ) from error
+            raise EventStoreError(f"Could not atomically write event store: {self.path}") from error
         finally:
             if temporary.exists():
                 temporary.unlink(missing_ok=True)

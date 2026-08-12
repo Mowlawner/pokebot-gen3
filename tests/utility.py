@@ -432,7 +432,9 @@ class BotTestCase(unittest.TestCase):
         from modules.context import context
 
         self.assertEqual(
-            "Manual", context.bot_mode, f"Expected bot to be in Manual mode, but it is in {context.bot_mode} mode."
+            "Manual",
+            context.bot_mode,
+            f"Expected bot to be in Manual mode, but it is in {context.bot_mode} mode.",
         )
 
     def assertIsNotInManualMode(self) -> None:

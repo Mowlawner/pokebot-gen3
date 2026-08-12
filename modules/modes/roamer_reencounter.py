@@ -93,7 +93,10 @@ class RoamerReencounterMode(BotMode):
             yield from register_key_item(mach_bike)
         using_bike = get_player().registered_item is mach_bike
 
-        has_good_ability = get_party().non_eggs[0].ability.name in ("Illuminate", "Arena Trap")
+        has_good_ability = get_party().non_eggs[0].ability.name in (
+            "Illuminate",
+            "Arena Trap",
+        )
 
         if not repel_is_active():
             yield from apply_repel()
@@ -141,7 +144,11 @@ class RoamerReencounterMode(BotMode):
                 # player's path. That's why in these games, we instead go into the Pokémon Center
                 # to achieve the required map change.
                 destination_coordinates = (10, 12) if context.rom.is_emerald else (19, 19)
-                yield from navigate_to(MapRSE.SLATEPORT_CITY, destination_coordinates, avoid_encounters=False)
+                yield from navigate_to(
+                    MapRSE.SLATEPORT_CITY,
+                    destination_coordinates,
+                    avoid_encounters=False,
+                )
 
             elif is_frlg and player_map is MapFRLG.PALLET_TOWN_RIVALS_HOUSE:
                 if player_coordinates == (4, 8):

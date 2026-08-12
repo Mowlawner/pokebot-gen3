@@ -115,11 +115,15 @@ class TurnAction(Enum):
         return TurnAction.UseMove, move_index
 
     @staticmethod
-    def use_move_against_left_side_opponent(move_index: int) -> tuple["TurnAction", int]:
+    def use_move_against_left_side_opponent(
+        move_index: int,
+    ) -> tuple["TurnAction", int]:
         return TurnAction.use_move(move_index)
 
     @staticmethod
-    def use_move_against_right_side_opponent(move_index: int) -> tuple["TurnAction", int]:
+    def use_move_against_right_side_opponent(
+        move_index: int,
+    ) -> tuple["TurnAction", int]:
         return TurnAction.UseMoveAgainstRightSideOpponent, move_index
 
     @staticmethod

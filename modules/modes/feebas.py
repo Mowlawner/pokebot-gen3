@@ -43,20 +43,13 @@ class FishingSpotList:
         self._map_height: int = map_height
 
     def __contains__(self, item):
-        if (
-            isinstance(item, tuple)
-            and len(item) == 2
-            and isinstance(item[0], int)
-            and isinstance(item[1], int)
-        ):
+        if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], int) and isinstance(item[1], int):
             return self._index(item) in self._fishing_spots
         else:
             return NotImplemented
 
     def add(self, coordinates: tuple[int, int]):
-        self._fishing_spots[self._index(coordinates)] = FishingSpot(
-            self._next_id, coordinates, 0
-        )
+        self._fishing_spots[self._index(coordinates)] = FishingSpot(self._next_id, coordinates, 0)
         self._next_id += 1
 
     def get_by_coordinates(self, coordinates: tuple[int, int]) -> FishingSpot | None:
@@ -68,10 +61,7 @@ class FishingSpotList:
 
     def get_next_untested(self) -> FishingSpot | None:
         for index in self._fishing_spots:
-            if (
-                self._fishing_spots[index].fishing_attempts
-                < maximum_number_of_fishing_attempts_per_tile
-            ):
+            if self._fishing_spots[index].fishing_attempts < maximum_number_of_fishing_attempts_per_tile:
                 return self._fishing_spots[index]
         return None
 
@@ -87,9 +77,7 @@ class FishingSpotList:
     def reset(self, can_use_waterfall: bool) -> None:
         for index in self._fishing_spots:
             if not can_use_waterfall and self._fishing_spots[index].coordinates[1] < 28:
-                self._fishing_spots[
-                    index
-                ].fishing_attempts = maximum_number_of_fishing_attempts_per_tile
+                self._fishing_spots[index].fishing_attempts = maximum_number_of_fishing_attempts_per_tile
             else:
                 self._fishing_spots[index].fishing_attempts = 0
 
@@ -99,12 +87,7 @@ class FishingSpotList:
 
 def _tile_is_accessible(x: int, y: int) -> bool:
     tile = get_map_data(MapRSE.ROUTE119, (x, y))
-    return (
-        tile.is_surfable
-        and not tile.collision
-        and tile.tile_type != "Waterfall"
-        and tile.has_encounters
-    )
+    return tile.is_surfable and not tile.collision and tile.tile_type != "Waterfall" and tile.has_encounters
 
 
 def _get_fishing_spots() -> FishingSpotList:
@@ -164,28 +147,19 @@ class FeebasMode(BotMode):
         if encounter.type.is_fishing:
             # If we see more than 20 non-Feebas encounters in a row, we assume that
             # something has gone wrong and start the search again.
-            if (
-                self._found_feebas is not None
-                and self._fishing_attempts_without_seeing_feebas > 20
-            ):
+            if self._found_feebas is not None and self._fishing_attempts_without_seeing_feebas > 20:
                 self._found_feebas = None
                 self._fishing_spots.reset(self._can_use_waterfall)
                 if encounter.coordinates:
-                    player_location = (
-                        get_player_avatar().map_location_in_front.local_position
-                    )
-                    self._fishing_spots.mark_as_tested_up_to_coordinates(
-                        player_location
-                    )
+                    player_location = get_player_avatar().map_location_in_front.local_position
+                    self._fishing_spots.mark_as_tested_up_to_coordinates(player_location)
 
             if encounter.pokemon.species.name == "Feebas":
                 self._found_feebas = get_clock_time()
                 self._fishing_attempts_without_seeing_feebas = 0
             else:
                 self._fishing_attempts_without_seeing_feebas += 1
-                spot = self._fishing_spots.get_by_coordinates(
-                    get_player_avatar().map_location_in_front.local_position
-                )
+                spot = self._fishing_spots.get_by_coordinates(get_player_avatar().map_location_in_front.local_position)
                 if spot is not None:
                     spot.fishing_attempts += 1
 
@@ -201,9 +175,7 @@ class FeebasMode(BotMode):
         assert_boxes_or_party_can_fit_pokemon()
 
         if not get_player_avatar().flags.Surfing:
-            raise BotModeError(
-                "Player is not surfing, only start this mode while surfing in any water at Route 119."
-            )
+            raise BotModeError("Player is not surfing, only start this mode while surfing in any water at Route 119.")
 
         if context.rom.is_emerald and get_party()[0].ability.name not in [
             "Sticky Hold",
@@ -213,13 +185,8 @@ class FeebasMode(BotMode):
 
         item_bag = get_item_bag()
         if item_bag.quantity_of(get_item_by_name("Old Rod")) == 0:
-            context.message = (
-                "Warning: It is recommended that you get the Old Rod to fish."
-            )
-        elif (
-            get_player().registered_item is None
-            or get_player().registered_item.name != "Old Rod"
-        ):
+            context.message = "Warning: It is recommended that you get the Old Rod to fish."
+        elif get_player().registered_item is None or get_player().registered_item.name != "Old Rod":
             yield from register_key_item(get_item_by_name("Old Rod"))
 
         if (
@@ -227,13 +194,9 @@ class FeebasMode(BotMode):
             and item_bag.quantity_of(get_item_by_name("Good Rod")) == 0
             and get_item_by_name("Super Rod") == 0
         ):
-            raise BotModeError(
-                "Error: You cannot use this mode without having a fishing rod."
-            )
+            raise BotModeError("Error: You cannot use this mode without having a fishing rod.")
 
-        self._can_use_waterfall = get_event_flag(
-            "BADGE08_GET"
-        ) and get_party().has_pokemon_with_move("Waterfall")
+        self._can_use_waterfall = get_event_flag("BADGE08_GET") and get_party().has_pokemon_with_move("Waterfall")
         if not self._can_use_waterfall:
             if not get_event_flag("BADGE08_GET"):
                 context.message = "Warning: You do not have the Rain Badge, so you cannot use Waterfall. There will be some water tiles that we cannot reach."
@@ -271,9 +234,7 @@ class FeebasMode(BotMode):
 
                 if target_spot.coordinates != player_location:
                     # Surf to the closest tile next to the target.
-                    target_tile, direction = _get_nearest_accessible_neighbour(
-                        target_spot.coordinates, player_location
-                    )
+                    target_tile, direction = _get_nearest_accessible_neighbour(target_spot.coordinates, player_location)
                     yield from navigate_to(MapRSE.ROUTE119, target_tile)
                     yield from ensure_facing_direction(direction)
 

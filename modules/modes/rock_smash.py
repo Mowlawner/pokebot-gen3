@@ -11,7 +11,13 @@ from modules.items import get_item_bag, get_item_by_name
 from modules.map_data import MapRSE, is_safari_map
 from modules.map_path import calculate_path
 from modules.memory import get_event_flag, read_symbol, unpack_uint16
-from modules.player import TileTransitionState, get_player, get_player_avatar, AvatarFlags, get_player_location
+from modules.player import (
+    TileTransitionState,
+    get_player,
+    get_player_avatar,
+    AvatarFlags,
+    get_player_location,
+)
 from modules.runtime import get_sprites_path
 from modules.safari_strategy import get_safari_balls_left
 from modules.save_data import get_save_data
@@ -147,14 +153,15 @@ class RockSmashMode(BotMode):
 
         assert_boxes_or_party_can_fit_pokemon()
         assert_has_pokemon_with_any_move(
-            ["Rock Smash"], "None of your party Pokémon know the move Rock Smash. Please teach it to someone."
+            ["Rock Smash"],
+            "None of your party Pokémon know the move Rock Smash. Please teach it to someone.",
         )
 
         if get_player_avatar().map_group_and_number in (
-                MapRSE.ROUTE121_SAFARI_ZONE_ENTRANCE,
-                MapRSE.SAFARI_ZONE_SOUTH,
-                MapRSE.SAFARI_ZONE_NORTHEAST,
-                MapRSE.SAFARI_ZONE_SOUTHEAST,
+            MapRSE.ROUTE121_SAFARI_ZONE_ENTRANCE,
+            MapRSE.SAFARI_ZONE_SOUTH,
+            MapRSE.SAFARI_ZONE_NORTHEAST,
+            MapRSE.SAFARI_ZONE_SOUTHEAST,
         ):
             assert_save_game_exists("There is no saved game. Cannot soft reset.")
             assert_boxes_or_party_can_fit_pokemon(check_in_saved_game=True)
@@ -163,7 +170,8 @@ class RockSmashMode(BotMode):
                 "In order to rock smash for Shuckle you should save in the entrance building to the Safari Zone.",
             )
             assert_item_exists_in_bag(
-                "Pokéblock Case", error_message="You need to own the Pokéblock Case in order to enter the Safari Zone."
+                "Pokéblock Case",
+                error_message="You need to own the Pokéblock Case in order to enter the Safari Zone.",
             )
             assert_item_exists_in_bag(
                 "Pokéblock Case",
@@ -248,13 +256,13 @@ class RockSmashMode(BotMode):
 
                     def is_near_entrance_door():
                         return (
-                                get_player_avatar().map_group_and_number == MapRSE.SAFARI_ZONE_SOUTH
-                                and get_player_avatar().local_coordinates in ((32, 33), (32, 34))
+                            get_player_avatar().map_group_and_number == MapRSE.SAFARI_ZONE_SOUTH
+                            and get_player_avatar().local_coordinates in ((32, 33), (32, 34))
                         )
 
                     if is_near_entrance_door() or (
-                            get_player_avatar().map_group_and_number == MapRSE.SAFARI_ZONE_SOUTH
-                            and get_global_script_context().is_active
+                        get_player_avatar().map_group_and_number == MapRSE.SAFARI_ZONE_SOUTH
+                        and get_global_script_context().is_active
                     ):
                         while is_near_entrance_door() or get_global_script_context().is_active:
                             yield
@@ -432,8 +440,8 @@ class RockSmashMode(BotMode):
             "Route121_SafariZoneEntrance_EventScript_TryEnterSafariZone", "A"
         )
         while (
-                get_player_avatar().local_coordinates != (32, 35)
-                or get_player_avatar().tile_transition_state != TileTransitionState.NOT_MOVING
+            get_player_avatar().local_coordinates != (32, 35)
+            or get_player_avatar().tile_transition_state != TileTransitionState.NOT_MOVING
         ):
             yield
 

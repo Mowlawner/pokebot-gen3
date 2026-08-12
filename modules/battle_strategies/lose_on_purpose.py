@@ -54,7 +54,13 @@ def _get_weakest_move_against(battle_state: "BattleState", pokemon: "BattlePokem
         if move.effect == "ABSORB":
             move_power *= 1.5
 
-        if move.effect in ("SOFTBOILED", "MOONLIGHT", "MORNING_SUN", "SYNTHESIS", "RECOVER"):
+        if move.effect in (
+            "SOFTBOILED",
+            "MOONLIGHT",
+            "MORNING_SUN",
+            "SYNTHESIS",
+            "RECOVER",
+        ):
             move_power = 1500
         elif move.effect in "REST":
             # Rest is the preferable healing move because it at least puts us to sleep.
@@ -65,7 +71,12 @@ def _get_weakest_move_against(battle_state: "BattleState", pokemon: "BattlePokem
             move_power = 1470
         elif (
             pokemon.status_permanent
-            in (StatusCondition.Poison, StatusCondition.BadPoison, StatusCondition.Burn, StatusCondition.Paralysis)
+            in (
+                StatusCondition.Poison,
+                StatusCondition.BadPoison,
+                StatusCondition.Burn,
+                StatusCondition.Paralysis,
+            )
             and move.effect == "REFRESH"
         ):
             move_power = 1470
@@ -75,11 +86,22 @@ def _get_weakest_move_against(battle_state: "BattleState", pokemon: "BattlePokem
             move_power += 25
 
         # Moves that would increase our own Defence.
-        if move.effect in ("DEFENSE_CURL", "DEFENSE_UP", "DEFENSE_UP_2", "DEFENSE_UP_HIT", "SPECIES_DEFENSE_UP_2"):
+        if move.effect in (
+            "DEFENSE_CURL",
+            "DEFENSE_UP",
+            "DEFENSE_UP_2",
+            "DEFENSE_UP_HIT",
+            "SPECIES_DEFENSE_UP_2",
+        ):
             move_power += 15
 
         # Moves that would decrease the opponent's attack power.
-        if move.effect in ("ATTACK_DOWN", "ATTACK_DOWN_2", "ATTACK_DOWN_HIT", "SPECIAL_ATTACK_DOWN_HIT"):
+        if move.effect in (
+            "ATTACK_DOWN",
+            "ATTACK_DOWN_2",
+            "ATTACK_DOWN_HIT",
+            "SPECIAL_ATTACK_DOWN_HIT",
+        ):
             move_power += 15
 
         # Add bonus for moves that would make US faint
@@ -182,7 +204,9 @@ class LoseOnPurposeBattleStrategy(BattleStrategy):
     def decide_turn(self, battle_state: "BattleState") -> tuple["TurnAction", any]:
         return TurnAction.use_move(
             _get_weakest_move_against(
-                battle_state, battle_state.own_side.active_battler, battle_state.opponent.active_battler
+                battle_state,
+                battle_state.own_side.active_battler,
+                battle_state.opponent.active_battler,
             )
         )
 

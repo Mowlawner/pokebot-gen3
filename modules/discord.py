@@ -52,7 +52,12 @@ def discord_send(message: DiscordMessage) -> None:
 
 
 async def _process_message(message: DiscordMessage) -> None:
-    webhook = DiscordWebhook(url=message.webhook_url, content=message.content, timeout=10, rate_limit_retry=True)
+    webhook = DiscordWebhook(
+        url=message.webhook_url,
+        content=message.content,
+        timeout=10,
+        rate_limit_retry=True,
+    )
 
     # If one of the image files do not yet exist (which can happen as things like the
     # encounter GIF or the TCG cards are generated in a separate thread) delay
@@ -188,7 +193,12 @@ def discord_rich_presence_loop() -> None:
                 details=" | ".join(details),
                 large_image=large_image,
                 start=int(start),
-                buttons=[{"label": "⏬ Download PokéBot Gen3", "url": "https://github.com/40Cakes/pokebot-gen3"}],
+                buttons=[
+                    {
+                        "label": "⏬ Download PokéBot Gen3",
+                        "url": "https://github.com/40Cakes/pokebot-gen3",
+                    }
+                ],
             )
         except Exception as error:
             console.print(f"[yellow]Setting Discord Rich Presence failed:[/] {str(error)}")

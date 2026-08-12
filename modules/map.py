@@ -736,7 +736,13 @@ _map_layout_cache: dict[str, dict[tuple[int, int], bytes]] = {}
 
 
 class MapLocation:
-    def __init__(self, map_header: bytes, map_group: int, map_number: int, local_position: tuple[int, int]):
+    def __init__(
+        self,
+        map_header: bytes,
+        map_group: int,
+        map_number: int,
+        local_position: tuple[int, int],
+    ):
         self._map_header = map_header
         self.map_group = map_group
         self.map_number = map_number
@@ -1465,15 +1471,24 @@ class ObjectEvent:
 
     @property
     def initial_coords(self) -> tuple[int, int]:
-        return unpack_uint16(self._data[0x0C:0x0E]) - 7, unpack_uint16(self._data[0x0E:0x10]) - 7
+        return (
+            unpack_uint16(self._data[0x0C:0x0E]) - 7,
+            unpack_uint16(self._data[0x0E:0x10]) - 7,
+        )
 
     @property
     def current_coords(self) -> tuple[int, int]:
-        return unpack_uint16(self._data[0x10:0x12]) - 7, unpack_uint16(self._data[0x12:0x14]) - 7
+        return (
+            unpack_uint16(self._data[0x10:0x12]) - 7,
+            unpack_uint16(self._data[0x12:0x14]) - 7,
+        )
 
     @property
     def previous_coords(self) -> tuple[int, int]:
-        return unpack_uint16(self._data[0x14:0x16]) - 7, unpack_uint16(self._data[0x16:0x18]) - 7
+        return (
+            unpack_uint16(self._data[0x14:0x16]) - 7,
+            unpack_uint16(self._data[0x16:0x18]) - 7,
+        )
 
     @property
     def facing_direction(self) -> str:
@@ -1618,7 +1633,9 @@ class ObjectEventTemplate:
         return (self._data[10] & 0xF0) >> 4, self._data[10] & 0x0F
 
     @property
-    def trainer_type(self) -> Literal["None", "Normal", "See All Directions", "Buried", "???"]:
+    def trainer_type(
+        self,
+    ) -> Literal["None", "Normal", "See All Directions", "Buried", "???"]:
         match unpack_uint16(self._data[12:14]):
             case 0:
                 return "None"
@@ -1754,7 +1771,8 @@ _map_header_cache: dict[str, dict[tuple[int, int], bytes]] = {}
 
 
 def get_map_data(
-    map_group_and_number: "tuple[int, int] | MapFRLG | MapRSE", local_position: tuple[int, int]
+    map_group_and_number: "tuple[int, int] | MapFRLG | MapRSE",
+    local_position: tuple[int, int],
 ) -> MapLocation:
     global _map_header_cache
     if not isinstance(map_group_and_number, tuple):
@@ -2012,7 +2030,7 @@ class EffectiveWildEncounterList:
     def to_dict(self) -> dict:
         return {
             "repel_level": self.repel_level,
-            "active_ability": self.active_ability.name if self.active_ability is not None else None,
+            "active_ability": (self.active_ability.name if self.active_ability is not None else None),
             "active_items": [item.name for item in self.active_items],
             "regular": self.regular_encounters.to_dict(),
             "effective": {
@@ -2106,7 +2124,10 @@ def _calculate_repel_rate_and_species_map(
 
 
 def _get_ability_repel_rate_and_species_map(
-    encounters: list[WildEncounter], encounter_type: str, lead_pokemon: Pokemon, repel_level: int
+    encounters: list[WildEncounter],
+    encounter_type: str,
+    lead_pokemon: Pokemon,
+    repel_level: int,
 ) -> tuple[float, dict[int, EffectiveWildEncounter]]:
     if (
         lead_pokemon.ability.name in ("Keen Eye", "Intimidate")
@@ -2125,11 +2146,19 @@ def _get_ability_repel_rate_and_species_map(
         new_encounters = list()
         for encounter in encounters:
             new_encounters.append(
-                WildEncounter(encounter.species, encounter.max_level, encounter.max_level, encounter.encounter_rate)
+                WildEncounter(
+                    encounter.species,
+                    encounter.max_level,
+                    encounter.max_level,
+                    encounter.encounter_rate,
+                )
             )
         return _calculate_repel_rate_and_species_map(new_encounters, repel_level)
 
-    elif lead_pokemon.ability.name in ("Static", "Magnet Pull") and encounter_type in ("land", "surf"):
+    elif lead_pokemon.ability.name in ("Static", "Magnet Pull") and encounter_type in (
+        "land",
+        "surf",
+    ):
         # For Static and Magnet Pull, we rewrite the WildEncounter list with just the type we're matching.  The
         # encounter_rate is set to 1, since all new slots are equally weighted, and the helper function will normalize
         # the rates so we don't have to worry about our comparison with the base rates.
@@ -2151,7 +2180,10 @@ def _get_ability_repel_rate_and_species_map(
 
 
 def _calculate_effective_encounters(
-    encounters: list[WildEncounter], encounter_type: str, lead_pokemon: Pokemon, repel_level: int
+    encounters: list[WildEncounter],
+    encounter_type: str,
+    lead_pokemon: Pokemon,
+    repel_level: int,
 ) -> list[EffectiveWildEncounter]:
     # Repels don't work for fishing.
     if encounter_type not in ("land", "surf", "rock_smash"):
@@ -2234,7 +2266,18 @@ def get_effective_encounter_rates_for_current_map() -> EffectiveWildEncounterLis
 
     if wild_encounters is None:
         encounter_list = EffectiveWildEncounterList(
-            map_group, map_number, repel_level, None, [], WildEncounterList.empty(), [], [], [], [], [], []
+            map_group,
+            map_number,
+            repel_level,
+            None,
+            [],
+            WildEncounterList.empty(),
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
         )
     else:
         encounter_affecting_abilities = get_encounter_affecting_abilities()
@@ -2267,16 +2310,25 @@ def get_effective_encounter_rates_for_current_map() -> EffectiveWildEncounterLis
                 wild_encounters.surf_encounters, "surf", lead_pokemon, repel_level
             ),
             rock_smash_encounters=_calculate_effective_encounters(
-                wild_encounters.rock_smash_encounters, "rock_smash", lead_pokemon, repel_level
+                wild_encounters.rock_smash_encounters,
+                "rock_smash",
+                lead_pokemon,
+                repel_level,
             ),
             old_rod_encounters=_calculate_effective_encounters(
                 wild_encounters.old_rod_encounters, "fishing", lead_pokemon, repel_level
             ),
             good_rod_encounters=_calculate_effective_encounters(
-                wild_encounters.good_rod_encounters, "fishing", lead_pokemon, repel_level
+                wild_encounters.good_rod_encounters,
+                "fishing",
+                lead_pokemon,
+                repel_level,
             ),
             super_rod_encounters=_calculate_effective_encounters(
-                wild_encounters.super_rod_encounters, "fishing", lead_pokemon, repel_level
+                wild_encounters.super_rod_encounters,
+                "fishing",
+                lead_pokemon,
+                repel_level,
             ),
         )
 

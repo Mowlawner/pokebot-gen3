@@ -3,12 +3,19 @@ from typing import Generator, Tuple
 
 from modules.battle_state import BattleOutcome
 from modules.context import context
-from modules.gui.multi_select_window import Selection, ask_for_choice_scroll, ask_for_choice
+from modules.gui.multi_select_window import (
+    Selection,
+    ask_for_choice_scroll,
+    ask_for_choice,
+)
 from modules.items import get_item_by_name, get_pokeblocks
 from modules.map_data import MapFRLG, MapRSE, is_safari_map
 from modules.memory import get_event_flag
 from modules.menuing import StartMenuNavigator
-from modules.modes.util.higher_level_actions import unmount_bicycle, put_pokeblock_in_feeder
+from modules.modes.util.higher_level_actions import (
+    unmount_bicycle,
+    put_pokeblock_in_feeder,
+)
 from modules.modes.util.walking import wait_for_player_avatar_to_be_controllable
 from modules.player import get_player, get_player_avatar, TileTransitionState
 from modules.pokemon import get_opponent
@@ -190,13 +197,15 @@ class SafariMode(BotMode):
             yield from wait_for_player_avatar_to_be_controllable()
         else:
             while (
-                    get_player_avatar().local_coordinates != (32, 35)
-                    or get_player_avatar().tile_transition_state != TileTransitionState.NOT_MOVING
+                get_player_avatar().local_coordinates != (32, 35)
+                or get_player_avatar().tile_transition_state != TileTransitionState.NOT_MOVING
             ):
                 yield
 
         yield from self._navigate_and_hunt(
-            safari_pokemon.value.map_location, safari_pokemon.value.tile_location, safari_pokemon.value.mode
+            safari_pokemon.value.map_location,
+            safari_pokemon.value.tile_location,
+            safari_pokemon.value.mode,
         )
 
     def _re_enter_safari_zone(self) -> Generator:
@@ -213,7 +222,10 @@ class SafariMode(BotMode):
         yield from wait_for_player_avatar_to_be_standing_still()
 
     def _navigate_and_hunt(
-            self, target_map: MapFRLG | MapRSE, tile_location: Tuple[int, int], mode: SafariHuntingMode
+        self,
+        target_map: MapFRLG | MapRSE,
+        tile_location: Tuple[int, int],
+        mode: SafariHuntingMode,
     ) -> Generator:
 
         def stop_condition():
@@ -294,7 +306,10 @@ class SafariMode(BotMode):
 
     def _select_pokemon(self, safari_pokemon_list):
         pokemon_choices = [
-            Selection(safari_pokemon.value.species.name, get_regular_sprite(safari_pokemon.value.species))
+            Selection(
+                safari_pokemon.value.species.name,
+                get_regular_sprite(safari_pokemon.value.species),
+            )
             for safari_pokemon in safari_pokemon_list.available_pokemon()
         ]
 
@@ -327,7 +342,10 @@ class SafariMode(BotMode):
     def _select_pokeblock_type(self) -> Generator:
         type_counts = get_pokeblock_type_counts()
         pokeblock_choices = [
-            Selection(f"{type_name} ×{count}", get_sprites_path() / "pokeblocks" / f"{type_name.lower()}.png")
+            Selection(
+                f"{type_name} ×{count}",
+                get_sprites_path() / "pokeblocks" / f"{type_name.lower()}.png",
+            )
             for type_name, count in type_counts
         ]
 

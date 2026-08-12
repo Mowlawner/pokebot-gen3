@@ -21,13 +21,15 @@ class RunAwayStrategy(DefaultBattleStrategy):
             return best_escape_method
         else:
             strongest_move = util.get_strongest_move_against(
-                battle_state.own_side.active_battler, battle_state.opponent.active_battler
+                battle_state.own_side.active_battler,
+                battle_state.opponent.active_battler,
             )
 
             if strongest_move is not None:
                 return TurnAction.use_move(
                     util.get_strongest_move_against(
-                        battle_state.own_side.active_battler, battle_state.opponent.active_battler
+                        battle_state.own_side.active_battler,
+                        battle_state.opponent.active_battler,
                     )
                 )
             else:

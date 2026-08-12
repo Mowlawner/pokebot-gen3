@@ -64,9 +64,7 @@ class BotMode:
         """
         raise NotImplementedError
 
-    def on_battle_started(
-        self, encounter: "EncounterInfo | None"
-    ) -> "BattleAction | BattleStrategy | None":
+    def on_battle_started(self, encounter: "EncounterInfo | None") -> "BattleAction | BattleStrategy | None":
         """
         This is called when a battle starts, i.e. a wild Pokémon is encountered or a trainer
         battle commenced.
@@ -98,9 +96,7 @@ class BotMode:
         """
         pass
 
-    def on_pokemon_evolving_after_battle(
-        self, pokemon: "Pokemon", party_index: int
-    ) -> bool:
+    def on_pokemon_evolving_after_battle(self, pokemon: "Pokemon", party_index: int) -> bool:
         """
         This _might_ be called if a Pokémon evolves after levelling up in a battle.
 
@@ -155,9 +151,7 @@ class BotMode:
         """
         pass
 
-    def on_pokemon_fainted_due_to_poison(
-        self, pokemon: "Pokemon", party_index: int
-    ) -> None:
+    def on_pokemon_fainted_due_to_poison(self, pokemon: "Pokemon", party_index: int) -> None:
         """
         This is called when a Pokémon faints due to poison while walking around the overworld
         (i.e. this will not be called if it happens during a battle.)
@@ -196,9 +190,7 @@ class BotMode:
         """
         return False
 
-    def on_egg_hatched(
-        self, encounter: "EncounterInfo", party_index: int
-    ) -> bool | None:
+    def on_egg_hatched(self, encounter: "EncounterInfo", party_index: int) -> bool | None:
         """
         This is called when an egg is hatching.
 
@@ -233,10 +225,7 @@ class FrameInfo:
     previous_frame: Optional["FrameInfo"]
 
     def game_state_changed(self) -> bool:
-        return (
-            self.previous_frame is None
-            or self.game_state != self.previous_frame.game_state
-        )
+        return self.previous_frame is None or self.game_state != self.previous_frame.game_state
 
     def game_state_changed_to(self, game_state_to_check: "GameState") -> bool:
         return self.game_state_changed() and self.game_state == game_state_to_check

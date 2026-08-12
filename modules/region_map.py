@@ -70,7 +70,7 @@ class FlyDestinationRSE(Enum):
             self.LilycoveCity: "VISITED_LILYCOVE_CITY",
             self.MossdeepCity: "VISITED_MOSSDEEP_CITY",
             self.SootopolisCity: "VISITED_SOOTOPOLIS_CITY",
-            self.PokemonLeague: "LANDMARK_POKEMON_LEAGUE" if context.rom.is_emerald else "SYS_POKEMON_LEAGUE_FLY",
+            self.PokemonLeague: ("LANDMARK_POKEMON_LEAGUE" if context.rom.is_emerald else "SYS_POKEMON_LEAGUE_FLY"),
             self.EverGrandeCity: "VISITED_EVER_GRANDE_CITY",
             self.PacifidlogTown: "VISITED_PACIFIDLOG_TOWN",
         }[self]

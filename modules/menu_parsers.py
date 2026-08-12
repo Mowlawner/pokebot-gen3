@@ -155,7 +155,8 @@ def get_party_menu_cursor_pos(party_length: int) -> dict:
         party_menu["learn_move_state"] = struct.unpack("<h", p_menu[16:18])[0]
     else:
         party_menu["slot_id"] = int.from_bytes(
-            context.emulator.read_bytes(0x0202002F + party_length * 136 + 3, length=1), "little"
+            context.emulator.read_bytes(0x0202002F + party_length * 136 + 3, length=1),
+            "little",
         )
         party_menu["slot_id_2"] = party_menu["slot_id"]
         # 0x0201C00 is the location of `gPartyMenu`
@@ -248,7 +249,8 @@ def get_learning_move_cursor_pos() -> int:
         case "POKEMON EMER":
             return int.from_bytes(
                 context.emulator.read_bytes(
-                    struct.unpack("<I", read_symbol("sMonSummaryScreen"))[0] + 0x40C6, length=1
+                    struct.unpack("<I", read_symbol("sMonSummaryScreen"))[0] + 0x40C6,
+                    length=1,
                 ),
                 "little",
             )

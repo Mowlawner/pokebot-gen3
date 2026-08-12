@@ -113,7 +113,10 @@ class PuzzleSolverMode(BotMode):
             case MapRSE.MIRAGE_TOWER_1F:
                 context.message = "Solving Mirage Tower..."
                 use_repel = True
-                assert_registered_item("Mach Bike", "This mode requires the Mach Bike registered to the Select button.")
+                assert_registered_item(
+                    "Mach Bike",
+                    "This mode requires the Mach Bike registered to the Select button.",
+                )
                 assert_has_pokemon_with_any_move(["Rock Smash"], "This mode requires Pokémon with Rock Smash.")
 
                 def path():
@@ -144,7 +147,10 @@ class PuzzleSolverMode(BotMode):
             case MapRSE.SKY_PILLAR_OUTSIDE:
                 context.message = "Solving Sky Pillar..."
                 use_repel = True
-                assert_registered_item("Mach Bike", "This mode requires the Mach Bike registered to the Select button.")
+                assert_registered_item(
+                    "Mach Bike",
+                    "This mode requires the Mach Bike registered to the Select button.",
+                )
 
                 def path():
                     yield from walk_one_tile("Up")
@@ -179,7 +185,9 @@ class PuzzleSolverMode(BotMode):
                 assert_has_pokemon_with_any_move(["Surf"], "Regi Initial Puzzle requires Pokémon with Surf.")
                 if context.rom.is_emerald:
                     assert_pokemon_in_party_slot(
-                        "Wailord", 0, "Sealed Chamber Puzzle requires Wailord in the first party slot."
+                        "Wailord",
+                        0,
+                        "Sealed Chamber Puzzle requires Wailord in the first party slot.",
                     )
                     assert_pokemon_in_party_slot(
                         "Relicanth",
@@ -188,7 +196,9 @@ class PuzzleSolverMode(BotMode):
                     )
                 if context.rom.is_rs:
                     assert_pokemon_in_party_slot(
-                        "Relicanth", 0, "Sealed Chamber Puzzle requires Relicanth in the first party slot."
+                        "Relicanth",
+                        0,
+                        "Sealed Chamber Puzzle requires Relicanth in the first party slot.",
                     )
                     assert_pokemon_in_party_slot(
                         "Wailord",
@@ -229,7 +239,8 @@ class PuzzleSolverMode(BotMode):
                     context.emulator.press_button("B")
                     if context.rom.is_emerald:
                         assert_has_pokemon_with_any_move(
-                            ["Rock Smash"], "Regirock Puzzle (Emerald) requires Pokémon with Rock Smash."
+                            ["Rock Smash"],
+                            "Regirock Puzzle (Emerald) requires Pokémon with Rock Smash.",
                         )
                         context.message = "Two Left, Two Down, Rock Smash..."
                         yield from follow_path([(6, 21), (6, 23)])
@@ -245,7 +256,8 @@ class PuzzleSolverMode(BotMode):
                             yield from walk_one_tile("Up")
                     if context.rom.is_rs:
                         assert_has_pokemon_with_any_move(
-                            ["Strength"], "Regirock Puzzle (Ruby/Sapphire) requires Pokémon with Strength."
+                            ["Strength"],
+                            "Regirock Puzzle (Ruby/Sapphire) requires Pokémon with Strength.",
                         )
                         context.message = "Two Right, Two Down, Strength..."
                         yield from follow_path([(10, 21), (10, 23)])
@@ -321,7 +333,8 @@ class PuzzleSolverMode(BotMode):
                     context.emulator.press_button("B")
                     if context.rom.is_emerald:
                         assert_has_pokemon_with_any_move(
-                            ["Flash"], "Registeel Puzzle (Emerald) requires Pokémon with Flash."
+                            ["Flash"],
+                            "Registeel Puzzle (Emerald) requires Pokémon with Flash.",
                         )
                         context.message = "Using Flash..."
                         yield from navigate_to(MapRSE.ANCIENT_TOMB, (8, 25))
@@ -337,7 +350,8 @@ class PuzzleSolverMode(BotMode):
 
                     if context.rom.is_rs:
                         assert_has_pokemon_with_any_move(
-                            ["Fly"], "Registeel Puzzle (Ruby/Sapphire) requires Pokémon with Fly."
+                            ["Fly"],
+                            "Registeel Puzzle (Ruby/Sapphire) requires Pokémon with Fly.",
                         )
                         yield from navigate_to(MapRSE.ANCIENT_TOMB, (8, 25))
                         yield from use_field_move("Fly")
@@ -356,9 +370,13 @@ class PuzzleSolverMode(BotMode):
             case MapRSE.SEAFLOOR_CAVERN_ENTRANCE:
                 context.message = "Solving Seafloor Cavern Puzzle..."
                 use_repel = True
-                assert_has_pokemon_with_any_move(["Strength"], "Seafloor Cavern Puzzle requires Pokémon with Strength.")
                 assert_has_pokemon_with_any_move(
-                    ["Rock Smash"], "Seafloor Cavern Puzzle requires Pokémon with Rock Smash."
+                    ["Strength"],
+                    "Seafloor Cavern Puzzle requires Pokémon with Strength.",
+                )
+                assert_has_pokemon_with_any_move(
+                    ["Rock Smash"],
+                    "Seafloor Cavern Puzzle requires Pokémon with Rock Smash.",
                 )
                 assert_has_pokemon_with_any_move(["Surf"], "Seafloor Cavern Puzzle requires Pokémon with Surf.")
 
@@ -590,13 +608,14 @@ class PuzzleSolverMode(BotMode):
                     yield from navigate_to(MapFRLG.SEVEN_ISLAND_SEVAULT_CANYON_TANOBY_KEY, (5, 11))
                     yield from walk_one_tile("Up")
                     while (
-                            "SevenIsland_SevaultCanyon_TanobyKey_EventScript_PuzzleSolved"
-                            not in get_global_script_context().stack
+                        "SevenIsland_SevaultCanyon_TanobyKey_EventScript_PuzzleSolved"
+                        not in get_global_script_context().stack
                     ):
                         context.emulator.press_button("Up")
                         yield
                     yield from wait_for_script_to_start_and_finish(
-                        "SevenIsland_SevaultCanyon_TanobyKey_EventScript_PuzzleSolved", "B"
+                        "SevenIsland_SevaultCanyon_TanobyKey_EventScript_PuzzleSolved",
+                        "B",
                     )
                     if get_event_flag("SYS_UNLOCKED_TANOBY_RUINS"):
                         context.message = "Tanoby Key puzzle complete!"
@@ -610,7 +629,10 @@ class PuzzleSolverMode(BotMode):
             case MapRSE.ROUTE113_GLASS_WORKSHOP:
                 context.message = "Collecting ashes..."
                 use_repel = True
-                assert_item_exists_in_bag("Soot Sack", "This mode requires the Soot Sack to have been obtained.")
+                assert_item_exists_in_bag(
+                    "Soot Sack",
+                    "This mode requires the Soot Sack to have been obtained.",
+                )
 
                 def path():
                     # glass workshop exit

@@ -5,9 +5,26 @@ from modules.battle_move_replacing import handle_move_replacement_dialogue
 from modules.battle_strategies import DefaultBattleStrategy, BattleStrategy
 from modules.context import context
 from modules.debug import debug
-from modules.items import Item, ItemPocket, get_item_bag, get_item_by_name, get_item_by_move_id
-from modules.memory import GameState, get_event_flag, get_game_state, read_symbol, unpack_uint16, get_event_var
-from modules.menuing import StartMenuNavigator, scroll_to_item_in_bag as real_scroll_to_item, is_fade_active
+from modules.items import (
+    Item,
+    ItemPocket,
+    get_item_bag,
+    get_item_by_name,
+    get_item_by_move_id,
+)
+from modules.memory import (
+    GameState,
+    get_event_flag,
+    get_game_state,
+    read_symbol,
+    unpack_uint16,
+    get_event_var,
+)
+from modules.menuing import (
+    StartMenuNavigator,
+    scroll_to_item_in_bag as real_scroll_to_item,
+    is_fade_active,
+)
 from modules.modes._interface import BotModeError
 from modules.player import get_player
 from modules.pokemon import LearnedMove

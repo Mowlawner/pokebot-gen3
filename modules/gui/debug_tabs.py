@@ -55,7 +55,12 @@ from modules.memory import (
     GameState,
 )
 from modules.menuing import is_fade_active
-from modules.player import get_player, get_player_avatar, AvatarFlags, TileTransitionState
+from modules.player import (
+    get_player,
+    get_player_avatar,
+    AvatarFlags,
+    TileTransitionState,
+)
 from modules.pokedex import get_pokedex
 from modules.pokemon import get_species_by_index
 from modules.pokemon_party import get_party
@@ -96,7 +101,11 @@ class FancyTreeview:
 
         self._items = {}
         self._tv = ttk.Treeview(
-            treeview_scrollbar_combo, columns="value", show="tree headings", selectmode="browse", height=height
+            treeview_scrollbar_combo,
+            columns="value",
+            show="tree headings",
+            selectmode="browse",
+            height=height,
         )
 
         self._tv.column("#0", width=220)
@@ -113,7 +122,8 @@ class FancyTreeview:
         self._context_menu.add_command(label="Copy Value", command=self._handle_copy)
         for action in additional_context_actions:
             self._context_menu.add_command(
-                label=action, command=lambda a=action: self._handle_action(additional_context_actions[a])
+                label=action,
+                command=lambda a=action: self._handle_action(additional_context_actions[a]),
             )
 
         self._tv.bind("<Button-3>", self._handle_right_click)
@@ -123,10 +133,16 @@ class FancyTreeview:
         self._tv.bind("<Right>", lambda _: root.focus_set())
 
         if on_highlight is not None:
-            self._tv.bind("<ButtonRelease-1>", lambda _: on_highlight(self._tv.item(self._tv.focus())["text"]))
+            self._tv.bind(
+                "<ButtonRelease-1>",
+                lambda _: on_highlight(self._tv.item(self._tv.focus())["text"]),
+            )
 
         if on_double_click is not None:
-            self._tv.bind("<Double-Button-1>", lambda _: on_double_click(self._tv.item(self._tv.focus())["text"]))
+            self._tv.bind(
+                "<Double-Button-1>",
+                lambda _: on_double_click(self._tv.item(self._tv.focus())["text"]),
+            )
 
     def update_data(self, data: dict) -> None:
         found_items = self._update_dict(data, "", "")
@@ -149,7 +165,12 @@ class FancyTreeview:
                     item = self._items[item_key]
                     self._tv.item(item, values=(data[key].get("__value", ""),))
                 else:
-                    item = self._tv.insert(parent, tkinter.END, text=key, values=(data[key].get("__value", ""),))
+                    item = self._tv.insert(
+                        parent,
+                        tkinter.END,
+                        text=key,
+                        values=(data[key].get("__value", ""),),
+                    )
                     self._items[item_key] = item
                 found_items.append(item_key)
                 found_items.extend(self._update_dict(data[key], f"{key_prefix}{key}.", item))
@@ -267,7 +288,9 @@ class MapViewer:
         map_width, map_height = tiles[0].map_size
 
         image = Image.new(
-            "RGB", (map_width * MapViewer.TILE_SIZE, map_height * MapViewer.TILE_SIZE), color=MapViewer.NORMAL
+            "RGB",
+            (map_width * MapViewer.TILE_SIZE, map_height * MapViewer.TILE_SIZE),
+            color=MapViewer.NORMAL,
         )
         image_draw = ImageDraw.Draw(image)
         for y in range(map_height):
@@ -529,7 +552,11 @@ class SymbolsTab(DebugTab):
         tv_frame.grid(row=1, column=0, sticky="NWSE")
 
         tv = ttk.Treeview(
-            tv_frame, columns=("name", "address", "length"), show="headings", selectmode="browse", height=22
+            tv_frame,
+            columns=("name", "address", "length"),
+            show="headings",
+            selectmode="browse",
+            height=22,
         )
 
         tv.column("name", width=300)
@@ -556,7 +583,12 @@ class SymbolsTab(DebugTab):
                 continue
 
             if symbol not in items:
-                items[symbol] = tv.insert("", tkinter.END, text=symbol, values=(symbol, hex(address), hex(length)))
+                items[symbol] = tv.insert(
+                    "",
+                    tkinter.END,
+                    text=symbol,
+                    values=(symbol, hex(address), hex(length)),
+                )
 
         def handle_input(event=None):
             search_term = search_input.get().strip().lower()
@@ -722,7 +754,7 @@ class PlayerTab(DebugTab):
             "Secret ID": player.secret_id,
             "Money": f"${player.money:,}",
             "Coins": f"{player.coins:,}",
-            "Registered Item": player.registered_item.name if player.registered_item is not None else "None",
+            "Registered Item": (player.registered_item.name if player.registered_item is not None else "None"),
             "Map Group and Number": player_avatar.map_group_and_number,
             "Local Coordinates": player_avatar.local_coordinates,
             "Flags": flags,
@@ -933,7 +965,10 @@ class EventFlagsTab(DebugTab):
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
 
-        context_actions = {"Copy Name": self._copy_name, "Toggle Flag": self._toggle_flag}
+        context_actions = {
+            "Copy Name": self._copy_name,
+            "Toggle Flag": self._toggle_flag,
+        }
 
         self._search_phrase = ""
         self._search_field = ttk.Entry(frame)
@@ -987,7 +1022,10 @@ class EventVarsTab(DebugTab):
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
 
-        context_actions = {"Copy Name": self._copy_name, "Change Value": self._change_value}
+        context_actions = {
+            "Copy Name": self._copy_name,
+            "Change Value": self._change_value,
+        }
 
         self._search_phrase = ""
         self._search_field = ttk.Entry(frame)
@@ -996,7 +1034,11 @@ class EventVarsTab(DebugTab):
         self._search_field.bind("<FocusOut>", self._handle_focus_out)
         self._search_field.bind("<Control-a>", self._handle_ctrl_a)
         self._tv = FancyTreeview(
-            frame, additional_context_actions=context_actions, height=21, row=1, on_double_click=self._change_value
+            frame,
+            additional_context_actions=context_actions,
+            height=21,
+            row=1,
+            on_double_click=self._change_value,
         )
         root.add(frame, text="Vars")
 
@@ -1214,7 +1256,11 @@ class MapTab(DebugTab):
         self._tv.update_data(self._get_data(show_different_tile))
         if show_different_tile:
             self._canvas.create_rectangle(
-                self._marker_rectangle[0], self._marker_rectangle[1], outline="red", dash=(5, 5), width=2
+                self._marker_rectangle[0],
+                self._marker_rectangle[1],
+                outline="red",
+                dash=(5, 5),
+                width=2,
             )
 
         if self._selected_object is not None:
@@ -1241,7 +1287,11 @@ class MapTab(DebugTab):
                         end_y = (max(relative_y + 6, previous_relative_y + 6) * 16 - 8) * scale
 
                         self._canvas.create_rectangle(
-                            (start_x, start_y), (end_x, end_y), outline="blue", dash=(5, 5), width=2
+                            (start_x, start_y),
+                            (end_x, end_y),
+                            outline="blue",
+                            dash=(5, 5),
+                            width=2,
                         )
 
                     found = True
@@ -1421,7 +1471,10 @@ class MapTab(DebugTab):
                         result["__value"][encounter.species.name] += encounter.encounter_rate
                     result[str(index)] = encounter
                     index += 1
-                v = map(lambda i: f"{i[1]}% {i[0]}", reversed(sorted(result["__value"].items(), key=lambda i: i[1])))
+                v = map(
+                    lambda i: f"{i[1]}% {i[0]}",
+                    reversed(sorted(result["__value"].items(), key=lambda i: i[1])),
+                )
                 result["__value"] = ", ".join(v)
                 return result, number_of_species
 
@@ -1438,18 +1491,22 @@ class MapTab(DebugTab):
                 encounters["__value"].append(f"{str(n)} Surfing")
             if encounter_list.rock_smash_encounter_rate > 0:
                 encounters["Rock Smash"], n = list_encounters(
-                    encounter_list.rock_smash_encounters, encounter_list.rock_smash_encounter_rate
+                    encounter_list.rock_smash_encounters,
+                    encounter_list.rock_smash_encounter_rate,
                 )
                 encounters["__value"].append(f"{str(n)} Rock Smash")
             if encounter_list.fishing_encounter_rate > 0:
                 encounters["Fishing (Old Rod)"], n1 = list_encounters(
-                    encounter_list.old_rod_encounters, encounter_list.fishing_encounter_rate
+                    encounter_list.old_rod_encounters,
+                    encounter_list.fishing_encounter_rate,
                 )
                 encounters["Fishing (Good Rod)"], n2 = list_encounters(
-                    encounter_list.good_rod_encounters, encounter_list.fishing_encounter_rate
+                    encounter_list.good_rod_encounters,
+                    encounter_list.fishing_encounter_rate,
                 )
                 encounters["Fishing (Super Rod)"], n3 = list_encounters(
-                    encounter_list.super_rod_encounters, encounter_list.fishing_encounter_rate
+                    encounter_list.super_rod_encounters,
+                    encounter_list.fishing_encounter_rate,
                 )
                 encounters["__value"].append(f"{n1}/{n2}/{n3} Fishing")
 
@@ -1589,7 +1646,11 @@ class MapTab(DebugTab):
                 return
 
             selected_object = map_objects[object_index]
-            self._selected_object = (selected_object.map_group, selected_object.map_num, selected_object.local_id)
+            self._selected_object = (
+                selected_object.map_group,
+                selected_object.map_num,
+                selected_object.local_id,
+            )
         elif selected_label.startswith("Object Template #"):
             object_index = int(selected_label[17:])
             current_map = get_map_data_for_current_position()
@@ -1598,4 +1659,8 @@ class MapTab(DebugTab):
                 return
 
             selected_object = map_objects[object_index]
-            self._selected_object = (current_map.map_group, current_map.map_number, selected_object.local_id)
+            self._selected_object = (
+                current_map.map_group,
+                current_map.map_number,
+                selected_object.local_id,
+            )

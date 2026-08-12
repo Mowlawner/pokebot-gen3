@@ -1,7 +1,12 @@
 from typing import Generator
 
 from modules.context import context
-from modules.encounter import EncounterValue, handle_encounter, log_encounter, EncounterInfo
+from modules.encounter import (
+    EncounterValue,
+    handle_encounter,
+    log_encounter,
+    EncounterInfo,
+)
 from modules.gui.multi_select_window import Selection, ask_for_choice
 from modules.items import get_item_by_name
 from modules.map_data import MapFRLG, MapRSE
@@ -201,7 +206,8 @@ class RoamerResetMode(BotMode):
             # Cut scene where you get the National Dex
             if get_event_var("DEX_UPGRADE_JOHTO_STARTER_STATE") == 1:
                 yield from wait_for_script_to_start_and_finish(
-                    "LittlerootTown_ProfessorBirchsLab_EventScript_UpgradeToNationalDex", "B"
+                    "LittlerootTown_ProfessorBirchsLab_EventScript_UpgradeToNationalDex",
+                    "B",
                 )
                 yield from wait_for_player_avatar_to_be_controllable()
                 yield from navigate_to(MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB, (6, 12))

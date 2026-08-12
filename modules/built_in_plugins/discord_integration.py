@@ -47,31 +47,23 @@ def pokemon_label(encounter: "EncounterInfo") -> str:
     else:
         gender_code = ""
 
-    map_name = (
-        encounter.map.pretty_name if encounter.map is not None else pokemon.location_met
-    )
+    map_name = encounter.map.pretty_name if encounter.map is not None else pokemon.location_met
     return f"{pokemon.nature.name} **{pokemon.species_name_for_stats}{gender_code}** (Lv. {pokemon.level:,}) at {map_name}!"
 
 
-def pokemon_fields(
-    pokemon: "Pokemon", species_stats: "EncounterSummary", short: bool = False
-) -> dict[str, str]:
+def pokemon_fields(pokemon: "Pokemon", species_stats: "EncounterSummary", short: bool = False) -> dict[str, str]:
     result = {"Shiny Value": f"{pokemon.shiny_value:,}"}
     if not short:
         result[f"IVs ({pokemon.ivs.sum()})"] = iv_table(pokemon)
         result["Held item"] = pokemon.held_item.name if pokemon.held_item else "None"
-    result[
-        f"{pokemon.species_name_for_stats} Encounters"
-    ] = f"{species_stats.total_encounters:,} ({species_stats.shiny_encounters:,}✨)"
-    result[
-        f"{pokemon.species_name_for_stats} Phase Encounters"
-    ] = f"{species_stats.phase_encounters:,}"
+    result[f"{pokemon.species_name_for_stats} Encounters"] = (
+        f"{species_stats.total_encounters:,} ({species_stats.shiny_encounters:,}✨)"
+    )
+    result[f"{pokemon.species_name_for_stats} Phase Encounters"] = f"{species_stats.phase_encounters:,}"
     return result
 
 
-def phase_summary_fields(
-    pokemon: "Pokemon", phase: "ShinyPhase | None", global_stats: GlobalStats
-) -> dict[str, str]:
+def phase_summary_fields(pokemon: "Pokemon", phase: "ShinyPhase | None", global_stats: GlobalStats) -> dict[str, str]:
     if phase is None:
         return {}
 
@@ -82,9 +74,7 @@ def phase_summary_fields(
     else:
         lowest_sv = None
 
-    result = {
-        "Phase Encounters": f"{phase.encounters:,} ({context.stats.encounter_rate:,}/h)"
-    }
+    result = {"Phase Encounters": f"{phase.encounters:,} ({context.stats.encounter_rate:,}/h)"}
     if phase.highest_iv_sum is not None and phase.lowest_iv_sum is not None:
         result["Phase IV Sum Records"] = (
             f":arrow_up: `{phase.highest_iv_sum.value:,}` IV ({phase.highest_iv_sum.species_name})\n"
@@ -97,20 +87,18 @@ def phase_summary_fields(
         )
 
     if phase.longest_streak is not None:
-        result[
-            "Phase Same Pokémon Streak"
-        ] = f"{phase.longest_streak.value:,} {phase.longest_streak.species_name} were encountered in a row!"
+        result["Phase Same Pokémon Streak"] = (
+            f"{phase.longest_streak.value:,} {phase.longest_streak.species_name} were encountered in a row!"
+        )
 
-    result[
-        "Total Encounters"
-    ] = f"{global_stats.totals.total_encounters:,} ({global_stats.totals.shiny_encounters:,}✨)"
+    result["Total Encounters"] = (
+        f"{global_stats.totals.total_encounters:,} ({global_stats.totals.shiny_encounters:,}✨)"
+    )
 
     return result
 
 
-def send_discord_message(
-    webhook_config: "DiscordWebhook", content: str, **kwargs
-) -> None:
+def send_discord_message(webhook_config: "DiscordWebhook", content: str, **kwargs) -> None:
     if webhook_config.ping_mode == "role":
         ping = f"\n📢 <@&{webhook_config.ping_id}>"
     elif webhook_config.ping_mode == "user":
@@ -121,11 +109,7 @@ def send_discord_message(
     if content == "":
         ping = ping.strip()
 
-    discord_send(
-        DiscordMessage(
-            webhook_url=webhook_config.webhook_url, content=f"{content}{ping}", **kwargs
-        )
-    )
+    discord_send(DiscordMessage(webhook_url=webhook_config.webhook_url, content=f"{content}{ping}", **kwargs))
 
 
 class DiscordPlugin(BotPlugin):
@@ -190,9 +174,7 @@ class DiscordPlugin(BotPlugin):
         # Discord Pokémon encounter milestones
         if (
             context.config.discord.pokemon_encounter_milestones.enable
-            and species_stats.total_encounters
-            % context.config.discord.pokemon_encounter_milestones.interval
-            == 0
+            and species_stats.total_encounters % context.config.discord.pokemon_encounter_milestones.interval == 0
         ):
             send_discord_message(
                 webhook_config=context.config.discord.pokemon_encounter_milestones,
@@ -208,9 +190,7 @@ class DiscordPlugin(BotPlugin):
         if (
             context.config.discord.shiny_pokemon_encounter_milestones.enable
             and opponent.is_shiny
-            and species_stats.shiny_encounters
-            % context.config.discord.shiny_pokemon_encounter_milestones.interval
-            == 0
+            and species_stats.shiny_encounters % context.config.discord.shiny_pokemon_encounter_milestones.interval == 0
         ):
             send_discord_message(
                 webhook_config=context.config.discord.shiny_pokemon_encounter_milestones,
@@ -225,9 +205,7 @@ class DiscordPlugin(BotPlugin):
         # Discord total encounter milestones
         if (
             context.config.discord.total_encounter_milestones.enable
-            and global_stats.totals.total_encounters
-            % context.config.discord.total_encounter_milestones.interval
-            == 0
+            and global_stats.totals.total_encounters % context.config.discord.total_encounter_milestones.interval == 0
         ):
             embed_thumbnail = random.choice(
                 [
@@ -266,11 +244,8 @@ class DiscordPlugin(BotPlugin):
             and (
                 phase_encounters == context.config.discord.phase_summary.first_interval
                 or (
-                    phase_encounters
-                    > context.config.discord.phase_summary.first_interval
-                    and phase_encounters
-                    % context.config.discord.phase_summary.consequent_interval
-                    == 0
+                    phase_encounters > context.config.discord.phase_summary.first_interval
+                    and phase_encounters % context.config.discord.phase_summary.consequent_interval == 0
                 )
             )
         ):
@@ -284,10 +259,7 @@ class DiscordPlugin(BotPlugin):
             )
 
         # Discord anti-shiny Pokémon encountered
-        if (
-            context.config.discord.anti_shiny_pokemon_encounter.enable
-            and opponent.is_anti_shiny
-        ):
+        if context.config.discord.anti_shiny_pokemon_encounter.enable and opponent.is_anti_shiny:
             send_discord_message(
                 webhook_config=context.config.discord.anti_shiny_pokemon_encounter,
                 content=f"{encounter.type.verb.title()} an anti-shiny 💀 {opponent.species_name_for_stats} 💀!",

@@ -106,21 +106,13 @@ class PokemonEditFrame:
         self._ability: ttk.Combobox
         self._nature: ttk.Combobox
         self._nickname_var = tkinter.StringVar(parent, value=pokemon.nickname)
-        if (
-            pokemon.is_empty
-            or pokemon.nickname.upper()
-            == pokemon.species.localised_names[context.rom.language.value]
-        ):
+        if pokemon.is_empty or pokemon.nickname.upper() == pokemon.species.localised_names[context.rom.language.value]:
             self._nickname_var.set("")
         self._experience = tkinter.IntVar(value=pokemon.total_exp)
         self._level = tkinter.IntVar(value=pokemon.level)
-        self._is_shiny_var = tkinter.BooleanVar(
-            value=pokemon.is_shiny and not pokemon.is_empty
-        )
+        self._is_shiny_var = tkinter.BooleanVar(value=pokemon.is_shiny and not pokemon.is_empty)
         self._is_egg_var = tkinter.BooleanVar(value=pokemon.is_egg)
-        self._gender_var = tkinter.StringVar(
-            value="none" if pokemon.gender is None else pokemon.gender
-        )
+        self._gender_var = tkinter.StringVar(value="none" if pokemon.gender is None else pokemon.gender)
 
         self._iv_vars = {
             "hp": tkinter.IntVar(value=pokemon.ivs.hp),
@@ -150,60 +142,28 @@ class PokemonEditFrame:
         }
 
         self._moves = (
-            tkinter.StringVar(
-                value=pokemon.moves[0].move.name
-                if pokemon.moves[0] is not None
-                else "(None)"
-            ),
-            tkinter.StringVar(
-                value=pokemon.moves[1].move.name
-                if pokemon.moves[1] is not None
-                else "(None)"
-            ),
-            tkinter.StringVar(
-                value=pokemon.moves[2].move.name
-                if pokemon.moves[2] is not None
-                else "(None)"
-            ),
-            tkinter.StringVar(
-                value=pokemon.moves[3].move.name
-                if pokemon.moves[3] is not None
-                else "(None)"
-            ),
+            tkinter.StringVar(value=(pokemon.moves[0].move.name if pokemon.moves[0] is not None else "(None)")),
+            tkinter.StringVar(value=(pokemon.moves[1].move.name if pokemon.moves[1] is not None else "(None)")),
+            tkinter.StringVar(value=(pokemon.moves[2].move.name if pokemon.moves[2] is not None else "(None)")),
+            tkinter.StringVar(value=(pokemon.moves[3].move.name if pokemon.moves[3] is not None else "(None)")),
         )
 
         self._move_pp_spinbox: list[ttk.Spinbox] = []
 
         self._move_pp_vars = [
-            tkinter.IntVar(
-                value=pokemon.moves[0].pp if pokemon.moves[0] is not None else 0
-            ),
-            tkinter.IntVar(
-                value=pokemon.moves[1].pp if pokemon.moves[1] is not None else 0
-            ),
-            tkinter.IntVar(
-                value=pokemon.moves[2].pp if pokemon.moves[2] is not None else 0
-            ),
-            tkinter.IntVar(
-                value=pokemon.moves[3].pp if pokemon.moves[3] is not None else 0
-            ),
+            tkinter.IntVar(value=pokemon.moves[0].pp if pokemon.moves[0] is not None else 0),
+            tkinter.IntVar(value=pokemon.moves[1].pp if pokemon.moves[1] is not None else 0),
+            tkinter.IntVar(value=pokemon.moves[2].pp if pokemon.moves[2] is not None else 0),
+            tkinter.IntVar(value=pokemon.moves[3].pp if pokemon.moves[3] is not None else 0),
         ]
 
         self._move_max_pp_labels: list[ttk.Label] = []
 
         self._move_pp_ups_vars = [
-            tkinter.IntVar(
-                value=pokemon.moves[0].pp_ups if pokemon.moves[0] is not None else 0
-            ),
-            tkinter.IntVar(
-                value=pokemon.moves[1].pp_ups if pokemon.moves[1] is not None else 0
-            ),
-            tkinter.IntVar(
-                value=pokemon.moves[2].pp_ups if pokemon.moves[2] is not None else 0
-            ),
-            tkinter.IntVar(
-                value=pokemon.moves[3].pp_ups if pokemon.moves[3] is not None else 0
-            ),
+            tkinter.IntVar(value=pokemon.moves[0].pp_ups if pokemon.moves[0] is not None else 0),
+            tkinter.IntVar(value=pokemon.moves[1].pp_ups if pokemon.moves[1] is not None else 0),
+            tkinter.IntVar(value=pokemon.moves[2].pp_ups if pokemon.moves[2] is not None else 0),
+            tkinter.IntVar(value=pokemon.moves[3].pp_ups if pokemon.moves[3] is not None else 0),
         ]
 
         self._current_hp_var = tkinter.IntVar(value=pokemon.current_hp)
@@ -234,9 +194,7 @@ class PokemonEditFrame:
                     )
                 )
         if len(moves) == 0:
-            moves.append(
-                LearnedMove.create(get_move_by_name("Splash"), remaining_pp=1, pp_ups=0)
-            )
+            moves.append(LearnedMove.create(get_move_by_name("Splash"), remaining_pp=1, pp_ups=0))
 
         return debug_create_pokemon(
             species=self._species,
@@ -244,9 +202,7 @@ class PokemonEditFrame:
             original_pokemon=self._pokemon,
             is_shiny=self._is_shiny_var.get(),
             is_egg=self._is_egg_var.get(),
-            gender=None
-            if self._gender_var.get() not in ("male", "female")
-            else self._gender_var.get(),
+            gender=(None if self._gender_var.get() not in ("male", "female") else self._gender_var.get()),
             nickname=self._nickname_var.get(),
             held_item=held_item,
             has_second_ability=self._ability.current() != 0,
@@ -300,19 +256,13 @@ class PokemonEditFrame:
 
         species_values = ["(Empty)"]
         for n in range(386):
-            species_values.append(
-                f"#{n + 1:03d} {get_species_by_national_dex(n + 1).name}"
-            )
+            species_values.append(f"#{n + 1:03d} {get_species_by_national_dex(n + 1).name}")
 
         species_frame = ttk.Frame(left_box, padding=5)
         label = ttk.Label(species_frame, text="Species:")
         label.grid(sticky="NWES", column=0, row=0)
         self._species_var = tkinter.StringVar(
-            value=species_values[
-                self._pokemon.species.national_dex_number
-                if not self._pokemon.is_empty
-                else 0
-            ]
+            value=species_values[(self._pokemon.species.national_dex_number if not self._pokemon.is_empty else 0)]
         )
         species = ttk.Combobox(
             species_frame,
@@ -340,13 +290,9 @@ class PokemonEditFrame:
         held_item_frame = ttk.Frame(left_box, padding=5)
         label = ttk.Label(held_item_frame, text="Held Item:")
         label.grid(sticky="NWES", column=0, row=0)
-        self._held_item = ttk.Combobox(
-            held_item_frame, values=item_values, state="readonly"
-        )
+        self._held_item = ttk.Combobox(held_item_frame, values=item_values, state="readonly")
         self._held_item.current(
-            0
-            if self._pokemon.held_item is None
-            else item_values.index(self._pokemon.held_item.name)
+            0 if self._pokemon.held_item is None else item_values.index(self._pokemon.held_item.name)
         )
         self._held_item.grid(column=0, row=1)
         held_item_frame.grid(sticky="W", column=0, row=2)
@@ -358,9 +304,7 @@ class PokemonEditFrame:
         nature_frame = ttk.Frame(left_box, padding=5)
         label = ttk.Label(nature_frame, text="Nature:")
         label.grid(sticky="NWES", column=0, row=0)
-        self._nature = ttk.Combobox(
-            nature_frame, values=nature_values, state="readonly"
-        )
+        self._nature = ttk.Combobox(nature_frame, values=nature_values, state="readonly")
         self._nature.current(self._pokemon.nature.index)
         self._nature.grid(column=0, row=1)
         nature_frame.grid(sticky="W", column=0, row=3)
@@ -369,12 +313,8 @@ class PokemonEditFrame:
         label = ttk.Label(ability_frame, text="Ability:")
         label.grid(sticky="NWES", column=0, row=0)
         ability_values = [ability.name for ability in self._pokemon.species.abilities]
-        self._ability = ttk.Combobox(
-            ability_frame, values=ability_values, state="readonly"
-        )
-        self._ability.current(
-            0 if self._pokemon.ability is self._pokemon.species.abilities[0] else 1
-        )
+        self._ability = ttk.Combobox(ability_frame, values=ability_values, state="readonly")
+        self._ability.current(0 if self._pokemon.ability is self._pokemon.species.abilities[0] else 1)
         self._ability.grid(column=0, row=1)
         ability_frame.grid(sticky="W", column=0, row=4)
 
@@ -387,23 +327,15 @@ class PokemonEditFrame:
         exp_frame.grid(sticky="NWES", column=0, row=5)
 
         shiny_frame = ttk.Frame(left_box, padding=5)
-        ttk.Checkbutton(shiny_frame, text="Shiny", variable=self._is_shiny_var).grid(
-            sticky="W"
-        )
-        ttk.Checkbutton(shiny_frame, text="Egg", variable=self._is_egg_var).grid(
-            sticky="W", row=1
-        )
+        ttk.Checkbutton(shiny_frame, text="Shiny", variable=self._is_shiny_var).grid(sticky="W")
+        ttk.Checkbutton(shiny_frame, text="Egg", variable=self._is_egg_var).grid(sticky="W", row=1)
         shiny_frame.grid(sticky="NWES", column=0, row=6)
 
         gender_frame = ttk.Frame(left_box, padding=5)
         ttk.Label(gender_frame, text="Gender:").grid(sticky="W", column=0, row=0)
         gender_frame.grid(sticky="NWES", column=0, row=7)
-        female_button = ttk.Radiobutton(
-            gender_frame, text="Female", variable=self._gender_var, value="female"
-        )
-        male_button = ttk.Radiobutton(
-            gender_frame, text="Male", variable=self._gender_var, value="male"
-        )
+        female_button = ttk.Radiobutton(gender_frame, text="Female", variable=self._gender_var, value="female")
+        male_button = ttk.Radiobutton(gender_frame, text="Male", variable=self._gender_var, value="male")
         gender_label = ttk.Label(gender_frame, text="Male")
         if 0 < self._pokemon.species.gender_ratio < 254:
             female_button.grid(sticky="W", row=1, column=0)
@@ -427,11 +359,7 @@ class PokemonEditFrame:
         def on_move_change(var, index, mode):
             for n in range(4):
                 if str(self._moves[n]) == var or str(self._move_pp_ups_vars[n]) == var:
-                    max_pp = (
-                        get_move_by_name(self._moves[n].get()).pp
-                        if self._moves[n].get() != "(None)"
-                        else 0
-                    )
+                    max_pp = get_move_by_name(self._moves[n].get()).pp if self._moves[n].get() != "(None)" else 0
                     try:
                         max_pp += (max_pp * 20 * self._move_pp_ups_vars[n].get()) // 100
                     except tkinter.TclError:
@@ -513,16 +441,10 @@ class PokemonEditFrame:
         n = 0
         for stat in stats_list:
             n += 1
-            ttk.Label(stats_frame, text=stats_list[stat]).grid(
-                sticky="W", column=0, row=n
-            )
-            iv_field = ttk.Spinbox(
-                stats_frame, from_=0, to=31, width=3, textvariable=self._iv_vars[stat]
-            )
+            ttk.Label(stats_frame, text=stats_list[stat]).grid(sticky="W", column=0, row=n)
+            iv_field = ttk.Spinbox(stats_frame, from_=0, to=31, width=3, textvariable=self._iv_vars[stat])
             iv_field.grid(sticky="W", column=1, row=n, padx=5)
-            ev_field = ttk.Spinbox(
-                stats_frame, from_=0, to=255, width=3, textvariable=self._ev_vars[stat]
-            )
+            ev_field = ttk.Spinbox(stats_frame, from_=0, to=255, width=3, textvariable=self._ev_vars[stat])
             ev_field.grid(sticky="W", column=2, row=n)
 
         current_hp_frame = ttk.Frame(right_box)
@@ -536,9 +458,7 @@ class PokemonEditFrame:
             textvariable=self._current_hp_var,
         )
         current_hp.grid(sticky="NWES", column=1, row=0)
-        self._total_hp_label = ttk.Label(
-            current_hp_frame, text=f"/{self._pokemon.stats.hp}"
-        )
+        self._total_hp_label = ttk.Label(current_hp_frame, text=f"/{self._pokemon.stats.hp}")
         self._total_hp_label.grid(sticky="NWES", column=2, row=0)
         current_hp_frame.grid(sticky="W", column=0, row=1, padx=5, pady=15)
 
@@ -569,12 +489,8 @@ class PokemonEditFrame:
         status_frame = ttk.Frame(right_box)
         label = ttk.Label(status_frame, text="Status Condition:")
         label.grid(sticky="W", column=0, row=0)
-        self._status_condition = ttk.Combobox(
-            status_frame, state="readonly", values=list(status_name_map.keys())
-        )
-        self._status_condition.current(
-            list(status_name_map.values()).index(self._pokemon.status_condition)
-        )
+        self._status_condition = ttk.Combobox(status_frame, state="readonly", values=list(status_name_map.keys()))
+        self._status_condition.current(list(status_name_map.values()).index(self._pokemon.status_condition))
         self._status_condition.grid(sticky="W", column=0, row=1)
         status_frame.grid(sticky="W", column=0, row=8, padx=5, pady=(0, 5))
 
@@ -590,9 +506,7 @@ class PokemonEditFrame:
             "toughness",
             "feel",
         ]:
-            ttk.Label(contest_frame, text=condition.title()).grid(
-                sticky="W", column=0, row=n
-            )
+            ttk.Label(contest_frame, text=condition.title()).grid(sticky="W", column=0, row=n)
             condition_field = ttk.Spinbox(
                 contest_frame,
                 from_=0,
@@ -611,9 +525,7 @@ class PokemonEditFrame:
             try:
                 ivs = StatsValues(self._iv_vars["hp"].get(), 0, 0, 0, 0, 0)
                 evs = StatsValues(self._ev_vars["hp"].get(), 0, 0, 0, 0, 0)
-                max_hp = StatsValues.calculate(
-                    self._species, ivs, evs, get_nature_by_index(0), self._level.get()
-                ).hp
+                max_hp = StatsValues.calculate(self._species, ivs, evs, get_nature_by_index(0), self._level.get()).hp
             except tkinter.TclError:
                 return
             self._current_hp_var.set(int(min(max_hp, self._current_hp_var.get())))
@@ -626,14 +538,10 @@ class PokemonEditFrame:
             level_button.configure(text=f"Level: {self._level.get()}")
             if self._level.get() < 100 and self._species is not None:
                 exp_needed_until_next_level = (
-                    self._species.level_up_type.get_experience_needed_for_level(
-                        self._level.get() + 1
-                    )
+                    self._species.level_up_type.get_experience_needed_for_level(self._level.get() + 1)
                     - self._experience.get()
                 )
-                exp_left.configure(
-                    text=f"({exp_needed_until_next_level:,} Exp. until level-up)"
-                )
+                exp_left.configure(text=f"({exp_needed_until_next_level:,} Exp. until level-up)")
             else:
                 exp_left.configure(text="")
             recalculate_max_hp()
@@ -652,9 +560,7 @@ class PokemonEditFrame:
                 is_second_ability = self._ability.current() != 0
                 choices = [ability.name for ability in new_species.abilities]
                 self._ability.configure(values=choices)
-                self._ability.current(
-                    1 if is_second_ability and len(choices) > 1 else 0
-                )
+                self._ability.current(1 if is_second_ability and len(choices) > 1 else 0)
 
                 previous_pokemon = self.to_pokemon()
                 if previous_pokemon is not None and not previous_pokemon.is_empty:
@@ -677,9 +583,7 @@ class PokemonEditFrame:
                 level_group = new_species.level_up_type
                 exp = level_group.get_experience_needed_for_level(self._level.get())
                 if self._level.get() < 100:
-                    exp_next_level = level_group.get_experience_needed_for_level(
-                        self._level.get() + 1
-                    )
+                    exp_next_level = level_group.get_experience_needed_for_level(self._level.get() + 1)
                     exp_diff = exp_next_level - exp
                     exp += int(exp_diff * exp_fraction)
                 self._experience.set(exp)
@@ -757,9 +661,7 @@ class PokemonEditFrame:
             if var == str(experience):
                 state = str(experience_entry.configure()["state"][4])
                 if state != "readonly":
-                    level_with_this_exp = level_type.get_level_from_total_experience(
-                        experience.get()
-                    )
+                    level_with_this_exp = level_type.get_level_from_total_experience(experience.get())
                     if level_with_this_exp != level.get():
                         level.set(level_with_this_exp)
 
@@ -767,14 +669,9 @@ class PokemonEditFrame:
                 state = str(level_entry.configure()["state"][4])
                 if state != "readonly" and 0 < level.get() <= 100:
                     if set_type.get() == "level_end" and level.get() <= 99:
-                        experience_value = (
-                            level_type.get_experience_needed_for_level(level.get() + 1)
-                            - 1
-                        )
+                        experience_value = level_type.get_experience_needed_for_level(level.get() + 1) - 1
                     else:
-                        experience_value = level_type.get_experience_needed_for_level(
-                            level.get()
-                        )
+                        experience_value = level_type.get_experience_needed_for_level(level.get())
                     if experience_value != experience.get():
                         experience.set(experience_value)
 
@@ -788,9 +685,7 @@ class PokemonEditFrame:
         label = ttk.Label(first_row, text="Exp.: ")
         label.grid(sticky="W", column=0, row=0)
         max_exp = level_type.get_experience_needed_for_level(100)
-        experience_entry = ttk.Spinbox(
-            first_row, from_=0, to=max_exp, width=8, textvariable=experience
-        )
+        experience_entry = ttk.Spinbox(first_row, from_=0, to=max_exp, width=8, textvariable=experience)
         experience_entry.grid(sticky="W", column=1, row=0, padx=(0, 15))
 
         label = ttk.Label(first_row, text="Level: ")

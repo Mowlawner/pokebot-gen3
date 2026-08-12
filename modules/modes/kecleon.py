@@ -32,7 +32,10 @@ class KecleonMode(BotMode):
         if not context.rom.is_emerald:
             return False
         targeted_tile = get_player_avatar().map_location_in_front
-        return targeted_tile in MapRSE.ROUTE119 and targeted_tile.local_position == (31, 6)
+        return targeted_tile in MapRSE.ROUTE119 and targeted_tile.local_position == (
+            31,
+            6,
+        )
 
     def __init__(self):
         super().__init__()

@@ -15,7 +15,12 @@ from apispec.yaml_utils import load_operations_from_docstring
 from modules.daycare import get_daycare_data
 
 try:
-    from aiortc import MediaStreamTrack, VideoStreamTrack, RTCPeerConnection, RTCSessionDescription
+    from aiortc import (
+        MediaStreamTrack,
+        VideoStreamTrack,
+        RTCPeerConnection,
+        RTCSessionDescription,
+    )
     from aiortc.contrib.media import MediaRelay
     from av import VideoFrame, Packet, AudioFrame
     from av.frame import Frame
@@ -47,7 +52,9 @@ custom_state: dict = {}
 
 
 def _update_via_work_queue(
-    state_cache_entry: StateCacheItem, update_callback: callable, maximum_age_in_frames: int = 5
+    state_cache_entry: StateCacheItem,
+    update_callback: callable,
+    maximum_age_in_frames: int = 5,
 ) -> None:
     """
     Ensures that an entry in the State cache is up-to-date.
@@ -703,7 +710,18 @@ def http_server(host: str, port: int) -> web.AppRunner:
         if not isinstance(new_buttons, list):
             return web.Response(text="This endpoint expects a JSON array as its payload.", status=422)
 
-        possible_buttons = ["A", "B", "Select", "Start", "Right", "Left", "Up", "Down", "R", "L"]
+        possible_buttons = [
+            "A",
+            "B",
+            "Select",
+            "Start",
+            "Right",
+            "Left",
+            "Up",
+            "Down",
+            "R",
+            "L",
+        ]
         buttons_to_press = []
         for button in new_buttons:
             for possible_button in possible_buttons:
@@ -845,7 +863,12 @@ def http_server(host: str, port: int) -> web.AppRunner:
             answer = await connection.createAnswer()
             await connection.setLocalDescription(answer)
 
-            return web.json_response({"sdp": connection.localDescription.sdp, "type": connection.localDescription.type})
+            return web.json_response(
+                {
+                    "sdp": connection.localDescription.sdp,
+                    "type": connection.localDescription.type,
+                }
+            )
 
     else:
 

@@ -95,32 +95,16 @@ class Discord(BaseConfig):
     delay: int = 0
     bot_id: str = "PokéBot Gen3"
     global_webhook_url: str = ""
-    shiny_pokemon_encounter: DiscordWebhook = Field(
-        default_factory=lambda: DiscordWebhook()
-    )
-    blocked_shiny_encounter: DiscordWebhook = Field(
-        default_factory=lambda: DiscordWebhook()
-    )
-    pokemon_encounter_milestones: DiscordWebhook = Field(
-        default_factory=lambda: DiscordWebhook(interval=10000)
-    )
-    shiny_pokemon_encounter_milestones: DiscordWebhook = Field(
-        default_factory=lambda: DiscordWebhook(interval=5)
-    )
-    total_encounter_milestones: DiscordWebhook = Field(
-        default_factory=lambda: DiscordWebhook(interval=25000)
-    )
+    shiny_pokemon_encounter: DiscordWebhook = Field(default_factory=lambda: DiscordWebhook())
+    blocked_shiny_encounter: DiscordWebhook = Field(default_factory=lambda: DiscordWebhook())
+    pokemon_encounter_milestones: DiscordWebhook = Field(default_factory=lambda: DiscordWebhook(interval=10000))
+    shiny_pokemon_encounter_milestones: DiscordWebhook = Field(default_factory=lambda: DiscordWebhook(interval=5))
+    total_encounter_milestones: DiscordWebhook = Field(default_factory=lambda: DiscordWebhook(interval=25000))
     phase_summary: DiscordWebhook = Field(
-        default_factory=lambda: DiscordWebhook(
-            first_interval=8192, consequent_interval=5000
-        )
+        default_factory=lambda: DiscordWebhook(first_interval=8192, consequent_interval=5000)
     )
-    anti_shiny_pokemon_encounter: DiscordWebhook = Field(
-        default_factory=lambda: DiscordWebhook()
-    )
-    custom_filter_pokemon_encounter: DiscordWebhook = Field(
-        default_factory=lambda: DiscordWebhook()
-    )
+    anti_shiny_pokemon_encounter: DiscordWebhook = Field(default_factory=lambda: DiscordWebhook())
+    custom_filter_pokemon_encounter: DiscordWebhook = Field(default_factory=lambda: DiscordWebhook())
     pickup: DiscordWebhook = Field(default_factory=lambda: DiscordWebhook(interval=10))
     tcg_cards: DiscordWebhook = Field(default_factory=lambda: DiscordWebhook())
 

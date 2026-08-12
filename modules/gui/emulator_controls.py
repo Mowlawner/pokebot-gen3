@@ -52,17 +52,20 @@ class EmulatorControls:
         self.emulator_menu = Menu(self.window, tearoff=0)
         self.emulator_menu.add_command(label="Load Save State", command=lambda: LoadStateWindow(self.window))
         self.emulator_menu.add_command(
-            label="New Save State", command=lambda: context.emulator.create_save_state("Manual")
+            label="New Save State",
+            command=lambda: context.emulator.create_save_state("Manual"),
         )
         self.emulator_menu.add_command(
-            label="Take Screenshot", command=lambda: context.emulator.take_screenshot("manual")
+            label="Take Screenshot",
+            command=lambda: context.emulator.take_screenshot("manual"),
         )
         self.emulator_menu.add_separator()
         self.emulator_menu.add_command(label="Reset", command=context.emulator.reset)
 
         self.profile_menu = Menu(self.window, tearoff=0)
         self.profile_menu.add_command(
-            label="Open Profile Folder", command=lambda: show_in_file_manager(str(context.profile.path))
+            label="Open Profile Folder",
+            command=lambda: show_in_file_manager(str(context.profile.path)),
         )
         self.profile_menu.add_command(label="Reset Shiny Phase Stats", command=self._reset_shiny_phase_stats)
 
@@ -127,7 +130,9 @@ class EmulatorControls:
 
         self._set_button_colour(self.toggle_video_button, active_condition=context.video)
         self._set_button_colour(
-            self.toggle_audio_button, active_condition=context.audio, disabled_condition=context.emulation_speed == 0
+            self.toggle_audio_button,
+            active_condition=context.audio,
+            disabled_condition=context.emulation_speed == 0,
         )
 
         self.bot_message.config(text=context.message)
@@ -169,7 +174,10 @@ class EmulatorControls:
                     self.bot_mode_menu.add_command(label=mode.name(), font=bold_font)
                     continue
 
-                if get_game_state() not in (GameState.TITLE_SCREEN, GameState.MAIN_MENU):
+                if get_game_state() not in (
+                    GameState.TITLE_SCREEN,
+                    GameState.MAIN_MENU,
+                ):
                     try:
                         is_selectable = mode.is_selectable()
                     except Exception:
@@ -180,7 +188,10 @@ class EmulatorControls:
                     is_selectable = False
 
                 if is_selectable:
-                    self.bot_mode_menu.add_command(label=mode.name(), command=lambda m=mode: select_bot_mode(m.name()))
+                    self.bot_mode_menu.add_command(
+                        label=mode.name(),
+                        command=lambda m=mode: select_bot_mode(m.name()),
+                    )
                 else:
                     disabled_modes.append(mode.name())
             if disabled_modes:
@@ -195,7 +206,12 @@ class EmulatorControls:
 
         ttk.Label(group, text="Bot Mode:", justify="left").grid(row=0, sticky="W")
         self.bot_mode_button = ttk.Button(
-            group, text=f"{context.bot_mode} ▾", width=20, padding=(0, 3), cursor="hand2", command=open_bot_mode_menu
+            group,
+            text=f"{context.bot_mode} ▾",
+            width=20,
+            padding=(0, 3),
+            cursor="hand2",
+            command=open_bot_mode_menu,
         )
         self.bot_mode_button.grid(row=1, sticky="W", padx=0)
 
@@ -216,12 +232,17 @@ class EmulatorControls:
                 (f"8× (key: {context.config.keys.emulator.set_speed_8x})", 8),
                 (f"16× (key: {context.config.keys.emulator.set_speed_16x})", 16),
                 (f"32× (key: {context.config.keys.emulator.set_speed_32x})", 32),
-                (f"Unthrottled (key: {context.config.keys.emulator.set_speed_unthrottled})", 0),
+                (
+                    f"Unthrottled (key: {context.config.keys.emulator.set_speed_unthrottled})",
+                    0,
+                ),
             ]
             for label, speed in speeds:
                 if context.emulation_speed == speed:
                     self.speed_menu.add_command(
-                        label=label, font=bold_font, command=lambda s=speed: set_emulation_speed(s)
+                        label=label,
+                        font=bold_font,
+                        command=lambda s=speed: set_emulation_speed(s),
                     )
                 else:
                     self.speed_menu.add_command(label=label, command=lambda s=speed: set_emulation_speed(s))
@@ -252,8 +273,16 @@ class EmulatorControls:
         style = ttk.Style()
         style.map(
             "Accent.TButton",
-            foreground=[("!active", "white"), ("active", "white"), ("pressed", "white")],
-            background=[("!active", "purple1"), ("active", "purple3"), ("pressed", "purple1")],
+            foreground=[
+                ("!active", "white"),
+                ("active", "white"),
+                ("pressed", "white"),
+            ],
+            background=[
+                ("!active", "purple1"),
+                ("active", "purple3"),
+                ("pressed", "purple1"),
+            ],
         )
         group.grid(row=row, column=column, sticky="W")
 
@@ -284,7 +313,7 @@ class EmulatorControls:
         version_label = ttk.Label(
             group,
             text=f"{context.rom.short_game_name} - {pokebot_name} {pokebot_version}",
-            foreground="grey" if not context.rom.game_name.startswith("Unsupported") else "red",
+            foreground=("grey" if not context.rom.game_name.startswith("Unsupported") else "red"),
             font=tkinter.font.Font(size=9),
         )
 
@@ -299,7 +328,12 @@ class EmulatorControls:
         else:
             version_label.grid(row=0, column=1, sticky="E")
 
-    def _set_button_colour(self, button: ttk.Button, active_condition: bool, disabled_condition: bool = False) -> None:
+    def _set_button_colour(
+        self,
+        button: ttk.Button,
+        active_condition: bool,
+        disabled_condition: bool = False,
+    ) -> None:
         if disabled_condition:
             button.config(style="TButton", state="disabled")
         elif active_condition:

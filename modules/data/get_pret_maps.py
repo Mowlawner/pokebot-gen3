@@ -32,7 +32,10 @@ def _might_be_map_coordinates(value) -> bool:
         current_map_group_name = ""
         map_group_names: dict[int, str] = {}
         output: list[str] = []
-        with open(this_dir.parent.parent.parent / directory / "include" / "constants" / "map_groups.h", "r") as file:
+        with open(
+            this_dir.parent.parent.parent / directory / "include" / "constants" / "map_groups.h",
+            "r",
+        ) as file:
             for line in file:
                 if line.startswith("// gMapGroup_"):
                     output.append("")

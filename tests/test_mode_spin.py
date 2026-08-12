@@ -1,4 +1,9 @@
-from tests.utility import BotTestCase, with_frame_timeout, with_save_state, set_next_rng_seed
+from tests.utility import (
+    BotTestCase,
+    with_frame_timeout,
+    with_save_state,
+    set_next_rng_seed,
+)
 
 
 class TestSpin(BotTestCase):
@@ -49,7 +54,8 @@ class TestSpin(BotTestCase):
                 if self.stats.last_encounter is not None:
                     if not checked_encounter:
                         self.assertTrue(
-                            self.stats.last_encounter.is_shiny, "Encountered starter Pokémon was not shiny."
+                            self.stats.last_encounter.is_shiny,
+                            "Encountered starter Pokémon was not shiny.",
                         )
                         checked_encounter = True
                     if self.stats.last_encounter.outcome is not None:

@@ -3,7 +3,13 @@ from tkinter import ttk, Tk, Toplevel, StringVar, IntVar, Canvas
 
 from modules.context import context
 from modules.debug_utilities import debug_write_item_bag
-from modules.items import ItemPocket, get_item_bag, _items_by_index, get_item_by_name, ItemSlot
+from modules.items import (
+    ItemPocket,
+    get_item_bag,
+    _items_by_index,
+    get_item_by_name,
+    ItemSlot,
+)
 
 
 class ItemBagEditMenu:
@@ -21,7 +27,12 @@ class ItemBagEditMenu:
         self.notebook = ttk.Notebook(self.window)
         self.notebook.grid(sticky="NWES", padx=5, pady=5)
 
-        self.save_button = ttk.Button(self.window, text="Save Item Bag", command=self._save, style="Accent.TButton")
+        self.save_button = ttk.Button(
+            self.window,
+            text="Save Item Bag",
+            command=self._save,
+            style="Accent.TButton",
+        )
         self.save_button.grid(sticky="NE", row=1, column=0, padx=5, pady=5)
 
         self._frames: dict[ItemPocket, ItemPocketFrame] = {}
@@ -122,11 +133,20 @@ class ItemPocketFrame:
             label = ttk.Label(inner_frame, text=f"#{n + 1}")
             label.grid(sticky="e", row=n, column=0, padx=5, pady=5)
 
-            combobox = ttk.Combobox(inner_frame, values=item_names, state="readonly", textvariable=self._item_vars[n])
+            combobox = ttk.Combobox(
+                inner_frame,
+                values=item_names,
+                state="readonly",
+                textvariable=self._item_vars[n],
+            )
             combobox.grid(sticky="e", row=n, column=1, padx=5, pady=5)
 
             spinbox = ttk.Spinbox(
-                inner_frame, from_=0, to=self._slot_size, textvariable=self._quantity_vars[n], width=4
+                inner_frame,
+                from_=0,
+                to=self._slot_size,
+                textvariable=self._quantity_vars[n],
+                width=4,
             )
             spinbox.grid(sticky="w", row=n, column=2, padx=5, pady=5)
 

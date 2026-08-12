@@ -88,11 +88,31 @@ class ROMLanguage(Enum):
 
 
 GB_ROMS = {
-    "f4cd194bdee0d04ca4eac29e09b8e4e9d818c133": ("Pokémon Crystal", 0, ROMLanguage.English),
-    "f2f52230b536214ef7c9924f483392993e226cfb": ("Pokémon Crystal", 1, ROMLanguage.English),
-    "a0fc810f1d4e124434f7be2c989ab5b5892ddf36": ("Pokémon Crystal (Australia)", 1, ROMLanguage.English),
-    "d8b8a3600a465308c9953dfa04f0081c05bdcb94": ("Pokémon Gold", 0, ROMLanguage.English),
-    "49b163f7e57702bc939d642a18f591de55d92dae": ("Pokémon Silver", 0, ROMLanguage.English),
+    "f4cd194bdee0d04ca4eac29e09b8e4e9d818c133": (
+        "Pokémon Crystal",
+        0,
+        ROMLanguage.English,
+    ),
+    "f2f52230b536214ef7c9924f483392993e226cfb": (
+        "Pokémon Crystal",
+        1,
+        ROMLanguage.English,
+    ),
+    "a0fc810f1d4e124434f7be2c989ab5b5892ddf36": (
+        "Pokémon Crystal (Australia)",
+        1,
+        ROMLanguage.English,
+    ),
+    "d8b8a3600a465308c9953dfa04f0081c05bdcb94": (
+        "Pokémon Gold",
+        0,
+        ROMLanguage.English,
+    ),
+    "49b163f7e57702bc939d642a18f591de55d92dae": (
+        "Pokémon Silver",
+        0,
+        ROMLanguage.English,
+    ),
 }
 
 
@@ -257,7 +277,15 @@ def _load_gba_rom(file: Path, handle: BinaryIO) -> ROM:
     if revision > 0:
         game_name += f" (Rev {revision})"
 
-    return ROM(file, game_name, game_title, game_code[:3], ROMLanguage(game_code[3]), maker_code, revision)
+    return ROM(
+        file,
+        game_name,
+        game_title,
+        game_code[:3],
+        ROMLanguage(game_code[3]),
+        maker_code,
+        revision,
+    )
 
 
 def _load_gb_rom(file: Path, handle: BinaryIO) -> ROM:
@@ -273,7 +301,15 @@ def _load_gb_rom(file: Path, handle: BinaryIO) -> ROM:
         raise InvalidROMError(f"{file.name}: ROM not supported. ('{game_title}')")
 
     game_name, revision, language = GB_ROMS[rom_hash]
-    return ROM(file, f"{game_name} ({language.value})", game_title, "GBCR", language, maker_code, revision)
+    return ROM(
+        file,
+        f"{game_name} ({language.value})",
+        game_title,
+        "GBCR",
+        language,
+        maker_code,
+        revision,
+    )
 
 
 def load_rom_data(file: Path) -> ROM:

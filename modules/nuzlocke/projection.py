@@ -79,9 +79,7 @@ class ObservedCampaignState:
 
 def _event_key(event: Event, session_id: str | None) -> str:
     payload = json.dumps(serialize_event(event), sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(
-        f"{session_id}\0{event.frame}\0{payload}".encode()
-    ).hexdigest()
+    return hashlib.sha256(f"{session_id}\0{event.frame}\0{payload}".encode()).hexdigest()
 
 
 class CampaignProjection:
@@ -133,9 +131,7 @@ class CampaignProjection:
         expected = self._state.last_event_sequence + 1
         actual = expected if sequence is None else sequence
         if actual != expected:
-            raise ValueError(
-                f"Event sequence out of order: expected {expected}, got {actual}"
-            )
+            raise ValueError(f"Event sequence out of order: expected {expected}, got {actual}")
         self._seen.add(key)
         meta = ObservedEvent(actual, type(event).__name__, session_id, event.frame)
         state = self._state
@@ -145,9 +141,7 @@ class CampaignProjection:
         changes = dict(
             last_event_sequence=actual,
             last_observed_frame=event.frame,
-            current_session_id=session_id
-            if session_id is not None
-            else state.current_session_id,
+            current_session_id=(session_id if session_id is not None else state.current_session_id),
             known_session_ids=sessions,
         )
         if isinstance(event, MapChanged):
@@ -174,18 +168,10 @@ class CampaignProjection:
                 indices.difference_update(event.left_party_indices)
                 changes["party_indices"] = tuple(sorted(indices))
             changes["last_party_change"] = meta
-            if (
-                event.entered_identities
-                or event.left_identities
-                or event.changed_identities
-            ):
+            if event.entered_identities or event.left_identities or event.changed_identities:
                 identities = list(state.party_identities or ())
                 identities.extend(event.entered_identities)
-                identities = [
-                    identity
-                    for identity in identities
-                    if identity not in event.left_identities
-                ]
+                identities = [identity for identity in identities if identity not in event.left_identities]
                 changes["party_identities"] = tuple(identities)
         elif isinstance(event, PokemonFainted):
             changes["observed_faints"] = state.observed_faints + (event,)
@@ -194,10 +180,7 @@ class CampaignProjection:
                     p
                     for p in state.observed_pokemon
                     if (event.identity is not None and p.identity == event.identity)
-                    or (
-                        event.identity is None
-                        and p.personality_value == event.personality_value
-                    )
+                    or (event.identity is None and p.personality_value == event.personality_value)
                 ),
                 None,
             )
@@ -211,34 +194,28 @@ class CampaignProjection:
             )
             changes["observed_pokemon"] = (
                 tuple(
-                    replacement
-                    if (
-                        (event.identity is not None and p.identity == event.identity)
-                        or (
-                            event.identity is None
-                            and p.personality_value == event.personality_value
+                    (
+                        replacement
+                        if (
+                            (event.identity is not None and p.identity == event.identity)
+                            or (event.identity is None and p.personality_value == event.personality_value)
                         )
+                        else p
                     )
-                    else p
                     for p in state.observed_pokemon
                 )
                 if old
                 else state.observed_pokemon + (replacement,)
             )
         elif isinstance(event, StorageChanged):
-            locations = dict(
-                (identity, (box, slot))
-                for identity, box, slot in (state.pc_locations or ())
-            )
+            locations = dict((identity, (box, slot)) for identity, box, slot in (state.pc_locations or ()))
             for location in event.left:
                 locations.pop(location.identity, None)
             for location in event.entered:
                 locations[location.identity] = (location.box, location.slot)
             for old_location, new_location in event.moved:
                 locations[new_location.identity] = (new_location.box, new_location.slot)
-            changes["pc_locations"] = tuple(
-                (identity, box, slot) for identity, (box, slot) in locations.items()
-            )
+            changes["pc_locations"] = tuple((identity, box, slot) for identity, (box, slot) in locations.items())
         elif isinstance(event, WhiteoutOccurred):
             changes["observed_whiteouts"] = state.observed_whiteouts + (meta,)
         self._state = replace(state, **changes)
@@ -247,9 +224,7 @@ class CampaignProjection:
         required = {"event_id", "session_id", "sequence", "frame", "type", "payload"}
         if set(record) != required:
             raise ValueError("Malformed event record")
-        event = deserialize_event(
-            {"type": record["type"], "payload": record["payload"]}
-        )
+        event = deserialize_event({"type": record["type"], "payload": record["payload"]})
         if record["frame"] != event.frame:
             raise ValueError("Event record frame does not match payload")
         self.apply(

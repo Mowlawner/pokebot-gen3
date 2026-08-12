@@ -63,46 +63,88 @@ class SafariPokemon(Enum):
         return context.rom.is_fr
 
     NIDORAN_F = SafariCatchingLocation(
-        get_species_by_name("Nidoran♀"), MapFRLG.SAFARI_ZONE_EAST, (29, 28), SafariHuntingMode.SPIN
+        get_species_by_name("Nidoran♀"),
+        MapFRLG.SAFARI_ZONE_EAST,
+        (29, 28),
+        SafariHuntingMode.SPIN,
     )
     NIDORINA = SafariCatchingLocation(
-        get_species_by_name("Nidorina"), MapFRLG.SAFARI_ZONE_CENTER, (24, 27), SafariHuntingMode.SPIN
+        get_species_by_name("Nidorina"),
+        MapFRLG.SAFARI_ZONE_CENTER,
+        (24, 27),
+        SafariHuntingMode.SPIN,
     )
     NIDORAN_M = SafariCatchingLocation(
-        get_species_by_name("Nidoran♂"), MapFRLG.SAFARI_ZONE_EAST, (29, 28), SafariHuntingMode.SPIN
+        get_species_by_name("Nidoran♂"),
+        MapFRLG.SAFARI_ZONE_EAST,
+        (29, 28),
+        SafariHuntingMode.SPIN,
     )
     NIDORINO = SafariCatchingLocation(
-        get_species_by_name("Nidorino"), MapFRLG.SAFARI_ZONE_CENTER, (24, 27), SafariHuntingMode.SPIN
+        get_species_by_name("Nidorino"),
+        MapFRLG.SAFARI_ZONE_CENTER,
+        (24, 27),
+        SafariHuntingMode.SPIN,
     )
     PARAS = SafariCatchingLocation(
-        get_species_by_name("Paras"), MapFRLG.SAFARI_ZONE_EAST, (29, 28), SafariHuntingMode.SPIN
+        get_species_by_name("Paras"),
+        MapFRLG.SAFARI_ZONE_EAST,
+        (29, 28),
+        SafariHuntingMode.SPIN,
     )
     PARASECT = SafariCatchingLocation(
-        get_species_by_name("Parasect"), MapFRLG.SAFARI_ZONE_CENTER, (24, 27), SafariHuntingMode.SPIN
+        get_species_by_name("Parasect"),
+        MapFRLG.SAFARI_ZONE_CENTER,
+        (24, 27),
+        SafariHuntingMode.SPIN,
     )
     VENONAT = SafariCatchingLocation(
-        get_species_by_name("Venonat"), MapFRLG.SAFARI_ZONE_CENTER, (24, 27), SafariHuntingMode.SPIN
+        get_species_by_name("Venonat"),
+        MapFRLG.SAFARI_ZONE_CENTER,
+        (24, 27),
+        SafariHuntingMode.SPIN,
     )
     VENOMOTH = SafariCatchingLocation(
-        get_species_by_name("Venomoth"), MapFRLG.SAFARI_ZONE_NORTH, (35, 30), SafariHuntingMode.SPIN
+        get_species_by_name("Venomoth"),
+        MapFRLG.SAFARI_ZONE_NORTH,
+        (35, 30),
+        SafariHuntingMode.SPIN,
     )
     DODUO = SafariCatchingLocation(
-        get_species_by_name("Doduo"), MapFRLG.SAFARI_ZONE_EAST, (29, 28), SafariHuntingMode.SPIN
+        get_species_by_name("Doduo"),
+        MapFRLG.SAFARI_ZONE_EAST,
+        (29, 28),
+        SafariHuntingMode.SPIN,
     )
     RHYHORN = SafariCatchingLocation(
-        get_species_by_name("Rhyhorn"), MapFRLG.SAFARI_ZONE_CENTER, (24, 27), SafariHuntingMode.SPIN
+        get_species_by_name("Rhyhorn"),
+        MapFRLG.SAFARI_ZONE_CENTER,
+        (24, 27),
+        SafariHuntingMode.SPIN,
     )
     EXEGGCUTE = SafariCatchingLocation(
-        get_species_by_name("Exeggcute"), MapFRLG.SAFARI_ZONE_CENTER, (24, 27), SafariHuntingMode.SPIN
+        get_species_by_name("Exeggcute"),
+        MapFRLG.SAFARI_ZONE_CENTER,
+        (24, 27),
+        SafariHuntingMode.SPIN,
     )
     TAUROS = SafariCatchingLocation(
-        get_species_by_name("Tauros"), MapFRLG.SAFARI_ZONE_WEST, (15, 27), SafariHuntingMode.SPIN
+        get_species_by_name("Tauros"),
+        MapFRLG.SAFARI_ZONE_WEST,
+        (15, 27),
+        SafariHuntingMode.SPIN,
     )
     CHANSEY = SafariCatchingLocation(
-        get_species_by_name("Chansey"), MapFRLG.SAFARI_ZONE_NORTH, (35, 30), SafariHuntingMode.SPIN
+        get_species_by_name("Chansey"),
+        MapFRLG.SAFARI_ZONE_NORTH,
+        (35, 30),
+        SafariHuntingMode.SPIN,
     )
     KANGASKHAN = SafariCatchingLocation(
-        get_species_by_name("Kangaskhan"), MapFRLG.SAFARI_ZONE_EAST, (29, 28), SafariHuntingMode.SPIN
+        get_species_by_name("Kangaskhan"),
+        MapFRLG.SAFARI_ZONE_EAST,
+        (29, 28),
+        SafariHuntingMode.SPIN,
     )
     PINSIR = SafariCatchingLocation(
         get_species_by_name("Pinsir"),
@@ -710,7 +752,10 @@ class RSESafariStrategy:
             (18, 17): "Up",  # PSYDUCK
             (25, 13): None,  # GOLDUCK
             (20, 20): None,  # GOLDEEN, MAGIKARP, SEAKING
-            (18, 33): "Right",  # HOOTHOOT, SPINARAK, MAREEP, SUNKERN, GLIGAR, SNUBBULL, STANTLER
+            (
+                18,
+                33,
+            ): "Right",  # HOOTHOOT, SPINARAK, MAREEP, SUNKERN, GLIGAR, SNUBBULL, STANTLER
             (6, 22): "Left",  # AIPOM, LEDYBA, PINECO, TEDDIURSA, HOUNDOUR, MILTANK
             (24, 21): "Right",  # MARILL, WOOPER, QUAGSIRE
             (20, 12): None,  # REMORAID, OCTILLERY
@@ -784,7 +829,9 @@ def get_lowest_feel_pokeblock_by_type(
     return best_index, best_pokeblock
 
 
-def get_lowest_feel_excluding_type(excluded_type: PokeblockType) -> tuple[int | None, Pokeblock | None]:
+def get_lowest_feel_excluding_type(
+    excluded_type: PokeblockType,
+) -> tuple[int | None, Pokeblock | None]:
     """Return the index and the Pokéblock with the lowest feel that is not of the excluded PokéblockType."""
     pokeblocks = get_pokeblocks()
     lowest_feel = float("inf")

@@ -1,12 +1,24 @@
 import math
 from typing import TYPE_CHECKING
 
-from modules.battle_state import BattlePokemon, BattleState, Weather, TemporaryStatus, BattleType
+from modules.battle_state import (
+    BattlePokemon,
+    BattleState,
+    Weather,
+    TemporaryStatus,
+    BattleType,
+)
 from modules.battle_strategies import TurnAction
 from modules.context import context
 from modules.items import ItemHoldEffect, get_item_bag, get_item_by_name
 from modules.memory import get_event_flag, read_symbol
-from modules.pokemon import StatusCondition, Pokemon, LearnedMove, get_type_by_name, get_ability_by_name
+from modules.pokemon import (
+    StatusCondition,
+    Pokemon,
+    LearnedMove,
+    get_type_by_name,
+    get_ability_by_name,
+)
 from modules.pokemon_party import get_party
 
 if TYPE_CHECKING:
@@ -273,7 +285,11 @@ class BattleStrategyUtil:
 
         if opponent.status_permanent in (StatusCondition.Sleep, StatusCondition.Freeze):
             status_multiplier = 2
-        elif opponent.status_permanent in (StatusCondition.Paralysis, StatusCondition.Poison, StatusCondition.Burn):
+        elif opponent.status_permanent in (
+            StatusCondition.Paralysis,
+            StatusCondition.Poison,
+            StatusCondition.Burn,
+        ):
             status_multiplier = 1.5
         elif opponent.status_permanent is StatusCondition.BadPoison and not context.rom.is_rs:
             # Due to a programming oversight in Ruby/Sapphire, the BadPoison state (which inflicts higher
@@ -294,7 +310,11 @@ class BattleStrategyUtil:
         return shake_success_probability**4
 
     def _calculate_base_move_damage(
-        self, move: "Move", attacker: "BattlePokemon", defender: "BattlePokemon", is_critical_hit: bool = False
+        self,
+        move: "Move",
+        attacker: "BattlePokemon",
+        defender: "BattlePokemon",
+        is_critical_hit: bool = False,
     ):
         # It is possible for the player to attack themselves (in double battles), so these
         # two things are not mutually exclusive and thus need to be checked separately.
@@ -566,7 +586,10 @@ class BattleStrategyUtil:
                 value = 100 - pokemon.level
             else:
                 value = pokemon.current_hp
-                if pokemon.status_condition in (StatusCondition.Sleep, StatusCondition.Freeze):
+                if pokemon.status_condition in (
+                    StatusCondition.Sleep,
+                    StatusCondition.Freeze,
+                ):
                     value *= 0.25
                 elif pokemon.status_condition == StatusCondition.BadPoison:
                     value *= 0.5

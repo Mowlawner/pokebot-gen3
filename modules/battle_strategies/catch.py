@@ -1,5 +1,9 @@
 from modules.battle_state import BattleState, TemporaryStatus
-from modules.battle_strategies import SafariTurnAction, DefaultBattleStrategy, BattleStrategyUtil
+from modules.battle_strategies import (
+    SafariTurnAction,
+    DefaultBattleStrategy,
+    BattleStrategyUtil,
+)
 from modules.battle_strategies import TurnAction
 from modules.context import context
 from modules.items import Item, get_item_bag, PokeblockType
@@ -49,7 +53,8 @@ class CatchStrategy(DefaultBattleStrategy):
         # condition to increase catch odds.
         if battle_state.opponent.active_battler.status_permanent == StatusCondition.Healthy:
             catch_success_chance = BattleStrategyUtil(battle_state).calculate_catch_success_chance(
-                battle_state, self._get_poke_ball_catch_rate_multiplier(battle_state, ball_to_throw)
+                battle_state,
+                self._get_poke_ball_catch_rate_multiplier(battle_state, ball_to_throw),
             )
 
             # Only bother inflicting a status condition if the chance of the opponent being caught
@@ -199,7 +204,10 @@ class CatchStrategy(DefaultBattleStrategy):
             opponent_ability = battle_state.opponent.active_battler.ability.name
 
             value = 0
-            if learned_move.move.effect == "SLEEP" and opponent_ability not in ("Insomnia", "Vital Spirit"):
+            if learned_move.move.effect == "SLEEP" and opponent_ability not in (
+                "Insomnia",
+                "Vital Spirit",
+            ):
                 value = 2 * learned_move.move.accuracy
             if learned_move.move.effect == "PARALYZE" and opponent_ability != "Limber":
                 value = 1.5 * learned_move.move.accuracy

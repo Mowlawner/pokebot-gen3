@@ -71,24 +71,55 @@ def parse_arguments(bot_mode_names: list[str]) -> StartupSettings:
         nargs="?",
         help="Profile to initialize. Otherwise, the profile selection menu will appear.",
     )
-    parser.add_argument("-m", "--bot-mode", choices=bot_mode_names, help="Initial bot mode (default: Manual).")
+    parser.add_argument(
+        "-m",
+        "--bot-mode",
+        choices=bot_mode_names,
+        help="Initial bot mode (default: Manual).",
+    )
     parser.add_argument(
         "-s",
         "--emulation-speed",
         choices=["0", "1", "2", "3", "4", "8", "16", "32"],
         help="Initial emulation speed (0 for unthrottled; default: 1)",
     )
-    parser.add_argument("-hl", "--headless", action="store_true", help="Run without a GUI, only using the console.")
-    parser.add_argument("-nv", "--no-video", action="store_true", help="Turn off video output by default.")
-    parser.add_argument("-na", "--no-audio", action="store_true", help="Turn off audio output by default.")
+    parser.add_argument(
+        "-hl",
+        "--headless",
+        action="store_true",
+        help="Run without a GUI, only using the console.",
+    )
+    parser.add_argument(
+        "-nv",
+        "--no-video",
+        action="store_true",
+        help="Turn off video output by default.",
+    )
+    parser.add_argument(
+        "-na",
+        "--no-audio",
+        action="store_true",
+        help="Turn off audio output by default.",
+    )
     parser.add_argument("-nt", "--no-theme", action="store_true", help="Turn off the fancy GUI theme.")
     parser.add_argument(
-        "-gl", "--use-opengl", action="store_true", help="Use OpenGL to render the video output (potentially faster)"
+        "-gl",
+        "--use-opengl",
+        action="store_true",
+        help="Use OpenGL to render the video output (potentially faster)",
     )
     parser.add_argument(
-        "-t", "--always-on-top", action="store_true", help="Keep the bot window always on top of other windows."
+        "-t",
+        "--always-on-top",
+        action="store_true",
+        help="Keep the bot window always on top of other windows.",
     )
-    parser.add_argument("-d", "--debug", action="store_true", help="Enable extra debug options and a debug menu.")
+    parser.add_argument(
+        "-d",
+        "--debug",
+        action="store_true",
+        help="Enable extra debug options and a debug menu.",
+    )
     parser.add_argument("-c", "--config", type=directory_arg, dest="config_path", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -157,7 +188,12 @@ if __name__ == "__main__":
         # be disabled using a command-line argument but for backward-compatibility reasons we
         # accept either.
         no_theme = os.getenv("POKEBOT_UNTHEMED") == "1" or startup_settings.no_theme
-        gui = PokebotGui(main_loop, on_exit, no_theme=no_theme, use_opengl=startup_settings.use_opengl)
+        gui = PokebotGui(
+            main_loop,
+            on_exit,
+            no_theme=no_theme,
+            use_opengl=startup_settings.use_opengl,
+        )
     context.gui = gui
 
     gui.run(startup_settings)

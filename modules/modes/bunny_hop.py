@@ -33,9 +33,7 @@ class BunnyHopMode(BotMode):
     def run(self) -> Generator:
         assert_player_has_poke_balls()
         assert_boxes_or_party_can_fit_pokemon()
-        assert_item_exists_in_bag(
-            ("Acro Bike",), "You need to have the Acro Bike in order to use this mode."
-        )
+        assert_item_exists_in_bag(("Acro Bike",), "You need to have the Acro Bike in order to use this mode.")
         yield from register_key_item(get_item_by_name("Acro Bike"))
 
         yield from apply_white_flute_if_available()
