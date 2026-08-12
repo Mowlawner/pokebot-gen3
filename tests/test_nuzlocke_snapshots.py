@@ -56,6 +56,15 @@ class TestNuzlockeSnapshots(unittest.TestCase):
             BATTLE_STARTING = 3
             BATTLE_ENDING = 4
 
+        class FakeMove:
+            name = "Pound"
+
+        class FakeLearnedMove:
+            move = FakeMove()
+            pp = 35
+            total_pp = 35
+            pp_ups = 0
+
         class FakePokemon:
             index = 0
             species = types.SimpleNamespace(name="Poochyena")
@@ -66,9 +75,11 @@ class TestNuzlockeSnapshots(unittest.TestCase):
             status_condition = types.SimpleNamespace(value="none")
             personality_value = 1
             original_trainer = types.SimpleNamespace(id=2, secret_id=3, name="May")
-            moves = ()
+            moves = (FakeLearnedMove(),)
             held_item = None
             is_egg = False
+            is_empty = False
+            is_valid = True
 
         player = Mock(name="player")
         player.name = "May"
@@ -123,6 +134,7 @@ class TestNuzlockeSnapshots(unittest.TestCase):
         self.assertEqual(result.player.coordinates, (5, 6))
         self.assertEqual(result.party[0].species, "Poochyena")
         self.assertEqual(result.pc.pokemon[0].slot, 4)
+        self.assertEqual(result.pc.pokemon[0].pokemon.moves[0].name, "Pound")
         self.assertTrue(result.pc_available)
         self.assertEqual(empty_storage_result.pc.pokemon, ())
         self.assertTrue(empty_storage_result.pc_available)
@@ -176,6 +188,57 @@ class TestNuzlockeSnapshots(unittest.TestCase):
         self.assertFalse(result.party_available)
         self.assertFalse(result.inventory_available)
         self.assertFalse(result.pc_available)
+
+    def test_malformed_storage_pokemon_is_not_normalized(self):
+        import modules.nuzlocke.snapshots as snapshots
+
+        class FakeState(Enum):
+            OVERWORLD = 1
+
+        malformed_pokemon = types.SimpleNamespace(is_empty=False, is_valid=False)
+        storage = types.SimpleNamespace(
+            active_box_index=13,
+            boxes=(
+                types.SimpleNamespace(
+                    number=13,
+                    slots=(types.SimpleNamespace(slot_index=29, pokemon=malformed_pokemon),),
+                ),
+            ),
+        )
+        fake_context = types.SimpleNamespace(
+            emulator=types.SimpleNamespace(get_frame_count=lambda: 7),
+            rom=types.SimpleNamespace(game_name="Pokémon Emerald"),
+        )
+        readers = {
+            "modules.context": types.SimpleNamespace(context=fake_context),
+            "modules.items": types.SimpleNamespace(get_item_bag=Mock(return_value=None)),
+            "modules.memory": types.SimpleNamespace(
+                get_game_state=Mock(return_value=FakeState.OVERWORLD),
+                get_event_flag=Mock(return_value=False),
+            ),
+            "modules.pokemon_party": types.SimpleNamespace(get_party=Mock(return_value=None)),
+            "modules.pokemon_storage": types.SimpleNamespace(get_pokemon_storage=Mock(return_value=storage)),
+            "modules.player": types.SimpleNamespace(
+                get_player=Mock(return_value=None),
+                get_player_avatar=Mock(return_value=None),
+                get_player_location=Mock(),
+                player_avatar_is_controllable=Mock(return_value=False),
+            ),
+        }
+        old_modules = {name: sys.modules.get(name) for name in readers}
+        try:
+            sys.modules.update(readers)
+            result = snapshots.get_nuzlocke_snapshot()
+        finally:
+            for name, module in old_modules.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
+
+        self.assertTrue(result.pc_available)
+        self.assertEqual(result.pc.active_box, 13)
+        self.assertEqual(result.pc.pokemon, ())
 
     def test_battle_starting_with_battlers_normalizes_battle_pokemon(self):
         import modules.nuzlocke.snapshots as snapshots

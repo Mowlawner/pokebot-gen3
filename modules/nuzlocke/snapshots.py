@@ -9,8 +9,10 @@ within-frame freshness limitations, but it never adds another snapshot cache.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from typing import TYPE_CHECKING
+
+from .identity import PokemonIdentity
 
 if TYPE_CHECKING:
     from modules.memory import GameState
@@ -40,6 +42,7 @@ class PokemonSnapshot:
     held_item: str | None
     fainted: bool
     egg: bool
+    identity: PokemonIdentity | None = dataclass_field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +99,7 @@ class BattlePokemonSnapshot:
     fainted: bool | None
     egg: bool
     moves: tuple[MoveSnapshot, ...]
+    identity: PokemonIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,7 +172,21 @@ def _pokemon(pokemon) -> PokemonSnapshot:
         held_item=pokemon.held_item.name if pokemon.held_item is not None else None,
         fainted=pokemon.current_hp == 0,
         egg=pokemon.is_egg,
+        identity=PokemonIdentity.from_pokemon(pokemon),
     )
+
+
+def _storage_pokemon_is_readable(pokemon) -> bool:
+    """Return whether a storage Pokémon can safely be normalized.
+
+    PokemonStorage normally applies parse_pokemon() before exposing a slot.
+    Keep this narrow guard at the passive snapshot boundary as storage data can
+    still be observed while the emulator is updating it.
+    """
+    try:
+        return not pokemon.is_empty and pokemon.is_valid
+    except (IndexError, TypeError, ValueError):
+        return False
 
 
 def _battle_pokemon(pokemon) -> BattlePokemonSnapshot:
@@ -184,6 +202,7 @@ def _battle_pokemon(pokemon) -> BattlePokemonSnapshot:
         fainted=None,
         egg=pokemon.is_egg,
         moves=_moves(pokemon),
+        identity=PokemonIdentity.from_battle_pokemon(pokemon),
     )
 
 
@@ -282,6 +301,7 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
                 StoragePokemonSnapshot(box.number, slot.slot_index, _pokemon(slot.pokemon))
                 for box in (storage.boxes if storage is not None else ())
                 for slot in box.slots
+                if _storage_pokemon_is_readable(slot.pokemon)
             ),
         ),
         progression=ProgressionSnapshot(

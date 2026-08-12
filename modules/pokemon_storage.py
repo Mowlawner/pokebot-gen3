@@ -4,7 +4,7 @@ from functools import cached_property
 from modules.context import context
 from modules.game import decode_string, get_symbol
 from modules.memory import read_symbol, unpack_uint32
-from modules.pokemon import Pokemon, Species
+from modules.pokemon import Pokemon, Species, parse_pokemon
 from modules.state_cache import state_cache
 
 
@@ -97,8 +97,8 @@ class PokemonStorage:
             slots = []
             for slot_index in range(30):
                 offset = pokemon_offset + (slot_index * 80)
-                pokemon = Pokemon(self._data[offset : offset + 80])
-                if not pokemon.is_empty:
+                pokemon = parse_pokemon(self._data[offset : offset + 80])
+                if pokemon is not None:
                     slots.append(PokemonStorageSlot(slot_index, pokemon))
 
             boxes.append(PokemonStorageBox(box_index, name, wallpaper_id, slots))

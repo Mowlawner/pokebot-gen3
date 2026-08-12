@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .snapshots import NuzlockeSnapshot, PartyPokemonSnapshot
+from .identity import PokemonIdentity
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,7 @@ class BattleStarted:
     is_trainer: bool
     is_wild: bool
     is_double: bool
+    own_pokemon_identities: tuple[PokemonIdentity, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +40,7 @@ class BattleEnded:
     is_trainer: bool
     is_wild: bool
     is_double: bool
+    own_pokemon_identities: tuple[PokemonIdentity, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +57,9 @@ class PartyChanged:
     left_party_indices: tuple[int, ...]
     reordered: bool
     changed_party_indices: tuple[int, ...]
+    entered_identities: tuple[PokemonIdentity, ...] = ()
+    left_identities: tuple[PokemonIdentity, ...] = ()
+    changed_identities: tuple[PokemonIdentity, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +70,22 @@ class PokemonFainted:
     nickname: str
     personality_value: int
     cause: str
+    identity: PokemonIdentity | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PokemonStorageLocation:
+    identity: PokemonIdentity
+    box: int
+    slot: int
+
+
+@dataclass(frozen=True, slots=True)
+class StorageChanged:
+    frame: int
+    entered: tuple[PokemonStorageLocation, ...]
+    left: tuple[PokemonStorageLocation, ...]
+    moved: tuple[tuple[PokemonStorageLocation, PokemonStorageLocation], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,13 +106,16 @@ Event = (
     | MapChanged
     | PartyChanged
     | PokemonFainted
+    | StorageChanged
     | WhiteoutOccurred
     | GameStateChanged
 )
 
 
 def _identity(pokemon: PartyPokemonSnapshot) -> tuple[Any, ...]:
-    """Best available current-game identity; this is not a persistent ID."""
+    """Use stable identity, retaining a legacy fallback for old snapshots."""
+    if pokemon.identity is not None:
+        return pokemon.identity
     return (
         pokemon.personality_value,
         pokemon.original_trainer_id,
@@ -154,14 +179,16 @@ class NuzlockeEventObserver:
             )
         ):
             battle = snapshot.battle
-            events.append(BattleStarted(snapshot.frame, battle.battle_type, battle.is_trainer, battle.is_wild, battle.is_double))
+            events.append(BattleStarted(snapshot.frame, battle.battle_type, battle.is_trainer, battle.is_wild, battle.is_double,
+                                        tuple(p.identity for p in battle.own_active if p.identity is not None)))
         elif (
             snapshot.battle_available
             and snapshot.battle is None
             and self._previous_ready_battle is not None
         ):
             battle = self._previous_ready_battle.battle
-            events.append(BattleEnded(snapshot.frame, battle.outcome, battle.battle_type, battle.is_trainer, battle.is_wild, battle.is_double))
+            events.append(BattleEnded(snapshot.frame, battle.outcome, battle.battle_type, battle.is_trainer, battle.is_wild, battle.is_double,
+                                      tuple(p.identity for p in battle.own_active if p.identity is not None)))
 
         previous_map = self._previous_map
         old_map, new_map = (_map(previous_map) if previous_map else None), _map(snapshot)
@@ -176,6 +203,8 @@ class NuzlockeEventObserver:
 
         if snapshot.party_available and self._previous_party is not None:
             events.extend(self._party_events(self._previous_party, snapshot))
+        if snapshot.pc_available and previous is not None and previous.pc_available:
+            events.extend(self._storage_events(previous, snapshot))
         self._remember_available(snapshot)
         return tuple(events)
 
@@ -210,7 +239,13 @@ class NuzlockeEventObserver:
         reordered = len(old_keys) == len(new_keys) and set(old_keys) == set(new_keys) and old_keys != new_keys
 
         if entered or left or changed or reordered:
-            event = PartyChanged(snapshot.frame, entered, left, reordered, changed)
+            entered_identities = tuple(p.identity for key, p in zip(new_keys, new) if key not in old_by_key and p.identity is not None)
+            left_identities = tuple(p.identity for key, p in zip(old_keys, old) if key not in new_by_key and p.identity is not None)
+            changed_identities = tuple(new_by_key[key].identity for key in new_keys
+                                       if key in old_by_key and new_by_key[key].identity is not None
+                                       and _party_state(old_by_key[key]) != _party_state(new_by_key[key]))
+            event = PartyChanged(snapshot.frame, entered, left, reordered, changed,
+                                 entered_identities, left_identities, changed_identities)
         else:
             event = None
 
@@ -226,9 +261,26 @@ class NuzlockeEventObserver:
                 cause = "battle" if snapshot.battle is not None or previous.battle is not None else "unknown"
                 if snapshot.battle is None and getattr(snapshot.game_state, "name", None) == "OVERWORLD" and pokemon.status in {"poison", "bad_poison"}:
                     cause = "poison"
-                faint_events.append(PokemonFainted(snapshot.frame, pokemon.party_index, pokemon.species, pokemon.nickname, pokemon.personality_value, cause))
+                faint_events.append(PokemonFainted(snapshot.frame, pokemon.party_index, pokemon.species, pokemon.nickname,
+                                                   pokemon.personality_value, cause, pokemon.identity))
                 self._fainted.add(key)
             elif not pokemon.fainted:
                 self._fainted.discard(key)
 
         return ([event] if event is not None else []) + faint_events
+
+    @staticmethod
+    def _storage_events(previous: NuzlockeSnapshot, snapshot: NuzlockeSnapshot) -> list[Event]:
+        def locations(value: NuzlockeSnapshot) -> dict[PokemonIdentity, PokemonStorageLocation]:
+            return {
+                item.pokemon.identity: PokemonStorageLocation(item.pokemon.identity, item.box, item.slot)
+                for item in value.pc.pokemon
+                if item.pokemon.identity is not None
+            }
+
+        old, new = locations(previous), locations(snapshot)
+        entered = tuple(new[identity] for identity in new.keys() - old.keys())
+        left = tuple(old[identity] for identity in old.keys() - new.keys())
+        moved = tuple((old[identity], new[identity]) for identity in old.keys() & new.keys()
+                      if old[identity] != new[identity])
+        return [StorageChanged(snapshot.frame, entered, left, moved)] if entered or left or moved else []

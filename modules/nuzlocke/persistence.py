@@ -13,7 +13,7 @@ import importlib
 import json
 import os
 import uuid
-from dataclasses import fields, is_dataclass
+from dataclasses import MISSING, fields, is_dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable
@@ -26,6 +26,7 @@ from .events import (
     MapChanged,
     PartyChanged,
     PokemonFainted,
+    StorageChanged,
     WhiteoutOccurred,
 )
 
@@ -33,6 +34,7 @@ SCHEMA_VERSION = 1
 _EVENT_TYPES = {cls.__name__: cls for cls in (
     BattleEnded, BattleStarted, GameStateChanged, MapChanged, PartyChanged,
     PokemonFainted, WhiteoutOccurred,
+    StorageChanged,
 )}
 
 
@@ -90,7 +92,13 @@ def deserialize_event(data: dict[str, Any]) -> Event:
     if event_type is None or not isinstance(data["payload"], dict):
         raise EventStoreCorruptionError("Unknown or malformed event type")
     try:
-        return event_type(**{field.name: _decode(data["payload"][field.name]) for field in fields(event_type)})
+        arguments = {}
+        for field in fields(event_type):
+            if field.name in data["payload"]:
+                arguments[field.name] = _decode(data["payload"][field.name])
+            elif field.default is MISSING and field.default_factory is MISSING:
+                raise KeyError(field.name)
+        return event_type(**arguments)
     except (KeyError, TypeError, ValueError, ImportError, AttributeError) as error:
         raise EventStoreCorruptionError("Invalid event payload") from error
 

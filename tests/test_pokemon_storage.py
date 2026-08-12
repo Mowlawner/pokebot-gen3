@@ -13,6 +13,11 @@ class _CacheItem:
 class TestPokemonStorageReader(unittest.TestCase):
     def _load_reader(self, *, offset):
         emulator = types.SimpleNamespace(read_bytes=Mock(return_value=bytes(33872)))
+
+        class FakePokemon:
+            def __init__(self, data):
+                self.data = data
+
         fake_modules = {
             "modules.context": types.SimpleNamespace(
                 context=types.SimpleNamespace(
@@ -28,7 +33,11 @@ class TestPokemonStorageReader(unittest.TestCase):
                 read_symbol=Mock(),
                 unpack_uint32=lambda value: 0,
             ),
-            "modules.pokemon": types.SimpleNamespace(Pokemon=object, Species=object),
+            "modules.pokemon": types.SimpleNamespace(
+                Pokemon=FakePokemon,
+                Species=object,
+                parse_pokemon=Mock(return_value=None),
+            ),
             "modules.state_cache": types.SimpleNamespace(
                 state_cache=types.SimpleNamespace(pokemon_storage=_CacheItem())
             ),
@@ -62,6 +71,22 @@ class TestPokemonStorageReader(unittest.TestCase):
             storage = module.get_pokemon_storage()
             self.assertIsInstance(storage, module.PokemonStorage)
             emulator.read_bytes.assert_called_once_with(0x02000000, 33872)
+        finally:
+            self._restore(module, old_modules)
+
+    def test_storage_boxes_expose_only_parsed_pokemon(self):
+        module, _, old_modules = self._load_reader(offset=0x02000000)
+        try:
+            valid_pokemon = types.SimpleNamespace(data=b"valid")
+            module.parse_pokemon.side_effect = [valid_pokemon, None] + [None] * 418
+
+            storage = module.PokemonStorage(0, bytes(33872))
+            slots = storage.boxes[0].slots
+
+            self.assertEqual(len(slots), 1)
+            self.assertEqual(slots[0].slot_index, 0)
+            self.assertIs(slots[0].pokemon, valid_pokemon)
+            self.assertEqual(module.parse_pokemon.call_count, 420)
         finally:
             self._restore(module, old_modules)
 
