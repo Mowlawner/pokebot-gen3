@@ -16,13 +16,20 @@ class Selection:
     button_enable: bool = True
 
 
-def ask_for_choice(choices: list[Selection], window_title: str = "Choose...") -> str | None:
+def ask_for_choice(
+    choices: list[Selection], window_title: str = "Choose..."
+) -> str | None:
     if context.gui.is_headless:
         console.print(f"\n[bold]{window_title}[/]")
         for index, choice in enumerate(choices):
-            console.print(f"  [bold magenta]\\[{index + 1}][/] " + choice.button_label.replace("\n", " "))
+            console.print(
+                f"  [bold magenta]\\[{index + 1}][/] "
+                + choice.button_label.replace("\n", " ")
+            )
         chosen_index = Prompt.ask(
-            "Choose option (number)", show_choices=False, choices=[str(n + 1) for n in range(len(choices))]
+            "Choose option (number)",
+            show_choices=False,
+            choices=[str(n + 1) for n in range(len(choices))],
         )
         return choices[int(chosen_index) - 1].button_label
 
@@ -39,7 +46,9 @@ def ask_for_choice(choices: list[Selection], window_title: str = "Choose...") ->
         selected_value = value
         window.after(50, remove_window)
 
-    maximum_number_of_lines = 1 + max(choice.button_label.count("\n") for choice in choices)
+    maximum_number_of_lines = 1 + max(
+        choice.button_label.count("\n") for choice in choices
+    )
 
     window_geometry = (len(choices) * 164, 160 + (maximum_number_of_lines * 20))
     window.title(window_title)
@@ -54,7 +63,9 @@ def ask_for_choice(choices: list[Selection], window_title: str = "Choose...") ->
 
     canvas = Canvas(frame)
     canvas.pack(side="left", fill="both", expand=True)
-    canvas.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.bind(
+        "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    )
 
     frame = ttk.Frame(canvas, width=window_geometry[1])
     for i in range(len(choices)):
@@ -92,7 +103,9 @@ def ask_for_choice(choices: list[Selection], window_title: str = "Choose...") ->
     return selected_value
 
 
-def ask_for_confirmation(message: str, window_title: str = "Confirmation") -> bool | None:
+def ask_for_confirmation(
+    message: str, window_title: str = "Confirmation"
+) -> bool | None:
     """
     Displays a confirmation window with the given message and Yes/No buttons.
 
@@ -163,19 +176,24 @@ def ask_for_confirmation(message: str, window_title: str = "Confirmation") -> bo
 
 
 def ask_for_choice_scroll(
-        choices: list[Selection],
-        window_title: str = "Choose...",
-        options_per_row: int = 3,
-        button_width: int = 165,
-        button_height: int = 165,
-        visible_rows: int = 2,
+    choices: list[Selection],
+    window_title: str = "Choose...",
+    options_per_row: int = 3,
+    button_width: int = 165,
+    button_height: int = 165,
+    visible_rows: int = 2,
 ) -> str | None:
     if context.gui.is_headless:
         console.print(f"\n[bold]{window_title}[/]")
         for index, choice in enumerate(choices):
-            console.print(f"  [bold magenta]\\[{index + 1}][/] " + choice.button_label.replace("\n", " "))
+            console.print(
+                f"  [bold magenta]\\[{index + 1}][/] "
+                + choice.button_label.replace("\n", " ")
+            )
         chosen_index = Prompt.ask(
-            "Choose option (number)", show_choices=False, choices=[str(n + 1) for n in range(len(choices))]
+            "Choose option (number)",
+            show_choices=False,
+            choices=[str(n + 1) for n in range(len(choices))],
         )
         return choices[int(chosen_index) - 1].button_label
 
@@ -213,7 +231,9 @@ def ask_for_choice_scroll(
     scrollbar.pack(side="right", fill="y")
 
     canvas.configure(yscrollcommand=scrollbar.set)
-    canvas.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.bind(
+        "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    )
 
     content_frame = ttk.Frame(canvas)
     canvas.create_window((0, 0), window=content_frame, anchor="nw")

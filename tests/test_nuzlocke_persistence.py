@@ -5,9 +5,20 @@ from enum import Enum
 from pathlib import Path
 
 from modules.nuzlocke.events import MapChanged
-from modules.nuzlocke.persistence import EventStoreCorruptionError, JsonEventStore, deserialize_event, serialize_event
+from modules.nuzlocke.persistence import (
+    EventStoreCorruptionError,
+    JsonEventStore,
+    deserialize_event,
+    serialize_event,
+)
 from modules.nuzlocke.runtime import NuzlockeRuntime
-from modules.nuzlocke.snapshots import InventorySnapshot, NuzlockeSnapshot, PlayerSnapshot, ProgressionSnapshot, StorageSnapshot
+from modules.nuzlocke.snapshots import (
+    InventorySnapshot,
+    NuzlockeSnapshot,
+    PlayerSnapshot,
+    ProgressionSnapshot,
+    StorageSnapshot,
+)
 
 
 class State(Enum):
@@ -15,7 +26,17 @@ class State(Enum):
 
 
 def snapshot(frame, map_number=2):
-    return NuzlockeSnapshot(frame, "test", State.OVERWORLD, PlayerSnapshot("May", 1, map_number, "MAP", (1, 1), "Down", True), (), InventorySnapshot((), (), ()), None, StorageSnapshot(0, ()), ProgressionSnapshot(()))
+    return NuzlockeSnapshot(
+        frame,
+        "test",
+        State.OVERWORLD,
+        PlayerSnapshot("May", 1, map_number, "MAP", (1, 1), "Down", True),
+        (),
+        InventorySnapshot((), (), ()),
+        None,
+        StorageSnapshot(0, ()),
+        ProgressionSnapshot(()),
+    )
 
 
 class TestNuzlockePersistence(unittest.TestCase):
@@ -28,7 +49,9 @@ class TestNuzlockePersistence(unittest.TestCase):
             self.assertFalse(store.append(event))
             self.assertEqual(store.append_many((MapChanged(2, (1, 3), (1, 4)),)), 1)
             reloaded = JsonEventStore(path)
-            self.assertEqual(reloaded.iter_events(), (event, MapChanged(2, (1, 3), (1, 4))))
+            self.assertEqual(
+                reloaded.iter_events(), (event, MapChanged(2, (1, 3), (1, 4)))
+            )
             self.assertEqual(reloaded.last_sequence(), 2)
 
     def test_sessions_allow_repeated_frames_and_runtime_sink(self):
@@ -46,7 +69,9 @@ class TestNuzlockePersistence(unittest.TestCase):
     def test_schema_and_corruption_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.json"
-            path.write_text(json.dumps({"schema_version": 999, "events": []}), encoding="utf-8")
+            path.write_text(
+                json.dumps({"schema_version": 999, "events": []}), encoding="utf-8"
+            )
             with self.assertRaises(EventStoreCorruptionError):
                 JsonEventStore(path)
             path.write_text('{"schema_version": 1, "events": [', encoding="utf-8")

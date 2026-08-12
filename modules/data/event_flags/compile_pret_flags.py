@@ -18,18 +18,21 @@ with open("flags.c", "w") as outfile:
     outfile.write("int main() {\n")
     with open("flags.h", "r") as file:
         for line in file.readlines():
-            if not line.startswith("#define") or line.strip() == "#define GUARD_CONSTANTS_FLAGS_H":
+            if (
+                not line.startswith("#define")
+                or line.strip() == "#define GUARD_CONSTANTS_FLAGS_H"
+            ):
                 continue
             match = re.match(r"^#define\s+(\S+)\s+(.*)$", line.strip())
             name, value = match.groups()
 
             if (
-                    name.startswith("NUM_")
-                    or (name.endswith("_START") and name != "FLAG_SYS_TV_START")
-                    or name.endswith("_END")
-                    or name.endswith("_COUNT")
-                    or re.match(r"^FLAG_0x[0-9A-Fa-f]+$", name)
-                    or re.match(r"^FLAG_UNUSED_0x[0-9A-Fa-f]+$", name)
+                name.startswith("NUM_")
+                or (name.endswith("_START") and name != "FLAG_SYS_TV_START")
+                or name.endswith("_END")
+                or name.endswith("_COUNT")
+                or re.match(r"^FLAG_0x[0-9A-Fa-f]+$", name)
+                or re.match(r"^FLAG_UNUSED_0x[0-9A-Fa-f]+$", name)
             ):
                 continue
 
@@ -38,7 +41,9 @@ with open("flags.c", "w") as outfile:
             else:
                 short_name = name
 
-            outfile.write('    printf("%d %s\\n", ' + name + ', "' + short_name + '");\n')
+            outfile.write(
+                '    printf("%d %s\\n", ' + name + ', "' + short_name + '");\n'
+            )
     outfile.write("    return 0;\n")
     outfile.write("}\n")
 

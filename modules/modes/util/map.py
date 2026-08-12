@@ -16,8 +16,16 @@ _closest_pokemon_centers: dict[MapFRLG | MapRSE, list[PokemonCenter]] = {
     MapRSE.ROUTE108: [PokemonCenter.DewfordTown],
     MapRSE.ROUTE109: [PokemonCenter.SlateportCity],
     MapRSE.ROUTE110: [PokemonCenter.SlateportCity, PokemonCenter.MauvilleCity],
-    MapRSE.ROUTE111: [PokemonCenter.MauvilleCity, PokemonCenter.MauvilleCity, PokemonCenter.FallarborTown],
-    MapRSE.ROUTE112: [PokemonCenter.LavaridgeTown, PokemonCenter.MauvilleCity, PokemonCenter.FallarborTown],
+    MapRSE.ROUTE111: [
+        PokemonCenter.MauvilleCity,
+        PokemonCenter.MauvilleCity,
+        PokemonCenter.FallarborTown,
+    ],
+    MapRSE.ROUTE112: [
+        PokemonCenter.LavaridgeTown,
+        PokemonCenter.MauvilleCity,
+        PokemonCenter.FallarborTown,
+    ],
     MapRSE.ROUTE113: [PokemonCenter.FallarborTown],
     MapRSE.ROUTE114: [PokemonCenter.FallarborTown],
     MapRSE.ROUTE115: [PokemonCenter.RustboroCity],
@@ -84,7 +92,7 @@ _closest_pokemon_centers: dict[MapFRLG | MapRSE, list[PokemonCenter]] = {
 
 
 def find_closest_pokemon_center(
-        location: MapLocation | tuple[MapFRLG | MapRSE, tuple[int, int]] | None = None,
+    location: MapLocation | tuple[MapFRLG | MapRSE, tuple[int, int]] | None = None,
 ) -> PokemonCenter:
     if isinstance(location, MapLocation):
         training_spot_map = location.map_group_and_number
@@ -101,14 +109,19 @@ def find_closest_pokemon_center(
                 path_to = calculate_path(location, pokemon_center_candidate.value)
                 path_from = calculate_path(pokemon_center_candidate.value, location)
                 path_length = len(path_to) + len(path_from)
-                if path_length_to_pokemon_center is None or path_length < path_length_to_pokemon_center:
+                if (
+                    path_length_to_pokemon_center is None
+                    or path_length < path_length_to_pokemon_center
+                ):
                     pokemon_center = pokemon_center_candidate
                     path_length_to_pokemon_center = path_length
             except PathFindingError:
                 pass
 
     if pokemon_center is None:
-        raise BotModeError("Could not find a suitable path from here to a Pokemon Center nearby.")
+        raise BotModeError(
+            "Could not find a suitable path from here to a Pokemon Center nearby."
+        )
 
     return pokemon_center
 

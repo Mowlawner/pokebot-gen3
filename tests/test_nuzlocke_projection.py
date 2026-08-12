@@ -4,11 +4,20 @@ from enum import Enum
 from pathlib import Path
 
 from modules.nuzlocke.events import (
-    BattleEnded, BattleStarted, GameStateChanged, MapChanged, PartyChanged,
-    PokemonFainted, WhiteoutOccurred,
+    BattleEnded,
+    BattleStarted,
+    GameStateChanged,
+    MapChanged,
+    PartyChanged,
+    PokemonFainted,
+    WhiteoutOccurred,
 )
 from modules.nuzlocke.persistence import JsonEventStore
-from modules.nuzlocke.projection import CampaignProjection, load_campaign_projection, reduce_events
+from modules.nuzlocke.projection import (
+    CampaignProjection,
+    load_campaign_projection,
+    reduce_events,
+)
 
 
 class State(Enum):
@@ -34,8 +43,11 @@ class TestCampaignProjection(unittest.TestCase):
 
     def test_party_faint_and_whiteout_are_historical(self):
         faint = PokemonFainted(2, 0, "Poochyena", "Pup", 123, "battle")
-        events = (PartyChanged(1, (0, 1), (), False, ()), faint,
-                  PartyChanged(3, (), (0,), False, ()))
+        events = (
+            PartyChanged(1, (0, 1), (), False, ()),
+            faint,
+            PartyChanged(3, (), (0,), False, ()),
+        )
         projection = CampaignProjection()
         for event in events:
             projection.apply(event)

@@ -5,7 +5,10 @@ from modules.battle_strategies import BattleStrategy, DefaultBattleStrategy
 from modules.context import context
 from modules.debug import debug
 from modules.encounter import EncounterInfo, handle_encounter
-from modules.map import get_map_data_for_current_position, get_effective_encounter_rates_for_current_map
+from modules.map import (
+    get_map_data_for_current_position,
+    get_effective_encounter_rates_for_current_map,
+)
 from modules.map_data import MapFRLG, get_map_enum
 from modules.modes import BotModeError, BattleAction
 from modules.modes.util import (
@@ -27,7 +30,9 @@ class PokecenterLoopController:
         self._needs_healing = False
         self._leave_pokemon_center = False
 
-    def on_battle_started(self, encounter: "EncounterInfo | None") -> BattleAction | BattleStrategy | None:
+    def on_battle_started(
+        self, encounter: "EncounterInfo | None"
+    ) -> BattleAction | BattleStrategy | None:
         if encounter is None:
             return None
 
@@ -47,12 +52,16 @@ class PokecenterLoopController:
             # in the strongest Pokémon immediately to allow the weak Pokémon to gain at least some
             # PP.
             lead_knows_damaging_moves = any(
-                [learned_move.move.base_power for learned_move in lead_pokemon.moves if learned_move is not None]
+                [
+                    learned_move.move.base_power
+                    for learned_move in lead_pokemon.moves
+                    if learned_move is not None
+                ]
             )
             if (
-                    lead_pokemon.current_hp <= 0
-                    or lead_knows_damaging_moves
-                    or not self.battle_strategy().party_can_battle()
+                lead_pokemon.current_hp <= 0
+                or lead_knows_damaging_moves
+                or not self.battle_strategy().party_can_battle()
             ):
                 self._needs_healing = True
 
@@ -66,8 +75,12 @@ class PokecenterLoopController:
             raise BotModeError("There are not encounters on this tile.")
 
         effective_encounters = get_effective_encounter_rates_for_current_map()
-        if (not current_location.is_surfable and len(effective_encounters.land_encounters) == 0) or (
-                current_location.is_surfable and len(effective_encounters.surf_encounters) == 0
+        if (
+            not current_location.is_surfable
+            and len(effective_encounters.land_encounters) == 0
+        ) or (
+            current_location.is_surfable
+            and len(effective_encounters.surf_encounters) == 0
         ):
             raise BotModeError(
                 "Currently, no encounters can happen on this map. This might be due to active Repel, or because this map simply doesn't have any."
@@ -78,7 +91,11 @@ class PokecenterLoopController:
         find_closest_pokemon_center(current_location)
 
     @debug.track
-    def run(self, stop_condition: Optional[Callable[[], bool]] = None, activity: Literal["spin", "fish"] = "spin"):
+    def run(
+        self,
+        stop_condition: Optional[Callable[[], bool]] = None,
+        activity: Literal["spin", "fish"] = "spin",
+    ):
         encounter_spot = get_map_data_for_current_position()
         pokemon_center = find_closest_pokemon_center(encounter_spot)
 
@@ -104,13 +121,15 @@ class PokecenterLoopController:
             self._leave_pokemon_center = False
             self._needs_healing = False
 
-            yield from navigate_to(get_map_enum(encounter_spot), encounter_spot.local_position)
+            yield from navigate_to(
+                get_map_enum(encounter_spot), encounter_spot.local_position
+            )
 
             def activity_stop_condition() -> bool:
                 return (
-                        self._needs_healing
-                        or self._leave_pokemon_center
-                        or (stop_condition is not None and stop_condition())
+                    self._needs_healing
+                    or self._leave_pokemon_center
+                    or (stop_condition is not None and stop_condition())
                 )
 
             if activity == "fish":

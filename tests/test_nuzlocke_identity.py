@@ -20,7 +20,9 @@ class TestPokemonIdentity(unittest.TestCase):
             personality_value = 10
             original_trainer = type("Trainer", (), {"id": 20, "secret_id": 30})()
 
-        self.assertEqual(PokemonIdentity.from_pokemon(FakePokemon()), PokemonIdentity(10, 20, 30))
+        self.assertEqual(
+            PokemonIdentity.from_pokemon(FakePokemon()), PokemonIdentity(10, 20, 30)
+        )
         FakePokemon.is_valid = False
         self.assertIsNone(PokemonIdentity.from_pokemon(FakePokemon()))
         FakePokemon.is_valid = True
@@ -41,19 +43,52 @@ class TestPokemonIdentity(unittest.TestCase):
 
     def test_identity_survives_location_and_mutable_snapshot_changes(self):
         from modules.nuzlocke.identity import PokemonIdentity
-        from modules.nuzlocke.snapshots import PartyPokemonSnapshot, StoragePokemonSnapshot
+        from modules.nuzlocke.snapshots import (
+            PartyPokemonSnapshot,
+            StoragePokemonSnapshot,
+        )
 
         identity = PokemonIdentity(10, 20, 30)
-        party = PartyPokemonSnapshot(party_index=0, species="Treecko", nickname="Sprig", level=5,
-                                     current_hp=10, max_hp=10, status="none", personality_value=10,
-                                     original_trainer_id=20, original_trainer_secret_id=30,
-                                     original_trainer_name="May", moves=(), held_item=None,
-                                     fainted=False, egg=False, identity=identity)
-        pc = StoragePokemonSnapshot(3, 14, PartyPokemonSnapshot(
-            party_index=5, species="Grovyle", nickname="Sprig", level=16, current_hp=20,
-            max_hp=30, status="poison", personality_value=10, original_trainer_id=20,
-            original_trainer_secret_id=30, original_trainer_name="May", moves=(), held_item=None,
-            fainted=False, egg=False, identity=identity))
+        party = PartyPokemonSnapshot(
+            party_index=0,
+            species="Treecko",
+            nickname="Sprig",
+            level=5,
+            current_hp=10,
+            max_hp=10,
+            status="none",
+            personality_value=10,
+            original_trainer_id=20,
+            original_trainer_secret_id=30,
+            original_trainer_name="May",
+            moves=(),
+            held_item=None,
+            fainted=False,
+            egg=False,
+            identity=identity,
+        )
+        pc = StoragePokemonSnapshot(
+            3,
+            14,
+            PartyPokemonSnapshot(
+                party_index=5,
+                species="Grovyle",
+                nickname="Sprig",
+                level=16,
+                current_hp=20,
+                max_hp=30,
+                status="poison",
+                personality_value=10,
+                original_trainer_id=20,
+                original_trainer_secret_id=30,
+                original_trainer_name="May",
+                moves=(),
+                held_item=None,
+                fainted=False,
+                egg=False,
+                identity=identity,
+            ),
+        )
         self.assertEqual(party.identity, pc.pokemon.identity)
 
     def test_invalid_and_empty_slots_have_no_identity(self):
@@ -76,10 +111,17 @@ class TestPokemonIdentity(unittest.TestCase):
             2,
             (),
             (),
-            ((PokemonStorageLocation(identity, 0, 1), PokemonStorageLocation(identity, 4, 29)),),
+            (
+                (
+                    PokemonStorageLocation(identity, 0, 1),
+                    PokemonStorageLocation(identity, 4, 29),
+                ),
+            ),
         )
         projection = CampaignProjection()
-        projection.apply(StorageChanged(1, (PokemonStorageLocation(identity, 0, 1),), ()))
+        projection.apply(
+            StorageChanged(1, (PokemonStorageLocation(identity, 0, 1),), ())
+        )
         projection.apply(event)
         self.assertEqual(projection.state.pc_locations, ((identity, 4, 29),))
 

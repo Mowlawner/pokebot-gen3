@@ -4,7 +4,11 @@ from modules.battle_state import BattleOutcome
 from modules.context import context
 from modules.items import get_item_by_name
 from modules.player import AcroBikeState, TileTransitionState, get_player_avatar
-from ._asserts import assert_item_exists_in_bag, assert_player_has_poke_balls, assert_boxes_or_party_can_fit_pokemon
+from ._asserts import (
+    assert_item_exists_in_bag,
+    assert_player_has_poke_balls,
+    assert_boxes_or_party_can_fit_pokemon,
+)
 from ._interface import BotMode
 from .util import apply_white_flute_if_available, register_key_item
 
@@ -29,7 +33,9 @@ class BunnyHopMode(BotMode):
     def run(self) -> Generator:
         assert_player_has_poke_balls()
         assert_boxes_or_party_can_fit_pokemon()
-        assert_item_exists_in_bag(("Acro Bike",), "You need to have the Acro Bike in order to use this mode.")
+        assert_item_exists_in_bag(
+            ("Acro Bike",), "You need to have the Acro Bike in order to use this mode."
+        )
         yield from register_key_item(get_item_by_name("Acro Bike"))
 
         yield from apply_white_flute_if_available()
@@ -39,13 +45,13 @@ class BunnyHopMode(BotMode):
             if not player.is_on_bike:
                 context.emulator.press_button("Select")
             elif (
-                    player.acro_bike_state == AcroBikeState.HOPPING_WHEELIE
-                    and player.tile_transition_state == TileTransitionState.CENTERING
+                player.acro_bike_state == AcroBikeState.HOPPING_WHEELIE
+                and player.tile_transition_state == TileTransitionState.CENTERING
             ):
                 context.emulator.release_button("B")
             elif (
-                    player.acro_bike_state == AcroBikeState.STANDING_WHEELIE
-                    and player.tile_transition_state == TileTransitionState.NOT_MOVING
+                player.acro_bike_state == AcroBikeState.STANDING_WHEELIE
+                and player.tile_transition_state == TileTransitionState.NOT_MOVING
             ):
                 context.emulator.hold_button("B")
             else:

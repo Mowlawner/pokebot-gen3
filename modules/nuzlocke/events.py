@@ -179,26 +179,67 @@ class NuzlockeEventObserver:
             )
         ):
             battle = snapshot.battle
-            events.append(BattleStarted(snapshot.frame, battle.battle_type, battle.is_trainer, battle.is_wild, battle.is_double,
-                                        tuple(p.identity for p in battle.own_active if p.identity is not None)))
+            events.append(
+                BattleStarted(
+                    snapshot.frame,
+                    battle.battle_type,
+                    battle.is_trainer,
+                    battle.is_wild,
+                    battle.is_double,
+                    tuple(
+                        p.identity for p in battle.own_active if p.identity is not None
+                    ),
+                )
+            )
         elif (
             snapshot.battle_available
             and snapshot.battle is None
             and self._previous_ready_battle is not None
         ):
             battle = self._previous_ready_battle.battle
-            events.append(BattleEnded(snapshot.frame, battle.outcome, battle.battle_type, battle.is_trainer, battle.is_wild, battle.is_double,
-                                      tuple(p.identity for p in battle.own_active if p.identity is not None)))
+            events.append(
+                BattleEnded(
+                    snapshot.frame,
+                    battle.outcome,
+                    battle.battle_type,
+                    battle.is_trainer,
+                    battle.is_wild,
+                    battle.is_double,
+                    tuple(
+                        p.identity for p in battle.own_active if p.identity is not None
+                    ),
+                )
+            )
 
         previous_map = self._previous_map
-        old_map, new_map = (_map(previous_map) if previous_map else None), _map(snapshot)
-        if snapshot.player_available and previous_map is not None and old_map != new_map:
+        old_map, new_map = (
+            (_map(previous_map) if previous_map else None),
+            _map(snapshot),
+        )
+        if (
+            snapshot.player_available
+            and previous_map is not None
+            and old_map != new_map
+        ):
             events.append(MapChanged(snapshot.frame, old_map, new_map))
 
         previous_state = self._previous_game_state
-        if snapshot.game_state_available and previous_state is not None and previous_state.game_state != snapshot.game_state:
-            events.append(GameStateChanged(snapshot.frame, previous_state.game_state, snapshot.game_state))
-        if snapshot.game_state_available and previous_state is not None and previous_state.game_state != snapshot.game_state and getattr(snapshot.game_state, "name", None) == "WHITEOUT":
+        if (
+            snapshot.game_state_available
+            and previous_state is not None
+            and previous_state.game_state != snapshot.game_state
+        ):
+            events.append(
+                GameStateChanged(
+                    snapshot.frame, previous_state.game_state, snapshot.game_state
+                )
+            )
+        if (
+            snapshot.game_state_available
+            and previous_state is not None
+            and previous_state.game_state != snapshot.game_state
+            and getattr(snapshot.game_state, "name", None) == "WHITEOUT"
+        ):
             events.append(WhiteoutOccurred(snapshot.frame))
 
         if snapshot.party_available and self._previous_party is not None:
@@ -222,30 +263,61 @@ class NuzlockeEventObserver:
         if snapshot.party_available:
             self._previous_party = snapshot
 
-    def _party_events(self, previous: NuzlockeSnapshot, snapshot: NuzlockeSnapshot) -> list[Event]:
+    def _party_events(
+        self, previous: NuzlockeSnapshot, snapshot: NuzlockeSnapshot
+    ) -> list[Event]:
         old = previous.party
         new = snapshot.party
         old_keys = tuple(_identity(p) for p in old)
         new_keys = tuple(_identity(p) for p in new)
         old_by_key = {key: p for key, p in zip(old_keys, old)}
         new_by_key = {key: p for key, p in zip(new_keys, new)}
-        entered = tuple(p.party_index for key, p in zip(new_keys, new) if key not in old_by_key)
-        left = tuple(p.party_index for key, p in zip(old_keys, old) if key not in new_by_key)
+        entered = tuple(
+            p.party_index for key, p in zip(new_keys, new) if key not in old_by_key
+        )
+        left = tuple(
+            p.party_index for key, p in zip(old_keys, old) if key not in new_by_key
+        )
         changed = tuple(
             new_by_key[key].party_index
             for key in new_keys
-            if key in old_by_key and _party_state(old_by_key[key]) != _party_state(new_by_key[key])
+            if key in old_by_key
+            and _party_state(old_by_key[key]) != _party_state(new_by_key[key])
         )
-        reordered = len(old_keys) == len(new_keys) and set(old_keys) == set(new_keys) and old_keys != new_keys
+        reordered = (
+            len(old_keys) == len(new_keys)
+            and set(old_keys) == set(new_keys)
+            and old_keys != new_keys
+        )
 
         if entered or left or changed or reordered:
-            entered_identities = tuple(p.identity for key, p in zip(new_keys, new) if key not in old_by_key and p.identity is not None)
-            left_identities = tuple(p.identity for key, p in zip(old_keys, old) if key not in new_by_key and p.identity is not None)
-            changed_identities = tuple(new_by_key[key].identity for key in new_keys
-                                       if key in old_by_key and new_by_key[key].identity is not None
-                                       and _party_state(old_by_key[key]) != _party_state(new_by_key[key]))
-            event = PartyChanged(snapshot.frame, entered, left, reordered, changed,
-                                 entered_identities, left_identities, changed_identities)
+            entered_identities = tuple(
+                p.identity
+                for key, p in zip(new_keys, new)
+                if key not in old_by_key and p.identity is not None
+            )
+            left_identities = tuple(
+                p.identity
+                for key, p in zip(old_keys, old)
+                if key not in new_by_key and p.identity is not None
+            )
+            changed_identities = tuple(
+                new_by_key[key].identity
+                for key in new_keys
+                if key in old_by_key
+                and new_by_key[key].identity is not None
+                and _party_state(old_by_key[key]) != _party_state(new_by_key[key])
+            )
+            event = PartyChanged(
+                snapshot.frame,
+                entered,
+                left,
+                reordered,
+                changed,
+                entered_identities,
+                left_identities,
+                changed_identities,
+            )
         else:
             event = None
 
@@ -257,12 +329,34 @@ class NuzlockeEventObserver:
             # A newly observed party member may already have 0 HP (for
             # example, while party data is being populated).  Without a
             # prior member snapshot that is not enough evidence of a faint.
-            if pokemon.fainted and old_pokemon is not None and not old_pokemon.fainted and key not in self._fainted:
-                cause = "battle" if snapshot.battle is not None or previous.battle is not None else "unknown"
-                if snapshot.battle is None and getattr(snapshot.game_state, "name", None) == "OVERWORLD" and pokemon.status in {"poison", "bad_poison"}:
+            if (
+                pokemon.fainted
+                and old_pokemon is not None
+                and not old_pokemon.fainted
+                and key not in self._fainted
+            ):
+                cause = (
+                    "battle"
+                    if snapshot.battle is not None or previous.battle is not None
+                    else "unknown"
+                )
+                if (
+                    snapshot.battle is None
+                    and getattr(snapshot.game_state, "name", None) == "OVERWORLD"
+                    and pokemon.status in {"poison", "bad_poison"}
+                ):
                     cause = "poison"
-                faint_events.append(PokemonFainted(snapshot.frame, pokemon.party_index, pokemon.species, pokemon.nickname,
-                                                   pokemon.personality_value, cause, pokemon.identity))
+                faint_events.append(
+                    PokemonFainted(
+                        snapshot.frame,
+                        pokemon.party_index,
+                        pokemon.species,
+                        pokemon.nickname,
+                        pokemon.personality_value,
+                        cause,
+                        pokemon.identity,
+                    )
+                )
                 self._fainted.add(key)
             elif not pokemon.fainted:
                 self._fainted.discard(key)
@@ -270,10 +364,16 @@ class NuzlockeEventObserver:
         return ([event] if event is not None else []) + faint_events
 
     @staticmethod
-    def _storage_events(previous: NuzlockeSnapshot, snapshot: NuzlockeSnapshot) -> list[Event]:
-        def locations(value: NuzlockeSnapshot) -> dict[PokemonIdentity, PokemonStorageLocation]:
+    def _storage_events(
+        previous: NuzlockeSnapshot, snapshot: NuzlockeSnapshot
+    ) -> list[Event]:
+        def locations(
+            value: NuzlockeSnapshot,
+        ) -> dict[PokemonIdentity, PokemonStorageLocation]:
             return {
-                item.pokemon.identity: PokemonStorageLocation(item.pokemon.identity, item.box, item.slot)
+                item.pokemon.identity: PokemonStorageLocation(
+                    item.pokemon.identity, item.box, item.slot
+                )
                 for item in value.pc.pokemon
                 if item.pokemon.identity is not None
             }
@@ -281,6 +381,13 @@ class NuzlockeEventObserver:
         old, new = locations(previous), locations(snapshot)
         entered = tuple(new[identity] for identity in new.keys() - old.keys())
         left = tuple(old[identity] for identity in old.keys() - new.keys())
-        moved = tuple((old[identity], new[identity]) for identity in old.keys() & new.keys()
-                      if old[identity] != new[identity])
-        return [StorageChanged(snapshot.frame, entered, left, moved)] if entered or left or moved else []
+        moved = tuple(
+            (old[identity], new[identity])
+            for identity in old.keys() & new.keys()
+            if old[identity] != new[identity]
+        )
+        return (
+            [StorageChanged(snapshot.frame, entered, left, moved)]
+            if entered or left or moved
+            else []
+        )

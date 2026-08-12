@@ -211,32 +211,58 @@ def _items(slots) -> tuple[ItemQuantity, ...]:
 
 
 def _player() -> tuple[PlayerSnapshot, bool]:
-    from modules.player import get_player, get_player_avatar, get_player_location, player_avatar_is_controllable
+    from modules.player import (
+        get_player,
+        get_player_avatar,
+        get_player_location,
+        player_avatar_is_controllable,
+    )
 
     player = get_player()
     avatar = get_player_avatar()
     if avatar is None:
-        return PlayerSnapshot(player.name if player else None, None, None, None, None, None, False), False
+        return (
+            PlayerSnapshot(
+                player.name if player else None, None, None, None, None, None, False
+            ),
+            False,
+        )
     location, coordinates = get_player_location()
     group, number = avatar.map_group_and_number
-    return PlayerSnapshot(
-        name=player.name if player else None,
-        map_group=group,
-        map_number=number,
-        map_name=getattr(location, "name", None),
-        coordinates=tuple(coordinates),
-        facing=avatar.facing_direction,
-        controllable=player_avatar_is_controllable(),
-    ), True
+    return (
+        PlayerSnapshot(
+            name=player.name if player else None,
+            map_group=group,
+            map_number=number,
+            map_name=getattr(location, "name", None),
+            coordinates=tuple(coordinates),
+            facing=avatar.facing_direction,
+            controllable=player_avatar_is_controllable(),
+        ),
+        True,
+    )
 
 
 def _battle(game_state: GameState) -> BattleSnapshot | None:
-    if getattr(game_state, "name", None) not in {"BATTLE", "BATTLE_STARTING", "BATTLE_ENDING"}:
+    if getattr(game_state, "name", None) not in {
+        "BATTLE",
+        "BATTLE_STARTING",
+        "BATTLE_ENDING",
+    }:
         return None
-    from modules.battle_state import BattleState, BattleType, get_battle_state, get_last_battle_outcome
+    from modules.battle_state import (
+        BattleState,
+        BattleType,
+        get_battle_state,
+        get_last_battle_outcome,
+    )
     from modules.memory import GameState
 
-    if game_state not in (GameState.BATTLE, GameState.BATTLE_STARTING, GameState.BATTLE_ENDING):
+    if game_state not in (
+        GameState.BATTLE,
+        GameState.BATTLE_STARTING,
+        GameState.BATTLE_ENDING,
+    ):
         return None
     state: BattleState | None = get_battle_state()
     if state is None:
@@ -248,8 +274,16 @@ def _battle(game_state: GameState) -> BattleSnapshot | None:
         outcome = "Unknown"
     battling_pokemon = state.battling_pokemon
     battle_ready = len(battling_pokemon) >= 2
-    own_active = tuple(_battle_pokemon(p) for p in state.own_side.active_battlers) if battle_ready else ()
-    opponent_active = tuple(_battle_pokemon(p) for p in state.opponent.active_battlers) if battle_ready else ()
+    own_active = (
+        tuple(_battle_pokemon(p) for p in state.own_side.active_battlers)
+        if battle_ready
+        else ()
+    )
+    opponent_active = (
+        tuple(_battle_pokemon(p) for p in state.opponent.active_battlers)
+        if battle_ready
+        else ()
+    )
     battle_ready = battle_ready and bool(own_active) and bool(opponent_active)
     return BattleSnapshot(
         battle_type=tuple(flag.name for flag in BattleType if flag in battle_type),
@@ -283,7 +317,10 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
         player=player,
         party=tuple(
             PartyPokemonSnapshot(
-                **{field: getattr(snapshot, field) for field in PokemonSnapshot.__dataclass_fields__},
+                **{
+                    field: getattr(snapshot, field)
+                    for field in PokemonSnapshot.__dataclass_fields__
+                },
                 party_index=p.index,
             )
             for p in party or ()
@@ -298,14 +335,19 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
         pc=StorageSnapshot(
             active_box=storage.active_box_index if storage is not None else 0,
             pokemon=tuple(
-                StoragePokemonSnapshot(box.number, slot.slot_index, _pokemon(slot.pokemon))
+                StoragePokemonSnapshot(
+                    box.number, slot.slot_index, _pokemon(slot.pokemon)
+                )
                 for box in (storage.boxes if storage is not None else ())
                 for slot in box.slots
                 if _storage_pokemon_is_readable(slot.pokemon)
             ),
         ),
         progression=ProgressionSnapshot(
-            tuple(NamedFlag(f"BADGE{i:02d}_GET", get_event_flag(f"BADGE{i:02d}_GET")) for i in range(1, 9))
+            tuple(
+                NamedFlag(f"BADGE{i:02d}_GET", get_event_flag(f"BADGE{i:02d}_GET"))
+                for i in range(1, 9)
+            )
         ),
         game_state_available=game_state is not None,
         player_available=player_available,

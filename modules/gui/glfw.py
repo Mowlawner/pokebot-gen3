@@ -29,7 +29,9 @@ class GlfwGui:
 
     def run(self, startup_settings: "StartupSettings"):
         if startup_settings.profile is None:
-            raise RuntimeError("The GLFW frontend cannot be started without selecting a profile.")
+            raise RuntimeError(
+                "The GLFW frontend cannot be started without selecting a profile."
+            )
 
         context.profile = startup_settings.profile
         context.config.load(startup_settings.profile.path, strict=False)
@@ -48,7 +50,9 @@ class GlfwGui:
         if not glfw.init():
             return
 
-        window = glfw.create_window(WIDTH * self._scale, HEIGHT * self._scale, "Pokebot OpenGL", None, None)
+        window = glfw.create_window(
+            WIDTH * self._scale, HEIGHT * self._scale, "Pokebot OpenGL", None, None
+        )
         if not window:
             glfw.terminate()
             return
@@ -85,10 +89,14 @@ class GlfwGui:
                     context.emulator.set_inputs(0)
                 elif key == glfw.KEY_EQUAL and modifiers == glfw.MOD_SHIFT:
                     self._scale = min(5, self._scale + 1)
-                    glfw.set_window_size(window, WIDTH * self._scale, HEIGHT * self._scale)
+                    glfw.set_window_size(
+                        window, WIDTH * self._scale, HEIGHT * self._scale
+                    )
                 elif key == glfw.KEY_MINUS:
                     self._scale = max(1, self._scale - 1)
-                    glfw.set_window_size(window, WIDTH * self._scale, HEIGHT * self._scale)
+                    glfw.set_window_size(
+                        window, WIDTH * self._scale, HEIGHT * self._scale
+                    )
                 elif key == glfw.KEY_1:
                     context.emulation_speed = 1
                 elif key == glfw.KEY_2:
@@ -136,7 +144,17 @@ class GlfwGui:
 
             # Upload texture data
             if frame_data is not None:
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, WIDTH, HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, frame_data)
+                glTexImage2D(
+                    GL_TEXTURE_2D,
+                    0,
+                    GL_RGBA,
+                    WIDTH,
+                    HEIGHT,
+                    0,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    frame_data,
+                )
 
             # Draw a fullscreen textured quad
             glEnable(GL_TEXTURE_2D)
@@ -161,7 +179,8 @@ class GlfwGui:
 
     def _on_frame(self):
         if (
-                context.emulator.get_speed_factor() == 1
-                or context.emulator._performance_tracker.time_since_last_render() >= (1 / 60) * 1_000_000_000
+            context.emulator.get_speed_factor() == 1
+            or context.emulator._performance_tracker.time_since_last_render()
+            >= (1 / 60) * 1_000_000_000
         ):
             context.emulator._performance_tracker.track_render()

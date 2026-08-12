@@ -95,17 +95,23 @@ class DaycareMode(BotMode):
                 f"The Pokemon in the daycare are not compatible. \n{get_daycare_data().compatibility[1]}."
             )
         if get_daycare_data().compatibility[0] == DaycareCompatibility.Low:
-            console.print("[bold yellow]WARNING: Low compatibility between daycare pokemon.")
+            console.print(
+                "[bold yellow]WARNING: Low compatibility between daycare pokemon."
+            )
             console.print(f"[bold yellow]{get_daycare_data().compatibility[1]}")
             console.print("[bold yellow]Egg generation rates may be affected.")
 
         if context.rom.is_emerald:
             party = get_party()
-            if not party.has_pokemon_with_ability("Flame Body") and not party.has_pokemon_with_ability("Magma Armor"):
+            if not party.has_pokemon_with_ability(
+                "Flame Body"
+            ) and not party.has_pokemon_with_ability("Magma Armor"):
                 console.print(
                     "[bold yellow]WARNING: No Pokémon in your party has the Flame Body or Magma Armor ability."
                 )
-                console.print("[bold yellow]This will slow down the egg hatching process.")
+                console.print(
+                    "[bold yellow]This will slow down the egg hatching process."
+                )
 
         item_bag = get_item_bag()
         if item_bag.quantity_of(get_item_by_name("Mach Bike")) > 0:
@@ -113,10 +119,12 @@ class DaycareMode(BotMode):
             self._use_bike = True
         elif context.rom.is_rse:
             if (
-                    get_item_storage().quantity_of(get_item_by_name("Mach Bike")) > 0
-                    or get_item_storage().quantity_of(get_item_by_name("Acro Bike")) > 0
+                get_item_storage().quantity_of(get_item_by_name("Mach Bike")) > 0
+                or get_item_storage().quantity_of(get_item_by_name("Acro Bike")) > 0
             ):
-                raise BotModeError("Your bicycle is stored in the PC storage system. Please go and get it.")
+                raise BotModeError(
+                    "Your bicycle is stored in the PC storage system. Please go and get it."
+                )
 
             # Get the Mach Bike in Mauville City
             yield from navigate_to(MapRSE.MAUVILLE_CITY, (35, 5))
@@ -144,10 +152,14 @@ class DaycareMode(BotMode):
             yield from register_key_item(get_item_by_name("Bicycle"))
             self._use_bike = True
         elif item_bag.quantity_of(get_item_by_name("Acro Bike")) > 0:
-            console.print("[bold yellow]WARNING: You do not have the Mach Bike, so we will just be running.")
+            console.print(
+                "[bold yellow]WARNING: You do not have the Mach Bike, so we will just be running."
+            )
             console.print("[bold yellow]This will slow down the egg hatching process.")
         else:
-            console.print("[bold yellow]WARNING: You do not have a bicycle, so we will just be running.")
+            console.print(
+                "[bold yellow]WARNING: You do not have a bicycle, so we will just be running."
+            )
             console.print("[bold yellow]This will slow down the egg hatching process.")
 
         def handle_egg_collecting():
@@ -171,12 +183,12 @@ class DaycareMode(BotMode):
             party_indices_to_release = []
             for index, pokemon in enumerate(get_party()):
                 if (
-                        index != 0
-                        and not pokemon.is_egg
-                        and pokemon.level_met == 0
-                        and pokemon.level == 5
-                        and pokemon.exp_fraction_to_next_level == 0
-                        and not judge_encounter(pokemon).is_of_interest
+                    index != 0
+                    and not pokemon.is_egg
+                    and pokemon.level_met == 0
+                    and pokemon.level == 5
+                    and pokemon.exp_fraction_to_next_level == 0
+                    and not judge_encounter(pokemon).is_of_interest
                 ):
                     party_indices_to_release.append(index)
             return party_indices_to_release
@@ -201,7 +213,10 @@ class DaycareMode(BotMode):
             # Interact with PC
             party = get_party()
             yield from interact_with_pc(
-                [PCAction.release_pokemon_from_party(party[index]) for index in party_indices_to_release]
+                [
+                    PCAction.release_pokemon_from_party(party[index])
+                    for index in party_indices_to_release
+                ]
             )
 
             # Leave daycare
