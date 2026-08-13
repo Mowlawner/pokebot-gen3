@@ -2,6 +2,8 @@
 
 from enum import Enum, IntEnum, auto
 from dataclasses import dataclass
+from datetime import datetime
+import random
 from typing import Generator
 
 from modules.console import console, diagnostic_print
@@ -33,7 +35,8 @@ from modules.player import (
     player_avatar_is_standing_still,
 )
 from modules.text_printer import get_text_printer
-from modules.start_game import resolve_start_game_initialization
+from modules.config.schemas_v1 import WallClockTimeMode
+from modules.start_game import RandomSource, resolve_start_game_initialization
 from modules.tasks import (
     get_global_script_context,
     get_task,
@@ -301,8 +304,10 @@ _CLOCK_TASKS = (
 _CLOCK_HANDLE_INPUT = "Task_SetClock_HandleInput"
 _CLOCK_HANDLE_CONFIRM_INPUT = "Task_SetClock_HandleConfirmInput"
 _CLOCK_ASK_CONFIRM = "Task_SetClock_AskConfirm"
-_CLOCK_TARGET_HOUR = 10
-_CLOCK_TARGET_MINUTE = 0
+_CLOCK_HOUR_MIN = 0
+_CLOCK_HOUR_MAX = 23
+_CLOCK_MINUTE_MIN = 0
+_CLOCK_MINUTE_MAX = 59
 _RIVAL_POKEBALL_SCRIPTS = {
     MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value: "LittlerootTown_MaysHouse_2F_EventScript_RivalsPokeBall",
     MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value: "LittlerootTown_BrendansHouse_2F_EventScript_RivalsPokeBall",
@@ -395,6 +400,14 @@ def _active_clock_task() -> str | None:
         return next((task for task in _CLOCK_TASKS if task_is_active(task)), None)
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
         return None
+
+
+def _clock_setting_complete() -> bool:
+    """Return true only after Emerald has finished the wall-clock task chain."""
+    try:
+        return get_event_flag("SET_WALL_CLOCK") and not _clock_task_active()
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        return False
 
 
 def get_opening_sequence_state(player_gender: object | None = None) -> OpeningSequenceState:
@@ -990,6 +1003,36 @@ def _start_game_configuration_values() -> tuple[str, str]:
     return player_name, player_gender
 
 
+def _clock_time_mode() -> WallClockTimeMode:
+    config = getattr(context, "config", None)
+    start_game = getattr(config, "start_game", None)
+    configured = getattr(start_game, "clock_time_mode", WallClockTimeMode.SYSTEM_TIME)
+    try:
+        return configured if isinstance(configured, WallClockTimeMode) else WallClockTimeMode(configured)
+    except (TypeError, ValueError):
+        return WallClockTimeMode.SYSTEM_TIME
+
+
+def _emerald_clock_time(
+    mode: WallClockTimeMode,
+    *,
+    now: datetime | None = None,
+    rng: RandomSource | None = None,
+) -> tuple[int, int]:
+    """Resolve one target in Emerald's internal 24-hour task representation."""
+    if mode is WallClockTimeMode.RANDOM:
+        if rng is None:
+            rng = random.Random()
+        return (
+            rng.randint(_CLOCK_HOUR_MIN, _CLOCK_HOUR_MAX),
+            rng.randint(_CLOCK_MINUTE_MIN, _CLOCK_MINUTE_MAX),
+        )
+
+    snapshot = datetime.now() if now is None else now
+    # The wall-clock UI is 12-hour, but the ROM task stores the hour as 0..23.
+    return snapshot.hour, snapshot.minute
+
+
 class EmeraldOpeningMode(BotMode):
     @staticmethod
     def name() -> str:
@@ -999,10 +1042,13 @@ class EmeraldOpeningMode(BotMode):
     def is_selectable() -> bool:
         return context.rom.is_emerald
 
-    def __init__(self):
+    def __init__(self, rng: RandomSource | None = None):
         super().__init__()
+        self._rng = random.Random() if rng is None else rng
         # Resolve policy once per mode run; do not regenerate on naming-screen frames.
-        self._start_game_initialization = resolve_start_game_initialization(*_start_game_configuration_values())
+        self._start_game_initialization = resolve_start_game_initialization(
+            *_start_game_configuration_values(), self._rng
+        )
         self._resolved_player_gender = self._start_game_initialization.gender
         self._resolved_player_name = self._start_game_initialization.name
         self.phase = OpeningSequenceState.TRUCK
@@ -1014,6 +1060,7 @@ class EmeraldOpeningMode(BotMode):
         self._last_truck_navigation_target: tuple[tuple[int, int], tuple[int, int]] | None = None
         self._pending_house_warp_destination: MapRSE | None = None
         self._clock_interaction_started = False
+        self._clock_target: tuple[int, int] | None = None
         self._last_clock_task: str | None = None
         self._clock_a_sent = False
         self._clock_confirm_yes_prepared = False
@@ -2058,7 +2105,10 @@ class EmeraldOpeningMode(BotMode):
                 yield from _advance_scripted_input()
                 return
             yield from self._set_clock()
-            if get_event_flag("SET_WALL_CLOCK"):
+            # SET_WALL_CLOCK is written by the ROM before its final fade/exit
+            # task has necessarily disappeared.  Keep ownership of the
+            # opening until the complete task chain has ended.
+            if _clock_setting_complete():
                 self.phase = OpeningSequenceState.PLAYER_HOUSE_1F
             return
 
@@ -2348,6 +2398,7 @@ class EmeraldOpeningMode(BotMode):
             phase=OpeningSequenceState.CLOCK_SETTING,
         )
         context.emulator.press_button("A")
+        self._clock_target = _emerald_clock_time(_clock_time_mode(), rng=self._rng)
         self._clock_interaction_started = True
         self._last_clock_task = None
         self._clock_a_sent = False
@@ -2515,7 +2566,10 @@ class EmeraldOpeningMode(BotMode):
         )
 
     def _set_clock(self) -> Generator:
-        """Drive Emerald's existing clock tasks toward the fixed test time."""
+        """Drive Emerald's existing clock tasks toward the resolved target."""
+        if self._clock_target is None:
+            self._clock_target = _emerald_clock_time(_clock_time_mode(), rng=self._rng)
+        target_hour, target_minute = self._clock_target
         clock_task = _active_clock_task()
         if clock_task is None:
             self._last_clock_task = None
@@ -2540,26 +2594,27 @@ class EmeraldOpeningMode(BotMode):
                 minutes = task.data_value(3)
                 if minute_hand_angle % 6:
                     self._last_truck_decision = "wait: clock hand animation"
-                elif (hours, minutes) == (_CLOCK_TARGET_HOUR, _CLOCK_TARGET_MINUTE):
-                    self._last_truck_decision = "clock: confirm selected 10:00"
+                elif (hours, minutes) == self._clock_target:
+                    self._last_truck_decision = f"clock: confirm selected {target_hour:02d}:{target_minute:02d}"
                     if not self._clock_a_sent:
                         _report_opening_a_decision(
                             source="EmeraldOpeningMode._set_clock",
-                            reason="clock hands reached the target time 10:00",
+                            reason=f"clock hands reached the target time {target_hour:02d}:{target_minute:02d}",
                             phase=OpeningSequenceState.CLOCK_SETTING,
                         )
                         context.emulator.press_button("A")
                         self._clock_a_sent = True
-                        self._last_truck_decision = "clock input: A (confirm 10:00)"
+                        self._last_truck_decision = f"clock input: A (confirm {target_hour:02d}:{target_minute:02d})"
                 else:
                     current = hours * 60 + minutes
-                    target = _CLOCK_TARGET_HOUR * 60 + _CLOCK_TARGET_MINUTE
-                    forward = (target - current) % (24 * 60)
+                    target = target_hour * 60 + target_minute
+                    forward = (target - current) % ((_CLOCK_HOUR_MAX + 1) * 60)
                     button = "Right" if forward <= 12 * 60 else "Left"
                     context.emulator.press_button(button)
                     self._clock_a_sent = False
                     self._last_truck_decision = (
-                        f"clock input: {button} toward 10:00 (current={hours:02d}:{minutes:02d})"
+                        f"clock input: {button} toward {target_hour:02d}:{target_minute:02d} "
+                        f"(current={hours:02d}:{minutes:02d})"
                     )
         elif clock_task == _CLOCK_ASK_CONFIRM:
             self._last_truck_decision = "clock: waiting for confirmation menu"

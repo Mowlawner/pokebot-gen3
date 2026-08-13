@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Literal
 
 from confz import BaseConfig
@@ -78,6 +79,13 @@ class CatchBlock(BaseConfig):
     block_list: list[str] = ["MissingNo"]
 
 
+class WallClockTimeMode(str, Enum):
+    """Policy used for the Emerald opening wall-clock setting."""
+
+    SYSTEM_TIME = "system_time"
+    RANDOM = "random"
+
+
 class StartGame(BaseConfig):
     """Settings used when starting a fresh game."""
 
@@ -86,6 +94,7 @@ class StartGame(BaseConfig):
     # ``random`` selects a human first name; ``gibberish`` preserves the
     # character-string generator for deliberate novelty runs.
     player_name: str = "random"
+    clock_time_mode: WallClockTimeMode = WallClockTimeMode.SYSTEM_TIME
 
 
 class Cheats(BaseConfig):

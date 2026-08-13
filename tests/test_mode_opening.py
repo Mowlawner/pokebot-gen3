@@ -680,6 +680,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         from modules.modes.opening import EmeraldOpeningMode
 
         mode = EmeraldOpeningMode()
+        mode._clock_target = (10, 0)
         emulator = unittest.mock.Mock()
         with (
             patch(
@@ -712,6 +713,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         from modules.modes.opening import EmeraldOpeningMode
 
         mode = EmeraldOpeningMode()
+        mode._clock_target = (10, 0)
         emulator = unittest.mock.Mock()
         task = types.SimpleNamespace(
             data_value=lambda index: {0: 0, 2: 9, 3: 59}[index],
@@ -752,13 +754,28 @@ class TestEmeraldOpeningState(unittest.TestCase):
         mode.phase = OpeningSequenceState.CLOCK_SETTING
         mode._clock_interaction_started = True
         with (
-            patch("modules.modes.opening._clock_task_active", return_value=True),
+            patch("modules.modes.opening._clock_task_active", return_value=False),
             patch.object(mode, "_set_clock", return_value=iter(())),
             patch("modules.modes.opening.get_event_flag", return_value=True),
         ):
             list(mode._advance_phase(OpeningSequenceState.CLOCK_SETTING))
 
         self.assertIs(mode.phase, OpeningSequenceState.PLAYER_HOUSE_1F)
+
+    def test_clock_setting_waits_for_rom_exit_after_completion_flag(self):
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.CLOCK_SETTING
+        mode._clock_interaction_started = True
+        with (
+            patch("modules.modes.opening._clock_task_active", return_value=True),
+            patch.object(mode, "_set_clock", return_value=iter(())),
+            patch("modules.modes.opening.get_event_flag", return_value=True),
+        ):
+            list(mode._advance_phase(OpeningSequenceState.CLOCK_SETTING))
+
+        self.assertIs(mode.phase, OpeningSequenceState.CLOCK_SETTING)
 
     def test_clock_setting_phase_does_not_resume_staircase_navigation(self):
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
@@ -808,6 +825,133 @@ class TestEmeraldOpeningState(unittest.TestCase):
                 _wall_clock_interaction(MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value, "male"),
                 ((5, 2), "Up"),
             )
+
+    def test_system_time_converts_local_24_hour_time_to_emerald_clock(self):
+        from datetime import datetime
+
+        from modules.config.schemas_v1 import WallClockTimeMode
+        from modules.modes.opening import _emerald_clock_time
+
+        cases = {
+            (0, 5): (0, 5),
+            (11, 12): (11, 12),
+            (12, 34): (12, 34),
+            (16, 32): (16, 32),
+            (23, 59): (23, 59),
+        }
+        for (hour, minute), expected in cases.items():
+            with self.subTest(hour=hour, minute=minute):
+                self.assertEqual(
+                    _emerald_clock_time(
+                        WallClockTimeMode.SYSTEM_TIME,
+                        now=datetime(2026, 1, 1, hour, minute),
+                    ),
+                    expected,
+                )
+
+    def test_random_clock_time_uses_injected_rng_boundaries(self):
+        from modules.config.schemas_v1 import WallClockTimeMode
+        from modules.modes.opening import _emerald_clock_time
+
+        class BoundaryRng:
+            def __init__(self):
+                self.calls = []
+
+            def randint(self, start, end):
+                self.calls.append((start, end))
+                return start if len(self.calls) == 1 else end
+
+        rng = BoundaryRng()
+        self.assertEqual(_emerald_clock_time(WallClockTimeMode.RANDOM, rng=rng), (0, 59))
+        self.assertEqual(rng.calls, [(0, 23), (0, 59)])
+
+    def test_system_time_target_reaches_clock_controller(self):
+        from datetime import datetime
+
+        from modules.config.schemas_v1 import WallClockTimeMode
+        from modules.modes.opening import EmeraldOpeningMode
+
+        mode = object.__new__(EmeraldOpeningMode)
+        mode._clock_target = None
+        mode._rng = None
+        mode._last_clock_task = None
+        mode._clock_a_sent = False
+        mode._clock_confirm_yes_prepared = False
+        emulator = unittest.mock.Mock()
+        task = types.SimpleNamespace(data_value=lambda index: {0: 0, 2: 3, 3: 27}[index])
+        with (
+            patch("modules.modes.opening._clock_time_mode", return_value=WallClockTimeMode.SYSTEM_TIME),
+            patch("modules.modes.opening.datetime") as clock,
+            patch("modules.modes.opening._active_clock_task", return_value="Task_SetClock_HandleInput"),
+            patch("modules.modes.opening.get_task", return_value=task),
+            patch.object(__import__("modules.modes.opening", fromlist=["context"]).context, "emulator", emulator),
+        ):
+            clock.now.return_value = datetime(2026, 1, 1, 16, 32)
+            list(mode._set_clock())
+
+        self.assertEqual(mode._clock_target, (16, 32))
+        emulator.press_button.assert_called_once_with("A")
+
+    def test_random_target_reaches_clock_controller(self):
+        from modules.config.schemas_v1 import WallClockTimeMode
+        from modules.modes.opening import EmeraldOpeningMode
+
+        class BoundaryRng:
+            def randint(self, start, end):
+                return end
+
+        mode = object.__new__(EmeraldOpeningMode)
+        mode._clock_target = None
+        mode._rng = BoundaryRng()
+        mode._last_clock_task = None
+        mode._clock_a_sent = False
+        mode._clock_confirm_yes_prepared = False
+        emulator = unittest.mock.Mock()
+        task = types.SimpleNamespace(data_value=lambda index: {0: 0, 2: 23, 3: 59}[index])
+        with (
+            patch("modules.modes.opening._clock_time_mode", return_value=WallClockTimeMode.RANDOM),
+            patch("modules.modes.opening._active_clock_task", return_value="Task_SetClock_HandleInput"),
+            patch("modules.modes.opening.get_task", return_value=task),
+            patch.object(__import__("modules.modes.opening", fromlist=["context"]).context, "emulator", emulator),
+        ):
+            list(mode._set_clock())
+
+        self.assertEqual(mode._clock_target, (23, 59))
+        emulator.press_button.assert_called_once_with("A")
+
+    def test_clock_selection_uses_shortest_24_hour_direction(self):
+        from modules.modes.opening import EmeraldOpeningMode
+
+        cases = (
+            ((10, 0), (16, 32), "Right"),
+            ((10, 0), (4, 32), "Left"),
+            ((23, 50), (0, 10), "Right"),
+            ((0, 10), (23, 50), "Left"),
+        )
+        for current, target, first_button in cases:
+            with self.subTest(current=current, target=target):
+                mode = object.__new__(EmeraldOpeningMode)
+                mode._clock_target = target
+                mode._last_clock_task = None
+                mode._clock_a_sent = False
+                mode._clock_confirm_yes_prepared = False
+                emulator = unittest.mock.Mock()
+                state = {0: 0, 2: current[0], 3: current[1]}
+                task = types.SimpleNamespace(data_value=state.__getitem__)
+                with (
+                    patch("modules.modes.opening._active_clock_task", return_value="Task_SetClock_HandleInput"),
+                    patch("modules.modes.opening.get_task", return_value=task),
+                    patch.object(
+                        __import__("modules.modes.opening", fromlist=["context"]).context, "emulator", emulator
+                    ),
+                ):
+                    list(mode._set_clock())
+                    self.assertEqual(emulator.press_button.call_args.args, (first_button,))
+
+                    state[2], state[3] = target
+                    list(mode._set_clock())
+
+                self.assertEqual(emulator.press_button.call_args_list[-1].args, ("A",))
 
     def test_unknown_protagonist_house_does_not_reuse_brendan_clock_target(self):
         from modules.modes.opening import _wall_clock_interaction

@@ -125,7 +125,8 @@ class TestStartGameNameResolution(unittest.TestCase):
             self.assertEqual(mode._resolved_player_gender, "male")
             self.assertEqual(mode._resolved_player_name, "ONCE")
 
-        resolve.assert_called_once_with("random", "random")
+        self.assertEqual(resolve.call_args.args[:2], ("random", "random"))
+        self.assertIsNotNone(resolve.call_args.args[2])
 
     def test_configuration_defaults_and_parsing(self):
         from modules.config import Config
@@ -135,4 +136,5 @@ class TestStartGameNameResolution(unittest.TestCase):
 
         self.assertEqual(config.start_game.player_name, "random")
         self.assertEqual(config.start_game.player_gender, "random")
+        self.assertEqual(config.start_game.clock_time_mode.value, "system_time")
         self.assertEqual(StartGame(player_name="ASH").player_name, "ASH")

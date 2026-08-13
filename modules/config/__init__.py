@@ -17,6 +17,7 @@ from modules.config.schemas_v1 import (
     HTTP,
     ProfileMetadata,
     StartGame,
+    WallClockTimeMode,
 )
 from modules.runtime import get_base_path
 
