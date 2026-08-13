@@ -891,11 +891,11 @@ class TestEmeraldOpeningState(unittest.TestCase):
             ),
             patch("modules.modes.opening.type_in_naming_screen", return_value=iter(())) as type_name,
         ):
-            generator = _enter_player_name()
+            generator = _enter_player_name("TEST")
             next(generator)
             with self.assertRaises(StopIteration):
                 next(generator)
-            type_name.assert_called_once_with("RED")
+            type_name.assert_called_once_with("TEST")
 
     def test_rival_pokeball_object_lookup_selects_may_script(self):
         from modules.map_data import MapRSE
@@ -1234,6 +1234,9 @@ class TestEmeraldOpeningState(unittest.TestCase):
             mocked_context.rom = types.SimpleNamespace(is_emerald=True)
             mocked_context.bot_mode = "Start New Game"
             mocked_context.debug = False
+            mocked_context.config = types.SimpleNamespace(
+                start_game=types.SimpleNamespace(player_name="gibberish", player_gender="random")
+            )
             mocked_context.emulator = types.SimpleNamespace(press_button=unittest.mock.Mock())
             with patch(
                 "modules.modes.opening.get_opening_sequence_state",

@@ -30,6 +30,7 @@ from modules.player import (
     player_avatar_is_standing_still,
 )
 from modules.text_printer import get_text_printer
+from modules.start_game import resolve_start_game_initialization
 from modules.tasks import (
     get_global_script_context,
     get_task,
@@ -664,7 +665,7 @@ def _birch_house_1f_ready_for_navigation() -> bool:
         return False
 
 
-def _enter_player_name() -> Generator:
+def _enter_player_name(player_name: str) -> Generator:
     """Wait for the naming keyboard to exist, including pointer/task gaps."""
     while True:
         if get_game_state() != GameState.NAMING_SCREEN:
@@ -673,12 +674,25 @@ def _enter_player_name() -> Generator:
             if get_naming_screen_data() is None:
                 yield
                 continue
-            yield from type_in_naming_screen("RED")
+            yield from type_in_naming_screen(player_name)
             return
         except (BotModeError, AttributeError, RuntimeError, ValueError, TypeError):
             # The naming callback can outlive the keyboard data by a frame.
             # This is a normal transition, not an automation failure.
             yield
+
+
+def _start_game_configuration_values() -> tuple[str, str]:
+    """Read Start Game settings while remaining compatible with minimal test contexts."""
+    config = getattr(context, "config", None)
+    start_game = getattr(config, "start_game", None)
+    player_name = getattr(start_game, "player_name", "gibberish")
+    player_gender = getattr(start_game, "player_gender", "random")
+    if not isinstance(player_name, str):
+        player_name = "gibberish"
+    if not isinstance(player_gender, str):
+        player_gender = "random"
+    return player_name, player_gender
 
 
 class EmeraldOpeningMode(BotMode):
@@ -692,6 +706,10 @@ class EmeraldOpeningMode(BotMode):
 
     def __init__(self):
         super().__init__()
+        # Resolve policy once per mode run; do not regenerate on naming-screen frames.
+        self._start_game_initialization = resolve_start_game_initialization(*_start_game_configuration_values())
+        self._resolved_player_gender = self._start_game_initialization.gender
+        self._resolved_player_name = self._start_game_initialization.name
         self.phase = OpeningSequenceState.TRUCK
         self._ball_coordinates: tuple[int, int] | None = None
         self._last_diagnostics: OpeningDiagnostics | None = None
@@ -764,7 +782,7 @@ class EmeraldOpeningMode(BotMode):
                 yield
                 continue
             if observed == OpeningSequenceState.PLAYER_NAMING:
-                yield from _enter_player_name()
+                yield from _enter_player_name(self._resolved_player_name)
                 continue
             if observed == OpeningSequenceState.CLOCK_SETTING:
                 yield from self._set_clock()
