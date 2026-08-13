@@ -1190,7 +1190,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         ):
             self.assertEqual(_starter_bag_interaction(), ((7, 15), (7, 14)))
 
-    def test_route101_handoff_navigates_below_bag_saves_and_hands_off(self):
+    def test_route101_handoff_navigates_below_bag_and_hands_off(self):
         from modules.map_data import MapRSE
         from modules.memory import GameState
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState, consume_starter_handoff
@@ -1205,7 +1205,6 @@ class TestEmeraldOpeningState(unittest.TestCase):
             patch("modules.modes.opening._starter_bag_interaction", return_value=((7, 15), (7, 14))),
             patch("modules.modes.opening.navigate_to", return_value=iter(())) as navigate,
             patch("modules.modes.opening.ensure_facing_direction", return_value=iter(())) as face,
-            patch("modules.modes.opening.save_the_game", return_value=iter(())) as save,
             patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
             patch(
                 "modules.modes.opening.get_player_avatar",
@@ -1225,7 +1224,6 @@ class TestEmeraldOpeningState(unittest.TestCase):
             expecting_script=True,
         )
         face.assert_called_once_with((7, 14))
-        save.assert_called_once_with()
         self.assertIs(mode.phase, OpeningSequenceState.STARTER_SELECTION)
         self.assertEqual(opening_context.bot_mode, "Starters")
         self.assertTrue(consume_starter_handoff())
@@ -1398,7 +1396,6 @@ class TestEmeraldOpeningState(unittest.TestCase):
             patch("modules.modes.opening._starter_bag_interaction", return_value=((7, 15), (7, 14))),
             patch("modules.modes.opening.navigate_to", return_value=iter(())),
             patch("modules.modes.opening.ensure_facing_direction") as face,
-            patch("modules.modes.opening.save_the_game") as save,
             patch(
                 "modules.modes.opening.get_player_avatar",
                 return_value=types.SimpleNamespace(
@@ -1410,7 +1407,6 @@ class TestEmeraldOpeningState(unittest.TestCase):
             list(mode._advance_phase(OpeningSequenceState.ROUTE_101))
 
         face.assert_not_called()
-        save.assert_not_called()
 
     def test_choose_starter_callback_on_route_101_is_explicit_handoff(self):
         from modules.memory import GameState

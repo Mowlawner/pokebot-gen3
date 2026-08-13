@@ -23,7 +23,6 @@ from modules.memory import (
     unpack_uint16,
     unpack_uint32,
 )
-from modules.modes.util.higher_level_actions import save_the_game
 from modules.modes.util.tasks_scripts import wait_for_fade_to_finish
 from modules.modes.util.walking import ensure_facing_direction, navigate_to
 from modules.player import (
@@ -2374,7 +2373,6 @@ class EmeraldOpeningMode(BotMode):
                 yield
                 return
             yield from ensure_facing_direction(starter_bag)
-            yield from save_the_game()
             global _starter_handoff_pending
             _starter_handoff_pending = True
             self.phase = OpeningSequenceState.STARTER_SELECTION
@@ -2385,7 +2383,7 @@ class EmeraldOpeningMode(BotMode):
                 dialogue_action=False,
                 dispatch="handoff",
                 navigation_target=starter_target,
-                decision="saved: hand off to Starters before opening bag",
+                decision="handoff: positioned and facing starter bag",
             )
             context.bot_mode = "Starters"
             return

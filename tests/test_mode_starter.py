@@ -5,9 +5,57 @@ from tests.utility import (
     set_next_choice,
     set_next_rng_seed,
 )
+from unittest.mock import ANY, Mock, patch
 
 
 class TestStarter(BotTestCase):
+    def test_opening_handoff_uses_normal_bag_task_for_configured_and_random_choices(self):
+        from modules.modes.starters import run_rse_hoenn
+
+        class BagTaskReached(Exception):
+            pass
+
+        for choice in ("Treecko", "Random"):
+            with self.subTest(choice=choice):
+                starter_context = Mock()
+                starter_context.bot_mode = "Starters"
+                starter_context.rom.is_rs = False
+                with (
+                    patch("modules.modes.starters.context", starter_context),
+                    patch("modules.modes.starters.ask_for_choice", return_value=choice),
+                    patch(
+                        "modules.modes.starters.get_player_avatar",
+                        return_value=Mock(local_coordinates=(7, 15)),
+                    ),
+                    patch("modules.modes.starters.ensure_facing_direction", return_value=iter(())),
+                    patch(
+                        "modules.modes.starters.wait_until_task_is_active",
+                        side_effect=BagTaskReached,
+                    ) as wait_for_bag,
+                ):
+                    with self.assertRaises(BagTaskReached):
+                        next(run_rse_hoenn(lambda: None, reset_before_selection=False))
+
+                wait_for_bag.assert_called_once_with("Task_HandleStarterChooseInput", "A")
+
+    def test_opening_handoff_returns_to_manual_after_starter_sequence(self):
+        from modules.modes.starters import StartersMode
+
+        starter_context = Mock()
+        starter_context.bot_mode = "Starters"
+        with (
+            patch("modules.modes.opening.consume_starter_handoff", return_value=True),
+            patch("modules.modes.starters.context", starter_context),
+            patch("modules.modes.starters.run_rse_hoenn", return_value=iter(())) as run_starter,
+        ):
+            list(StartersMode().run())
+
+        run_starter.assert_called_once_with(
+            ANY,
+            reset_before_selection=False,
+        )
+        starter_context.set_manual_mode.assert_called_once_with()
+
     @with_save_state(
         [
             "emerald/in_front_of_starter_pokemon_bag.ss1",

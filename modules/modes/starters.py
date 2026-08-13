@@ -1,16 +1,19 @@
 import random
 from typing import Generator, Callable
 
+from modules.console import diagnostic_print
 from modules.context import context
 from modules.encounter import handle_encounter, EncounterInfo
 from modules.gui.multi_select_window import Selection, ask_for_choice
 from modules.map_data import MapFRLG, MapRSE
+from modules.memory import get_game_state, get_game_state_symbol
 from modules.menuing import PokemonPartyMenuNavigator, StartMenuNavigator
 from modules.modes.util.walking import navigate_to
-from modules.player import get_player_avatar
+from modules.player import get_player_avatar, player_avatar_is_controllable
 from modules.pokemon_party import get_party_size, get_party
 from modules.runtime import get_sprites_path
 from modules.save_data import get_save_data
+from modules.tasks import get_global_script_context, get_tasks
 from ._asserts import SavedMapLocation, assert_save_game_exists, assert_saved_on_map
 from ._interface import BattleAction, BotMode, BotModeError
 from .util import (
@@ -23,6 +26,58 @@ from .util import (
     wait_until_task_is_not_active,
 )
 from ..battle_state import get_main_battle_callback, EncounterType
+
+
+def _report_starters_state(phase: str, decision: str) -> None:
+    """Report only the state needed to diagnose entry into starter selection."""
+    try:
+        avatar = get_player_avatar()
+        location = (avatar.map_group_and_number, avatar.local_coordinates)
+        facing = avatar.facing_direction
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        location = None
+        facing = None
+
+    try:
+        game_state = get_game_state()
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        game_state = None
+    try:
+        game_state_symbol = get_game_state_symbol()
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        game_state_symbol = None
+    try:
+        controllable = player_avatar_is_controllable()
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        controllable = None
+    try:
+        script = get_global_script_context()
+        script_active = script.is_active
+        script_stack = script.stack if script_active else []
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        script_active = None
+        script_stack = None
+    try:
+        active_tasks = [task.symbol for task in (get_tasks() or [])]
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        active_tasks = None
+    try:
+        controller_depth = len(context.controller_stack)
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        controller_depth = None
+
+    diagnostic_print(
+        "[bold yellow]Starters phase: "
+        f"phase={phase} decision={decision!r} "
+        f"mode={getattr(context, 'bot_mode', None)!r} "
+        f"mode_instance={type(getattr(context, 'bot_mode_instance', None)).__name__} "
+        f"controller_depth={controller_depth!r} "
+        f"location={location!r} facing={facing!r} "
+        f"game_state={game_state!r} game_state_symbol={game_state_symbol!r} "
+        f"controllable={controllable!r} script_active={script_active!r} "
+        f"script_stack={script_stack!r} active_tasks={active_tasks!r}[/]",
+        trace=True,
+    )
 
 
 def run_frlg() -> Generator:
@@ -83,8 +138,8 @@ def run_frlg() -> Generator:
 def run_rse_hoenn(
     get_active_encounter: Callable[[], EncounterInfo],
     reset_before_selection: bool = True,
-    open_bag_on_handoff: bool = False,
 ) -> Generator:
+    _report_starters_state("RSE_HOENN_ENTRY", "await starter choice")
     # Set up: Ask for starter choice because we cannot deduce that from the player location.
     starter_choice = ask_for_choice(
         [
@@ -96,7 +151,9 @@ def run_rse_hoenn(
         window_title="Select a starter...",
     )
     if starter_choice is None:
+        _report_starters_state("RSE_HOENN_ENTRY", "starter choice cancelled; return")
         return
+    _report_starters_state("RSE_HOENN_ENTRY", f"starter choice={starter_choice!r}")
 
     while context.bot_mode != "Manual":
         if reset_before_selection:
@@ -104,22 +161,24 @@ def run_rse_hoenn(
 
         # Starter bag can be accessed from the right or from the bottom, make sure we are looking
         # at it in either case.
+        _report_starters_state("RSE_HOENN_BAG_SETUP", "face starter bag before waiting for interaction task")
         avatar = get_player_avatar()
         if avatar.local_coordinates == (8, 14):
             yield from ensure_facing_direction("Left")
         else:
             yield from ensure_facing_direction("Up")
 
-        if open_bag_on_handoff:
-            context.emulator.press_button("A")
-            yield
-            open_bag_on_handoff = False
-
         # Open bag
+        bag_task = "Task_StarterChoose2" if context.rom.is_rs else "Task_HandleStarterChooseInput"
+        _report_starters_state(
+            "RSE_HOENN_BAG_SETUP",
+            f"wait for {bag_task} and press A",
+        )
         if context.rom.is_rs:
             yield from wait_until_task_is_active("Task_StarterChoose2", "A")
         else:
             yield from wait_until_task_is_active("Task_HandleStarterChooseInput", "A")
+        _report_starters_state("RSE_HOENN_BAG_INTERACTION", "starter task became active; choose configured starter")
 
         starter = starter_choice
         if starter == "Random":
@@ -242,17 +301,27 @@ class StartersMode(BotMode):
         return BattleAction.CustomAction
 
     def run(self) -> Generator:
-        # A fresh-game opening controller hands off while the starter bag is
-        # already open.  This path intentionally does not require a save state.
+        _report_starters_state("MODE_ENTRY", "StartersMode.run advanced")
+        # A fresh-game opening controller hands off at the starter bag. This
+        # path intentionally does not require a save state.
         from .opening import consume_starter_handoff
 
         if consume_starter_handoff():
+            _report_starters_state("MODE_ENTRY", "handoff consumed; enter RSE Hoenn starter generator")
             yield from run_rse_hoenn(
                 lambda: self._active_encounter,
                 reset_before_selection=False,
-                open_bag_on_handoff=True,
             )
+            # The opening controller temporarily switches to this mode so the
+            # normal starter generator can own the interaction.  Once that
+            # generator returns, leave the temporary mode behind; otherwise
+            # the main loop would construct another StartersMode and restart
+            # the sequence.
+            if context.bot_mode == "Starters":
+                context.set_manual_mode()
             return
+
+        _report_starters_state("MODE_ENTRY", "no handoff pending; validate saved-game starter mode path")
 
         assert_save_game_exists("There is no saved game. Cannot soft reset.")
 
