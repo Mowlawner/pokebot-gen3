@@ -4,6 +4,36 @@ from unittest.mock import patch
 
 
 class TestEmeraldOpeningState(unittest.TestCase):
+    def test_littleroot_house_maps_are_resolved_by_player_gender(self):
+        from modules.map_data import MapRSE
+        from modules.memory import GameState
+        from modules.modes.opening import OpeningSequenceState, get_opening_sequence_state
+
+        cases = (
+            (
+                "male",
+                MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F,
+                OpeningSequenceState.PLAYER_HOUSE_1F,
+                MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_1F,
+                OpeningSequenceState.BIRCH_HOUSE_1F,
+            ),
+            (
+                "female",
+                MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_1F,
+                OpeningSequenceState.PLAYER_HOUSE_1F,
+                MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F,
+                OpeningSequenceState.BIRCH_HOUSE_1F,
+            ),
+        )
+        with patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD):
+            for gender, player_map, player_state, rival_map, rival_state in cases:
+                for map_id, expected in ((player_map, player_state), (rival_map, rival_state)):
+                    with patch(
+                        "modules.modes.opening.get_map_data_for_current_position",
+                        return_value=types.SimpleNamespace(map_group_and_number=map_id.value),
+                    ):
+                        self.assertIs(get_opening_sequence_state(gender), expected)
+
     def test_options_menu_is_recognized_as_a_pre_game_state(self):
         from modules.memory import GameState
         from modules.modes.opening import OpeningSequenceState, get_opening_sequence_state
@@ -775,7 +805,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
             side_effect=AssertionError("clock interaction must not resolve ROM events"),
         ):
             self.assertEqual(
-                _wall_clock_interaction(MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value),
+                _wall_clock_interaction(MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value, "male"),
                 ((5, 2), "Up"),
             )
 
@@ -800,9 +830,42 @@ class TestEmeraldOpeningState(unittest.TestCase):
             return_value=types.SimpleNamespace(bg_events=[clock]),
         ):
             self.assertEqual(
-                _wall_clock_interaction(MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value),
+                _wall_clock_interaction(MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value, "female"),
                 ((3, 2), "Up"),
             )
+
+    def test_female_clock_controller_resolves_target_without_wall_clock_symbol(self):
+        from modules.map_data import MapRSE
+        from modules.modes.opening import EmeraldOpeningMode
+        from modules.start_game import PlayerGender
+
+        mode = EmeraldOpeningMode.__new__(EmeraldOpeningMode)
+        mode._resolved_player_gender = PlayerGender.FEMALE
+        mode._last_truck_decision = None
+        mode._clock_interaction_started = False
+        mode._last_clock_task = None
+        mode._clock_a_sent = False
+        mode._clock_confirm_yes_prepared = False
+        opening_context = types.SimpleNamespace(
+            emulator=types.SimpleNamespace(press_button=unittest.mock.Mock()),
+            debug=False,
+        )
+        with (
+            patch.object(mode, "_can_navigate", return_value=True),
+            patch("modules.modes.opening._current_map_id", return_value=MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value),
+            patch(
+                "modules.modes.opening.get_map_data_for_current_position",
+                return_value=types.SimpleNamespace(bg_events=[]),
+            ),
+            patch("modules.modes.opening.navigate_to", return_value=iter(())) as navigate,
+            patch("modules.modes.opening.ensure_facing_direction", return_value=iter(())) as face,
+            patch("modules.modes.opening.context", opening_context),
+        ):
+            list(mode._start_clock_interaction())
+
+        navigate.assert_called_once_with((1, 3), (3, 2), avoid_scripted_events=False)
+        face.assert_called_once_with("Up")
+        opening_context.emulator.press_button.assert_called_once_with("A")
 
     def test_mom_dialogue_task_advances_when_script_context_is_unavailable(self):
         from modules.modes.opening import _advance_scripted_input
@@ -1251,6 +1314,42 @@ class TestEmeraldOpeningState(unittest.TestCase):
             from modules.modes.opening import consume_starter_handoff
 
             self.assertTrue(consume_starter_handoff())
+
+    def test_birch_gender_task_precedes_main_menu_new_game_branch(self):
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+        from modules.start_game import PlayerGender
+
+        emulator = types.SimpleNamespace(press_button=unittest.mock.Mock())
+        opening_context = types.SimpleNamespace(
+            emulator=emulator,
+            rom=types.SimpleNamespace(is_emerald=True),
+            bot_mode="Start New Game",
+            debug=False,
+            config=types.SimpleNamespace(
+                start_game=types.SimpleNamespace(player_name="gibberish", player_gender="female")
+            ),
+        )
+        choose_gender_task = types.SimpleNamespace(symbol="Task_NewGameBirchSpeech_ChooseGender")
+        with (
+            patch("modules.modes.opening.context", opening_context),
+            patch(
+                "modules.modes.opening.resolve_start_game_initialization",
+                return_value=types.SimpleNamespace(gender=PlayerGender.FEMALE, name="MAY"),
+            ),
+            patch(
+                "modules.modes.opening.get_opening_sequence_state",
+                return_value=OpeningSequenceState.MAIN_MENU,
+            ),
+            patch("modules.modes.opening.get_tasks", return_value=[choose_gender_task]),
+            patch(
+                "modules.modes.opening.get_task",
+                return_value=types.SimpleNamespace(data_value=lambda index: 0),
+            ),
+        ):
+            mode = EmeraldOpeningMode()
+            next(mode.run())
+
+        emulator.press_button.assert_called_once_with("Down")
 
     def test_initial_settings_enter_options_set_fast_and_return_to_main_menu(self):
         from modules.modes.opening import EmeraldOpeningMode

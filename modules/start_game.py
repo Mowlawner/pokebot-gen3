@@ -7,7 +7,6 @@ from typing import Protocol
 
 from modules.keyboard import get_current_keyboard_layout
 
-
 # Western Gen III player names contain at most seven visible characters. The
 # terminator in SaveBlock2 is storage, not part of this limit.
 PLAYER_NAME_MAX_LENGTH = 7

@@ -1,4 +1,5 @@
 import atexit
+import inspect
 import queue
 import time
 import zlib
@@ -18,7 +19,7 @@ import mgba.log
 import mgba.png
 import mgba.vfs
 from mgba import ffi, lib, libmgba_version_string
-from modules.console import console
+from modules.console import console, diagnostic_print
 from modules.profiles import Profile
 from modules.tasks import task_is_active
 
@@ -507,6 +508,8 @@ class LibmgbaEmulator:
         """
         :param inputs: A bitfield with all the buttons that should now be pressed
         """
+        if inputs:
+            self._report_birch_gender_input("set_inputs", inputs, path="set_inputs")
         self._core._core.setKeys(self._core._core, inputs)
 
     def press_button(self, button: str = None, inputs: int = 0):
@@ -515,14 +518,74 @@ class LibmgbaEmulator:
         :param inputs: Alternate raw input bitfield
         """
         button_inputs = inputs or input_map[button]
+        self._report_birch_gender_input(button, button_inputs, path="press_button")
         self._pressed_inputs |= (self._prev_pressed_inputs & button_inputs) ^ button_inputs
+
+    def _report_birch_gender_input(self, button: str | None, button_inputs: int, *, path: str = "press_button") -> None:
+        """Trace all bot-generated inputs that overlap Birch's gender UI.
+
+        This is intentionally located at the emulator boundary so it also
+        observes callers outside the opening mode. It only reads state and is
+        disabled unless detailed debug tracing is enabled.
+        """
+        try:
+            from modules.context import context
+
+            if not context.debug or not getattr(context, "debug_trace", False):
+                return
+            from modules.tasks import get_task, get_tasks
+
+            gender_names = (
+                "Task_NewGameBirchSpeech_BoyOrGirl",
+                "Task_NewGameBirchSpeech_WaitToShowGenderMenu",
+                "Task_NewGameBirchSpeech_ChooseGender",
+                "Task_NewGameBirchSpeech_SlideOutOldGenderSprite",
+                "Task_NewGameBirchSpeech_SlideInNewGenderSprite",
+            )
+            active = [name for name in gender_names if name in get_tasks()]
+            if not active:
+                return
+            task_data = {
+                name: tuple(get_task(name).data_value(i) for i in range(len(get_task(name).data) // 2))
+                for name in active
+                if get_task(name) is not None
+            }
+            mode = getattr(context, "bot_mode_instance", None)
+            target = getattr(mode, "_resolved_player_gender", None)
+            try:
+                from modules.player import get_player
+
+                player_gender = get_player().gender
+            except (AttributeError, RuntimeError, ValueError, TypeError, IndexError, KeyError):
+                player_gender = None
+            pending = (
+                getattr(self, "_prev_pressed_inputs", None),
+                getattr(self, "_pressed_inputs", None),
+                getattr(self, "_held_inputs", None),
+            )
+            callers = [
+                f"{frame.frame.f_globals.get('__name__', '?')}:{frame.function}" for frame in inspect.stack()[2:6]
+            ]
+            diagnostic_print(
+                "[bold yellow]Birch gender input boundary: "
+                f"path={path} button={button!r} mask={button_inputs:#x} callers={callers} "
+                f"active_tasks={active} target_gender={target} player_gender={player_gender} "
+                f"task_data={task_data} input_buffer={self.get_inputs():#x} "
+                f"pending_inputs={pending}[/]",
+                trace=True,
+            )
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError, KeyError):
+            # Diagnostics must never affect controller behavior.
+            return
 
     def hold_button(self, button: str = None, inputs: int = 0):
         """
         :param button: A GBA button to be held, will be held until ReleaseInput called
         :param inputs: Alternate raw input bitfield
         """
-        self._held_inputs |= inputs or input_map[button]
+        button_inputs = inputs or input_map[button]
+        self._report_birch_gender_input(button, button_inputs, path="hold_button")
+        self._held_inputs |= button_inputs
 
     def is_button_held(self, button: str = None) -> bool:
         """

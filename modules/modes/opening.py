@@ -26,6 +26,7 @@ from modules.modes.util.tasks_scripts import wait_for_fade_to_finish
 from modules.modes.util.walking import ensure_facing_direction, navigate_to
 from modules.player import (
     AvatarFlags,
+    get_player,
     get_player_avatar,
     get_player_map_object,
     player_avatar_is_controllable,
@@ -59,6 +60,8 @@ _BIRCH_GENDER_TASKS = (
     "Task_NewGameBirchSpeech_SlideInNewGenderSprite",
 )
 _last_scripted_input_trace: tuple | None = None
+_birch_gender_diagnostic_phase: str | None = None
+_birch_gender_diagnostic_target: object | None = None
 
 
 class EmeraldTextSpeed(IntEnum):
@@ -222,33 +225,50 @@ def _birch_gender_task_snapshot() -> tuple | None:
             if task is None:
                 task_data.append((name, False, None, ()))
                 continue
-            task_data.append((name, True, task.symbol, tuple(task.data_value(i) for i in range(len(task.data) // 2))))
+            task_data.append(
+                (
+                    name,
+                    True,
+                    task.symbol,
+                    tuple(task.data_value(i) for i in range(min(16, len(task.data) // 2))),
+                )
+            )
 
         script = get_global_script_context()
-        script_state = None if script is None else (
-            script.is_active,
-            script.mode,
-            script.native_function_name,
-            script.script_function_name,
-            script.native_pointer,
-            script.bytecode_pointer,
-            tuple(script.stack),
+        script_state = (
+            None
+            if script is None
+            else (
+                script.is_active,
+                script.mode,
+                script.native_function_name,
+                script.script_function_name,
+                script.native_pointer,
+                script.bytecode_pointer,
+                tuple(script.stack),
+            )
         )
         avatar = get_player_avatar()
         location = (avatar.map_group_and_number, avatar.local_coordinates)
         state = get_game_state()
+        try:
+            player_gender = get_player().gender
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError, KeyError):
+            player_gender = None
 
         sprites = []
         for sprite_id in range(64):
             sprite = get_game_sprite_by_id(sprite_id)
             if "in_use" in sprite.flags:
-                sprites.append((
-                    sprite_id,
-                    sprite.coordinates,
-                    sprite.secondary_coordinates,
-                    tuple(sprite.data_value(i) for i in range(8)),
-                    tuple(sprite.flags),
-                ))
+                sprites.append(
+                    (
+                        sprite_id,
+                        sprite.coordinates,
+                        sprite.secondary_coordinates,
+                        tuple(sprite.data_value(i) for i in range(8)),
+                        tuple(sprite.flags),
+                    )
+                )
 
         objects = []
         for obj in get_map_objects():
@@ -260,6 +280,7 @@ def _birch_gender_task_snapshot() -> tuple | None:
             location,
             state.name,
             get_game_state_symbol(),
+            player_gender,
             tuple(task.symbol for task in tasks),
             script_state,
             tuple(sprites),
@@ -295,6 +316,10 @@ _STARTER_BAG_SCRIPT = "Route101_EventScript_BirchsBag"
 _EMERALD_WALL_CLOCK_INTERACTIONS = {
     MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value: ((5, 2), "Up"),
 }
+_EMERALD_PLAYER_HOUSE_CLOCK_INTERACTIONS = {
+    "male": ((5, 2), "Up"),
+    "female": ((3, 2), "Up"),
+}
 _TRUCK_SEQUENCE_TASKS = (
     "Task_HandleTruckSequence",
     "Task_Truck1",
@@ -309,6 +334,51 @@ def _current_map_id() -> tuple[int, int] | None:
     except (AttributeError, RuntimeError, ValueError, TypeError):
         return None
     return None if location is None else location.map_group_and_number
+
+
+def _opening_player_gender(player_gender: object | None = None) -> str:
+    """Return the gender used to assign Emerald's two Littleroot houses.
+
+    During a fresh opening the save-backed Player may not exist yet, so the
+    mode passes its already-resolved gender explicitly.  Direct state probes
+    can use the saved Player when available and retain the historical male
+    default during the pre-save transition.
+    """
+    value = getattr(player_gender, "value", player_gender)
+    if value in ("male", "female"):
+        return value
+    try:
+        value = get_player().gender
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        value = "male"
+    return value if value in ("male", "female") else "male"
+
+
+def _littleroot_house_maps(
+    player_gender: object | None = None,
+) -> tuple[MapRSE, MapRSE, MapRSE, MapRSE]:
+    """Return player/rival 1F and 2F maps for the selected protagonist."""
+    if _opening_player_gender(player_gender) == "female":
+        return (
+            MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_1F,
+            MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F,
+            MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F,
+            MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F,
+        )
+    return (
+        MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F,
+        MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F,
+        MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_1F,
+        MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F,
+    )
+
+
+def _player_house_map(floor: int, player_gender: object | None = None) -> MapRSE:
+    return _littleroot_house_maps(player_gender)[floor - 1]
+
+
+def _rival_house_map(floor: int, player_gender: object | None = None) -> MapRSE:
+    return _littleroot_house_maps(player_gender)[floor + 1]
 
 
 def _clock_task_active() -> bool:
@@ -327,7 +397,7 @@ def _active_clock_task() -> str | None:
         return None
 
 
-def get_opening_sequence_state() -> OpeningSequenceState:
+def get_opening_sequence_state(player_gender: object | None = None) -> OpeningSequenceState:
     """Classify the currently observable opening state.
 
     This deliberately treats transitional frames as ``SCRIPTED_INTRO`` rather
@@ -358,13 +428,13 @@ def get_opening_sequence_state() -> OpeningSequenceState:
         return OpeningSequenceState.TRUCK
     if map_id == MapRSE.LITTLEROOT_TOWN.value:
         return OpeningSequenceState.LITTLEROOT_TOWN
-    if map_id == MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value:
+    if map_id == _player_house_map(2, player_gender).value:
         return OpeningSequenceState.PLAYER_HOUSE_2F
-    if map_id == MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F.value:
+    if map_id == _player_house_map(1, player_gender).value:
         return OpeningSequenceState.PLAYER_HOUSE_1F
-    if map_id == MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_1F.value:
+    if map_id == _rival_house_map(1, player_gender).value:
         return OpeningSequenceState.BIRCH_HOUSE_1F
-    if map_id == MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value:
+    if map_id == _rival_house_map(2, player_gender).value:
         return OpeningSequenceState.BIRCH_HOUSE_2F
     if map_id == MapRSE.ROUTE101.value:
         return OpeningSequenceState.ROUTE_101
@@ -477,7 +547,7 @@ def _post_clock_2f_ready_for_stair_navigation() -> bool:
         return False
 
 
-def _post_clock_1f_arrival_complete() -> bool:
+def _post_clock_1f_arrival_complete(player_gender: object | None = None) -> bool:
     """Whether Emerald finished the expected TV event after returning from 2F.
 
     The 1F map's ``OnFrame`` script starts the Petalburg Gym broadcast while
@@ -488,7 +558,7 @@ def _post_clock_1f_arrival_complete() -> bool:
     """
     try:
         if (
-            _current_map_id() != MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F.value
+            _current_map_id() != _player_house_map(1, player_gender).value
             or get_event_var("LITTLEROOT_INTRO_STATE") != 7
             or get_game_state() != GameState.OVERWORLD
             or not player_avatar_is_controllable()
@@ -641,44 +711,57 @@ def _starter_bag_interaction() -> tuple[tuple[int, int], tuple[int, int]] | None
     return (bag_x, bag_y + 1), bag_coordinates
 
 
-def _wall_clock_interaction(map_id: tuple[int, int] | None = None) -> tuple[tuple[int, int], str] | None:
-    """Return the known clock target for the current Emerald house map."""
+def _wall_clock_interaction(
+    map_id: tuple[int, int] | None = None,
+    player_gender: object | None = None,
+) -> tuple[tuple[int, int], str] | None:
+    """Return the clock target for the selected player's 2F house.
+
+    The two physical houses are semantically interchangeable during the
+    opening, but their wall clocks are at different tiles.  Classify the
+    physical map through the same gender-aware house resolver used by the
+    opening state machine before resolving the layout-specific target.
+    """
     if map_id is None:
         map_id = _current_map_id()
+    gender = _opening_player_gender(player_gender)
+    if map_id != _player_house_map(2, gender).value:
+        return None
+
     target = _EMERALD_WALL_CLOCK_INTERACTIONS.get(map_id)
     if target is not None:
         return target
 
-    # The May house remains separate from Brendan's fixed opening path.  When
-    # that path is enabled, prefer its live ROM background-event data so its
-    # layout can define its own target; never fall back to Brendan's target.
-    if map_id != MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value:
-        return None
+    # May's house has a different layout, so use its ROM event rather than
+    # falling back to Brendan's interaction tile.
     location = get_map_data_for_current_position()
-    if location is None:
-        return None
-    clock = next(
-        (
-            event
-            for event in location.bg_events
-            if event.kind == "Script" and event.script_symbol.endswith("_EventScript_WallClock")
-        ),
-        None,
-    )
-    if clock is None:
-        return None
-    offsets = {
-        "Up": ((0, 1), "Up"),
-        "Down": ((0, -1), "Down"),
-        "Left": ((1, 0), "Left"),
-        "Right": ((-1, 0), "Right"),
-    }
-    offset_and_direction = offsets.get(clock.player_facing_direction)
-    if offset_and_direction is None:
-        return None
-    (offset_x, offset_y), direction = offset_and_direction
-    clock_x, clock_y = clock.local_coordinates
-    return (clock_x + offset_x, clock_y + offset_y), direction
+    if location is not None:
+        clock = next(
+            (
+                event
+                for event in location.bg_events
+                if event.kind == "Script" and event.script_symbol.endswith("_EventScript_WallClock")
+            ),
+            None,
+        )
+        if clock is not None:
+            offsets = {
+                "Up": ((0, 1), "Up"),
+                "Down": ((0, -1), "Down"),
+                "Left": ((1, 0), "Left"),
+                "Right": ((-1, 0), "Right"),
+            }
+            offset_and_direction = offsets.get(clock.player_facing_direction)
+            if offset_and_direction is not None:
+                (offset_x, offset_y), direction = offset_and_direction
+                clock_x, clock_y = clock.local_coordinates
+                return (clock_x + offset_x, clock_y + offset_y), direction
+
+    # Some shipped Emerald symbol tables expose this event under an unnamed
+    # or numeric script symbol.  The semantic house still identifies the
+    # layout, so retain its ROM-known interaction tile when symbol lookup is
+    # unavailable.
+    return _EMERALD_PLAYER_HOUSE_CLOCK_INTERACTIONS.get(gender)
 
 
 def _scripted_input_waiting() -> bool:
@@ -689,13 +772,107 @@ def _scripted_input_waiting() -> bool:
         return False
 
 
+def _report_birch_gender_input_attempt(
+    *,
+    path: str,
+    button: str,
+    observed: OpeningSequenceState | None = None,
+    before_inputs: int | None = None,
+    before_pending: tuple[int | None, int | None, int | None] | None = None,
+) -> None:
+    """Report a generic input immediately before it reaches the emulator.
+
+    This is deliberately diagnostic-only.  It reports only attempted inputs
+    while one of Birch's gender-menu tasks is present, so normal opening
+    tracing remains quiet and the input call itself is not altered.
+    """
+    if not context.debug or not getattr(context, "debug_trace", False):
+        return
+    snapshot = _birch_gender_task_snapshot()
+    if snapshot is None or snapshot == ("unavailable",):
+        return
+    state = None
+    try:
+        state = EmeraldOpeningMode._dialogue_state_snapshot()
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        pass
+    (
+        present,
+        task_data,
+        _location,
+        game_state,
+        game_state_symbol,
+        player_gender,
+        active_tasks,
+        _script,
+        _sprites,
+        _objects,
+    ) = snapshot
+    phase = observed.name if observed is not None else _birch_gender_diagnostic_phase
+    native_state = None if state is None else (state[2], state[3], state[10])
+    script_state = None if state is None else (state[2], state[4], state[11])
+    field_message_state = (
+        None
+        if state is None
+        else {
+            "task_active": state[0],
+            "task_data_0": state[1],
+            "waiting": state[5],
+            "visible": state[7],
+            "printer": state[8],
+        }
+    )
+    diagnostic_print(
+        "[bold yellow]Birch gender input: "
+        f"path={path} button={button} phase={phase} "
+        f"active_gender_tasks={present} target_gender={_birch_gender_diagnostic_target} "
+        f"player_gender={player_gender} "
+        f"task_data_0_16={task_data} native_state={native_state} "
+        f"script_state={script_state} field_message_state={field_message_state} "
+        f"input_buffer_before={before_inputs} pending_inputs_before={before_pending} "
+        f"game_state={game_state} game_state_symbol={game_state_symbol} "
+        f"relevant_active_tasks={active_tasks}[/]",
+        trace=True,
+    )
+
+
+def _report_opening_a_decision(
+    *,
+    source: str,
+    reason: str,
+    phase: OpeningSequenceState | None = None,
+) -> None:
+    """Trace the exact opening branch that decided to submit an A input."""
+    if not context.debug or not getattr(context, "debug_trace", False):
+        return
+    try:
+        active_tasks = [task.symbol for task in (get_tasks() or [])]
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        active_tasks = []
+    try:
+        player_gender = get_player().gender
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError, KeyError):
+        player_gender = None
+    diagnostic_print(
+        "[bold yellow]Opening A decision: "
+        f"source={source} reason={reason!r} "
+        f"phase={(phase.name if phase is not None else _birch_gender_diagnostic_phase)} "
+        f"active_tasks={active_tasks} "
+        f"target_gender={_birch_gender_diagnostic_target} player_gender={player_gender}[/]",
+        trace=True,
+    )
+
+
 def _advance_scripted_input() -> Generator:
     """Advance only when the game reports that an input is currently wanted."""
     global _last_scripted_input_trace
     waiting_for_input = _scripted_input_waiting()
+    waiting_reason = "is_field_message_waiting_for_input()" if waiting_for_input else None
     if not waiting_for_input:
         try:
             waiting_for_input = context.rom.is_emerald and task_is_active("Task_DrawFieldMessage")
+            if waiting_for_input:
+                waiting_reason = "Emerald Task_DrawFieldMessage fallback"
         except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
             pass
     if waiting_for_input:
@@ -713,6 +890,16 @@ def _advance_scripted_input() -> Generator:
                 )
             except (AttributeError, RuntimeError, TypeError):
                 pass
+            _report_birch_gender_input_attempt(
+                path="_advance_scripted_input",
+                button="A",
+                before_inputs=before_inputs,
+                before_pending=before_pending,
+            )
+        _report_opening_a_decision(
+            source="_advance_scripted_input",
+            reason=waiting_reason or "scripted input predicate returned true",
+        )
         context.emulator.press_button("A")
         if context.debug and getattr(context, "debug_trace", False):
             try:
@@ -846,13 +1033,71 @@ class EmeraldOpeningMode(BotMode):
         self._initial_menu_repositioned = False
         self._last_text_speed_configuration_key: tuple | None = None
         self._last_birch_gender_diagnostics: tuple | None = None
+        self._birch_gender_a_sent = False
+
+    @staticmethod
+    def _active_birch_gender_task() -> str | None:
+        try:
+            active_tasks = {task.symbol for task in (get_tasks() or [])}
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            return None
+        # ChooseGender is the actionable state; the other tasks describe
+        # setup/transition frames around the menu.
+        for task_name in _BIRCH_GENDER_TASKS:
+            if task_name in active_tasks:
+                return task_name
+        return None
+
+    def _advance_birch_gender_selection(self, observed: OpeningSequenceState) -> Generator:
+        """Give Birch's gender menu precedence over generic opening states."""
+        task_name = self._active_birch_gender_task()
+        if task_name is None:
+            self._birch_gender_a_sent = False
+            return False
+
+        if task_name != "Task_NewGameBirchSpeech_ChooseGender":
+            yield
+            return True
+
+        if self._birch_gender_a_sent:
+            yield
+            return True
+
+        task = get_task(task_name)
+        if task is None:
+            yield
+            return True
+
+        cursor = task.data_value(6)
+        target = 1 if getattr(self._resolved_player_gender, "value", self._resolved_player_gender) == "female" else 0
+        if cursor == target:
+            _report_opening_a_decision(
+                source="EmeraldOpeningMode._advance_birch_gender_selection",
+                reason=f"ChooseGender cursor {cursor} matches target {target}; confirm selection",
+                phase=observed,
+            )
+            _report_birch_gender_input_attempt(
+                path="_advance_birch_gender_selection",
+                button="A",
+                observed=observed,
+            )
+            context.emulator.press_button("A")
+            self._birch_gender_a_sent = True
+        else:
+            button = "Down" if target > cursor else "Up"
+            context.emulator.press_button(button)
+        yield
+        return True
 
     def run(self) -> Generator:
         if not context.rom.is_emerald:
             raise BotModeError("Start New Game only supports Pokémon Emerald.")
 
         while context.bot_mode != "Manual":
-            observed = get_opening_sequence_state()
+            observed = get_opening_sequence_state(self._resolved_player_gender)
+            global _birch_gender_diagnostic_phase, _birch_gender_diagnostic_target
+            _birch_gender_diagnostic_phase = observed.name
+            _birch_gender_diagnostic_target = self._resolved_player_gender
             diagnostics = get_opening_diagnostics(self.phase, observed)
             self._report_diagnostics(diagnostics)
             self._report_birch_gender_diagnostics()
@@ -865,8 +1110,17 @@ class EmeraldOpeningMode(BotMode):
                 context.bot_mode = "Starters"
                 return
 
+            birch_gender_action = yield from self._advance_birch_gender_selection(observed)
+            if birch_gender_action:
+                continue
+
             if observed == OpeningSequenceState.TITLE or observed == OpeningSequenceState.MAIN_MENU:
                 if observed is OpeningSequenceState.TITLE:
+                    _report_opening_a_decision(
+                        source="EmeraldOpeningMode.run:title branch",
+                        reason="TITLE state requires dismissing the title screen",
+                        phase=observed,
+                    )
                     context.emulator.press_button("A")
                     yield
                     continue
@@ -888,6 +1142,11 @@ class EmeraldOpeningMode(BotMode):
                     yield
                     continue
 
+                _report_opening_a_decision(
+                    source="EmeraldOpeningMode.run:main-menu branch",
+                    reason="main-menu cursor is positioned on New Game",
+                    phase=observed,
+                )
                 context.emulator.press_button("A")
                 yield
                 continue
@@ -1025,6 +1284,11 @@ class EmeraldOpeningMode(BotMode):
         while not task_is_active("Task_HandleMainMenuInput"):
             self._report_text_speed_configuration(observation, "wait: main-menu input task")
             yield
+        _report_opening_a_decision(
+            source="EmeraldOpeningMode._configure_initial_game_settings",
+            reason="main-menu input task active after selecting Options",
+            phase=OpeningSequenceState.MAIN_MENU,
+        )
         context.emulator.press_button("A")
         self._initial_options_entered = True
         self._report_text_speed_configuration(observation, "press A: enter Options")
@@ -1076,7 +1340,7 @@ class EmeraldOpeningMode(BotMode):
             # not a particular page of text.  Emerald can expose the same
             # wait state for several consecutive pages, so input readiness is
             # the semantic signal that another dismissal is required.
-            self._press_dialogue_input(state)
+            self._press_dialogue_input(state, observed)
             self._dialogue_before_input = state
             if script_waiting:
                 self._dialogue_wait_input_state = state
@@ -1383,12 +1647,19 @@ class EmeraldOpeningMode(BotMode):
             f"reason={reason!r} navigation_target={navigation_target!r}[/]"
         )
 
-    def _press_dialogue_input(self, state: tuple) -> None:
+    def _press_dialogue_input(self, state: tuple, observed: OpeningSequenceState | None = None) -> None:
         if not context.debug or not getattr(context, "debug_trace", False):
             context.emulator.press_button("B")
             return
         before_inputs = self._dialogue_emulator_inputs()
         before_pending = self._dialogue_pending_inputs()
+        _report_birch_gender_input_attempt(
+            path="_press_dialogue_input",
+            button="B",
+            observed=observed,
+            before_inputs=before_inputs,
+            before_pending=before_pending,
+        )
         context.emulator.press_button("B")
         after_inputs = self._dialogue_emulator_inputs()
         after_pending = self._dialogue_pending_inputs()
@@ -1636,8 +1907,16 @@ class EmeraldOpeningMode(BotMode):
         observed: OpeningSequenceState,
         diagnostics: OpeningDiagnostics | None = None,
     ) -> Generator:
+        player_1f, player_2f = (
+            _player_house_map(1, self._resolved_player_gender),
+            _player_house_map(2, self._resolved_player_gender),
+        )
+        rival_1f, rival_2f = (
+            _rival_house_map(1, self._resolved_player_gender),
+            _rival_house_map(2, self._resolved_player_gender),
+        )
         if self.phase is OpeningSequenceState.PLAYER_HOUSE_1F_POST_CLOCK_ARRIVAL:
-            if not _post_clock_1f_arrival_complete():
+            if not _post_clock_1f_arrival_complete(self._resolved_player_gender):
                 self._last_truck_decision = "wait: expected post-clock 1F TV event"
                 # Ordinary field dialogue is handled by run() before this
                 # phase is advanced.  This yield covers the ROM's scripted
@@ -1696,7 +1975,7 @@ class EmeraldOpeningMode(BotMode):
                 yield from _advance_scripted_input()
                 return
             else:
-                yield from _warp_to(MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F)
+                yield from _warp_to(player_1f)
                 self.phase = OpeningSequenceState.PLAYER_HOUSE_1F
                 return
 
@@ -1712,8 +1991,8 @@ class EmeraldOpeningMode(BotMode):
                     # wait state.  Once the ROM has released control, resume
                     # driving the same ROM-defined staircase warp.
                     if (
-                        destination is MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F
-                        and observed_map == MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value
+                        destination is player_1f
+                        and observed_map == player_2f.value
                         and get_event_flag("SET_WALL_CLOCK")
                     ):
                         if not _post_clock_2f_ready_for_stair_navigation():
@@ -1727,9 +2006,9 @@ class EmeraldOpeningMode(BotMode):
                     yield
                     return
                 self._pending_house_warp_destination = None
-                if destination is MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F:
+                if destination is player_2f:
                     self.phase = OpeningSequenceState.PLAYER_HOUSE_2F
-                elif destination is MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F:
+                elif destination is player_1f:
                     self.phase = OpeningSequenceState.PLAYER_HOUSE_1F_POST_CLOCK_ARRIVAL
                 elif destination is MapRSE.LITTLEROOT_TOWN:
                     self.phase = OpeningSequenceState.POST_CLOCK_TOWN
@@ -1740,17 +2019,17 @@ class EmeraldOpeningMode(BotMode):
                     self._last_truck_decision = "wait: player's house 1F introductory dialogue"
                     yield from _advance_scripted_input()
                     return
-                self._pending_house_warp_destination = MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F
+                self._pending_house_warp_destination = player_2f
                 self._last_truck_decision = "navigate: ROM-defined staircase warp to player's house 2F"
-                yield from _warp_to(MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F)
+                yield from _warp_to(player_2f)
                 return
             if observed == OpeningSequenceState.PLAYER_HOUSE_2F:
                 if get_event_flag("SET_WALL_CLOCK"):
                     # The staircase is the only supported route back down;
                     # walking to it lets the map/path system handle the warp.
-                    self._pending_house_warp_destination = MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F
+                    self._pending_house_warp_destination = player_1f
                     self._last_truck_decision = "navigate: ROM-defined staircase warp back to player's house 1F"
-                    yield from _warp_to(MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F)
+                    yield from _warp_to(player_1f)
                 else:
                     self.phase = OpeningSequenceState.PLAYER_HOUSE_2F
             elif get_event_flag("SET_WALL_CLOCK") and observed == OpeningSequenceState.PLAYER_HOUSE_1F:
@@ -1788,7 +2067,7 @@ class EmeraldOpeningMode(BotMode):
                 # The rival's house starts a ROM-owned arrival event as the
                 # warp completes.  Accept that expected interruption so the
                 # generic dialogue handler can service it on the next frame.
-                yield from _warp_to(MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_1F, expecting_script=True)
+                yield from _warp_to(rival_1f, expecting_script=True)
                 self.phase = OpeningSequenceState.BIRCH_HOUSE_1F
             return
 
@@ -1816,7 +2095,7 @@ class EmeraldOpeningMode(BotMode):
                 self._last_truck_decision = "wait: Birch's house arrival event"
                 yield
                 return
-            yield from _warp_to(MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F)
+            yield from _warp_to(rival_2f)
             self.phase = OpeningSequenceState.BIRCH_HOUSE_2F
             return
 
@@ -1869,11 +2148,16 @@ class EmeraldOpeningMode(BotMode):
                 decision=self._last_truck_decision,
             )
             yield from navigate_to(
-                MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F,
+                rival_2f,
                 interaction_coordinates,
                 avoid_scripted_events=False,
             )
             yield from ensure_facing_direction(interaction_facing)
+            _report_opening_a_decision(
+                source="EmeraldOpeningMode._advance_phase:May Poké Ball interaction",
+                reason="navigation and facing completed at the interaction target",
+                phase=observed,
+            )
             context.emulator.press_button("A")
             yield
             self.phase = OpeningSequenceState.MAY_SEQUENCE
@@ -1904,10 +2188,10 @@ class EmeraldOpeningMode(BotMode):
                         observed,
                         branch="navigate to May's House 1F warp",
                         reason="Rival event complete; descend from 2F",
-                        navigation_target=MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_1F.value,
+                        navigation_target=rival_1f.value,
                     )
                     yield from _warp_to(
-                        MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_1F,
+                        rival_1f,
                         expecting_script=True,
                     )
                 else:
@@ -2045,7 +2329,7 @@ class EmeraldOpeningMode(BotMode):
             yield
             return
         house_map = _current_map_id()
-        target = _wall_clock_interaction(house_map)
+        target = _wall_clock_interaction(house_map, self._resolved_player_gender)
         if house_map is None or target is None:
             self._last_truck_decision = f"wait: Emerald wall-clock target unavailable for map={house_map}"
             yield
@@ -2058,6 +2342,11 @@ class EmeraldOpeningMode(BotMode):
             avoid_scripted_events=False,
         )
         yield from ensure_facing_direction(facing)
+        _report_opening_a_decision(
+            source="EmeraldOpeningMode._start_clock_interaction",
+            reason="navigation and facing completed at the wall clock",
+            phase=OpeningSequenceState.CLOCK_SETTING,
+        )
         context.emulator.press_button("A")
         self._clock_interaction_started = True
         self._last_clock_task = None
@@ -2201,6 +2490,11 @@ class EmeraldOpeningMode(BotMode):
             return
         snapshot = _birch_gender_task_snapshot()
         if snapshot is None:
+            if self._last_birch_gender_diagnostics is not None:
+                diagnostic_print(
+                    "[dim]Birch gender UI: disappeared; lifecycle boundary reached[/]",
+                    trace=True,
+                )
             self._last_birch_gender_diagnostics = None
             return
         key = (self._resolved_player_gender, snapshot)
@@ -2210,10 +2504,11 @@ class EmeraldOpeningMode(BotMode):
         if snapshot == ("unavailable",):
             diagnostic_print("[dim]Birch gender UI: state temporarily unavailable[/]", trace=True)
             return
-        present, task_data, location, state, callback, active_tasks, script, sprites, objects = snapshot
+        present, task_data, location, state, callback, player_gender, active_tasks, script, sprites, objects = snapshot
         diagnostic_print(
             "[dim]Birch gender UI: "
             f"target_gender={self._resolved_player_gender} present={present} "
+            f"player_gender={player_gender} "
             f"tasks={task_data} location={location} game_state={state} callback={callback} "
             f"active_tasks={active_tasks} script_native={script} sprites={sprites} objects={objects}[/]",
             trace=True,
@@ -2248,6 +2543,11 @@ class EmeraldOpeningMode(BotMode):
                 elif (hours, minutes) == (_CLOCK_TARGET_HOUR, _CLOCK_TARGET_MINUTE):
                     self._last_truck_decision = "clock: confirm selected 10:00"
                     if not self._clock_a_sent:
+                        _report_opening_a_decision(
+                            source="EmeraldOpeningMode._set_clock",
+                            reason="clock hands reached the target time 10:00",
+                            phase=OpeningSequenceState.CLOCK_SETTING,
+                        )
                         context.emulator.press_button("A")
                         self._clock_a_sent = True
                         self._last_truck_decision = "clock input: A (confirm 10:00)"
@@ -2272,6 +2572,11 @@ class EmeraldOpeningMode(BotMode):
                 self._clock_confirm_yes_prepared = True
                 self._last_truck_decision = "clock input: Up (select YES)"
             elif not self._clock_a_sent:
+                _report_opening_a_decision(
+                    source="EmeraldOpeningMode._set_clock",
+                    reason="clock confirmation menu is prepared on YES",
+                    phase=OpeningSequenceState.CLOCK_SETTING,
+                )
                 context.emulator.press_button("A")
                 self._clock_a_sent = True
                 self._last_truck_decision = "clock input: A (confirm YES)"
