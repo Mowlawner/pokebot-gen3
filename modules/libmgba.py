@@ -155,6 +155,11 @@ class LibmgbaEmulator:
         self._prev_pressed_inputs: int = 0
         self._pressed_inputs: int = 0
         self._held_inputs: int = 0
+        # Input masks for the last two frames actually sent to mGBA.  Keep
+        # these separate from _pressed_inputs, which is only a pending pulse.
+        # The ROM derives JOY_NEW/JOY_HELD/JOY_RELEASE from this transition.
+        self._previous_frame_inputs: int = 0
+        self._current_frame_inputs: int = 0
 
         if not is_test_run:
             atexit.register(self.shutdown)
@@ -478,6 +483,26 @@ class LibmgbaEmulator:
         """
         return self._core._core.getKeys(self._core._core)
 
+    def get_held_inputs(self) -> int:
+        """Return the inputs currently held by the bot until released."""
+        return self._held_inputs
+
+    def get_previous_frame_inputs(self) -> int:
+        """Return the complete input mask sent during the preceding frame."""
+        return self._previous_frame_inputs
+
+    def get_current_frame_inputs(self) -> int:
+        """Return the complete input mask sent during the current frame."""
+        return self._current_frame_inputs
+
+    def get_new_inputs(self) -> int:
+        """Return inputs that transitioned from released to held this frame."""
+        return self._current_frame_inputs & ~self._previous_frame_inputs
+
+    def get_released_inputs(self) -> int:
+        """Return inputs that transitioned from held to released this frame."""
+        return self._previous_frame_inputs & ~self._current_frame_inputs
+
     def set_inputs(self, inputs: int):
         """
         :param inputs: A bitfield with all the buttons that should now be pressed
@@ -489,7 +514,8 @@ class LibmgbaEmulator:
         :param button: A GBA button to be pressed, if pressed on previous frame it will be released
         :param inputs: Alternate raw input bitfield
         """
-        self._pressed_inputs |= (self._prev_pressed_inputs & input_map[button]) ^ input_map[button]
+        button_inputs = inputs or input_map[button]
+        self._pressed_inputs |= (self._prev_pressed_inputs & button_inputs) ^ button_inputs
 
     def hold_button(self, button: str = None, inputs: int = 0):
         """
@@ -594,14 +620,20 @@ class LibmgbaEmulator:
         """
         Runs the emulation for a single frame, and then waits if necessary to hit the target FPS rate.
         """
-        self.set_inputs(self._pressed_inputs | self._held_inputs)
+        applied_inputs = self._pressed_inputs | self._held_inputs
+        self.set_inputs(applied_inputs)
+        self._previous_frame_inputs = self._current_frame_inputs
+        self._current_frame_inputs = applied_inputs
 
         begin = time.time_ns()
         self._core.run_frame()
         self._performance_tracker.time_spent_emulating += time.time_ns() - begin
 
         begin = time.time_ns()
-        self._prev_pressed_inputs = self._pressed_inputs
+        # Track what was actually applied, including a neutral frame.  Using
+        # only _pressed_inputs here made a neutral frame leave A marked stale,
+        # so the next press_button("A") was incorrectly suppressed.
+        self._prev_pressed_inputs = applied_inputs
         self._pressed_inputs = 0
 
         samples_available = self._gba_audio.available

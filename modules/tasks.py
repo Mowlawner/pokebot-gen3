@@ -10,6 +10,7 @@ from modules.context import context
 from modules.game import get_symbol_name_before
 from modules.memory import get_symbol_name, read_symbol, unpack_uint16, unpack_uint32
 from modules.state_cache import state_cache
+from modules.text_printer import get_text_printer
 
 
 class Task:
@@ -216,3 +217,31 @@ def is_waiting_for_input() -> bool:
         # ``and`` otherwise returns the integer printer-active flag when it is
         # zero.  Keep this helper's documented bool contract at the boundary.
         return bool(text_printer_is_active and text_printer_state in (2, 3))
+
+
+def is_field_message_waiting_for_input(field_message_lifecycle_active: bool = False) -> bool:
+    """Whether Emerald's ordinary field-message printer is awaiting A/B.
+
+    ``is_waiting_for_input`` intentionally also recognizes the script native
+    ``WaitForAorBPress``.  That native is useful for many script operations,
+    but is not by itself proof that an ordinary field message is on screen.
+    Once a caller has observed the field-message task, the caller can keep
+    that lifecycle active while Emerald transitions to ``WaitForAorBPress``.
+    During that transition the task and printer may both be inactive, so the
+    native wait is the authoritative input signal.
+    """
+    try:
+        if context.rom.is_rs:
+            return False
+        if not is_waiting_for_input():
+            return False
+        if task_is_active("Task_DrawFieldMessage"):
+            return True
+        script_context = get_global_script_context()
+        if script_context is None or script_context.native_function_name != "WaitForAorBPress":
+            return False
+        return field_message_lifecycle_active or get_text_printer().active
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        # Emulator state is legitimately incomplete for a frame during a map
+        # transition.  Callers should retry, not switch modes or raise.
+        return False

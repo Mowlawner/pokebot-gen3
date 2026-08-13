@@ -80,7 +80,11 @@ def run_frlg() -> Generator:
         )
 
 
-def run_rse_hoenn(get_active_encounter: Callable[[], EncounterInfo], reset_before_selection: bool = True) -> Generator:
+def run_rse_hoenn(
+    get_active_encounter: Callable[[], EncounterInfo],
+    reset_before_selection: bool = True,
+    open_bag_on_handoff: bool = False,
+) -> Generator:
     # Set up: Ask for starter choice because we cannot deduce that from the player location.
     starter_choice = ask_for_choice(
         [
@@ -105,6 +109,11 @@ def run_rse_hoenn(get_active_encounter: Callable[[], EncounterInfo], reset_befor
             yield from ensure_facing_direction("Left")
         else:
             yield from ensure_facing_direction("Up")
+
+        if open_bag_on_handoff:
+            context.emulator.press_button("A")
+            yield
+            open_bag_on_handoff = False
 
         # Open bag
         if context.rom.is_rs:
@@ -238,7 +247,11 @@ class StartersMode(BotMode):
         from .opening import consume_starter_handoff
 
         if consume_starter_handoff():
-            yield from run_rse_hoenn(lambda: self._active_encounter, reset_before_selection=False)
+            yield from run_rse_hoenn(
+                lambda: self._active_encounter,
+                reset_before_selection=False,
+                open_bag_on_handoff=True,
+            )
             return
 
         assert_save_game_exists("There is no saved game. Cannot soft reset.")

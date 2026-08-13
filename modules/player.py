@@ -299,9 +299,16 @@ def player_avatar_is_controllable() -> bool:
     ):
         return False
 
-    # When exiting a door in RSE, there is a single frame where the game erroneously reports
-    # the player as controllable even though it's still in the exiting animation.
-    if task_is_active("Task_ExitDoor") or task_is_active("sub_8080B9C"):
+    # When exiting a door, there can be a frame where the game reports the
+    # player as controllable even though the exit animation has not finished.
+    # RSE uses Task_ExitDoor/sub_8080B9C for animated exits, while house
+    # warps use Task_ExitNonAnimDoor.  The latter still owns the post-warp
+    # movement/transition and must be allowed to finish before navigation.
+    if (
+        task_is_active("Task_ExitDoor")
+        or task_is_active("sub_8080B9C")
+        or task_is_active("Task_ExitNonAnimDoor")
+    ):
         return False
 
     return True

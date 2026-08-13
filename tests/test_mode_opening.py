@@ -331,18 +331,241 @@ class TestEmeraldOpeningState(unittest.TestCase):
         self.assertIs(mode._pending_house_warp_destination, MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F)
         warp.assert_called_once_with(MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F)
 
-    def test_upstairs_navigation_transitions_to_clock_setting_phase(self):
+    def test_post_clock_2f_does_not_stick_on_pending_1f_warp(self):
+        """2F is temporary while the 1F phase waits for Mom's sequence."""
         from modules.map_data import MapRSE
         from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.PLAYER_HOUSE_1F
+        mode._pending_house_warp_destination = MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F
+        with (
+            patch(
+                "modules.modes.opening._current_map_id",
+                return_value=MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value,
+            ),
+            patch("modules.modes.opening.get_event_flag", return_value=True),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.modes.opening.player_avatar_is_controllable", return_value=True),
+            patch("modules.modes.opening.is_waiting_for_input", return_value=False),
+            patch("modules.modes.opening.get_global_script_context", return_value=None),
+            patch("modules.modes.opening._warp_to", return_value=iter(())) as warp,
+        ):
+            list(mode._advance_phase(OpeningSequenceState.PLAYER_HOUSE_2F))
+
+        self.assertIs(mode.phase, OpeningSequenceState.PLAYER_HOUSE_1F)
+        self.assertEqual(
+            mode._last_truck_decision,
+            "navigate: ROM-defined staircase warp back to player's house 1F",
+        )
+        warp.assert_called_once_with(MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F)
+
+    def test_house_1f_waits_for_non_animated_door_exit_before_navigation(self):
+        """The 1F map is visible before the ROM's post-warp door task ends."""
+        from modules.map_data import MapRSE
+        from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.PLAYER_HOUSE_1F
+        with (
+            patch("modules.modes.opening._current_map_id", return_value=MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F.value),
+            patch(
+                "modules.modes.opening.get_player_avatar",
+                return_value=types.SimpleNamespace(local_coordinates=(8, 3)),
+            ),
+            patch("modules.modes.opening.get_event_flag", return_value=True),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.modes.opening.task_is_active", side_effect=lambda task: task == "Task_ExitNonAnimDoor"),
+            # This is the result of the shared player controllability guard
+            # while Task_ExitNonAnimDoor is active.
+            patch("modules.modes.opening.player_avatar_is_controllable", return_value=False),
+            patch("modules.modes.opening.navigate_to", return_value=iter(())) as navigate,
+        ):
+            list(mode._advance_phase(OpeningSequenceState.PLAYER_HOUSE_1F))
+
+        navigate.assert_not_called()
+        self.assertIs(mode.phase, OpeningSequenceState.PLAYER_HOUSE_1F)
+
+    def test_post_clock_1f_arrival_waits_for_rom_tv_event_completion(self):
+        """VAR_LITTLEROOT_INTRO_STATE 6 starts the expected TV event."""
+        from modules.map_data import MapRSE
+        from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.PLAYER_HOUSE_1F_POST_CLOCK_ARRIVAL
+        with (
+            patch("modules.modes.opening._current_map_id", return_value=MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F.value),
+            patch("modules.modes.opening.get_event_var", return_value=6),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.modes.opening.player_avatar_is_controllable", return_value=True),
+            patch("modules.modes.opening.get_global_script_context", return_value=None),
+            patch("modules.modes.opening.navigate_to", return_value=iter(())) as navigate,
+        ):
+            list(mode._advance_phase(OpeningSequenceState.PLAYER_HOUSE_1F))
+
+        navigate.assert_not_called()
+        self.assertIs(mode.phase, OpeningSequenceState.PLAYER_HOUSE_1F_POST_CLOCK_ARRIVAL)
+        self.assertEqual(mode._last_truck_decision, "wait: expected post-clock 1F TV event")
+
+    def test_post_clock_1f_arrival_returns_to_navigation_after_rom_completion_marker(self):
+        from modules.map_data import MapRSE
+        from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.PLAYER_HOUSE_1F_POST_CLOCK_ARRIVAL
+        with (
+            patch("modules.modes.opening._current_map_id", return_value=MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F.value),
+            patch("modules.modes.opening.get_event_var", return_value=7),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.modes.opening.player_avatar_is_controllable", return_value=True),
+            patch("modules.modes.opening.get_global_script_context", return_value=None),
+        ):
+            list(mode._advance_phase(OpeningSequenceState.PLAYER_HOUSE_1F))
+
+        self.assertIs(mode.phase, OpeningSequenceState.PLAYER_HOUSE_1F)
+        self.assertEqual(mode._last_truck_decision, "complete: post-clock 1F TV event")
+
+    def test_post_clock_town_accepts_expected_birch_house_arrival_script(self):
+        from modules.map_data import MapRSE
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.POST_CLOCK_TOWN
+        with patch("modules.modes.opening._warp_to", return_value=iter(())) as warp:
+            list(mode._advance_phase(OpeningSequenceState.LITTLEROOT_TOWN))
+
+        warp.assert_called_once_with(MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_1F, expecting_script=True)
+        self.assertIs(mode.phase, OpeningSequenceState.BIRCH_HOUSE_1F)
+
+    def test_birch_house_waits_for_arrival_script_before_navigating_upstairs(self):
+        from modules.map_data import MapRSE
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.BIRCH_HOUSE_1F
+        with (
+            patch("modules.modes.opening._birch_house_1f_ready_for_navigation", return_value=False),
+            patch("modules.modes.opening._warp_to", return_value=iter(())) as warp,
+        ):
+            list(mode._advance_phase(OpeningSequenceState.BIRCH_HOUSE_1F))
+
+        warp.assert_not_called()
+        self.assertEqual(mode._last_truck_decision, "wait: Birch's house arrival event")
+
+        with (
+            patch("modules.modes.opening._birch_house_1f_ready_for_navigation", return_value=True),
+            patch("modules.modes.opening._warp_to", return_value=iter(())) as warp,
+        ):
+            list(mode._advance_phase(OpeningSequenceState.BIRCH_HOUSE_1F))
+
+        warp.assert_called_once_with(MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F)
+        self.assertIs(mode.phase, OpeningSequenceState.BIRCH_HOUSE_2F)
+
+    def test_birch_house_reconciles_observed_second_floor_before_warp_returns(self):
+        from modules.map_data import MapRSE
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.BIRCH_HOUSE_1F
+        with patch("modules.modes.opening._advance_scripted_input", return_value=iter(())) as advance:
+            list(mode._advance_phase(OpeningSequenceState.BIRCH_HOUSE_2F))
+
+        self.assertIs(mode.phase, OpeningSequenceState.BIRCH_HOUSE_2F)
+        advance.assert_not_called()
+
+    def test_birch_second_floor_navigates_to_ball_and_starts_rival_event(self):
+        from modules.map_data import MapRSE
+        from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.BIRCH_HOUSE_2F
+        emulator = unittest.mock.Mock()
+        with (
+            patch.object(mode, "_can_navigate", return_value=True),
+            patch(
+                "modules.modes.opening._rival_pokeball_interaction",
+                return_value=((6, 4), (6, 3)),
+            ),
+            patch("modules.modes.opening.navigate_to", return_value=iter(())) as navigate,
+            patch("modules.modes.opening.ensure_facing_direction", return_value=iter(())) as face,
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch.object(__import__("modules.modes.opening", fromlist=["context"]).context,
+                         "emulator", emulator),
+        ):
+            list(mode._advance_phase(OpeningSequenceState.BIRCH_HOUSE_2F))
+
+        navigate.assert_called_once_with(
+            MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F,
+            (6, 4),
+            avoid_scripted_events=False,
+        )
+        face.assert_called_once_with((6, 3))
+        emulator.press_button.assert_called_once_with("A")
+        self.assertIs(mode.phase, OpeningSequenceState.MAY_SEQUENCE)
+
+    def test_expected_rival_event_returns_to_opening_control(self):
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.MAY_SEQUENCE
+        with (
+            patch("modules.modes.opening._may_sequence_event_complete", return_value=False),
+            patch("modules.modes.opening._advance_scripted_input", return_value=iter(())) as advance,
+        ):
+            list(mode._advance_phase(OpeningSequenceState.BIRCH_HOUSE_2F))
+
+        advance.assert_not_called()
+        self.assertIs(mode.phase, OpeningSequenceState.MAY_SEQUENCE)
+
+        list(mode._advance_phase(OpeningSequenceState.ROUTE_101))
+        self.assertIs(mode.phase, OpeningSequenceState.ROUTE_101)
+
+    def test_may_sequence_descends_after_rival_event_completes(self):
+        from modules.map_data import MapRSE
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.MAY_SEQUENCE
+        with (
+            patch("modules.modes.opening._may_sequence_event_complete", return_value=True),
+            patch("modules.modes.opening._warp_to", return_value=iter(())) as warp,
+        ):
+            list(mode._advance_phase(OpeningSequenceState.BIRCH_HOUSE_2F))
+
+        warp.assert_called_once_with(MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_1F, expecting_script=True)
+        self.assertIs(mode.phase, OpeningSequenceState.MAY_SEQUENCE)
+
+    def test_may_sequence_leaves_house_after_descending(self):
+        from modules.map_data import MapRSE
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.MAY_SEQUENCE
+        with (
+            patch("modules.modes.opening._may_sequence_event_complete", return_value=True),
+            patch("modules.modes.opening._warp_to", return_value=iter(())) as warp,
+        ):
+            list(mode._advance_phase(OpeningSequenceState.BIRCH_HOUSE_1F))
+
+        warp.assert_called_once_with(MapRSE.LITTLEROOT_TOWN, expecting_script=True)
+        self.assertIs(mode.phase, OpeningSequenceState.ROUTE_101)
+
+    def test_observed_second_floor_at_start_position_starts_fixed_clock_interaction(self):
+        from modules.map_data import MapRSE
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
 
         mode = EmeraldOpeningMode()
         mode.phase = OpeningSequenceState.PLAYER_HOUSE_2F
         with (
             patch.object(mode, "_can_navigate", return_value=True),
+            patch("modules.modes.opening._current_map_id", return_value=MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value),
             patch("modules.modes.opening.navigate_to", return_value=iter(())) as navigate,
             patch("modules.modes.opening.ensure_facing_direction", return_value=iter(())) as face,
-            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
             patch.object(
                 __import__("modules.modes.opening", fromlist=["context"]).context,
                 "emulator",
@@ -354,11 +577,210 @@ class TestEmeraldOpeningState(unittest.TestCase):
         self.assertIs(mode.phase, OpeningSequenceState.CLOCK_SETTING)
         navigate.assert_called_once_with(
             MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F,
-            (7, 2),
+            (5, 2),
             avoid_scripted_events=False,
         )
         face.assert_called_once_with("Up")
         emulator.press_button.assert_called_once_with("A")
+
+    def test_clock_setting_observation_starts_interaction_without_event_lookup(self):
+        from modules.map_data import MapRSE
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.CLOCK_SETTING
+        with (
+            patch.object(mode, "_can_navigate", return_value=True),
+            patch("modules.modes.opening._clock_task_active", return_value=False),
+            patch("modules.modes.opening._current_map_id", return_value=MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value),
+            patch("modules.modes.opening.navigate_to", return_value=iter(())) as navigate,
+            patch("modules.modes.opening.ensure_facing_direction", return_value=iter(())) as face,
+            patch("modules.modes.opening.get_map_data_for_current_position",
+                  side_effect=AssertionError("clock event lookup must not be required")),
+            patch.object(
+                __import__("modules.modes.opening", fromlist=["context"]).context,
+                "emulator",
+                types.SimpleNamespace(press_button=unittest.mock.Mock()),
+            ),
+        ):
+            list(mode._advance_phase(OpeningSequenceState.PLAYER_HOUSE_2F))
+
+        self.assertIs(mode.phase, OpeningSequenceState.CLOCK_SETTING)
+        self.assertTrue(mode._clock_interaction_started)
+        navigate.assert_called_once_with(
+            MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F,
+            (5, 2),
+            avoid_scripted_events=False,
+        )
+        face.assert_called_once_with("Up")
+
+    def test_clock_ui_is_left_to_existing_clock_handler_after_interaction(self):
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.CLOCK_SETTING
+        mode._clock_interaction_started = True
+        with (
+            patch("modules.modes.opening._clock_task_active", return_value=True),
+            patch.object(mode, "_set_clock", return_value=iter(())) as set_clock,
+            patch("modules.modes.opening.navigate_to") as navigate,
+        ):
+            list(mode._advance_phase(OpeningSequenceState.PLAYER_HOUSE_2F))
+
+        set_clock.assert_called_once_with()
+        navigate.assert_not_called()
+
+    def test_clock_handle_input_is_advanced_once_per_task_phase(self):
+        from modules.modes.opening import EmeraldOpeningMode
+
+        mode = EmeraldOpeningMode()
+        emulator = unittest.mock.Mock()
+        with (
+            patch("modules.modes.opening._active_clock_task", side_effect=[
+                "Task_SetClock_HandleInput",
+                "Task_SetClock_HandleInput",
+                "Task_SetClock_AskConfirm",
+                "Task_SetClock_HandleConfirmInput",
+                "Task_SetClock_HandleConfirmInput",
+            ]),
+            patch("modules.modes.opening.get_task", return_value=types.SimpleNamespace(
+                data_value=lambda index: {0: 0, 2: 10, 3: 0}[index],
+            )),
+            patch.object(__import__("modules.modes.opening", fromlist=["context"]).context,
+                         "emulator", emulator),
+        ):
+            for _ in range(5):
+                list(mode._set_clock())
+
+        self.assertEqual(
+            emulator.press_button.call_args_list,
+            [unittest.mock.call("A"), unittest.mock.call("Up"), unittest.mock.call("A")],
+        )
+
+    def test_clock_selection_uses_directional_input_until_target_time(self):
+        from modules.modes.opening import EmeraldOpeningMode
+
+        mode = EmeraldOpeningMode()
+        emulator = unittest.mock.Mock()
+        task = types.SimpleNamespace(
+            data_value=lambda index: {0: 0, 2: 9, 3: 59}[index],
+        )
+        with (
+            patch("modules.modes.opening._active_clock_task", return_value="Task_SetClock_HandleInput"),
+            patch("modules.modes.opening.get_task", return_value=task),
+            patch.object(__import__("modules.modes.opening", fromlist=["context"]).context,
+                         "emulator", emulator),
+        ):
+            list(mode._set_clock())
+
+        emulator.press_button.assert_called_once_with("Right")
+
+    def test_clock_confirmed_and_exit_tasks_require_no_additional_input(self):
+        from modules.modes.opening import EmeraldOpeningMode
+
+        mode = EmeraldOpeningMode()
+        emulator = unittest.mock.Mock()
+        with (
+            patch("modules.modes.opening._active_clock_task", side_effect=[
+                "Task_SetClock_Confirmed",
+                "Task_SetClock_Exit",
+            ]),
+            patch.object(__import__("modules.modes.opening", fromlist=["context"]).context,
+                         "emulator", emulator),
+        ):
+            list(mode._set_clock())
+            list(mode._set_clock())
+
+        emulator.press_button.assert_not_called()
+
+    def test_clock_setting_completion_returns_to_house_progression(self):
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.CLOCK_SETTING
+        mode._clock_interaction_started = True
+        with (
+            patch("modules.modes.opening._clock_task_active", return_value=True),
+            patch.object(mode, "_set_clock", return_value=iter(())),
+            patch("modules.modes.opening.get_event_flag", return_value=True),
+        ):
+            list(mode._advance_phase(OpeningSequenceState.CLOCK_SETTING))
+
+        self.assertIs(mode.phase, OpeningSequenceState.PLAYER_HOUSE_1F)
+
+    def test_clock_setting_phase_does_not_resume_staircase_navigation(self):
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.CLOCK_SETTING
+        mode._clock_interaction_started = True
+        with (
+            patch("modules.modes.opening._clock_task_active", return_value=False),
+            patch("modules.modes.opening._scripted_input_waiting", return_value=False),
+            patch.object(mode, "_set_clock", return_value=iter(())) as set_clock,
+            patch("modules.modes.opening.get_event_flag", return_value=False),
+            patch("modules.modes.opening.navigate_to") as navigate,
+        ):
+            list(mode._advance_phase(OpeningSequenceState.PLAYER_HOUSE_2F))
+
+        set_clock.assert_called_once_with()
+        navigate.assert_not_called()
+        self.assertNotEqual(mode._last_truck_decision, "navigate: ROM-defined staircase warp to player's house 2F")
+
+    def test_clock_popup_advances_before_clock_task_starts(self):
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.CLOCK_SETTING
+        mode._clock_interaction_started = True
+        with (
+            patch("modules.modes.opening._clock_task_active", return_value=False),
+            patch("modules.modes.opening._scripted_input_waiting", return_value=True),
+            patch("modules.modes.opening._advance_scripted_input", return_value=iter(())) as advance,
+            patch.object(mode, "_set_clock", return_value=iter(())) as set_clock,
+        ):
+            list(mode._advance_phase(OpeningSequenceState.PLAYER_HOUSE_2F))
+
+        advance.assert_called_once_with()
+        set_clock.assert_not_called()
+
+    def test_wall_clock_target_is_fixed_for_emerald_opening(self):
+        from modules.map_data import MapRSE
+        from modules.modes.opening import _wall_clock_interaction
+
+        with patch(
+            "modules.modes.opening.get_map_data_for_current_position",
+            side_effect=AssertionError("clock interaction must not resolve ROM events"),
+        ):
+            self.assertEqual(
+                _wall_clock_interaction(MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value),
+                ((5, 2), "Up"),
+            )
+
+    def test_unknown_protagonist_house_does_not_reuse_brendan_clock_target(self):
+        from modules.modes.opening import _wall_clock_interaction
+
+        with patch("modules.modes.opening.get_map_data_for_current_position", return_value=None):
+            self.assertIsNone(_wall_clock_interaction((1, 3)))
+
+    def test_may_house_clock_target_comes_from_its_map_event_data(self):
+        from modules.map_data import MapRSE
+        from modules.modes.opening import _wall_clock_interaction
+
+        clock = types.SimpleNamespace(
+            kind="Script",
+            script_symbol="LittlerootTown_MaysHouse_2F_EventScript_WallClock",
+            local_coordinates=(3, 1),
+            player_facing_direction="Up",
+        )
+        with patch(
+            "modules.modes.opening.get_map_data_for_current_position",
+            return_value=types.SimpleNamespace(bg_events=[clock]),
+        ):
+            self.assertEqual(
+                _wall_clock_interaction(MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value),
+                ((3, 2), "Up"),
+            )
 
     def test_mom_dialogue_task_advances_when_script_context_is_unavailable(self):
         from modules.modes.opening import _advance_scripted_input
@@ -453,18 +875,240 @@ class TestEmeraldOpeningState(unittest.TestCase):
                 next(generator)
             type_name.assert_called_once_with("RED")
 
-    def test_item_ball_detection_returns_object_coordinate(self):
-        from modules.modes.opening import _item_ball_coordinates
+    def test_rival_pokeball_object_lookup_selects_may_script(self):
+        from modules.map_data import MapRSE
+        from modules.modes.opening import _rival_pokeball_object_template
 
-        objects = [
-            types.SimpleNamespace(graphics_id=0x01, local_coordinates=(4, 4)),
-            types.SimpleNamespace(graphics_id=0x3C, local_coordinates=(6, 3)),
-        ]
-        with patch(
-            "modules.modes.opening.get_map_data_for_current_position",
-            return_value=types.SimpleNamespace(objects=objects),
+        rival = types.SimpleNamespace(
+            local_id=15, local_coordinates=(5, 4),
+            script_symbol="LittlerootTown_MaysHouse_2F_EventScript_RivalsPokeBall",
+        )
+        unrelated = types.SimpleNamespace(local_id=2, local_coordinates=(5, 4), script_symbol="Unrelated")
+        with (
+            patch("modules.modes.opening.get_map_data_for_current_position", return_value=types.SimpleNamespace(
+                map_group_and_number=MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value,
+                objects=[unrelated, rival],
+            )),
         ):
-            self.assertEqual(_item_ball_coordinates(), (6, 3))
+            self.assertIs(_rival_pokeball_object_template(), rival)
+
+    def test_rival_pokeball_object_lookup_selects_brendan_script(self):
+        from modules.map_data import MapRSE
+        from modules.modes.opening import _rival_pokeball_object_template
+
+        rival = types.SimpleNamespace(
+            local_id=15, local_coordinates=(3, 4),
+            script_symbol="LittlerootTown_BrendansHouse_2F_EventScript_RivalsPokeBall",
+        )
+        with patch("modules.modes.opening.get_map_data_for_current_position", return_value=types.SimpleNamespace(
+            map_group_and_number=MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value,
+            objects=[types.SimpleNamespace(script_symbol="LittlerootTown_MaysHouse_2F_EventScript_RivalsPokeBall"), rival],
+        )):
+            self.assertIs(_rival_pokeball_object_template(), rival)
+
+    def test_rival_pokeball_object_lookup_rejects_unrelated_objects(self):
+        from modules.map_data import MapRSE
+        from modules.modes.opening import _rival_pokeball_object_template
+
+        with patch("modules.modes.opening.get_map_data_for_current_position", return_value=types.SimpleNamespace(
+            map_group_and_number=MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value,
+            objects=[types.SimpleNamespace(local_id=15, script_symbol="LittlerootTown_MaysHouse_2F_EventScript_PC")],
+        )):
+            self.assertIsNone(_rival_pokeball_object_template())
+
+    def test_rival_pokeball_interaction_uses_object_coordinates(self):
+        from modules.modes.opening import _rival_pokeball_interaction
+
+        object_template = types.SimpleNamespace(local_coordinates=(5, 4), script_symbol="Rival")
+        with (
+            patch("modules.modes.opening._rival_pokeball_object_template", return_value=object_template),
+            patch("modules.modes.opening.get_player_avatar", return_value=types.SimpleNamespace(local_coordinates=(7, 2))),
+        ):
+            self.assertEqual(_rival_pokeball_interaction(), ((5, 5), (5, 4)))
+
+    def test_route101_starter_bag_target_comes_from_scripted_object(self):
+        from modules.map_data import MapRSE
+        from modules.modes.opening import _starter_bag_interaction
+
+        bag = types.SimpleNamespace(
+            local_coordinates=(7, 14),
+            script_symbol="Route101_EventScript_BirchsBag",
+        )
+        with patch("modules.modes.opening.get_map_data_for_current_position", return_value=types.SimpleNamespace(
+            map_group_and_number=MapRSE.ROUTE101.value,
+            objects=[types.SimpleNamespace(local_coordinates=(10, 6), script_symbol="Unrelated"), bag],
+        )):
+            self.assertEqual(_starter_bag_interaction(), ((7, 15), (7, 14)))
+
+    def test_route101_handoff_navigates_below_bag_saves_and_hands_off(self):
+        from modules.map_data import MapRSE
+        from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState, consume_starter_handoff
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.ROUTE_101
+        emulator = unittest.mock.Mock()
+        opening_context = types.SimpleNamespace(bot_mode="Start New Game", emulator=emulator, debug=False)
+        with (
+            patch.object(mode, "_can_navigate", return_value=True),
+            patch("modules.modes.opening._route101_ready_for_navigation", return_value=True),
+            patch("modules.modes.opening._starter_bag_interaction", return_value=((7, 15), (7, 14))),
+            patch("modules.modes.opening.navigate_to", return_value=iter(())) as navigate,
+            patch("modules.modes.opening.ensure_facing_direction", return_value=iter(())) as face,
+            patch("modules.modes.opening.save_the_game", return_value=iter(())) as save,
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.modes.opening.get_player_avatar", return_value=types.SimpleNamespace(
+                local_coordinates=(7, 15),
+            )),
+            patch("modules.modes.opening.context", opening_context),
+        ):
+            list(mode._advance_phase(OpeningSequenceState.ROUTE_101))
+
+        navigate.assert_called_once_with(
+            MapRSE.ROUTE101,
+            (7, 15),
+            avoid_encounters=False,
+            avoid_scripted_events=False,
+            expecting_script=True,
+        )
+        face.assert_called_once_with((7, 14))
+        save.assert_called_once_with()
+        self.assertIs(mode.phase, OpeningSequenceState.STARTER_SELECTION)
+        self.assertEqual(opening_context.bot_mode, "Starters")
+        self.assertTrue(consume_starter_handoff())
+
+    def test_route101_waits_for_printing_arrival_script_before_navigation(self):
+        from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.ROUTE_101
+        with (
+            patch.object(mode, "_can_navigate", return_value=True),
+            patch("modules.modes.opening._route101_ready_for_navigation", return_value=False),
+            patch("modules.modes.opening.navigate_to") as navigate,
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+        ):
+            list(mode._advance_phase(OpeningSequenceState.ROUTE_101))
+
+        navigate.assert_not_called()
+
+    def test_route101_phase_navigates_from_littleroot_before_checking_arrival_state(self):
+        from modules.map_data import MapRSE
+        from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.ROUTE_101
+        with (
+            patch.object(mode, "_can_navigate", return_value=True),
+            patch("modules.modes.opening._route101_ready_for_navigation") as ready,
+            patch("modules.modes.opening.navigate_to", return_value=iter(())) as navigate,
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+        ):
+            list(mode._advance_phase(OpeningSequenceState.LITTLEROOT_TOWN))
+
+        ready.assert_not_called()
+        navigate.assert_called_once_with(
+            MapRSE.ROUTE101,
+            (10, 6),
+            avoid_encounters=False,
+            avoid_scripted_events=False,
+            expecting_script=True,
+        )
+
+    def test_route101_readiness_rejects_active_printing_field_message(self):
+        from modules.memory import GameState
+        from modules.modes.opening import _route101_ready_for_navigation
+
+        with (
+            patch("modules.modes.opening.player_avatar_is_controllable", return_value=True),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.modes.opening.is_waiting_for_input", return_value=False),
+            patch("modules.modes.opening.task_is_active", side_effect=lambda task: task == "Task_DrawFieldMessage"),
+            patch("modules.modes.opening.get_global_script_context", return_value=types.SimpleNamespace(
+                is_active=True,
+            )),
+        ):
+            self.assertFalse(_route101_ready_for_navigation())
+
+    def test_route101_readiness_waits_until_rescue_completion_marker(self):
+        from modules.memory import GameState
+        from modules.modes.opening import _route101_ready_for_navigation
+
+        with (
+            patch("modules.modes.opening.get_event_var", return_value=1),
+            patch("modules.modes.opening.player_avatar_is_controllable", return_value=True),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.modes.opening.task_is_active", return_value=False),
+        ):
+            self.assertFalse(_route101_ready_for_navigation())
+
+    def test_route101_readiness_ignores_stale_native_wait_after_rescue(self):
+        from modules.memory import GameState
+        from modules.modes.opening import _route101_ready_for_navigation
+
+        # The ROM has released control and removed the field-message task, but
+        # the global context still reports WaitForAorBPress for this frame.
+        with (
+            patch("modules.modes.opening.get_event_var", return_value=2),
+            patch("modules.modes.opening.player_avatar_is_controllable", return_value=True),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.modes.opening.is_waiting_for_input", return_value=True),
+            patch("modules.modes.opening.task_is_active", return_value=False),
+            patch("modules.modes.opening.get_global_script_context", return_value=types.SimpleNamespace(
+                is_active=True,
+                native_function_name="WaitForAorBPress",
+            )),
+        ):
+            self.assertTrue(_route101_ready_for_navigation())
+
+    def test_route101_arrival_dialogue_still_owns_input_before_completion_marker(self):
+        from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.ROUTE_101
+        emulator = types.SimpleNamespace(press_button=unittest.mock.Mock())
+        with (
+            patch("modules.modes.opening.get_event_var", return_value=1),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.modes.opening.player_avatar_is_controllable", return_value=True),
+            patch("modules.modes.opening.task_is_active", side_effect=lambda task: task == "Task_DrawFieldMessage"),
+            patch("modules.modes.opening.is_field_message_waiting_for_input", return_value=True),
+            patch("modules.modes.opening.context", types.SimpleNamespace(
+                rom=types.SimpleNamespace(is_emerald=True),
+                emulator=emulator,
+                debug=False,
+            )),
+        ):
+            action = list(mode._advance_startup_dialogue(OpeningSequenceState.ROUTE_101))
+
+        self.assertEqual(action, [True])
+        emulator.press_button.assert_called_once_with("B")
+
+    def test_route101_does_not_face_or_save_if_navigation_returns_early(self):
+        from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.ROUTE_101
+        with (
+            patch.object(mode, "_can_navigate", return_value=True),
+            patch("modules.modes.opening._route101_ready_for_navigation", return_value=True),
+            patch("modules.modes.opening._starter_bag_interaction", return_value=((7, 15), (7, 14))),
+            patch("modules.modes.opening.navigate_to", return_value=iter(())),
+            patch("modules.modes.opening.ensure_facing_direction") as face,
+            patch("modules.modes.opening.save_the_game") as save,
+            patch("modules.modes.opening.get_player_avatar", return_value=types.SimpleNamespace(
+                local_coordinates=(11, 19),
+            )),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+        ):
+            list(mode._advance_phase(OpeningSequenceState.ROUTE_101))
+
+        face.assert_not_called()
+        save.assert_not_called()
 
     def test_choose_starter_callback_on_route_101_is_explicit_handoff(self):
         from modules.memory import GameState
