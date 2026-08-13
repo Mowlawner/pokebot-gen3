@@ -208,10 +208,8 @@ _CLOCK_ASK_CONFIRM = "Task_SetClock_AskConfirm"
 _CLOCK_TARGET_HOUR = 10
 _CLOCK_TARGET_MINUTE = 0
 _RIVAL_POKEBALL_SCRIPTS = {
-    MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value:
-        "LittlerootTown_MaysHouse_2F_EventScript_RivalsPokeBall",
-    MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value:
-        "LittlerootTown_BrendansHouse_2F_EventScript_RivalsPokeBall",
+    MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value: "LittlerootTown_MaysHouse_2F_EventScript_RivalsPokeBall",
+    MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value: "LittlerootTown_BrendansHouse_2F_EventScript_RivalsPokeBall",
 }
 _STARTER_BAG_SCRIPT = "Route101_EventScript_BirchsBag"
 # These are interaction positions, not the player's observed position.  In
@@ -528,11 +526,7 @@ def _rival_pokeball_object_template():
     if script_symbol is None:
         return None
     return next(
-        (
-            obj
-            for obj in location.objects
-            if obj.script_symbol == script_symbol
-        ),
+        (obj for obj in location.objects if obj.script_symbol == script_symbol),
         None,
     )
 
@@ -635,8 +629,11 @@ def _advance_scripted_input() -> Generator:
 
 def _startup_dialogue_waiting(observed: OpeningSequenceState) -> bool:
     """Detect only ordinary Emerald field dialogue, never a generic script wait."""
-    if observed in (OpeningSequenceState.PLAYER_NAMING, OpeningSequenceState.CLOCK_SETTING,
-                    OpeningSequenceState.STARTER_SELECTION):
+    if observed in (
+        OpeningSequenceState.PLAYER_NAMING,
+        OpeningSequenceState.CLOCK_SETTING,
+        OpeningSequenceState.STARTER_SELECTION,
+    ):
         return False
     try:
         if get_game_state() != GameState.OVERWORLD:
@@ -653,12 +650,7 @@ def _scripted_std_msgbox_waiting(state: tuple) -> bool:
     Require the script and native symbols together with the sampled input-wait
     state so an unrelated ``WaitForAorBPress`` native wait is not dialogue.
     """
-    return (
-        state[2] is True
-        and state[3] == "WaitForAorBPress"
-        and state[4] == "Std_MsgboxDefault"
-        and state[5] is True
-    )
+    return state[2] is True and state[3] == "WaitForAorBPress" and state[4] == "Std_MsgboxDefault" and state[5] is True
 
 
 def _birch_house_1f_ready_for_navigation() -> bool:
@@ -1133,24 +1125,26 @@ class EmeraldOpeningMode(BotMode):
             return
         self._last_route101_runtime_key = key
         console.print(
-            (lambda: (
-                "Opening Route 101 runtime source=working-tree/opening.py "
-                f"stage={stage!r} route101_state={route_state!r} "
-                f"route_state_error={route_state_error!r} "
-                f"map={map_id!r} coords={coordinates!r} facing={facing!r} "
-                f"game_state={game_state!r} "
-                f"controllable={controllable!r} "
-                f"controllable_snapshot={state[6]!r} "
-                f"controllable_error={controllable_error!r} "
-                f"map_object_exists={map_object_exists!r} "
-                f"map_object_flags={map_object_flags!r} forced_move={forced_move!r} "
-                f"script_active={state[2]} script={state[4]!r} "
-                f"native={state[3]!r} native_ptr={state[10]!r} "
-                f"script_pc={state[11]!r} field_task_active={state[0]} "
-                f"field_task_state={state[1]!r} message_visible={state[7]} "
-                f"printer_state={state[8]!r} waiting={state[5]} "
-                f"active_tasks={state[9]!r} inputs={input_state!r}"
-            ))()
+            (
+                lambda: (
+                    "Opening Route 101 runtime source=working-tree/opening.py "
+                    f"stage={stage!r} route101_state={route_state!r} "
+                    f"route_state_error={route_state_error!r} "
+                    f"map={map_id!r} coords={coordinates!r} facing={facing!r} "
+                    f"game_state={game_state!r} "
+                    f"controllable={controllable!r} "
+                    f"controllable_snapshot={state[6]!r} "
+                    f"controllable_error={controllable_error!r} "
+                    f"map_object_exists={map_object_exists!r} "
+                    f"map_object_flags={map_object_flags!r} forced_move={forced_move!r} "
+                    f"script_active={state[2]} script={state[4]!r} "
+                    f"native={state[3]!r} native_ptr={state[10]!r} "
+                    f"script_pc={state[11]!r} field_task_active={state[0]} "
+                    f"field_task_state={state[1]!r} message_visible={state[7]} "
+                    f"printer_state={state[8]!r} waiting={state[5]} "
+                    f"active_tasks={state[9]!r} inputs={input_state!r}"
+                )
+            )()
         )
 
     def _report_dialogue_handler(
@@ -1401,9 +1395,7 @@ class EmeraldOpeningMode(BotMode):
             game_state = get_game_state()
         except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
             game_state = None
-        handler_candidate = detected or (
-            _scripted_std_msgbox_waiting(state)
-        )
+        handler_candidate = detected or (_scripted_std_msgbox_waiting(state))
         map_id = _current_map_id()
         coordinates = None
         try:
@@ -1603,9 +1595,7 @@ class EmeraldOpeningMode(BotMode):
                         self._last_truck_decision = "navigate: ROM-defined staircase warp back to player's house 1F"
                         yield from _warp_to(destination)
                         return
-                    self._last_truck_decision = (
-                        f"wait: house warp to {destination.name}; observed map={observed_map}"
-                    )
+                    self._last_truck_decision = f"wait: house warp to {destination.name}; observed map={observed_map}"
                     yield
                     return
                 self._pending_house_warp_destination = None
@@ -2116,7 +2106,9 @@ class EmeraldOpeningMode(BotMode):
                     button = "Right" if forward <= 12 * 60 else "Left"
                     context.emulator.press_button(button)
                     self._clock_a_sent = False
-                    self._last_truck_decision = f"clock input: {button} toward 10:00 (current={hours:02d}:{minutes:02d})"
+                    self._last_truck_decision = (
+                        f"clock input: {button} toward 10:00 (current={hours:02d}:{minutes:02d})"
+                    )
         elif clock_task == _CLOCK_ASK_CONFIRM:
             self._last_truck_decision = "clock: waiting for confirmation menu"
         elif clock_task == _CLOCK_HANDLE_CONFIRM_INPUT:

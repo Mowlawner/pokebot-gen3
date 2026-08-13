@@ -28,9 +28,12 @@ class TestIsWaitingForInput(unittest.TestCase):
             patch("modules.tasks.context", types.SimpleNamespace(rom=types.SimpleNamespace(is_rs=False))),
             patch("modules.tasks.task_is_active", return_value=False),
             patch("modules.tasks.is_waiting_for_input", return_value=True),
-            patch("modules.tasks.get_global_script_context", return_value=types.SimpleNamespace(
-                native_function_name="WaitForAorBPress",
-            )),
+            patch(
+                "modules.tasks.get_global_script_context",
+                return_value=types.SimpleNamespace(
+                    native_function_name="WaitForAorBPress",
+                ),
+            ),
             patch("modules.tasks.get_text_printer", return_value=types.SimpleNamespace(active=True)),
         ):
             self.assertTrue(is_field_message_waiting_for_input())
@@ -42,9 +45,12 @@ class TestIsWaitingForInput(unittest.TestCase):
             patch("modules.tasks.context", types.SimpleNamespace(rom=types.SimpleNamespace(is_rs=False))),
             patch("modules.tasks.task_is_active", return_value=False),
             patch("modules.tasks.is_waiting_for_input", return_value=True),
-            patch("modules.tasks.get_global_script_context", return_value=types.SimpleNamespace(
-                native_function_name="WaitForAorBPress",
-            )),
+            patch(
+                "modules.tasks.get_global_script_context",
+                return_value=types.SimpleNamespace(
+                    native_function_name="WaitForAorBPress",
+                ),
+            ),
             patch("modules.tasks.get_text_printer", return_value=types.SimpleNamespace(active=False)),
         ):
             self.assertTrue(is_field_message_waiting_for_input(field_message_lifecycle_active=True))
@@ -56,9 +62,12 @@ class TestIsWaitingForInput(unittest.TestCase):
             patch("modules.tasks.context", types.SimpleNamespace(rom=types.SimpleNamespace(is_rs=False))),
             patch("modules.tasks.task_is_active", return_value=False),
             patch("modules.tasks.is_waiting_for_input", return_value=False),
-            patch("modules.tasks.get_global_script_context", return_value=types.SimpleNamespace(
-                native_function_name="WaitForMovementFinish",
-            )),
+            patch(
+                "modules.tasks.get_global_script_context",
+                return_value=types.SimpleNamespace(
+                    native_function_name="WaitForMovementFinish",
+                ),
+            ),
         ):
             self.assertFalse(is_field_message_waiting_for_input())
 

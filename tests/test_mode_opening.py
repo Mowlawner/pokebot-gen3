@@ -137,12 +137,14 @@ class TestEmeraldOpeningState(unittest.TestCase):
         )
         location = types.SimpleNamespace(
             map_group_and_number=MapRSE.INSIDE_OF_TRUCK.value,
-            warps=[types.SimpleNamespace(
-                destination_map_group=127,
-                destination_map_number=127,
-                destination_location=resolved_destination,
-                local_coordinates=(4, 4),
-            )],
+            warps=[
+                types.SimpleNamespace(
+                    destination_map_group=127,
+                    destination_map_number=127,
+                    destination_location=resolved_destination,
+                    local_coordinates=(4, 4),
+                )
+            ],
         )
         with (
             patch("modules.modes.opening._current_map_id", return_value=MapRSE.INSIDE_OF_TRUCK.value),
@@ -174,12 +176,16 @@ class TestEmeraldOpeningState(unittest.TestCase):
         mode = EmeraldOpeningMode()
         location = types.SimpleNamespace(
             map_group_and_number=MapRSE.INSIDE_OF_TRUCK.value,
-            warps=[types.SimpleNamespace(
-                destination_map_group=127,
-                destination_map_number=127,
-                destination_location=property(lambda _: (_ for _ in ()).throw(AssertionError("dynamic destination must not be read"))),
-                local_coordinates=(4, 1),
-            )],
+            warps=[
+                types.SimpleNamespace(
+                    destination_map_group=127,
+                    destination_map_number=127,
+                    destination_location=property(
+                        lambda _: (_ for _ in ()).throw(AssertionError("dynamic destination must not be read"))
+                    ),
+                    local_coordinates=(4, 1),
+                )
+            ],
         )
         diagnostics = OpeningDiagnostics(
             phase=OpeningSequenceState.TRUCK,
@@ -296,7 +302,9 @@ class TestEmeraldOpeningState(unittest.TestCase):
         )
         warp.assert_called_once_with(MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F)
 
-        with patch("modules.modes.opening._current_map_id", return_value=MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value):
+        with patch(
+            "modules.modes.opening._current_map_id", return_value=MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value
+        ):
             list(mode._advance_phase(OpeningSequenceState.PLAYER_HOUSE_2F))
         self.assertIs(mode.phase, OpeningSequenceState.PLAYER_HOUSE_2F)
         self.assertIsNone(mode._pending_house_warp_destination)
@@ -501,8 +509,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
             patch("modules.modes.opening.navigate_to", return_value=iter(())) as navigate,
             patch("modules.modes.opening.ensure_facing_direction", return_value=iter(())) as face,
             patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
-            patch.object(__import__("modules.modes.opening", fromlist=["context"]).context,
-                         "emulator", emulator),
+            patch.object(__import__("modules.modes.opening", fromlist=["context"]).context, "emulator", emulator),
         ):
             list(mode._advance_phase(OpeningSequenceState.BIRCH_HOUSE_2F))
 
@@ -602,8 +609,10 @@ class TestEmeraldOpeningState(unittest.TestCase):
             patch("modules.modes.opening._current_map_id", return_value=MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value),
             patch("modules.modes.opening.navigate_to", return_value=iter(())) as navigate,
             patch("modules.modes.opening.ensure_facing_direction", return_value=iter(())) as face,
-            patch("modules.modes.opening.get_map_data_for_current_position",
-                  side_effect=AssertionError("clock event lookup must not be required")),
+            patch(
+                "modules.modes.opening.get_map_data_for_current_position",
+                side_effect=AssertionError("clock event lookup must not be required"),
+            ),
             patch.object(
                 __import__("modules.modes.opening", fromlist=["context"]).context,
                 "emulator",
@@ -643,18 +652,23 @@ class TestEmeraldOpeningState(unittest.TestCase):
         mode = EmeraldOpeningMode()
         emulator = unittest.mock.Mock()
         with (
-            patch("modules.modes.opening._active_clock_task", side_effect=[
-                "Task_SetClock_HandleInput",
-                "Task_SetClock_HandleInput",
-                "Task_SetClock_AskConfirm",
-                "Task_SetClock_HandleConfirmInput",
-                "Task_SetClock_HandleConfirmInput",
-            ]),
-            patch("modules.modes.opening.get_task", return_value=types.SimpleNamespace(
-                data_value=lambda index: {0: 0, 2: 10, 3: 0}[index],
-            )),
-            patch.object(__import__("modules.modes.opening", fromlist=["context"]).context,
-                         "emulator", emulator),
+            patch(
+                "modules.modes.opening._active_clock_task",
+                side_effect=[
+                    "Task_SetClock_HandleInput",
+                    "Task_SetClock_HandleInput",
+                    "Task_SetClock_AskConfirm",
+                    "Task_SetClock_HandleConfirmInput",
+                    "Task_SetClock_HandleConfirmInput",
+                ],
+            ),
+            patch(
+                "modules.modes.opening.get_task",
+                return_value=types.SimpleNamespace(
+                    data_value=lambda index: {0: 0, 2: 10, 3: 0}[index],
+                ),
+            ),
+            patch.object(__import__("modules.modes.opening", fromlist=["context"]).context, "emulator", emulator),
         ):
             for _ in range(5):
                 list(mode._set_clock())
@@ -675,8 +689,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         with (
             patch("modules.modes.opening._active_clock_task", return_value="Task_SetClock_HandleInput"),
             patch("modules.modes.opening.get_task", return_value=task),
-            patch.object(__import__("modules.modes.opening", fromlist=["context"]).context,
-                         "emulator", emulator),
+            patch.object(__import__("modules.modes.opening", fromlist=["context"]).context, "emulator", emulator),
         ):
             list(mode._set_clock())
 
@@ -688,12 +701,14 @@ class TestEmeraldOpeningState(unittest.TestCase):
         mode = EmeraldOpeningMode()
         emulator = unittest.mock.Mock()
         with (
-            patch("modules.modes.opening._active_clock_task", side_effect=[
-                "Task_SetClock_Confirmed",
-                "Task_SetClock_Exit",
-            ]),
-            patch.object(__import__("modules.modes.opening", fromlist=["context"]).context,
-                         "emulator", emulator),
+            patch(
+                "modules.modes.opening._active_clock_task",
+                side_effect=[
+                    "Task_SetClock_Confirmed",
+                    "Task_SetClock_Exit",
+                ],
+            ),
+            patch.object(__import__("modules.modes.opening", fromlist=["context"]).context, "emulator", emulator),
         ):
             list(mode._set_clock())
             list(mode._set_clock())
@@ -887,15 +902,19 @@ class TestEmeraldOpeningState(unittest.TestCase):
         from modules.modes.opening import _rival_pokeball_object_template
 
         rival = types.SimpleNamespace(
-            local_id=15, local_coordinates=(5, 4),
+            local_id=15,
+            local_coordinates=(5, 4),
             script_symbol="LittlerootTown_MaysHouse_2F_EventScript_RivalsPokeBall",
         )
         unrelated = types.SimpleNamespace(local_id=2, local_coordinates=(5, 4), script_symbol="Unrelated")
         with (
-            patch("modules.modes.opening.get_map_data_for_current_position", return_value=types.SimpleNamespace(
-                map_group_and_number=MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value,
-                objects=[unrelated, rival],
-            )),
+            patch(
+                "modules.modes.opening.get_map_data_for_current_position",
+                return_value=types.SimpleNamespace(
+                    map_group_and_number=MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value,
+                    objects=[unrelated, rival],
+                ),
+            ),
         ):
             self.assertIs(_rival_pokeball_object_template(), rival)
 
@@ -904,23 +923,35 @@ class TestEmeraldOpeningState(unittest.TestCase):
         from modules.modes.opening import _rival_pokeball_object_template
 
         rival = types.SimpleNamespace(
-            local_id=15, local_coordinates=(3, 4),
+            local_id=15,
+            local_coordinates=(3, 4),
             script_symbol="LittlerootTown_BrendansHouse_2F_EventScript_RivalsPokeBall",
         )
-        with patch("modules.modes.opening.get_map_data_for_current_position", return_value=types.SimpleNamespace(
-            map_group_and_number=MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value,
-            objects=[types.SimpleNamespace(script_symbol="LittlerootTown_MaysHouse_2F_EventScript_RivalsPokeBall"), rival],
-        )):
+        with patch(
+            "modules.modes.opening.get_map_data_for_current_position",
+            return_value=types.SimpleNamespace(
+                map_group_and_number=MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value,
+                objects=[
+                    types.SimpleNamespace(script_symbol="LittlerootTown_MaysHouse_2F_EventScript_RivalsPokeBall"),
+                    rival,
+                ],
+            ),
+        ):
             self.assertIs(_rival_pokeball_object_template(), rival)
 
     def test_rival_pokeball_object_lookup_rejects_unrelated_objects(self):
         from modules.map_data import MapRSE
         from modules.modes.opening import _rival_pokeball_object_template
 
-        with patch("modules.modes.opening.get_map_data_for_current_position", return_value=types.SimpleNamespace(
-            map_group_and_number=MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value,
-            objects=[types.SimpleNamespace(local_id=15, script_symbol="LittlerootTown_MaysHouse_2F_EventScript_PC")],
-        )):
+        with patch(
+            "modules.modes.opening.get_map_data_for_current_position",
+            return_value=types.SimpleNamespace(
+                map_group_and_number=MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value,
+                objects=[
+                    types.SimpleNamespace(local_id=15, script_symbol="LittlerootTown_MaysHouse_2F_EventScript_PC")
+                ],
+            ),
+        ):
             self.assertIsNone(_rival_pokeball_object_template())
 
     def test_rival_pokeball_interaction_uses_object_coordinates(self):
@@ -929,7 +960,9 @@ class TestEmeraldOpeningState(unittest.TestCase):
         object_template = types.SimpleNamespace(local_coordinates=(5, 4), script_symbol="Rival")
         with (
             patch("modules.modes.opening._rival_pokeball_object_template", return_value=object_template),
-            patch("modules.modes.opening.get_player_avatar", return_value=types.SimpleNamespace(local_coordinates=(7, 2))),
+            patch(
+                "modules.modes.opening.get_player_avatar", return_value=types.SimpleNamespace(local_coordinates=(7, 2))
+            ),
         ):
             self.assertEqual(_rival_pokeball_interaction(), ((5, 5), (5, 4)))
 
@@ -941,10 +974,13 @@ class TestEmeraldOpeningState(unittest.TestCase):
             local_coordinates=(7, 14),
             script_symbol="Route101_EventScript_BirchsBag",
         )
-        with patch("modules.modes.opening.get_map_data_for_current_position", return_value=types.SimpleNamespace(
-            map_group_and_number=MapRSE.ROUTE101.value,
-            objects=[types.SimpleNamespace(local_coordinates=(10, 6), script_symbol="Unrelated"), bag],
-        )):
+        with patch(
+            "modules.modes.opening.get_map_data_for_current_position",
+            return_value=types.SimpleNamespace(
+                map_group_and_number=MapRSE.ROUTE101.value,
+                objects=[types.SimpleNamespace(local_coordinates=(10, 6), script_symbol="Unrelated"), bag],
+            ),
+        ):
             self.assertEqual(_starter_bag_interaction(), ((7, 15), (7, 14)))
 
     def test_route101_handoff_navigates_below_bag_saves_and_hands_off(self):
@@ -964,9 +1000,12 @@ class TestEmeraldOpeningState(unittest.TestCase):
             patch("modules.modes.opening.ensure_facing_direction", return_value=iter(())) as face,
             patch("modules.modes.opening.save_the_game", return_value=iter(())) as save,
             patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
-            patch("modules.modes.opening.get_player_avatar", return_value=types.SimpleNamespace(
-                local_coordinates=(7, 15),
-            )),
+            patch(
+                "modules.modes.opening.get_player_avatar",
+                return_value=types.SimpleNamespace(
+                    local_coordinates=(7, 15),
+                ),
+            ),
             patch("modules.modes.opening.context", opening_context),
         ):
             list(mode._advance_phase(OpeningSequenceState.ROUTE_101))
@@ -1034,9 +1073,12 @@ class TestEmeraldOpeningState(unittest.TestCase):
             patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
             patch("modules.modes.opening.is_waiting_for_input", return_value=False),
             patch("modules.modes.opening.task_is_active", side_effect=lambda task: task == "Task_DrawFieldMessage"),
-            patch("modules.modes.opening.get_global_script_context", return_value=types.SimpleNamespace(
-                is_active=True,
-            )),
+            patch(
+                "modules.modes.opening.get_global_script_context",
+                return_value=types.SimpleNamespace(
+                    is_active=True,
+                ),
+            ),
         ):
             self.assertFalse(_route101_ready_for_navigation())
 
@@ -1100,10 +1142,13 @@ class TestEmeraldOpeningState(unittest.TestCase):
             patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
             patch("modules.modes.opening.is_waiting_for_input", return_value=True),
             patch("modules.modes.opening.task_is_active", return_value=False),
-            patch("modules.modes.opening.get_global_script_context", return_value=types.SimpleNamespace(
-                is_active=True,
-                native_function_name="WaitForAorBPress",
-            )),
+            patch(
+                "modules.modes.opening.get_global_script_context",
+                return_value=types.SimpleNamespace(
+                    is_active=True,
+                    native_function_name="WaitForAorBPress",
+                ),
+            ),
         ):
             self.assertTrue(_route101_ready_for_navigation())
 
@@ -1120,11 +1165,14 @@ class TestEmeraldOpeningState(unittest.TestCase):
             patch("modules.modes.opening.player_avatar_is_controllable", return_value=True),
             patch("modules.modes.opening.task_is_active", side_effect=lambda task: task == "Task_DrawFieldMessage"),
             patch("modules.modes.opening.is_field_message_waiting_for_input", return_value=True),
-            patch("modules.modes.opening.context", types.SimpleNamespace(
-                rom=types.SimpleNamespace(is_emerald=True),
-                emulator=emulator,
-                debug=False,
-            )),
+            patch(
+                "modules.modes.opening.context",
+                types.SimpleNamespace(
+                    rom=types.SimpleNamespace(is_emerald=True),
+                    emulator=emulator,
+                    debug=False,
+                ),
+            ),
         ):
             action = list(mode._advance_startup_dialogue(OpeningSequenceState.ROUTE_101))
 
@@ -1144,9 +1192,12 @@ class TestEmeraldOpeningState(unittest.TestCase):
             patch("modules.modes.opening.navigate_to", return_value=iter(())),
             patch("modules.modes.opening.ensure_facing_direction") as face,
             patch("modules.modes.opening.save_the_game") as save,
-            patch("modules.modes.opening.get_player_avatar", return_value=types.SimpleNamespace(
-                local_coordinates=(11, 19),
-            )),
+            patch(
+                "modules.modes.opening.get_player_avatar",
+                return_value=types.SimpleNamespace(
+                    local_coordinates=(11, 19),
+                ),
+            ),
             patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
         ):
             list(mode._advance_phase(OpeningSequenceState.ROUTE_101))
@@ -1214,9 +1265,11 @@ class TestEmeraldOpeningState(unittest.TestCase):
             patch.object(
                 mode,
                 "_message_speed_observation",
-                side_effect=[(1, 1, None, "Task_OptionMenuProcessInput.data[1]"),
-                             (1, 1, None, "Task_OptionMenuProcessInput.data[1]"),
-                             (2, 1, None, "Task_OptionMenuProcessInput.data[1]")],
+                side_effect=[
+                    (1, 1, None, "Task_OptionMenuProcessInput.data[1]"),
+                    (1, 1, None, "Task_OptionMenuProcessInput.data[1]"),
+                    (2, 1, None, "Task_OptionMenuProcessInput.data[1]"),
+                ],
             ),
             patch("modules.modes.opening.task_is_active", side_effect=[True, False, True, True]),
             patch("modules.modes.opening.get_game_state", return_value=GameState.MAIN_MENU),
@@ -1245,10 +1298,13 @@ class TestEmeraldOpeningState(unittest.TestCase):
             debug=False,
         )
         mode = EmeraldOpeningMode()
-        with patch("modules.modes.opening.context", opening_context), patch.object(
-            mode,
-            "_message_speed_observation",
-            return_value=(2, 1, None, "Task_OptionMenuProcessInput.data[1]"),
+        with (
+            patch("modules.modes.opening.context", opening_context),
+            patch.object(
+                mode,
+                "_message_speed_observation",
+                return_value=(2, 1, None, "Task_OptionMenuProcessInput.data[1]"),
+            ),
         ):
             list(mode._configure_initial_game_settings())
 
@@ -1301,12 +1357,15 @@ class TestEmeraldOpeningState(unittest.TestCase):
         ):
             list(mode._configure_initial_game_settings())
 
-        self.assertEqual(emulator.press_button.call_args_list, [
-            unittest.mock.call("Down"),
-            unittest.mock.call("A"),
-            unittest.mock.call("Right"),
-            unittest.mock.call("B"),
-        ])
+        self.assertEqual(
+            emulator.press_button.call_args_list,
+            [
+                unittest.mock.call("Down"),
+                unittest.mock.call("A"),
+                unittest.mock.call("Right"),
+                unittest.mock.call("B"),
+            ],
+        )
 
     def test_text_speed_configuration_diagnostics_are_state_change_deduplicated(self):
         from modules.modes.opening import EmeraldOpeningMode
@@ -1351,13 +1410,16 @@ class TestEmeraldOpeningState(unittest.TestCase):
         ):
             list(mode._configure_initial_game_settings())
 
-        self.assertEqual(emulator.press_button.call_args_list, [
-            unittest.mock.call("Down"),
-            unittest.mock.call("A"),
-            unittest.mock.call("Right"),
-            unittest.mock.call("Right"),
-            unittest.mock.call("B"),
-        ])
+        self.assertEqual(
+            emulator.press_button.call_args_list,
+            [
+                unittest.mock.call("Down"),
+                unittest.mock.call("A"),
+                unittest.mock.call("Right"),
+                unittest.mock.call("Right"),
+                unittest.mock.call("B"),
+            ],
+        )
 
     def test_main_menu_repositions_to_new_game_after_options(self):
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
@@ -1384,8 +1446,11 @@ class TestEmeraldOpeningState(unittest.TestCase):
             next(generator)
             next(generator)
 
-        self.assertEqual(emulator.press_button.call_args_list, [
-            unittest.mock.call("Up"),
-            unittest.mock.call("A"),
-        ])
+        self.assertEqual(
+            emulator.press_button.call_args_list,
+            [
+                unittest.mock.call("Up"),
+                unittest.mock.call("A"),
+            ],
+        )
         self.assertTrue(mode._initial_menu_repositioned)

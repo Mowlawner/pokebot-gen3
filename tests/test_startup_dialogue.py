@@ -32,8 +32,18 @@ class TestStartupDialogue(unittest.TestCase):
         opening_context = self._mode_context()
         mode = EmeraldOpeningMode()
         state = (
-            True, 2, True, "IsFieldMessageBoxHidden", "Std_MsgboxDefault",
-            True, True, True, "Clear", ("Task_DrawFieldMessage",), 134841149, 136284591,
+            True,
+            2,
+            True,
+            "IsFieldMessageBoxHidden",
+            "Std_MsgboxDefault",
+            True,
+            True,
+            True,
+            "Clear",
+            ("Task_DrawFieldMessage",),
+            134841149,
+            136284591,
         )
         with (
             patch("modules.modes.opening.context", opening_context),
@@ -50,9 +60,13 @@ class TestStartupDialogue(unittest.TestCase):
                 [True],
             )
 
-        self.assertEqual(opening_context.emulator.press_button.call_args_list, [
-            unittest.mock.call("B"), unittest.mock.call("B"),
-        ])
+        self.assertEqual(
+            opening_context.emulator.press_button.call_args_list,
+            [
+                unittest.mock.call("B"),
+                unittest.mock.call("B"),
+            ],
+        )
 
     def test_multi_page_dialogue_advances_until_complete(self):
         from modules.memory import GameState
@@ -60,8 +74,34 @@ class TestStartupDialogue(unittest.TestCase):
 
         opening_context = self._mode_context()
         mode = EmeraldOpeningMode()
-        first_page = (True, 2, True, "IsFieldMessageBoxHidden", "Std_MsgboxDefault", True, True, True, "Clear", (), 1, 10)
-        second_page = (True, 3, True, "IsFieldMessageBoxHidden", "Std_MsgboxDefault", True, True, True, "Clear", (), 1, 11)
+        first_page = (
+            True,
+            2,
+            True,
+            "IsFieldMessageBoxHidden",
+            "Std_MsgboxDefault",
+            True,
+            True,
+            True,
+            "Clear",
+            (),
+            1,
+            10,
+        )
+        second_page = (
+            True,
+            3,
+            True,
+            "IsFieldMessageBoxHidden",
+            "Std_MsgboxDefault",
+            True,
+            True,
+            True,
+            "Clear",
+            (),
+            1,
+            11,
+        )
         with (
             patch("modules.modes.opening.context", opening_context),
             patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
@@ -130,10 +170,13 @@ class TestStartupDialogue(unittest.TestCase):
                     script_function_name="",
                 ),
             ),
-            patch("modules.modes.opening.get_text_printer", return_value=types.SimpleNamespace(
-                active=False,
-                raw_state="End",
-            )),
+            patch(
+                "modules.modes.opening.get_text_printer",
+                return_value=types.SimpleNamespace(
+                    active=False,
+                    raw_state="End",
+                ),
+            ),
         ):
             list(mode._advance_startup_dialogue(OpeningSequenceState.LITTLEROOT_TOWN))
             result = list(mode._advance_startup_dialogue(OpeningSequenceState.LITTLEROOT_TOWN))
@@ -180,8 +223,18 @@ class TestStartupDialogue(unittest.TestCase):
         opening_context = self._mode_context()
         mode = EmeraldOpeningMode()
         state = (
-            False, None, True, "WaitForAorBPress", "Std_MsgboxDefault",
-            True, True, False, "HandleCharacter", (), 134851737, 136778545,
+            False,
+            None,
+            True,
+            "WaitForAorBPress",
+            "Std_MsgboxDefault",
+            True,
+            True,
+            False,
+            "HandleCharacter",
+            (),
+            134851737,
+            136778545,
         )
         with (
             patch("modules.modes.opening.context", opening_context),
@@ -205,8 +258,18 @@ class TestStartupDialogue(unittest.TestCase):
         opening_context = self._mode_context()
         mode = EmeraldOpeningMode()
         state = (
-            False, None, True, "WaitForAorBPress", "SomeOtherScript",
-            True, True, False, "HandleCharacter", (), 1, 2,
+            False,
+            None,
+            True,
+            "WaitForAorBPress",
+            "SomeOtherScript",
+            True,
+            True,
+            False,
+            "HandleCharacter",
+            (),
+            1,
+            2,
         )
         with (
             patch("modules.modes.opening.context", opening_context),
@@ -228,8 +291,18 @@ class TestStartupDialogue(unittest.TestCase):
         mode = EmeraldOpeningMode()
         mode._dialogue_active = True
         state = (
-            False, None, True, "WaitForAorBPress", "Std_MsgboxDefault",
-            False, False, False, "HandleCharacter", (), 1, 10,
+            False,
+            None,
+            True,
+            "WaitForAorBPress",
+            "Std_MsgboxDefault",
+            False,
+            False,
+            False,
+            "HandleCharacter",
+            (),
+            1,
+            10,
         )
         with (
             patch("modules.modes.opening.context", opening_context),
@@ -251,8 +324,16 @@ class TestStartupDialogue(unittest.TestCase):
         mode = EmeraldOpeningMode()
         mode._dialogue_active = True
         state = (
-            False, None, True, "WaitForAorBPress", "Std_MsgboxDefault",
-            True, False, False, "HandleCharacter", (),
+            False,
+            None,
+            True,
+            "WaitForAorBPress",
+            "Std_MsgboxDefault",
+            True,
+            False,
+            False,
+            "HandleCharacter",
+            (),
         )
         with (
             patch("modules.modes.opening.context", opening_context),
@@ -274,8 +355,16 @@ class TestStartupDialogue(unittest.TestCase):
         mode._dialogue_active = True
         mode._dialogue_before_input = ("previous",)
         state = (
-            False, None, True, "WaitForAorBPress", "Std_MsgboxDefault",
-            True, False, False, "HandleCharacter", (),
+            False,
+            None,
+            True,
+            "WaitForAorBPress",
+            "Std_MsgboxDefault",
+            True,
+            False,
+            False,
+            "HandleCharacter",
+            (),
         )
         with (
             patch("modules.modes.opening.context", opening_context),
@@ -291,9 +380,13 @@ class TestStartupDialogue(unittest.TestCase):
                 [True],
             )
 
-        self.assertEqual(opening_context.emulator.press_button.call_args_list, [
-            unittest.mock.call("B"), unittest.mock.call("B"),
-        ])
+        self.assertEqual(
+            opening_context.emulator.press_button.call_args_list,
+            [
+                unittest.mock.call("B"),
+                unittest.mock.call("B"),
+            ],
+        )
 
     def test_new_script_wait_after_printer_state_gets_input(self):
         """A printer transition must not suppress the newly exposed native wait."""
@@ -305,12 +398,32 @@ class TestStartupDialogue(unittest.TestCase):
         mode._dialogue_active = True
         mode._dialogue_wait_input_state = ("stale native wait",)
         printer_state = (
-            True, 2, True, "IsFieldMessageBoxHidden", "Std_MsgboxDefault",
-            True, False, True, "Clear", (), 134851737, 136778545,
+            True,
+            2,
+            True,
+            "IsFieldMessageBoxHidden",
+            "Std_MsgboxDefault",
+            True,
+            False,
+            True,
+            "Clear",
+            (),
+            134851737,
+            136778545,
         )
         native_wait_state = (
-            False, None, True, "WaitForAorBPress", "Std_MsgboxDefault",
-            True, False, False, "HandleCharacter", (), 134851737, 136778545,
+            False,
+            None,
+            True,
+            "WaitForAorBPress",
+            "Std_MsgboxDefault",
+            True,
+            False,
+            False,
+            "HandleCharacter",
+            (),
+            134851737,
+            136778545,
         )
         with (
             patch("modules.modes.opening.context", opening_context),
@@ -412,9 +525,22 @@ class TestStartupDialogue(unittest.TestCase):
         with (
             patch("modules.modes.opening.context", opening_context),
             patch("modules.modes.opening._startup_dialogue_waiting", return_value=False),
-            patch.object(EmeraldOpeningMode, "_dialogue_state_snapshot", return_value=(
-                False, None, True, "WaitForMovementFinish", "OpeningScript", False, True, False, "HandleCharacter", (),
-            )),
+            patch.object(
+                EmeraldOpeningMode,
+                "_dialogue_state_snapshot",
+                return_value=(
+                    False,
+                    None,
+                    True,
+                    "WaitForMovementFinish",
+                    "OpeningScript",
+                    False,
+                    True,
+                    False,
+                    "HandleCharacter",
+                    (),
+                ),
+            ),
         ):
             result = list(EmeraldOpeningMode()._advance_startup_dialogue(OpeningSequenceState.LITTLEROOT_TOWN))
         self.assertEqual(result, [])
@@ -440,16 +566,26 @@ class TestStartupDialogue(unittest.TestCase):
 
         opening_context = self._mode_context()
         mode = EmeraldOpeningMode()
-        active = (True, 2, True, "IsFieldMessageBoxHidden", "Std_MsgboxDefault",
-                  True, False, True, "Clear", (), 134149, 136778544)
+        active = (
+            True,
+            2,
+            True,
+            "IsFieldMessageBoxHidden",
+            "Std_MsgboxDefault",
+            True,
+            False,
+            True,
+            "Clear",
+            (),
+            134149,
+            136778544,
+        )
         ended = (False, None, False, "", "", False, True, False, "End", (), None, None)
         with (
             patch("modules.modes.opening.context", opening_context),
             patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
-            patch.object(EmeraldOpeningMode, "_dialogue_state_snapshot",
-                         side_effect=[active, ended, ended, ended]),
-            patch("modules.modes.opening.is_field_message_waiting_for_input",
-                  side_effect=[True, False, False]),
+            patch.object(EmeraldOpeningMode, "_dialogue_state_snapshot", side_effect=[active, ended, ended, ended]),
+            patch("modules.modes.opening.is_field_message_waiting_for_input", side_effect=[True, False, False]),
         ):
             self.assertEqual(
                 list(mode._advance_startup_dialogue(OpeningSequenceState.PLAYER_HOUSE_2F)),
