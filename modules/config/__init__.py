@@ -16,6 +16,8 @@ from modules.config.schemas_v1 import (
     Logging,
     HTTP,
     ProfileMetadata,
+    StartGame,
+    WallClockTimeMode,
 )
 from modules.runtime import get_base_path
 
@@ -29,6 +31,7 @@ CONFIG_ATTRS = {
     "keys",
     "logging",
     "http",
+    "start_game",
 }
 
 
@@ -59,6 +62,7 @@ class Config:
         self.logging: Logging = Logging()
         self.metadata: ProfileMetadata | None = None
         self.http: HTTP = HTTP()
+        self.start_game: StartGame = StartGame()
         self.load(strict=strict)
 
     def load(self, config_dir: str | Path | None = None, strict: bool = True):

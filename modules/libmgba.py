@@ -1,4 +1,5 @@
 import atexit
+import inspect
 import queue
 import time
 import zlib
@@ -18,7 +19,7 @@ import mgba.log
 import mgba.png
 import mgba.vfs
 from mgba import ffi, lib, libmgba_version_string
-from modules.console import console
+from modules.console import console, diagnostic_print
 from modules.profiles import Profile
 from modules.tasks import task_is_active
 
@@ -155,6 +156,11 @@ class LibmgbaEmulator:
         self._prev_pressed_inputs: int = 0
         self._pressed_inputs: int = 0
         self._held_inputs: int = 0
+        # Input masks for the last two frames actually sent to mGBA.  Keep
+        # these separate from _pressed_inputs, which is only a pending pulse.
+        # The ROM derives JOY_NEW/JOY_HELD/JOY_RELEASE from this transition.
+        self._previous_frame_inputs: int = 0
+        self._current_frame_inputs: int = 0
 
         if not is_test_run:
             atexit.register(self.shutdown)
@@ -478,10 +484,32 @@ class LibmgbaEmulator:
         """
         return self._core._core.getKeys(self._core._core)
 
+    def get_held_inputs(self) -> int:
+        """Return the inputs currently held by the bot until released."""
+        return self._held_inputs
+
+    def get_previous_frame_inputs(self) -> int:
+        """Return the complete input mask sent during the preceding frame."""
+        return self._previous_frame_inputs
+
+    def get_current_frame_inputs(self) -> int:
+        """Return the complete input mask sent during the current frame."""
+        return self._current_frame_inputs
+
+    def get_new_inputs(self) -> int:
+        """Return inputs that transitioned from released to held this frame."""
+        return self._current_frame_inputs & ~self._previous_frame_inputs
+
+    def get_released_inputs(self) -> int:
+        """Return inputs that transitioned from held to released this frame."""
+        return self._previous_frame_inputs & ~self._current_frame_inputs
+
     def set_inputs(self, inputs: int):
         """
         :param inputs: A bitfield with all the buttons that should now be pressed
         """
+        if inputs:
+            self._report_birch_gender_input("set_inputs", inputs, path="set_inputs")
         self._core._core.setKeys(self._core._core, inputs)
 
     def press_button(self, button: str = None, inputs: int = 0):
@@ -489,14 +517,75 @@ class LibmgbaEmulator:
         :param button: A GBA button to be pressed, if pressed on previous frame it will be released
         :param inputs: Alternate raw input bitfield
         """
-        self._pressed_inputs |= (self._prev_pressed_inputs & input_map[button]) ^ input_map[button]
+        button_inputs = inputs or input_map[button]
+        self._report_birch_gender_input(button, button_inputs, path="press_button")
+        self._pressed_inputs |= (self._prev_pressed_inputs & button_inputs) ^ button_inputs
+
+    def _report_birch_gender_input(self, button: str | None, button_inputs: int, *, path: str = "press_button") -> None:
+        """Trace all bot-generated inputs that overlap Birch's gender UI.
+
+        This is intentionally located at the emulator boundary so it also
+        observes callers outside the opening mode. It only reads state and is
+        disabled unless detailed debug tracing is enabled.
+        """
+        try:
+            from modules.context import context
+
+            if not context.debug or not getattr(context, "debug_trace", False):
+                return
+            from modules.tasks import get_task, get_tasks
+
+            gender_names = (
+                "Task_NewGameBirchSpeech_BoyOrGirl",
+                "Task_NewGameBirchSpeech_WaitToShowGenderMenu",
+                "Task_NewGameBirchSpeech_ChooseGender",
+                "Task_NewGameBirchSpeech_SlideOutOldGenderSprite",
+                "Task_NewGameBirchSpeech_SlideInNewGenderSprite",
+            )
+            active = [name for name in gender_names if name in get_tasks()]
+            if not active:
+                return
+            task_data = {
+                name: tuple(get_task(name).data_value(i) for i in range(len(get_task(name).data) // 2))
+                for name in active
+                if get_task(name) is not None
+            }
+            mode = getattr(context, "bot_mode_instance", None)
+            target = getattr(mode, "_resolved_player_gender", None)
+            try:
+                from modules.player import get_player
+
+                player_gender = get_player().gender
+            except (AttributeError, RuntimeError, ValueError, TypeError, IndexError, KeyError):
+                player_gender = None
+            pending = (
+                getattr(self, "_prev_pressed_inputs", None),
+                getattr(self, "_pressed_inputs", None),
+                getattr(self, "_held_inputs", None),
+            )
+            callers = [
+                f"{frame.frame.f_globals.get('__name__', '?')}:{frame.function}" for frame in inspect.stack()[2:6]
+            ]
+            diagnostic_print(
+                "[bold yellow]Birch gender input boundary: "
+                f"path={path} button={button!r} mask={button_inputs:#x} callers={callers} "
+                f"active_tasks={active} target_gender={target} player_gender={player_gender} "
+                f"task_data={task_data} input_buffer={self.get_inputs():#x} "
+                f"pending_inputs={pending}[/]",
+                trace=True,
+            )
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError, KeyError):
+            # Diagnostics must never affect controller behavior.
+            return
 
     def hold_button(self, button: str = None, inputs: int = 0):
         """
         :param button: A GBA button to be held, will be held until ReleaseInput called
         :param inputs: Alternate raw input bitfield
         """
-        self._held_inputs |= inputs or input_map[button]
+        button_inputs = inputs or input_map[button]
+        self._report_birch_gender_input(button, button_inputs, path="hold_button")
+        self._held_inputs |= button_inputs
 
     def is_button_held(self, button: str = None) -> bool:
         """
@@ -594,14 +683,20 @@ class LibmgbaEmulator:
         """
         Runs the emulation for a single frame, and then waits if necessary to hit the target FPS rate.
         """
-        self.set_inputs(self._pressed_inputs | self._held_inputs)
+        applied_inputs = self._pressed_inputs | self._held_inputs
+        self.set_inputs(applied_inputs)
+        self._previous_frame_inputs = self._current_frame_inputs
+        self._current_frame_inputs = applied_inputs
 
         begin = time.time_ns()
         self._core.run_frame()
         self._performance_tracker.time_spent_emulating += time.time_ns() - begin
 
         begin = time.time_ns()
-        self._prev_pressed_inputs = self._pressed_inputs
+        # Track what was actually applied, including a neutral frame.  Using
+        # only _pressed_inputs here made a neutral frame leave A marked stale,
+        # so the next press_button("A") was incorrectly suppressed.
+        self._prev_pressed_inputs = applied_inputs
         self._pressed_inputs = 0
 
         samples_available = self._gba_audio.available

@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from enum import Enum
 from pathlib import Path
+from unittest.mock import patch
 
 from modules.nuzlocke.events import MapChanged
 from modules.nuzlocke.persistence import (
@@ -11,6 +12,7 @@ from modules.nuzlocke.persistence import (
     deserialize_event,
     serialize_event,
 )
+import modules.nuzlocke.persistence as persistence
 from modules.nuzlocke.runtime import NuzlockeRuntime
 from modules.nuzlocke.snapshots import (
     InventorySnapshot,
@@ -51,6 +53,25 @@ class TestNuzlockePersistence(unittest.TestCase):
             reloaded = JsonEventStore(path)
             self.assertEqual(reloaded.iter_events(), (event, MapChanged(2, (1, 3), (1, 4))))
             self.assertEqual(reloaded.last_sequence(), 2)
+
+    def test_atomic_replace_runs_after_temporary_handle_is_closed(self):
+        """The real replacement must occur outside the temporary-file context."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            store = JsonEventStore(path, session_id="session-a")
+            event = MapChanged(1, (1, 2), (1, 3))
+            real_replace = persistence.os.replace
+
+            def replace(source, destination):
+                # On Windows this real replace raises if the writer still owns
+                # source.  Keeping the callback real also exercises the
+                # destination replacement path rather than merely mocking it.
+                real_replace(source, destination)
+
+            with patch.object(persistence.os, "replace", side_effect=replace):
+                self.assertTrue(store.append(event))
+
+            self.assertEqual(JsonEventStore(path).iter_events(), (event,))
 
     def test_sessions_allow_repeated_frames_and_runtime_sink(self):
         with tempfile.TemporaryDirectory() as directory:

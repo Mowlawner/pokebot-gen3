@@ -26,6 +26,7 @@ class PokebotHeadless:
         context.video = not startup_settings.no_video
         context.emulation_speed = startup_settings.emulation_speed
         context.debug = False
+        context.debug_trace = False
         context.bot_mode = startup_settings.bot_mode
 
         self._main_loop()

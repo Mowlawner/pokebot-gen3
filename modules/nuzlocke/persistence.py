@@ -16,6 +16,7 @@ import uuid
 from dataclasses import MISSING, fields, is_dataclass
 from enum import Enum
 from pathlib import Path
+from threading import RLock
 from typing import Any, Iterable
 
 from .events import (
@@ -136,6 +137,9 @@ class JsonEventStore:
         self.session_id = session_id or str(uuid.uuid4())
         self._records: list[dict[str, Any]] = []
         self._ids: set[str] = set()
+        # The temporary filename is intentionally stable.  Serialize writes so
+        # concurrent callers cannot overwrite or remove one another's temp file.
+        self._write_lock = RLock()
         if self.path.exists():
             self._load()
 
@@ -208,35 +212,38 @@ class JsonEventStore:
         return len(self._records)
 
     def flush(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_name(self.path.name + ".tmp")
-        document = (
-            json.dumps(
-                {"schema_version": SCHEMA_VERSION, "events": self._records},
-                sort_keys=True,
-                indent=2,
+        with self._write_lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_name(self.path.name + ".tmp")
+            document = (
+                json.dumps(
+                    {"schema_version": SCHEMA_VERSION, "events": self._records},
+                    sort_keys=True,
+                    indent=2,
+                )
+                + "\n"
             )
-            + "\n"
-        )
-        try:
-            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-                handle.write(document)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
             try:
-                directory_fd = os.open(self.path.parent, os.O_RDONLY)
+                with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                    handle.write(document)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                # The context manager above must exit before replace.  This is
+                # required on Windows, where an open temp handle can block it.
+                os.replace(temporary, self.path)
                 try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            except OSError:
-                pass
-        except OSError as error:
-            raise EventStoreError(f"Could not atomically write event store: {self.path}") from error
-        finally:
-            if temporary.exists():
-                temporary.unlink(missing_ok=True)
+                    directory_fd = os.open(self.path.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                except OSError:
+                    pass
+            except OSError as error:
+                raise EventStoreError(f"Could not atomically write event store: {self.path}") from error
+            finally:
+                if temporary.exists():
+                    temporary.unlink(missing_ok=True)
 
     def __call__(self, event: Event, session_id: str) -> None:
         self.append(event, session_id)

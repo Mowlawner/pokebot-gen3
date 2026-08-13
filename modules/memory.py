@@ -240,6 +240,7 @@ class GameState(IntEnum):
     POKEMON_SUMMARY_SCREEN = auto()
     UNKNOWN = auto()
     QUEST_LOG = auto()
+    OPTIONS_MENU = auto()
 
 
 def get_game_state_symbol() -> str:
@@ -293,6 +294,8 @@ def get_game_state() -> GameState:
             result = GameState.TITLE_SCREEN
         case "CB2_MAINMENU":
             result = GameState.MAIN_MENU
+        case "MAINCB2_OPTIONMENU" | "CB2_INITOPTIONMENU":
+            result = GameState.OPTIONS_MENU
         case "CB2_EVOLUTIONSCENEUPDATE":
             result = GameState.EVOLUTION
         case "CB2_EGGHATCH" | "CB2_LOADEGGHATCH" | "CB2_EGGHATCH_0" | "CB2_EGGHATCH_1":

@@ -29,6 +29,7 @@ def get_bot_modes() -> list[Type[BotMode]]:
         from .kecleon import KecleonMode
         from .level_grind import LevelGrindMode
         from .nugget_bridge import NuggetBridgeMode
+        from .opening import EmeraldOpeningMode
         from .puzzle_solver import PuzzleSolverMode
         from .roamer_reencounter import RoamerReencounterMode
         from .roamer_reset import RoamerResetMode
@@ -60,6 +61,7 @@ def get_bot_modes() -> list[Type[BotMode]]:
             RockSmashMode,
             SafariMode,
             SpinMode,
+            EmeraldOpeningMode,
             StartersMode,
             StaticRunAway,
             StaticGiftResetsMode,

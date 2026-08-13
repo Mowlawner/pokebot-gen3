@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from rich.console import Console, Group
@@ -233,3 +234,17 @@ def print_stats(stats: "GlobalStats", encounter: "EncounterInfo") -> None:
 
 
 console = Console(theme=theme)
+
+
+def diagnostic_print(message: str | Callable[[], str], *, trace: bool = False) -> None:
+    """Print a diagnostic message only when its configured level is enabled.
+
+    ``message`` may be a callable so expensive formatting is skipped entirely
+    when the diagnostic level is disabled.  Trace messages are deliberately
+    separate from normal debug output because they can be emitted every frame.
+    """
+    from modules.context import context
+
+    if not context.debug or (trace and not getattr(context, "debug_trace", False)):
+        return
+    console.print(message() if callable(message) else message)

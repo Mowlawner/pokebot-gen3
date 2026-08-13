@@ -49,6 +49,10 @@ class BotContext:
         self.profile: Optional["Profile"] = None
         self.stats: Optional["StatsDatabase"] = None
         self.debug: bool = False
+        # Normal debug logging is intended to be safe during emulation.  The
+        # opening sequence can opt into high-volume diagnostic tracing when a
+        # detailed ROM-state investigation is needed.
+        self.debug_trace: bool = False
         self.testing: bool = False
 
         self._current_message: str = ""

@@ -26,6 +26,7 @@ required_modules = [
     "pyperclip3~=0.4.1",
     "plyer~=2.1.0",
     "notify-py~=0.3.42",
+    "names",
     "apispec~=6.3.0",
     "ttkthemes~=3.2.2",
     "darkdetect~=0.8.0",
