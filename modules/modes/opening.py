@@ -7,13 +7,15 @@ from typing import Generator
 from modules.console import console, diagnostic_print
 from modules.context import context
 from modules.keyboard import get_naming_screen_data, type_in_naming_screen
-from modules.map import get_map_data_for_current_position
+from modules.game_sprites import get_game_sprite_by_id
+from modules.map import get_map_data_for_current_position, get_map_objects
 from modules.map_data import MapRSE
 from modules.memory import (
     GameState,
     get_event_flag,
     get_event_var,
     get_game_state,
+    get_game_state_symbol,
     get_save_block,
     read_symbol,
     unpack_uint16,
@@ -50,6 +52,13 @@ _EMERALD_OPTIONS_TASKS = (
     "Task_OptionMenuSave",
     "Task_OptionMenuFadeOut",
 )
+_BIRCH_GENDER_TASKS = (
+    "Task_NewGameBirchSpeech_ChooseGender",
+    "Task_NewGameBirchSpeech_WaitToShowGenderMenu",
+    "Task_NewGameBirchSpeech_SlideOutOldGenderSprite",
+    "Task_NewGameBirchSpeech_SlideInNewGenderSprite",
+)
+_last_scripted_input_trace: tuple | None = None
 
 
 class EmeraldTextSpeed(IntEnum):
@@ -193,6 +202,71 @@ def get_opening_diagnostics(
         clock_hours,
         clock_minutes,
     )
+
+
+def _birch_gender_task_snapshot() -> tuple | None:
+    """Collect read-only state while Emerald's Birch gender UI tasks exist.
+
+    This deliberately reports raw task words and sprite metadata. It does not
+    assign a meaning to any word or derive a gender from the saved Player.
+    """
+    try:
+        tasks = get_tasks()
+        present = [name for name in _BIRCH_GENDER_TASKS if name in tasks]
+        if not present:
+            return None
+
+        task_data = []
+        for name in _BIRCH_GENDER_TASKS:
+            task = get_task(name)
+            if task is None:
+                task_data.append((name, False, None, ()))
+                continue
+            task_data.append((name, True, task.symbol, tuple(task.data_value(i) for i in range(len(task.data) // 2))))
+
+        script = get_global_script_context()
+        script_state = None if script is None else (
+            script.is_active,
+            script.mode,
+            script.native_function_name,
+            script.script_function_name,
+            script.native_pointer,
+            script.bytecode_pointer,
+            tuple(script.stack),
+        )
+        avatar = get_player_avatar()
+        location = (avatar.map_group_and_number, avatar.local_coordinates)
+        state = get_game_state()
+
+        sprites = []
+        for sprite_id in range(64):
+            sprite = get_game_sprite_by_id(sprite_id)
+            if "in_use" in sprite.flags:
+                sprites.append((
+                    sprite_id,
+                    sprite.coordinates,
+                    sprite.secondary_coordinates,
+                    tuple(sprite.data_value(i) for i in range(8)),
+                    tuple(sprite.flags),
+                ))
+
+        objects = []
+        for obj in get_map_objects():
+            objects.append((obj.local_id, obj.sprite_id, obj.graphics_id, obj.current_coords, tuple(obj.flags)))
+
+        return (
+            tuple(present),
+            tuple(task_data),
+            location,
+            state.name,
+            get_game_state_symbol(),
+            tuple(task.symbol for task in tasks),
+            script_state,
+            tuple(sprites),
+            tuple(objects),
+        )
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError, KeyError):
+        return ("unavailable",)
 
 
 _CLOCK_TASKS = (
@@ -617,6 +691,7 @@ def _scripted_input_waiting() -> bool:
 
 def _advance_scripted_input() -> Generator:
     """Advance only when the game reports that an input is currently wanted."""
+    global _last_scripted_input_trace
     waiting_for_input = _scripted_input_waiting()
     if not waiting_for_input:
         try:
@@ -624,7 +699,40 @@ def _advance_scripted_input() -> Generator:
         except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
             pass
     if waiting_for_input:
+        before_inputs = None
+        before_pending = (None, None, None)
+        after_inputs = None
+        after_pending = (None, None, None)
+        if context.debug and getattr(context, "debug_trace", False):
+            try:
+                before_inputs = context.emulator.get_inputs()
+                before_pending = (
+                    getattr(context.emulator, "_prev_pressed_inputs", None),
+                    getattr(context.emulator, "_pressed_inputs", None),
+                    getattr(context.emulator, "_held_inputs", None),
+                )
+            except (AttributeError, RuntimeError, TypeError):
+                pass
         context.emulator.press_button("A")
+        if context.debug and getattr(context, "debug_trace", False):
+            try:
+                after_inputs = context.emulator.get_inputs()
+                after_pending = (
+                    getattr(context.emulator, "_prev_pressed_inputs", None),
+                    getattr(context.emulator, "_pressed_inputs", None),
+                    getattr(context.emulator, "_held_inputs", None),
+                )
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+            trace = (before_inputs, after_inputs, before_pending, after_pending)
+            if trace != _last_scripted_input_trace:
+                _last_scripted_input_trace = trace
+                diagnostic_print(
+                    "[dim]Opening scripted input: operation='press A' "
+                    f"inputs_before={before_inputs} inputs_after={after_inputs} "
+                    f"pending_before={before_pending} pending_after={after_pending}[/]",
+                    trace=True,
+                )
     yield
 
 
@@ -737,6 +845,7 @@ class EmeraldOpeningMode(BotMode):
         self._initial_options_cursor_positioned = False
         self._initial_menu_repositioned = False
         self._last_text_speed_configuration_key: tuple | None = None
+        self._last_birch_gender_diagnostics: tuple | None = None
 
     def run(self) -> Generator:
         if not context.rom.is_emerald:
@@ -746,6 +855,7 @@ class EmeraldOpeningMode(BotMode):
             observed = get_opening_sequence_state()
             diagnostics = get_opening_diagnostics(self.phase, observed)
             self._report_diagnostics(diagnostics)
+            self._report_birch_gender_diagnostics()
             self._report_dialogue_detection(observed)
             self._report_route101_lifecycle(observed)
             self._report_route101_runtime(observed)
@@ -2083,6 +2193,30 @@ class EmeraldOpeningMode(BotMode):
             f"message_visible={None if state is None else state[7]} "
             f"printer_state={None if state is None else state[8]} "
             f"active_tasks={None if state is None else state[9]}[/]"
+        )
+
+    def _report_birch_gender_diagnostics(self) -> None:
+        """Emit a deduplicated, input-free trace of Birch's gender UI."""
+        if not context.debug or not getattr(context, "debug_trace", False):
+            return
+        snapshot = _birch_gender_task_snapshot()
+        if snapshot is None:
+            self._last_birch_gender_diagnostics = None
+            return
+        key = (self._resolved_player_gender, snapshot)
+        if key == self._last_birch_gender_diagnostics:
+            return
+        self._last_birch_gender_diagnostics = key
+        if snapshot == ("unavailable",):
+            diagnostic_print("[dim]Birch gender UI: state temporarily unavailable[/]", trace=True)
+            return
+        present, task_data, location, state, callback, active_tasks, script, sprites, objects = snapshot
+        diagnostic_print(
+            "[dim]Birch gender UI: "
+            f"target_gender={self._resolved_player_gender} present={present} "
+            f"tasks={task_data} location={location} game_state={state} callback={callback} "
+            f"active_tasks={active_tasks} script_native={script} sprites={sprites} objects={objects}[/]",
+            trace=True,
         )
 
     def _set_clock(self) -> Generator:
