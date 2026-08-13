@@ -1,19 +1,34 @@
 """Emerald's fresh-game opening sequence."""
 
-from enum import Enum, auto
+from enum import Enum, IntEnum, auto
 from dataclasses import dataclass
 from typing import Generator
 
-from modules.console import console
+from modules.console import console, diagnostic_print
 from modules.context import context
 from modules.keyboard import get_naming_screen_data, type_in_naming_screen
 from modules.map import get_map_data_for_current_position
 from modules.map_data import MapRSE
-from modules.memory import GameState, get_event_flag, get_event_var, get_game_state
+from modules.memory import (
+    GameState,
+    get_event_flag,
+    get_event_var,
+    get_game_state,
+    get_save_block,
+    read_symbol,
+    unpack_uint16,
+    unpack_uint32,
+)
 from modules.modes.util.higher_level_actions import save_the_game
 from modules.modes.util.tasks_scripts import wait_for_fade_to_finish
 from modules.modes.util.walking import ensure_facing_direction, navigate_to
-from modules.player import get_player_avatar, player_avatar_is_controllable, player_avatar_is_standing_still
+from modules.player import (
+    AvatarFlags,
+    get_player_avatar,
+    get_player_map_object,
+    player_avatar_is_controllable,
+    player_avatar_is_standing_still,
+)
 from modules.text_printer import get_text_printer
 from modules.tasks import (
     get_global_script_context,
@@ -26,6 +41,22 @@ from modules.tasks import (
 from ._interface import BotMode, BotModeError
 
 _starter_handoff_pending = False
+_EMERALD_TEXT_SPEED_SAVE_BLOCK2_OFFSET = 0x14
+_EMERALD_TEXT_SPEED_MASK = 0x07
+_EMERALD_OPTIONS_TASKS = (
+    "Task_OptionMenuProcessInput",
+    "Task_OptionMenuFadeIn",
+    "Task_OptionMenuSave",
+    "Task_OptionMenuFadeOut",
+)
+
+
+class EmeraldTextSpeed(IntEnum):
+    """Values used by Emerald's Options-menu text-speed setting."""
+
+    SLOW = 0
+    MEDIUM = 1
+    FAST = 2
 
 
 def consume_starter_handoff() -> bool:
@@ -54,6 +85,7 @@ class OpeningSequenceState(Enum):
     STARTER_SELECTION = auto()
     SCRIPTED_INTRO = auto()
     UNKNOWN = auto()
+    OPTIONS_MENU = auto()
 
 
 @dataclass(frozen=True)
@@ -239,6 +271,8 @@ def get_opening_sequence_state() -> OpeningSequenceState:
         return OpeningSequenceState.TITLE
     if game_state == GameState.MAIN_MENU:
         return OpeningSequenceState.MAIN_MENU
+    if game_state == GameState.OPTIONS_MENU:
+        return OpeningSequenceState.OPTIONS_MENU
     if game_state == GameState.NAMING_SCREEN:
         return OpeningSequenceState.PLAYER_NAMING
     if _clock_task_active():
@@ -409,22 +443,37 @@ def _may_sequence_event_complete() -> bool:
 def _route101_ready_for_navigation() -> bool:
     """Whether the Route 101 rescue has released control for pathing onward.
 
-    ``WaitForAorBPress`` can remain in the global script context for a frame
-    after the rescue message task and field box have gone away.  The ROM's
-    Route 101 state variable is the event boundary: the rescue script sets it
-    to 2 only after closing its final message and before releasing the player.
+    The ROM's Route 101 state variable is the event boundary: the rescue
+    script sets it to 2 only after closing its final message and before
+    releasing the player.  The field-message task is deliberately diagnostic
+    only.  It can outlive ``closemessage`` in the emulator observation, so it
+    is not evidence that the rescue event is still running.
     """
     try:
-        if (
-            get_event_var("ROUTE101_STATE") < 2
-            or not player_avatar_is_controllable()
-        ):
-            return False
-        if task_is_active("Task_DrawFieldMessage"):
-            return False
-        return True
+        return get_event_var("ROUTE101_STATE") >= 2 and player_avatar_is_controllable()
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
         return False
+
+
+def _route101_observation_stage(route_state: int | None, state: tuple) -> str:
+    """Name only what the raw Route 101 snapshot proves.
+
+    These labels are observational, not additional completion predicates.  In
+    particular, a visible message is reported as such without claiming that
+    it is the Birch rescue message or that it needs input from the bot.
+    """
+    message_visible = bool(state[7])
+    script_active = state[2] is True
+    controllable = state[6] is True
+    if route_state == 0 and not script_active and not message_visible:
+        return "A_arrival_before_rescue"
+    if message_visible:
+        return "C_message_visible"
+    if route_state is not None and route_state < 2 and script_active:
+        return "B_or_D_rescue_script_no_message"
+    if route_state is not None and route_state >= 2 and controllable:
+        return "E_or_F_rescue_complete_control_restored"
+    return "unclassified"
 
 
 def _warp_to(destination: MapRSE, *, expecting_script: bool = False) -> Generator:
@@ -597,6 +646,21 @@ def _startup_dialogue_waiting(observed: OpeningSequenceState) -> bool:
         return False
 
 
+def _scripted_std_msgbox_waiting(state: tuple) -> bool:
+    """Recognize Emerald's script-owned standard message input wait.
+
+    ``Task_DrawFieldMessage`` is not present for every ROM message lifecycle.
+    Require the script and native symbols together with the sampled input-wait
+    state so an unrelated ``WaitForAorBPress`` native wait is not dialogue.
+    """
+    return (
+        state[2] is True
+        and state[3] == "WaitForAorBPress"
+        and state[4] == "Std_MsgboxDefault"
+        and state[5] is True
+    )
+
+
 def _birch_house_1f_ready_for_navigation() -> bool:
     """Whether the arrival event in Birch's house has released the player."""
     try:
@@ -653,8 +717,16 @@ class EmeraldOpeningMode(BotMode):
         self._dialogue_before_input: tuple | None = None
         self._dialogue_wait_input_state: tuple | None = None
         self._last_dialogue_detection_key: tuple | None = None
+        self._last_route101_lifecycle_key: tuple | None = None
         self._last_phase_dispatch_key: tuple | None = None
         self._last_may_sequence_key: tuple | None = None
+        self._last_route101_readiness_key: tuple | None = None
+        self._last_route101_runtime_key: tuple | None = None
+        self._initial_settings_configured = False
+        self._initial_options_entered = False
+        self._initial_options_cursor_positioned = False
+        self._initial_menu_repositioned = False
+        self._last_text_speed_configuration_key: tuple | None = None
 
     def run(self) -> Generator:
         if not context.rom.is_emerald:
@@ -665,6 +737,8 @@ class EmeraldOpeningMode(BotMode):
             diagnostics = get_opening_diagnostics(self.phase, observed)
             self._report_diagnostics(diagnostics)
             self._report_dialogue_detection(observed)
+            self._report_route101_lifecycle(observed)
+            self._report_route101_runtime(observed)
             if observed is OpeningSequenceState.STARTER_SELECTION:
                 global _starter_handoff_pending
                 _starter_handoff_pending = True
@@ -672,6 +746,28 @@ class EmeraldOpeningMode(BotMode):
                 return
 
             if observed == OpeningSequenceState.TITLE or observed == OpeningSequenceState.MAIN_MENU:
+                if observed is OpeningSequenceState.TITLE:
+                    context.emulator.press_button("A")
+                    yield
+                    continue
+
+                if not self._initial_settings_configured:
+                    yield from self._configure_initial_game_settings()
+                    self._initial_settings_configured = True
+                    continue
+
+                # Returning from Options leaves Emerald's main-menu cursor on
+                # Option. Move back to New Game before using the original
+                # opening handoff. If FAST was already selected, the cursor
+                # never left New Game and no repositioning is needed.
+                if self._initial_options_entered and not self._initial_menu_repositioned:
+                    while not task_is_active("Task_HandleMainMenuInput"):
+                        yield
+                    context.emulator.press_button("Up")
+                    self._initial_menu_repositioned = True
+                    yield
+                    continue
+
                 context.emulator.press_button("A")
                 yield
                 continue
@@ -704,12 +800,140 @@ class EmeraldOpeningMode(BotMode):
             )
             yield from self._advance_phase(observed, diagnostics)
 
+    @staticmethod
+    def _message_speed_observation() -> tuple[int | None, int | None, int | None, str | None]:
+        """Read temporary Options state alongside persisted SaveBlock2 state."""
+        temporary_value = None
+        candidate_symbol = None
+        for task_name in _EMERALD_OPTIONS_TASKS:
+            try:
+                task = get_task(task_name)
+                if task is not None:
+                    temporary_value = task.data_value(1)
+                    candidate_symbol = f"{task_name}.data[1]"
+                    break
+            except (AttributeError, RuntimeError, ValueError, TypeError, IndexError, KeyError):
+                pass
+
+        try:
+            persisted_bytes = get_save_block(
+                2,
+                offset=_EMERALD_TEXT_SPEED_SAVE_BLOCK2_OFFSET,
+                size=2,
+            )
+            persisted_value = unpack_uint16(persisted_bytes) & _EMERALD_TEXT_SPEED_MASK
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError, KeyError):
+            persisted_value = None
+
+        try:
+            save_block_pointer = unpack_uint32(read_symbol("gSaveBlock2Ptr", size=4))
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError, KeyError):
+            save_block_pointer = None
+        observed_value = temporary_value if temporary_value is not None else persisted_value
+        if candidate_symbol is None and persisted_value is not None:
+            candidate_symbol = "SaveBlock2.optionsTextSpeed"
+        return observed_value, persisted_value, save_block_pointer, candidate_symbol
+
+    @classmethod
+    def _message_speed(cls) -> int | None:
+        """Read Emerald's live Options-menu text-speed value.
+
+        Emerald persists the Options values in SaveBlock2, but the open
+        Options menu edits ``Task_OptionMenuProcessInput.data[1]`` first.
+        The similarly named ``sTextSpeed`` symbol is part of recorded-battle
+        state and is not the setting currently displayed by the menu.
+        """
+        return cls._message_speed_observation()[0]
+
+    @staticmethod
+    def _message_speed_name(raw_value: int | None) -> str:
+        try:
+            return EmeraldTextSpeed(raw_value).name
+        except (TypeError, ValueError):
+            return "UNKNOWN"
+
+    def _report_text_speed_configuration(
+        self,
+        observation: tuple[int | None, int | None, int | None, str | None],
+        decision: str,
+    ) -> None:
+        """Report setting observations only when the decision changes."""
+        raw_value, persisted_value, save_block_pointer, candidate_symbol = observation
+        key = (raw_value, persisted_value, save_block_pointer, candidate_symbol, decision)
+        if key == self._last_text_speed_configuration_key:
+            return
+        self._last_text_speed_configuration_key = key
+        diagnostic_print(
+            lambda: (
+                "[dim]Text speed configuration: "
+                f"candidate_symbol={candidate_symbol!r} "
+                f"observed_value={raw_value!r} "
+                f"observed_name={self._message_speed_name(raw_value)} "
+                f"save_block_value={persisted_value!r} "
+                f"save_block2={None if save_block_pointer is None else hex(save_block_pointer)} "
+                f"decision={decision}[/]"
+            )
+        )
+
+    def _configure_initial_game_settings(self) -> Generator:
+        """Ensure required settings before entering the fresh-game flow.
+
+        Emerald's initial menu opens with New Game selected and its Options
+        entry immediately below it. The Options screen opens on Text Speed,
+        so the only setting needed here can be changed through the normal UI.
+        This small generator is intentionally independent of the opening
+        phases so future save-based initializers can reuse the same check and
+        setting operation.
+        """
+        observation = self._message_speed_observation()
+        if observation[0] == EmeraldTextSpeed.FAST:
+            self._report_text_speed_configuration(observation, "complete: already FAST")
+            return
+        self._report_text_speed_configuration(observation, "wait: enter Options")
+
+        while not task_is_active("Task_HandleMainMenuInput"):
+            yield
+        context.emulator.press_button("Down")
+        self._initial_options_cursor_positioned = True
+        self._report_text_speed_configuration(observation, "press Down: select Options")
+        yield
+
+        # The save-file check can briefly reclaim the main-menu task after a
+        # cursor move.  Wait for the menu's input task to be active again so
+        # this A press is an actual selection, not an ignored transition-frame
+        # input.
+        while not task_is_active("Task_HandleMainMenuInput"):
+            self._report_text_speed_configuration(observation, "wait: main-menu input task")
+            yield
+        context.emulator.press_button("A")
+        self._initial_options_entered = True
+        self._report_text_speed_configuration(observation, "press A: enter Options")
+        yield
+
+        while not task_is_active("Task_OptionMenuProcessInput"):
+            self._report_text_speed_configuration(observation, "wait: Options input task")
+            yield
+
+        while True:
+            observation = self._message_speed_observation()
+            if observation[0] == EmeraldTextSpeed.FAST:
+                self._report_text_speed_configuration(observation, "complete: FAST observed")
+                break
+            self._report_text_speed_configuration(observation, "press Right: advance text speed")
+            context.emulator.press_button("Right")
+            yield
+
+        context.emulator.press_button("B")
+        self._report_text_speed_configuration(observation, "press B: save and exit Options")
+        while get_game_state() != GameState.MAIN_MENU:
+            self._report_text_speed_configuration(observation, "wait: return to main menu")
+            yield
+
     def _advance_startup_dialogue(self, observed: OpeningSequenceState) -> Generator:
         """Advance one page of ordinary field dialogue and yield one frame."""
-        # Route 101's rescue completion marker supersedes a stale
-        # WaitForAorBPress context.  Once the ROM has released the avatar,
-        # allow the phase controller to send directional input; do not turn
-        # the stale native wait into another dialogue dismissal.
+        # Route 101's rescue completion marker supersedes a stale native wait
+        # only after the ROM has released the avatar.  Before that boundary,
+        # a qualified Std_MsgboxDefault wait remains actionable dialogue.
         if observed is OpeningSequenceState.ROUTE_101 and _route101_ready_for_navigation():
             return False
         state = self._dialogue_state_snapshot()
@@ -720,11 +944,7 @@ class EmeraldOpeningMode(BotMode):
             self._dialogue_active = True
             self._report_dialogue(observed, "field message lifecycle started")
         field_message_waiting = self._dialogue_detection(observed, state)[0]
-        script_waiting = (
-            self._dialogue_active
-            and state[2] is True
-            and state[3] == "WaitForAorBPress"
-        )
+        script_waiting = _scripted_std_msgbox_waiting(state)
         if not script_waiting and self._dialogue_wait_input_state is not None:
             self._report_dialogue_handler(observed, "clear script-wait key after leaving native wait", state)
             self._dialogue_wait_input_state = None
@@ -767,6 +987,172 @@ class EmeraldOpeningMode(BotMode):
             self._report_dialogue_handler(observed, "return: no dialogue", state)
         return False
 
+    def _report_route101_lifecycle(self, observed: OpeningSequenceState) -> None:
+        """Report meaningful Route 101 message/control boundaries only."""
+        if not context.debug or observed is not OpeningSequenceState.ROUTE_101:
+            return
+        state = self._dialogue_state_snapshot()
+        detected, reason = self._dialogue_detection(observed, state)
+        ready = _route101_ready_for_navigation()
+        if ready:
+            lifecycle = "route navigation ready; player controllable again"
+        elif state[0] and not state[5]:
+            lifecycle = "scripted field message active; not awaiting player input"
+        elif state[2] and state[3] == "WaitForAorBPress" and not state[5]:
+            lifecycle = "scripted event active; native wait but no input requested"
+        elif state[2] and not state[0] and not state[7]:
+            lifecycle = "scripted event active; no message"
+        elif detected:
+            lifecycle = "dialogue detected; actionable player input required"
+        elif self._dialogue_active and not state[0] and not state[7]:
+            lifecycle = "message/dialogue completed; awaiting control return"
+        else:
+            lifecycle = "scripted event transition"
+        key = (
+            lifecycle,
+            state,
+            detected,
+            reason,
+            ready,
+        )
+        if key == self._last_route101_lifecycle_key:
+            return
+        self._last_route101_lifecycle_key = key
+        diagnostic_print(
+            lambda: (
+                "[dim]Opening Route 101 lifecycle: "
+                f"state={lifecycle!r} detected={detected} reason={reason!r} "
+                f"controllable={state[6]} game_message_task={state[0]} "
+                f"message_task_state={state[1]!r} message_visible={state[7]} "
+                f"printer_state={state[8]!r} waiting={state[5]} "
+                f"script_active={state[2]} native={state[3]!r} "
+                f"script={state[4]!r} active_tasks={state[9]!r} "
+                f"route101_ready={ready}[/]"
+            )
+        )
+
+    def _report_route101_readiness(self, observed: OpeningSequenceState) -> None:
+        """Report each Route 101 gate input only when the snapshot changes."""
+        if not context.debug or observed is not OpeningSequenceState.ROUTE_101:
+            return
+        state = self._dialogue_state_snapshot()
+        try:
+            route_state = get_event_var("ROUTE101_STATE")
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            route_state = None
+        try:
+            game_state = get_game_state()
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            game_state = None
+        ready = route_state is not None and route_state >= 2 and state[6] is True
+        key = (self.phase, observed, route_state, game_state, state, ready)
+        if key == getattr(self, "_last_route101_readiness_key", None):
+            return
+        self._last_route101_readiness_key = key
+        diagnostic_print(
+            lambda: (
+                "[dim]Opening Route 101 readiness: "
+                f"ready={ready} route101_state={route_state!r} "
+                f"script_active={state[2]} native={state[3]!r} "
+                f"native_ptr={state[10]!r} script={state[4]!r} "
+                f"script_pc={state[11]!r} game_state={game_state!r} "
+                f"controllable={state[6]} waiting={state[5]} "
+                f"field_message_task_active={state[0]} "
+                f"field_message_task_state={state[1]!r} "
+                f"message_visible={state[7]} printer_state={state[8]!r} "
+                f"active_tasks={state[9]!r} "
+                "predicate=route101_state>=2 and controllable[/]"
+            )
+        )
+
+    def _report_route101_runtime(self, observed: OpeningSequenceState) -> None:
+        """Emit one complete Route 101 runtime snapshot per state change."""
+        if not context.debug or observed is not OpeningSequenceState.ROUTE_101:
+            return
+        state = self._dialogue_state_snapshot()
+        route_state_error = None
+        try:
+            route_state = get_event_var("ROUTE101_STATE")
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError) as error:
+            route_state = None
+            route_state_error = repr(error)
+        controllable_error = None
+        try:
+            controllable = player_avatar_is_controllable()
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError) as error:
+            controllable = None
+            controllable_error = repr(error)
+        map_object_exists = None
+        map_object_flags = None
+        forced_move = None
+        try:
+            map_object = get_player_map_object()
+            map_object_exists = map_object is not None
+            map_object_flags = None if map_object is None else tuple(sorted(map_object.flags))
+            forced_move = AvatarFlags.ForcedMove in get_player_avatar().flags
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError) as error:
+            controllable_error = controllable_error or repr(error)
+        try:
+            avatar = get_player_avatar()
+            coordinates = avatar.local_coordinates
+            facing = avatar.facing_direction
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            coordinates = None
+            facing = None
+        try:
+            map_id = _current_map_id()
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            map_id = None
+        try:
+            game_state = get_game_state()
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            game_state = None
+        try:
+            inputs = context.emulator.get_inputs()
+        except (AttributeError, RuntimeError, TypeError):
+            inputs = None
+        input_state = (inputs, self._dialogue_pending_inputs())
+        stage = _route101_observation_stage(route_state, state)
+        key = (
+            stage,
+            route_state,
+            route_state_error,
+            controllable,
+            controllable_error,
+            map_object_exists,
+            map_object_flags,
+            forced_move,
+            map_id,
+            coordinates,
+            facing,
+            game_state,
+            state,
+            input_state,
+        )
+        if key == self._last_route101_runtime_key:
+            return
+        self._last_route101_runtime_key = key
+        console.print(
+            (lambda: (
+                "Opening Route 101 runtime source=working-tree/opening.py "
+                f"stage={stage!r} route101_state={route_state!r} "
+                f"route_state_error={route_state_error!r} "
+                f"map={map_id!r} coords={coordinates!r} facing={facing!r} "
+                f"game_state={game_state!r} "
+                f"controllable={controllable!r} "
+                f"controllable_snapshot={state[6]!r} "
+                f"controllable_error={controllable_error!r} "
+                f"map_object_exists={map_object_exists!r} "
+                f"map_object_flags={map_object_flags!r} forced_move={forced_move!r} "
+                f"script_active={state[2]} script={state[4]!r} "
+                f"native={state[3]!r} native_ptr={state[10]!r} "
+                f"script_pc={state[11]!r} field_task_active={state[0]} "
+                f"field_task_state={state[1]!r} message_visible={state[7]} "
+                f"printer_state={state[8]!r} waiting={state[5]} "
+                f"active_tasks={state[9]!r} inputs={input_state!r}"
+            ))()
+        )
+
     def _report_dialogue_handler(
         self,
         observed: OpeningSequenceState,
@@ -774,16 +1160,17 @@ class EmeraldOpeningMode(BotMode):
         state: tuple,
     ) -> None:
         """Trace handler entry/return decisions at the ROM wait boundary."""
-        if not context.debug:
-            return
-        console.print(
-            "[dim]Opening dialogue handler: "
-            f"event={event!r} observed={observed.name} "
-            f"task_active={state[0]} waiting={state[5]} visible={state[7]} "
-            f"native={state[3]!r} native_ptr={state[10]!r} script_pc={state[11]!r} "
-            f"dialogue_active={self._dialogue_active} "
-            f"before_input={self._dialogue_before_input!r} "
-            f"wait_input_state={self._dialogue_wait_input_state!r}[/]"
+        diagnostic_print(
+            lambda: (
+                "[dim]Opening dialogue handler: "
+                f"event={event!r} observed={observed.name} "
+                f"task_active={state[0]} waiting={state[5]} visible={state[7]} "
+                f"native={state[3]!r} native_ptr={state[10]!r} script_pc={state[11]!r} "
+                f"dialogue_active={self._dialogue_active} "
+                f"before_input={self._dialogue_before_input!r} "
+                f"wait_input_state={self._dialogue_wait_input_state!r}[/]"
+            ),
+            trace=True,
         )
 
     def _report_phase_dispatch(
@@ -875,7 +1262,7 @@ class EmeraldOpeningMode(BotMode):
         )
 
     def _press_dialogue_input(self, state: tuple) -> None:
-        if not context.debug:
+        if not context.debug or not getattr(context, "debug_trace", False):
             context.emulator.press_button("B")
             return
         before_inputs = self._dialogue_emulator_inputs()
@@ -921,7 +1308,7 @@ class EmeraldOpeningMode(BotMode):
         before_pending: tuple[int | None, int | None, int | None] | None = None,
         after_pending: tuple[int | None, int | None, int | None] | None = None,
     ) -> None:
-        if not context.debug:
+        if not getattr(context, "debug_trace", False):
             return
         if before_inputs is None:
             before_inputs = self._dialogue_emulator_inputs()
@@ -931,8 +1318,30 @@ class EmeraldOpeningMode(BotMode):
             before_pending = self._dialogue_pending_inputs()
         if after_pending is None:
             after_pending = self._dialogue_pending_inputs()
+        diagnostic_print(
+            lambda: self._format_dialogue_input_trace(
+                state,
+                operation,
+                before_inputs,
+                after_inputs,
+                before_pending,
+                after_pending,
+            ),
+            trace=True,
+        )
+
+    def _format_dialogue_input_trace(
+        self,
+        state: tuple,
+        operation: str,
+        before_inputs: int | None,
+        after_inputs: int | None,
+        before_pending: tuple[int | None, int | None, int | None],
+        after_pending: tuple[int | None, int | None, int | None],
+    ) -> str:
+        """Build the expensive before/after input trace only for tracing."""
         after_state = self._dialogue_state_snapshot()
-        console.print(
+        return (
             "[dim]Opening dialogue input: "
             f"operation={operation!r} requested=B "
             f"inputs_before={before_inputs} inputs_after={after_inputs} "
@@ -972,6 +1381,8 @@ class EmeraldOpeningMode(BotMode):
             if state[3] == "WaitForAorBPress" and state[7]:
                 return True, "WaitForAorBPress with visible field message"
             return True, "field-message predicate reported actionable input"
+        if _scripted_std_msgbox_waiting(state):
+            return True, "Std_MsgboxDefault is waiting for A/B input"
         if not state[0] and state[3] == "WaitForAorBPress":
             return False, "WaitForAorBPress is outside an observed field-message lifecycle"
         if not state[0]:
@@ -991,9 +1402,7 @@ class EmeraldOpeningMode(BotMode):
         except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
             game_state = None
         handler_candidate = detected or (
-            self._dialogue_active
-            and state[2] is True
-            and state[3] == "WaitForAorBPress"
+            _scripted_std_msgbox_waiting(state)
         )
         map_id = _current_map_id()
         coordinates = None
@@ -1405,6 +1814,10 @@ class EmeraldOpeningMode(BotMode):
             if observed not in (OpeningSequenceState.LITTLEROOT_TOWN, OpeningSequenceState.ROUTE_101):
                 yield from _advance_scripted_input()
                 return
+            if observed is OpeningSequenceState.ROUTE_101:
+                # Capture the gate inputs even while controllability itself is
+                # the component keeping navigation paused.
+                self._report_route101_readiness(observed)
             if not self._can_navigate():
                 yield
                 return

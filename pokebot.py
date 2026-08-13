@@ -48,6 +48,7 @@ class StartupSettings:
     emulation_speed: int
     always_on_top: bool
     config_path: str
+    debug_trace: bool = False
 
 
 def directory_arg(value: str) -> pathlib.Path:
@@ -120,6 +121,13 @@ def parse_arguments(bot_mode_names: list[str]) -> StartupSettings:
         action="store_true",
         help="Enable extra debug options and a debug menu.",
     )
+    parser.add_argument(
+        "--debug-trace",
+        "--trace",
+        dest="debug_trace",
+        action="store_true",
+        help="Enable high-volume diagnostic tracing (implies --debug).",
+    )
     parser.add_argument("-c", "--config", type=directory_arg, dest="config_path", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -129,7 +137,7 @@ def parse_arguments(bot_mode_names: list[str]) -> StartupSettings:
 
     return StartupSettings(
         profile=preselected_profile,
-        debug=bool(args.debug),
+        debug=bool(args.debug or args.debug_trace),
         bot_mode=args.bot_mode or "Manual",
         headless=bool(args.headless),
         no_video=bool(args.no_video),
@@ -139,6 +147,7 @@ def parse_arguments(bot_mode_names: list[str]) -> StartupSettings:
         emulation_speed=int(args.emulation_speed or "1"),
         always_on_top=bool(args.always_on_top),
         config_path=args.config_path,
+        debug_trace=bool(args.debug_trace),
     )
 
 

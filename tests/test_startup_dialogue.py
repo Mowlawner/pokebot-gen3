@@ -154,6 +154,7 @@ class TestStartupDialogue(unittest.TestCase):
         with (
             patch("modules.modes.opening.context", opening_context),
             patch("modules.modes.opening._startup_dialogue_waiting", side_effect=[True, False, False, False]),
+            patch("modules.modes.opening.is_waiting_for_input", return_value=True),
             patch("modules.modes.opening.get_task", side_effect=[task, None, None, None]),
             patch("modules.modes.opening.get_global_script_context", return_value=script_context),
         ):
@@ -171,6 +172,76 @@ class TestStartupDialogue(unittest.TestCase):
                 [True],
             )
         self.assertEqual(opening_context.emulator.press_button.call_count, 3)
+
+    def test_script_owned_standard_message_without_draw_task_sends_b(self):
+        from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        opening_context = self._mode_context()
+        mode = EmeraldOpeningMode()
+        state = (
+            False, None, True, "WaitForAorBPress", "Std_MsgboxDefault",
+            True, True, False, "HandleCharacter", (), 134851737, 136778545,
+        )
+        with (
+            patch("modules.modes.opening.context", opening_context),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch.object(EmeraldOpeningMode, "_dialogue_state_snapshot", return_value=state),
+            patch("modules.modes.opening.is_field_message_waiting_for_input", return_value=False),
+        ):
+            detected, reason = mode._dialogue_detection(OpeningSequenceState.ROUTE_101, state)
+            self.assertTrue(detected)
+            self.assertEqual(reason, "Std_MsgboxDefault is waiting for A/B input")
+            result = list(mode._advance_startup_dialogue(OpeningSequenceState.ROUTE_101))
+
+        self.assertEqual(result, [True])
+        opening_context.emulator.press_button.assert_called_once_with("B")
+        self.assertTrue(mode._dialogue_active)
+
+    def test_wait_for_a_or_b_without_standard_message_script_is_not_dialogue(self):
+        from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        opening_context = self._mode_context()
+        mode = EmeraldOpeningMode()
+        state = (
+            False, None, True, "WaitForAorBPress", "SomeOtherScript",
+            True, True, False, "HandleCharacter", (), 1, 2,
+        )
+        with (
+            patch("modules.modes.opening.context", opening_context),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch.object(EmeraldOpeningMode, "_dialogue_state_snapshot", return_value=state),
+            patch("modules.modes.opening.is_field_message_waiting_for_input", return_value=False),
+        ):
+            result = list(mode._advance_startup_dialogue(OpeningSequenceState.ROUTE_101))
+
+        self.assertEqual(result, [])
+        opening_context.emulator.press_button.assert_not_called()
+
+    def test_stale_native_wait_without_input_readiness_does_not_dismiss_script(self):
+        """A scripted transition must not treat a stale native name as input."""
+        from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        opening_context = self._mode_context()
+        mode = EmeraldOpeningMode()
+        mode._dialogue_active = True
+        state = (
+            False, None, True, "WaitForAorBPress", "Std_MsgboxDefault",
+            False, False, False, "HandleCharacter", (), 1, 10,
+        )
+        with (
+            patch("modules.modes.opening.context", opening_context),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch.object(EmeraldOpeningMode, "_dialogue_state_snapshot", return_value=state),
+            patch("modules.modes.opening.is_field_message_waiting_for_input", return_value=False),
+        ):
+            result = list(mode._advance_startup_dialogue(OpeningSequenceState.ROUTE_101))
+
+        self.assertEqual(result, [])
+        opening_context.emulator.press_button.assert_not_called()
+        self.assertFalse(mode._dialogue_active)
 
     def test_task_ended_inactive_printer_wait_for_a_or_b_generates_a(self):
         from modules.memory import GameState

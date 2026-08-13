@@ -4,6 +4,13 @@ from unittest.mock import patch
 
 
 class TestEmeraldOpeningState(unittest.TestCase):
+    def test_options_menu_is_recognized_as_a_pre_game_state(self):
+        from modules.memory import GameState
+        from modules.modes.opening import OpeningSequenceState, get_opening_sequence_state
+
+        with patch("modules.modes.opening.get_game_state", return_value=GameState.OPTIONS_MENU):
+            self.assertIs(get_opening_sequence_state(), OpeningSequenceState.OPTIONS_MENU)
+
     def test_littleroot_and_house_maps_have_distinct_progression_states(self):
         from modules.memory import GameState
         from modules.modes.opening import OpeningSequenceState, get_opening_sequence_state
@@ -1022,6 +1029,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         from modules.modes.opening import _route101_ready_for_navigation
 
         with (
+            patch("modules.modes.opening.get_event_var", return_value=1),
             patch("modules.modes.opening.player_avatar_is_controllable", return_value=True),
             patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
             patch("modules.modes.opening.is_waiting_for_input", return_value=False),
@@ -1031,6 +1039,42 @@ class TestEmeraldOpeningState(unittest.TestCase):
             )),
         ):
             self.assertFalse(_route101_ready_for_navigation())
+
+    def test_route101_readiness_uses_rescue_completion_marker_not_stale_message_task(self):
+        from modules.memory import GameState
+        from modules.modes.opening import _route101_ready_for_navigation
+
+        with (
+            patch("modules.modes.opening.get_event_var", return_value=2),
+            patch("modules.modes.opening.player_avatar_is_controllable", return_value=True),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.modes.opening.task_is_active", return_value=True),
+        ):
+            self.assertTrue(_route101_ready_for_navigation())
+
+    def test_route101_observation_stage_labels_only_proven_raw_states(self):
+        from modules.modes.opening import _route101_observation_stage
+
+        def state(*, script=False, visible=False, controllable=False):
+            values = [False, None, script, None, None, False, controllable, visible, None, (), None, None]
+            return tuple(values)
+
+        self.assertEqual(
+            _route101_observation_stage(0, state()),
+            "A_arrival_before_rescue",
+        )
+        self.assertEqual(
+            _route101_observation_stage(1, state(script=True)),
+            "B_or_D_rescue_script_no_message",
+        )
+        self.assertEqual(
+            _route101_observation_stage(1, state(script=True, visible=True)),
+            "C_message_visible",
+        )
+        self.assertEqual(
+            _route101_observation_stage(2, state(controllable=True)),
+            "E_or_F_rescue_complete_control_restored",
+        )
 
     def test_route101_readiness_waits_until_rescue_completion_marker(self):
         from modules.memory import GameState
@@ -1153,3 +1197,195 @@ class TestEmeraldOpeningState(unittest.TestCase):
             from modules.modes.opening import consume_starter_handoff
 
             self.assertTrue(consume_starter_handoff())
+
+    def test_initial_settings_enter_options_set_fast_and_return_to_main_menu(self):
+        from modules.modes.opening import EmeraldOpeningMode
+        from modules.memory import GameState
+
+        emulator = types.SimpleNamespace(press_button=unittest.mock.Mock())
+        opening_context = types.SimpleNamespace(
+            emulator=emulator,
+            rom=types.SimpleNamespace(is_emerald=True),
+            debug=False,
+        )
+        mode = EmeraldOpeningMode()
+        with (
+            patch("modules.modes.opening.context", opening_context),
+            patch.object(
+                mode,
+                "_message_speed_observation",
+                side_effect=[(1, 1, None, "Task_OptionMenuProcessInput.data[1]"),
+                             (1, 1, None, "Task_OptionMenuProcessInput.data[1]"),
+                             (2, 1, None, "Task_OptionMenuProcessInput.data[1]")],
+            ),
+            patch("modules.modes.opening.task_is_active", side_effect=[True, False, True, True]),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.MAIN_MENU),
+        ):
+            list(mode._configure_initial_game_settings())
+
+        self.assertEqual(
+            emulator.press_button.call_args_list,
+            [
+                unittest.mock.call("Down"),
+                unittest.mock.call("A"),
+                unittest.mock.call("Right"),
+                unittest.mock.call("B"),
+            ],
+        )
+        self.assertTrue(mode._initial_options_entered)
+        self.assertTrue(mode._initial_options_cursor_positioned)
+
+    def test_initial_settings_skip_options_when_fast_is_already_selected(self):
+        from modules.modes.opening import EmeraldOpeningMode
+
+        emulator = types.SimpleNamespace(press_button=unittest.mock.Mock())
+        opening_context = types.SimpleNamespace(
+            emulator=emulator,
+            rom=types.SimpleNamespace(is_emerald=True),
+            debug=False,
+        )
+        mode = EmeraldOpeningMode()
+        with patch("modules.modes.opening.context", opening_context), patch.object(
+            mode,
+            "_message_speed_observation",
+            return_value=(2, 1, None, "Task_OptionMenuProcessInput.data[1]"),
+        ):
+            list(mode._configure_initial_game_settings())
+
+        emulator.press_button.assert_not_called()
+        self.assertFalse(mode._initial_options_entered)
+
+    def test_message_speed_reads_emerald_save_block2_option(self):
+        from modules.modes.opening import EmeraldOpeningMode
+
+        mode = EmeraldOpeningMode()
+        with patch("modules.modes.opening.get_save_block", return_value=b"\x02\x00") as read_save_block:
+            self.assertEqual(mode._message_speed(), 2)
+        read_save_block.assert_called_once_with(2, offset=0x14, size=2)
+
+    def test_options_task_data_is_authoritative_while_menu_is_open(self):
+        from modules.modes.opening import EmeraldOpeningMode
+
+        mode = EmeraldOpeningMode()
+        task = types.SimpleNamespace(data_value=lambda index: 2)
+        with (
+            patch("modules.modes.opening.get_task", return_value=task),
+            patch("modules.modes.opening.get_save_block", return_value=b"\x01\x00"),
+            patch("modules.modes.opening.read_symbol", return_value=b"\x00\x00\x00\x02"),
+        ):
+            self.assertEqual(
+                mode._message_speed_observation(),
+                (2, 1, 0x02000000, "Task_OptionMenuProcessInput.data[1]"),
+            )
+
+    def test_runtime_save_block_value_change_from_medium_to_fast_completes_configuration(self):
+        from modules.modes.opening import EmeraldOpeningMode
+        from modules.memory import GameState
+
+        emulator = types.SimpleNamespace(press_button=unittest.mock.Mock())
+        opening_context = types.SimpleNamespace(
+            emulator=emulator,
+            rom=types.SimpleNamespace(is_emerald=True),
+            debug=False,
+        )
+        mode = EmeraldOpeningMode()
+        with (
+            patch("modules.modes.opening.context", opening_context),
+            patch(
+                "modules.modes.opening.get_save_block",
+                side_effect=[b"\x01\x00", b"\x01\x00", b"\x02\x00"],
+            ),
+            patch("modules.modes.opening.read_symbol", return_value=b"\x00\x00\x00\x02"),
+            patch("modules.modes.opening.task_is_active", side_effect=[True, False, True, True]),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.MAIN_MENU),
+        ):
+            list(mode._configure_initial_game_settings())
+
+        self.assertEqual(emulator.press_button.call_args_list, [
+            unittest.mock.call("Down"),
+            unittest.mock.call("A"),
+            unittest.mock.call("Right"),
+            unittest.mock.call("B"),
+        ])
+
+    def test_text_speed_configuration_diagnostics_are_state_change_deduplicated(self):
+        from modules.modes.opening import EmeraldOpeningMode
+
+        mode = EmeraldOpeningMode()
+        with patch("modules.modes.opening.diagnostic_print") as diagnostic:
+            observation = (1, 1, 0x1234, "Task_OptionMenuProcessInput.data[1]")
+            mode._report_text_speed_configuration(observation, "press Right: advance text speed")
+            mode._report_text_speed_configuration(observation, "press Right: advance text speed")
+            mode._report_text_speed_configuration(
+                (2, 1, 0x1234, "Task_OptionMenuProcessInput.data[1]"),
+                "complete: FAST observed",
+            )
+
+        self.assertEqual(diagnostic.call_count, 2)
+
+    def test_initial_settings_advance_from_slow_until_fast_without_wrapping(self):
+        from modules.modes.opening import EmeraldOpeningMode
+        from modules.memory import GameState
+
+        emulator = types.SimpleNamespace(press_button=unittest.mock.Mock())
+        opening_context = types.SimpleNamespace(
+            emulator=emulator,
+            rom=types.SimpleNamespace(is_emerald=True),
+            debug=False,
+        )
+        mode = EmeraldOpeningMode()
+        with (
+            patch("modules.modes.opening.context", opening_context),
+            patch.object(
+                mode,
+                "_message_speed_observation",
+                side_effect=[
+                    (0, 0, None, "Task_OptionMenuProcessInput.data[1]"),
+                    (0, 0, None, "Task_OptionMenuProcessInput.data[1]"),
+                    (1, 0, None, "Task_OptionMenuProcessInput.data[1]"),
+                    (2, 0, None, "Task_OptionMenuProcessInput.data[1]"),
+                ],
+            ),
+            patch("modules.modes.opening.task_is_active", side_effect=[True, True, True, True]),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.MAIN_MENU),
+        ):
+            list(mode._configure_initial_game_settings())
+
+        self.assertEqual(emulator.press_button.call_args_list, [
+            unittest.mock.call("Down"),
+            unittest.mock.call("A"),
+            unittest.mock.call("Right"),
+            unittest.mock.call("Right"),
+            unittest.mock.call("B"),
+        ])
+
+    def test_main_menu_repositions_to_new_game_after_options(self):
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+        from modules.memory import GameState
+
+        emulator = types.SimpleNamespace(press_button=unittest.mock.Mock())
+        opening_context = types.SimpleNamespace(
+            emulator=emulator,
+            rom=types.SimpleNamespace(is_emerald=True),
+            debug=False,
+            bot_mode="Start New Game",
+        )
+        mode = EmeraldOpeningMode()
+        mode._initial_settings_configured = True
+        mode._initial_options_entered = True
+        with (
+            patch("modules.modes.opening.context", opening_context),
+            patch("modules.modes.opening.get_opening_sequence_state", return_value=OpeningSequenceState.MAIN_MENU),
+            patch("modules.modes.opening.get_opening_diagnostics", return_value=None),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.MAIN_MENU),
+            patch("modules.modes.opening.task_is_active", return_value=True),
+        ):
+            generator = mode.run()
+            next(generator)
+            next(generator)
+
+        self.assertEqual(emulator.press_button.call_args_list, [
+            unittest.mock.call("Up"),
+            unittest.mock.call("A"),
+        ])
+        self.assertTrue(mode._initial_menu_repositioned)
