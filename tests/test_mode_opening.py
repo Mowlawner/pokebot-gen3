@@ -599,7 +599,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         warp.assert_called_once_with(MapRSE.LITTLEROOT_TOWN, expecting_script=True)
         self.assertIs(mode.phase, OpeningSequenceState.ROUTE_101)
 
-    def test_observed_second_floor_at_start_position_starts_fixed_clock_interaction(self):
+    def test_observed_second_floor_at_start_position_starts_clock_interaction(self):
         from modules.map_data import MapRSE
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
 
@@ -813,7 +813,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         advance.assert_called_once_with()
         set_clock.assert_not_called()
 
-    def test_wall_clock_target_is_fixed_for_emerald_opening(self):
+    def test_wall_clock_target_uses_rom_known_fallback_for_brendan_house(self):
         from modules.map_data import MapRSE
         from modules.modes.opening import _wall_clock_interaction
 

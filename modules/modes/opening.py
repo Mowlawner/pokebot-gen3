@@ -308,6 +308,8 @@ _CLOCK_HOUR_MIN = 0
 _CLOCK_HOUR_MAX = 23
 _CLOCK_MINUTE_MIN = 0
 _CLOCK_MINUTE_MAX = 59
+_CLOCK_MINUTES_PER_HOUR = 60
+_CLOCK_PERIOD_MINUTES = (_CLOCK_HOUR_MAX + 1) * _CLOCK_MINUTES_PER_HOUR
 _RIVAL_POKEBALL_SCRIPTS = {
     MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value: "LittlerootTown_MaysHouse_2F_EventScript_RivalsPokeBall",
     MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value: "LittlerootTown_BrendansHouse_2F_EventScript_RivalsPokeBall",
@@ -408,6 +410,24 @@ def _clock_setting_complete() -> bool:
         return get_event_flag("SET_WALL_CLOCK") and not _clock_task_active()
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
         return False
+
+
+def _clock_minutes(hour: int, minute: int) -> int:
+    """Convert Emerald's internal 24-hour clock value to a position."""
+    return hour * _CLOCK_MINUTES_PER_HOUR + minute
+
+
+def _clock_input_direction(
+    current_hour: int,
+    current_minute: int,
+    target_hour: int,
+    target_minute: int,
+) -> str:
+    """Choose the shortest direction around Emerald's 24-hour clock."""
+    forward = (
+        _clock_minutes(target_hour, target_minute) - _clock_minutes(current_hour, current_minute)
+    ) % _CLOCK_PERIOD_MINUTES
+    return "Right" if forward <= _CLOCK_PERIOD_MINUTES // 2 else "Left"
 
 
 def get_opening_sequence_state(player_gender: object | None = None) -> OpeningSequenceState:
@@ -1029,7 +1049,7 @@ def _emerald_clock_time(
         )
 
     snapshot = datetime.now() if now is None else now
-    # The wall-clock UI is 12-hour, but the ROM task stores the hour as 0..23.
+    # The visible wall-clock UI is 12-hour, but the ROM task stores 0..23.
     return snapshot.hour, snapshot.minute
 
 
@@ -1079,7 +1099,6 @@ class EmeraldOpeningMode(BotMode):
         self._initial_options_cursor_positioned = False
         self._initial_menu_repositioned = False
         self._last_text_speed_configuration_key: tuple | None = None
-        self._last_birch_gender_diagnostics: tuple | None = None
         self._birch_gender_a_sent = False
 
     @staticmethod
@@ -1147,7 +1166,6 @@ class EmeraldOpeningMode(BotMode):
             _birch_gender_diagnostic_target = self._resolved_player_gender
             diagnostics = get_opening_diagnostics(self.phase, observed)
             self._report_diagnostics(diagnostics)
-            self._report_birch_gender_diagnostics()
             self._report_dialogue_detection(observed)
             self._report_route101_lifecycle(observed)
             self._report_route101_runtime(observed)
@@ -2535,36 +2553,6 @@ class EmeraldOpeningMode(BotMode):
             f"active_tasks={None if state is None else state[9]}[/]"
         )
 
-    def _report_birch_gender_diagnostics(self) -> None:
-        """Emit a deduplicated, input-free trace of Birch's gender UI."""
-        if not context.debug or not getattr(context, "debug_trace", False):
-            return
-        snapshot = _birch_gender_task_snapshot()
-        if snapshot is None:
-            if self._last_birch_gender_diagnostics is not None:
-                diagnostic_print(
-                    "[dim]Birch gender UI: disappeared; lifecycle boundary reached[/]",
-                    trace=True,
-                )
-            self._last_birch_gender_diagnostics = None
-            return
-        key = (self._resolved_player_gender, snapshot)
-        if key == self._last_birch_gender_diagnostics:
-            return
-        self._last_birch_gender_diagnostics = key
-        if snapshot == ("unavailable",):
-            diagnostic_print("[dim]Birch gender UI: state temporarily unavailable[/]", trace=True)
-            return
-        present, task_data, location, state, callback, player_gender, active_tasks, script, sprites, objects = snapshot
-        diagnostic_print(
-            "[dim]Birch gender UI: "
-            f"target_gender={self._resolved_player_gender} present={present} "
-            f"player_gender={player_gender} "
-            f"tasks={task_data} location={location} game_state={state} callback={callback} "
-            f"active_tasks={active_tasks} script_native={script} sprites={sprites} objects={objects}[/]",
-            trace=True,
-        )
-
     def _set_clock(self) -> Generator:
         """Drive Emerald's existing clock tasks toward the resolved target."""
         if self._clock_target is None:
@@ -2606,10 +2594,7 @@ class EmeraldOpeningMode(BotMode):
                         self._clock_a_sent = True
                         self._last_truck_decision = f"clock input: A (confirm {target_hour:02d}:{target_minute:02d})"
                 else:
-                    current = hours * 60 + minutes
-                    target = target_hour * 60 + target_minute
-                    forward = (target - current) % ((_CLOCK_HOUR_MAX + 1) * 60)
-                    button = "Right" if forward <= 12 * 60 else "Left"
+                    button = _clock_input_direction(hours, minutes, target_hour, target_minute)
                     context.emulator.press_button(button)
                     self._clock_a_sent = False
                     self._last_truck_decision = (
