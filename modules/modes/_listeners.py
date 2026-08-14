@@ -2,6 +2,7 @@ from types import GeneratorType
 from typing import Iterable
 
 from modules.context import context
+from modules.console import diagnostic_print
 from modules.debug import debug
 from modules.encounter import handle_encounter, EncounterInfo, log_encounter
 from modules.map import get_map_objects, get_map_data_for_current_position
@@ -94,6 +95,38 @@ class BattleListener(BotListener):
         self._was_starting_to_become_visible = False
         self._reported_end_of_battle = False
         self._current_action: BattleAction | None = None
+        self._post_battle_wait_frames = 0
+
+    @staticmethod
+    def _controller_boundary_snapshot() -> str:
+        try:
+            avatar = get_player_avatar()
+            location = (avatar.map_group_and_number, avatar.local_coordinates)
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            location = None
+        try:
+            script = get_global_script_context()
+            script_stack = script.stack if script is not None and script.is_active else []
+            native_callback = script.native_function_name if script is not None else None
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            script_stack = None
+            native_callback = None
+        try:
+            active_tasks = [task.symbol for task in (get_tasks() or [])]
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            active_tasks = None
+        try:
+            printer = get_text_printer()
+            printer_state = (printer.active, getattr(printer.state, "name", printer.state))
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            printer_state = None
+        return (
+            f"location={location!r} game_state={get_game_state()!r} "
+            f"script_stack={script_stack!r} active_tasks={active_tasks!r} "
+            f"native_callback={native_callback!r} printer={printer_state!r} "
+            f"controllers={[controller.__qualname__ for controller in context.controller_stack]!r} "
+            f"mode={context.bot_mode!r}"
+        )
 
     def handle_frame(self, bot_mode: BotMode, frame: FrameInfo):
         if (not self._in_battle or self._reported_end_of_battle) and (
@@ -106,6 +139,7 @@ class BattleListener(BotListener):
             self._was_starting_to_become_visible = False
             self._reported_end_of_battle = False
             self._current_action = None
+            self._post_battle_wait_frames = 0
 
         elif self._in_battle and not self._reported_start_of_battle and get_game_state() == GameState.BATTLE:
             self._reported_start_of_battle = True
@@ -128,6 +162,17 @@ class BattleListener(BotListener):
                 action = BattleAction.CustomAction
             elif action is None:
                 action = handle_encounter(self._active_wild_encounter)
+
+            diagnostic_print(
+                lambda: (
+                    "BATTLE_HANDOFF: "
+                    f"mode={context.bot_mode} game_state={get_game_state().name} "
+                    f"main_callback={get_main_battle_callback()} "
+                    f"battle_type={get_battle_state().type} "
+                    f"action={getattr(action, 'name', action)} active_tasks={frame.active_tasks}"
+                ),
+                trace=True,
+            )
 
             if context.bot_mode == "Manual":
                 _ensure_plugin_hook_will_run(plugin_battle_started(self._active_wild_encounter))
@@ -170,6 +215,10 @@ class BattleListener(BotListener):
                 and player_avatar_is_standing_still()
             ):
                 self._in_battle = False
+                diagnostic_print(
+                    lambda: "BATTLE_CONTROLLER_FINISHED: " + self._controller_boundary_snapshot(),
+                    trace=True,
+                )
                 if outcome == BattleOutcome.NoSafariBallsLeft:
                     context.controller_stack.append(
                         SafariZoneListener.handle_safari_zone_timeout_global(bot_mode, "Safari balls")
@@ -212,9 +261,24 @@ class BattleListener(BotListener):
     @debug.track
     def _wait_until_battle_is_over(self):
         while self._in_battle:
+            self._post_battle_wait_frames += 1
+            if self._post_battle_wait_frames == 1 or self._post_battle_wait_frames % 30 == 0:
+                diagnostic_print(
+                    lambda: (
+                        "BATTLE_CONTROLLER_WAIT: "
+                        f"frame={self._post_battle_wait_frames} input='B' "
+                        + self._controller_boundary_snapshot()
+                    ),
+                    trace=True,
+                )
             if get_game_state() != GameState.OVERWORLD or get_map_data_for_current_position().map_type != "Underwater":
                 context.emulator.press_button("B")
             yield
+
+        diagnostic_print(
+            lambda: "BATTLE_CONTROLLER_RETURN: " + self._controller_boundary_snapshot(),
+            trace=True,
+        )
 
     @isolate_inputs
     @debug.track

@@ -137,4 +137,6 @@ class TestStartGameNameResolution(unittest.TestCase):
         self.assertEqual(config.start_game.player_name, "random")
         self.assertEqual(config.start_game.player_gender, "random")
         self.assertEqual(config.start_game.clock_time_mode.value, "system_time")
+        self.assertIsNone(config.start_game.starter)
         self.assertEqual(StartGame(player_name="ASH").player_name, "ASH")
+        self.assertEqual(StartGame(starter="Torchic").starter, "Torchic")

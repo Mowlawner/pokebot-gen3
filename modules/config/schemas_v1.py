@@ -95,6 +95,7 @@ class StartGame(BaseConfig):
     # character-string generator for deliberate novelty runs.
     player_name: str = "random"
     clock_time_mode: WallClockTimeMode = WallClockTimeMode.SYSTEM_TIME
+    starter: Literal["Treecko", "Torchic", "Mudkip", "Random"] | None = None
 
 
 class Cheats(BaseConfig):

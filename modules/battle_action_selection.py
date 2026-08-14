@@ -10,6 +10,7 @@ from modules.battle_state import (
 )
 from modules.battle_strategies import BattleStrategy, TurnAction, SafariTurnAction
 from modules.context import context
+from modules.console import diagnostic_print
 from modules.debug import debug
 from modules.items import Item, ItemBattleUse, get_pokeblocks
 from modules.memory import (
@@ -78,6 +79,15 @@ def handle_battle_action_selection(strategy: BattleStrategy) -> Generator:
         if previous_battler_index != battler_index:
             battle_state = get_battle_state()
             previous_battler_index = battler_index
+
+        diagnostic_print(
+            lambda: (
+                "BATTLE_ACTION: "
+                f"menu_ready={get_battle_controller_callback(battler_index)} "
+                f"selected={getattr(action, 'name', action)} move_index={index}"
+            ),
+            trace=True,
+        )
 
         match action:
             case TurnAction.UseMove | TurnAction.UseMoveAgainstRightSideOpponent | TurnAction.UseMoveAgainstPartner:
@@ -284,6 +294,13 @@ def battle_action_use_move(
     ):
         context.emulator.press_button("A")
         yield
+    diagnostic_print(
+        lambda: (
+            "BATTLE_ACTION_ACCEPTED: "
+            f"move_index={move_index} callback={get_battle_controller_callback(battler_index)}"
+        ),
+        trace=True,
+    )
     if action is TurnAction.UseMove:
         target_index = 1
         if battle_state.opponent.left_battler is None:

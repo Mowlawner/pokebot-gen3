@@ -1241,7 +1241,9 @@ class EmeraldOpeningMode(BotMode):
                 dialogue_action=False,
                 dispatch=self.phase.name,
             )
-            yield from self._advance_phase(observed, diagnostics)
+            phase_completed = yield from self._advance_phase(observed, diagnostics)
+            if phase_completed:
+                return
 
     @staticmethod
     def _message_speed_observation() -> tuple[int | None, int | None, int | None, str | None]:
@@ -2375,18 +2377,17 @@ class EmeraldOpeningMode(BotMode):
             yield from ensure_facing_direction(starter_bag)
             global _starter_handoff_pending
             _starter_handoff_pending = True
-            self.phase = OpeningSequenceState.STARTER_SELECTION
             self._report_phase_dispatch(
                 observed,
                 phase_before=OpeningSequenceState.ROUTE_101,
-                resulting_phase=self.phase,
+                resulting_phase=OpeningSequenceState.ROUTE_101,
                 dialogue_action=False,
                 dispatch="handoff",
                 navigation_target=starter_target,
-                decision="handoff: positioned and facing starter bag",
+                decision="handoff: positioned and facing starter bag; opening complete",
             )
             context.bot_mode = "Starters"
-            return
+            return True
 
         yield from _advance_scripted_input()
 

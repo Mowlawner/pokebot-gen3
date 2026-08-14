@@ -1214,7 +1214,10 @@ class TestEmeraldOpeningState(unittest.TestCase):
             ),
             patch("modules.modes.opening.context", opening_context),
         ):
-            list(mode._advance_phase(OpeningSequenceState.ROUTE_101))
+            handoff = mode._advance_phase(OpeningSequenceState.ROUTE_101)
+            with self.assertRaises(StopIteration) as stopped:
+                next(handoff)
+            self.assertTrue(stopped.exception.value)
 
         navigate.assert_called_once_with(
             MapRSE.ROUTE101,
@@ -1224,9 +1227,47 @@ class TestEmeraldOpeningState(unittest.TestCase):
             expecting_script=True,
         )
         face.assert_called_once_with((7, 14))
-        self.assertIs(mode.phase, OpeningSequenceState.STARTER_SELECTION)
+        self.assertIs(mode.phase, OpeningSequenceState.ROUTE_101)
         self.assertEqual(opening_context.bot_mode, "Starters")
         self.assertTrue(consume_starter_handoff())
+
+    def test_route101_handoff_completes_opening_mode_generator(self):
+        from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.ROUTE_101
+        opening_context = types.SimpleNamespace(
+            bot_mode="Start New Game",
+            emulator=unittest.mock.Mock(),
+            debug=False,
+            rom=types.SimpleNamespace(is_emerald=True),
+        )
+        with (
+            patch.object(mode, "_report_diagnostics"),
+            patch.object(mode, "_report_dialogue_detection"),
+            patch.object(mode, "_report_route101_lifecycle"),
+            patch.object(mode, "_report_route101_runtime"),
+            patch.object(mode, "_report_phase_dispatch"),
+            patch.object(mode, "_advance_startup_dialogue", return_value=iter(())),
+            patch.object(mode, "_can_navigate", return_value=True),
+            patch("modules.modes.opening.get_opening_sequence_state", return_value=OpeningSequenceState.ROUTE_101),
+            patch("modules.modes.opening._route101_ready_for_navigation", return_value=True),
+            patch("modules.modes.opening._starter_bag_interaction", return_value=((7, 15), (7, 14))),
+            patch("modules.modes.opening.navigate_to", return_value=iter(())),
+            patch("modules.modes.opening.ensure_facing_direction", return_value=iter(())),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch(
+                "modules.modes.opening.get_player_avatar",
+                return_value=types.SimpleNamespace(local_coordinates=(7, 15)),
+            ),
+            patch("modules.modes.opening.context", opening_context),
+        ):
+            with self.assertRaises(StopIteration):
+                next(mode.run())
+
+        self.assertEqual(opening_context.bot_mode, "Starters")
+        opening_context.emulator.press_button.assert_not_called()
 
     def test_route101_waits_for_printing_arrival_script_before_navigation(self):
         from modules.memory import GameState

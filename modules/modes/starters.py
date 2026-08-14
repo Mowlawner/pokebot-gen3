@@ -28,7 +28,30 @@ from .util import (
 from ..battle_state import get_main_battle_callback, EncounterType
 
 
-def _report_starters_state(phase: str, decision: str) -> None:
+HOENN_STARTERS = ("Treecko", "Torchic", "Mudkip")
+
+
+def _configured_hoenn_starter() -> str | None:
+    start_game = getattr(getattr(context, "config", None), "start_game", None)
+    configured = getattr(start_game, "starter", None)
+    if configured in (*HOENN_STARTERS, "Random"):
+        return configured
+    return None
+
+
+def _resolve_hoenn_starter(starter_choice: str) -> str:
+    if starter_choice == "Random":
+        return random.choice(HOENN_STARTERS)
+    return starter_choice
+
+
+def _report_starters_state(
+    phase: str,
+    decision: str,
+    *,
+    starter_selection_mode: str = "interactive_prompt",
+    starter_selection_value: object = "not selected",
+) -> None:
     """Report only the state needed to diagnose entry into starter selection."""
     try:
         avatar = get_player_avatar()
@@ -75,7 +98,9 @@ def _report_starters_state(phase: str, decision: str) -> None:
         f"location={location!r} facing={facing!r} "
         f"game_state={game_state!r} game_state_symbol={game_state_symbol!r} "
         f"controllable={controllable!r} script_active={script_active!r} "
-        f"script_stack={script_stack!r} active_tasks={active_tasks!r}[/]",
+        f"script_stack={script_stack!r} active_tasks={active_tasks!r} "
+        f"starter_selection_mode={starter_selection_mode!r} "
+        f"starter_selection_value={starter_selection_value!r}[/]",
         trace=True,
     )
 
@@ -139,24 +164,44 @@ def run_rse_hoenn(
     get_active_encounter: Callable[[], EncounterInfo],
     reset_before_selection: bool = True,
 ) -> Generator:
-    _report_starters_state("RSE_HOENN_ENTRY", "await starter choice")
-    # Set up: Ask for starter choice because we cannot deduce that from the player location.
-    starter_choice = ask_for_choice(
-        [
-            Selection("Treecko", get_sprites_path() / "pokemon" / "normal" / "Treecko.png"),
-            Selection("Torchic", get_sprites_path() / "pokemon" / "normal" / "Torchic.png"),
-            Selection("Mudkip", get_sprites_path() / "pokemon" / "normal" / "Mudkip.png"),
-            Selection("Random", get_sprites_path() / "pokemon" / "normal" / "Unown (qm).png"),
-        ],
-        window_title="Select a starter...",
+    configured_starter = _configured_hoenn_starter()
+    configured_selection = configured_starter is not None
+    starter_selection_mode = "configured" if configured_selection else "interactive_prompt"
+    _report_starters_state(
+        "RSE_HOENN_CHOICE_BOUNDARY",
+        "resolve configured starter" if configured_selection else "BEFORE ask_for_choice: call about to begin",
+        starter_selection_mode=starter_selection_mode,
+        starter_selection_value=configured_starter if configured_selection else "not selected",
+    )
+    if configured_selection:
+        starter_choice = configured_starter
+    else:
+        # Set up: Ask for starter choice because we cannot deduce that from the player location.
+        starter_choice = ask_for_choice(
+            [
+                Selection("Treecko", get_sprites_path() / "pokemon" / "normal" / "Treecko.png"),
+                Selection("Torchic", get_sprites_path() / "pokemon" / "normal" / "Torchic.png"),
+                Selection("Mudkip", get_sprites_path() / "pokemon" / "normal" / "Mudkip.png"),
+                Selection("Random", get_sprites_path() / "pokemon" / "normal" / "Unown (qm).png"),
+            ],
+            window_title="Select a starter...",
+        )
+    _report_starters_state(
+        "RSE_HOENN_CHOICE_BOUNDARY",
+        "AFTER ask_for_choice: call returned",
+        starter_selection_value=starter_choice,
     )
     if starter_choice is None:
-        _report_starters_state("RSE_HOENN_ENTRY", "starter choice cancelled; return")
+        _report_starters_state(
+            "RSE_HOENN_ENTRY",
+            "starter choice cancelled; return",
+            starter_selection_value=starter_choice,
+        )
         return
     _report_starters_state("RSE_HOENN_ENTRY", f"starter choice={starter_choice!r}")
 
     while context.bot_mode != "Manual":
-        if reset_before_selection:
+        if reset_before_selection and not configured_selection:
             yield from soft_reset(mash_random_keys=True)
 
         # Starter bag can be accessed from the right or from the bottom, make sure we are looking
@@ -180,9 +225,7 @@ def run_rse_hoenn(
             yield from wait_until_task_is_active("Task_HandleStarterChooseInput", "A")
         _report_starters_state("RSE_HOENN_BAG_INTERACTION", "starter task became active; choose configured starter")
 
-        starter = starter_choice
-        if starter == "Random":
-            starter = random.choice(["Treecko", "Torchic", "Mudkip"])
+        starter = _resolve_hoenn_starter(starter_choice)
 
         # Select the correct starter
         if starter == "Treecko":
@@ -194,7 +237,8 @@ def run_rse_hoenn(
             context.emulator.press_button("Right")
             yield
 
-        yield from wait_for_unique_rng_value()
+        if not configured_selection:
+            yield from wait_for_unique_rng_value()
 
         # Wait until the starter Pokémon has been sent out into battle before resetting.
         # The Pokémon is already generated as soon as the battle starts, but to make it
@@ -211,11 +255,31 @@ def run_rse_hoenn(
             context.emulator.press_button("A")
             yield
 
+        _report_starters_state(
+            "RSE_HOENN_BATTLE_READY",
+            "starter received and opening battle is visible",
+            starter_selection_mode=starter_selection_mode,
+            starter_selection_value=starter,
+        )
+
         handle_encounter(
             get_active_encounter(),
             do_not_log_battle_action=True,
             disable_auto_catch=True,
         )
+
+        # The opening handoff is a one-shot sequence.  The normal saved-game
+        # mode keeps looping here so it can reset and hunt for a shiny starter,
+        # but the opening controller must return as soon as the starter has
+        # been received and the first battle has begun.
+        if not reset_before_selection:
+            _report_starters_state(
+                "RSE_HOENN_COMPLETE",
+                "opening battle begun; return control to the normal bot controller",
+                starter_selection_mode=starter_selection_mode,
+                starter_selection_value=starter,
+            )
+            return
 
 
 def run_rse_johto(get_active_encounter: Callable[[], EncounterInfo]):
@@ -295,18 +359,26 @@ class StartersMode(BotMode):
     def __init__(self):
         super().__init__()
         self._active_encounter: EncounterInfo | None = None
+        self._opening_handoff_active = False
 
     def on_battle_started(self, encounter: EncounterInfo | None) -> BattleAction | None:
         self._active_encounter = encounter
+        if self._opening_handoff_active:
+            _report_starters_state(
+                "RSE_HOENN_BATTLE_HANDOFF",
+                "opening battle detected; delegate to the normal battle controller",
+            )
+            return BattleAction.Fight
         return BattleAction.CustomAction
 
     def run(self) -> Generator:
-        _report_starters_state("MODE_ENTRY", "StartersMode.run advanced")
+        _report_starters_state("MODE_ENTRY", "STARTERS MODE RUN ENTERED")
         # A fresh-game opening controller hands off at the starter bag. This
         # path intentionally does not require a save state.
         from .opening import consume_starter_handoff
 
         if consume_starter_handoff():
+            self._opening_handoff_active = True
             _report_starters_state("MODE_ENTRY", "handoff consumed; enter RSE Hoenn starter generator")
             yield from run_rse_hoenn(
                 lambda: self._active_encounter,
@@ -318,6 +390,10 @@ class StartersMode(BotMode):
             # the main loop would construct another StartersMode and restart
             # the sequence.
             if context.bot_mode == "Starters":
+                _report_starters_state(
+                    "RSE_HOENN_CONTROLLER_RETURN",
+                    "starter generator returned; handing control to manual mode",
+                )
                 context.set_manual_mode()
             return
 

@@ -3,7 +3,7 @@ import sys
 from collections import deque
 from typing import Generator
 
-from modules.console import console
+from modules.console import console, diagnostic_print
 from modules.context import context
 from modules.memory import get_game_state
 from modules.modes import (
@@ -77,6 +77,7 @@ def main_loop() -> None:
         context.bot_listeners = get_bot_listeners(context.rom)
         context.nuzlocke_runtime = NuzlockeRuntime(event_sink=nuzlocke_event_store)
         previous_frame_info: FrameInfo | None = None
+        last_controller_boundary: tuple | None = None
 
         while True:
             # Process work queue, which can be used to get the main thread to access the emulator
@@ -106,6 +107,26 @@ def main_loop() -> None:
                 previous_frame=previous_frame_info,
             )
 
+            controller_boundary = (
+                context.bot_mode,
+                type(context.bot_mode_instance).__name__ if context.bot_mode_instance is not None else None,
+                tuple(frame_info.controller_stack),
+            )
+            if controller_boundary != last_controller_boundary:
+                diagnostic_print(
+                    lambda: (
+                        "CONTROLLER_BOUNDARY: "
+                        f"mode={context.bot_mode!r} "
+                        f"mode_instance={type(context.bot_mode_instance).__name__ if context.bot_mode_instance is not None else None!r} "
+                        f"stack={frame_info.controller_stack!r} "
+                        f"game_state={frame_info.game_state!r} "
+                        f"active_tasks={frame_info.active_tasks!r} "
+                        f"script_stack={frame_info.script_stack!r}"
+                    ),
+                    trace=True,
+                )
+                last_controller_boundary = controller_boundary
+
             # Reset all bot listeners if the emulator has been reset.
             if previous_frame_info is not None and previous_frame_info.frame_count > frame_info.frame_count:
                 state_cache.reset()
@@ -117,13 +138,28 @@ def main_loop() -> None:
             # bot modes, listeners, GUI rendering, and HTTP consumers.
             context.nuzlocke_runtime.update()
 
+            new_starters_mode_created = False
             if context.bot_mode == "Manual":
                 if not isinstance(context.bot_mode_instance, ManualBotMode):
                     context.emulator.reset_held_buttons()
                 context.bot_mode_instance = ManualBotMode()
             elif len(context.controller_stack) == 0:
+                is_new_starters_mode = context.bot_mode == "Starters"
+                if is_new_starters_mode:
+                    diagnostic_print(
+                        "[bold yellow]CONTROLLER STARTERS HANDOFF: " "OpeningMode returned; creating StartersMode[/]",
+                        trace=True,
+                    )
                 context.bot_mode_instance = get_bot_mode_by_name(context.bot_mode)()
                 context.controller_stack.append(context.bot_mode_instance.run())
+                new_starters_mode_created = is_new_starters_mode
+                if is_new_starters_mode:
+                    diagnostic_print(
+                        "[bold yellow]CONTROLLER STARTERS HANDOFF: "
+                        f"StartersMode created instance={context.bot_mode_instance!r}; "
+                        "iterator appended[/]",
+                        trace=True,
+                    )
 
             try:
                 for listener in context.bot_listeners.copy():
@@ -131,7 +167,20 @@ def main_loop() -> None:
                 if context.bot_mode == "Manual":
                     context.controller_stack = []
                 if len(context.controller_stack) > 0:
-                    next(context.controller_stack[-1])
+                    if new_starters_mode_created:
+                        diagnostic_print(
+                            "[bold yellow]CONTROLLER STARTERS HANDOFF: " "advancing newly-created StartersMode[/]",
+                            trace=True,
+                        )
+                    try:
+                        next(context.controller_stack[-1])
+                    finally:
+                        if new_starters_mode_created:
+                            diagnostic_print(
+                                "[bold yellow]CONTROLLER STARTERS HANDOFF: "
+                                "newly-created StartersMode advance returned or raised[/]",
+                                trace=True,
+                            )
             except (StopIteration, GeneratorExit):
                 context.controller_stack.pop()
             except BotModeError as e:
