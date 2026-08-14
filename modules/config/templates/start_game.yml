@@ -1,3 +1,4 @@
 player_gender: random
 player_name: random
 clock_time_mode: system_time
+starter: null # `Treecko`, `Torchic`, `Mudkip`, or `Random`

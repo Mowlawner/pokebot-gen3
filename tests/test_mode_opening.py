@@ -63,6 +63,49 @@ class TestEmeraldOpeningState(unittest.TestCase):
                 ):
                     self.assertIs(get_opening_sequence_state(), expected)
 
+    def test_birch_lab_with_a_party_is_the_post_starter_completion_state(self):
+        from modules.map_data import MapRSE
+        from modules.memory import GameState
+        from modules.modes.opening import OpeningSequenceState, get_opening_sequence_state
+
+        with (
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch(
+                "modules.modes.opening.get_map_data_for_current_position",
+                return_value=types.SimpleNamespace(
+                    map_group_and_number=MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value,
+                ),
+            ),
+            patch("modules.modes.opening.get_party_size", return_value=1),
+        ):
+            self.assertIs(get_opening_sequence_state(), OpeningSequenceState.COMPLETE)
+
+    def test_completed_opening_returns_without_input_or_navigation(self):
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        emulator = types.SimpleNamespace(press_button=unittest.mock.Mock())
+        opening_context = types.SimpleNamespace(
+            bot_mode="Start New Game",
+            emulator=emulator,
+            rom=types.SimpleNamespace(is_emerald=True),
+            debug=False,
+            config=types.SimpleNamespace(
+                start_game=types.SimpleNamespace(player_name="gibberish", player_gender="random")
+            ),
+        )
+        with (
+            patch("modules.modes.opening.context", opening_context),
+            patch(
+                "modules.modes.opening.get_opening_sequence_state",
+                return_value=OpeningSequenceState.COMPLETE,
+            ),
+        ):
+            with self.assertRaises(StopIteration):
+                next(EmeraldOpeningMode().run())
+
+        self.assertEqual(opening_context.bot_mode, "Start New Game")
+        emulator.press_button.assert_not_called()
+
     def test_clock_task_is_explicitly_detected(self):
         from modules.memory import GameState
         from modules.modes.opening import OpeningSequenceState, get_opening_sequence_state
@@ -679,8 +722,11 @@ class TestEmeraldOpeningState(unittest.TestCase):
     def test_clock_handle_input_is_advanced_once_per_task_phase(self):
         from modules.modes.opening import EmeraldOpeningMode
 
-        mode = EmeraldOpeningMode()
+        mode = object.__new__(EmeraldOpeningMode)
         mode._clock_target = (10, 0)
+        mode._last_clock_task = None
+        mode._clock_a_sent = False
+        mode._clock_confirm_yes_prepared = False
         emulator = unittest.mock.Mock()
         with (
             patch(
@@ -712,8 +758,11 @@ class TestEmeraldOpeningState(unittest.TestCase):
     def test_clock_selection_uses_directional_input_until_target_time(self):
         from modules.modes.opening import EmeraldOpeningMode
 
-        mode = EmeraldOpeningMode()
+        mode = object.__new__(EmeraldOpeningMode)
         mode._clock_target = (10, 0)
+        mode._last_clock_task = None
+        mode._clock_a_sent = False
+        mode._clock_confirm_yes_prepared = False
         emulator = unittest.mock.Mock()
         task = types.SimpleNamespace(
             data_value=lambda index: {0: 0, 2: 9, 3: 59}[index],
@@ -725,7 +774,33 @@ class TestEmeraldOpeningState(unittest.TestCase):
         ):
             list(mode._set_clock())
 
-        emulator.press_button.assert_called_once_with("Right")
+        emulator.hold_button.assert_called_once_with("Right")
+        emulator.press_button.assert_not_called()
+
+    def test_clock_direction_remains_held_across_input_frames(self):
+        from modules.modes.opening import EmeraldOpeningMode
+
+        mode = object.__new__(EmeraldOpeningMode)
+        mode._clock_target = (10, 0)
+        mode._last_clock_task = None
+        mode._clock_a_sent = False
+        mode._clock_confirm_yes_prepared = False
+        emulator = unittest.mock.Mock()
+        state = {0: 0, 2: 9, 3: 59}
+        task = types.SimpleNamespace(data_value=state.__getitem__)
+        with (
+            patch("modules.modes.opening._active_clock_task", return_value="Task_SetClock_HandleInput"),
+            patch("modules.modes.opening.get_task", return_value=task),
+            patch.object(__import__("modules.modes.opening", fromlist=["context"]).context, "emulator", emulator),
+        ):
+            list(mode._set_clock())
+            list(mode._set_clock())
+            state[2], state[3] = mode._clock_target
+            list(mode._set_clock())
+
+        emulator.hold_button.assert_called_once_with("Right")
+        emulator.release_button.assert_called_once_with("Right")
+        emulator.press_button.assert_called_once_with("A")
 
     def test_clock_confirmed_and_exit_tasks_require_no_additional_input(self):
         from modules.modes.opening import EmeraldOpeningMode
@@ -890,7 +965,8 @@ class TestEmeraldOpeningState(unittest.TestCase):
             list(mode._set_clock())
 
         self.assertEqual(mode._clock_target, (16, 32))
-        emulator.press_button.assert_called_once_with("A")
+        emulator.hold_button.assert_called_once_with("Left")
+        emulator.press_button.assert_not_called()
 
     def test_random_target_reaches_clock_controller(self):
         from modules.config.schemas_v1 import WallClockTimeMode
@@ -946,7 +1022,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
                     ),
                 ):
                     list(mode._set_clock())
-                    self.assertEqual(emulator.press_button.call_args.args, (first_button,))
+                    self.assertEqual(emulator.hold_button.call_args.args, (first_button,))
 
                     state[2], state[3] = target
                     list(mode._set_clock())
@@ -1190,7 +1266,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         ):
             self.assertEqual(_starter_bag_interaction(), ((7, 15), (7, 14)))
 
-    def test_route101_handoff_navigates_below_bag_saves_and_hands_off(self):
+    def test_route101_handoff_navigates_below_bag_and_hands_off(self):
         from modules.map_data import MapRSE
         from modules.memory import GameState
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState, consume_starter_handoff
@@ -1205,7 +1281,6 @@ class TestEmeraldOpeningState(unittest.TestCase):
             patch("modules.modes.opening._starter_bag_interaction", return_value=((7, 15), (7, 14))),
             patch("modules.modes.opening.navigate_to", return_value=iter(())) as navigate,
             patch("modules.modes.opening.ensure_facing_direction", return_value=iter(())) as face,
-            patch("modules.modes.opening.save_the_game", return_value=iter(())) as save,
             patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
             patch(
                 "modules.modes.opening.get_player_avatar",
@@ -1215,7 +1290,10 @@ class TestEmeraldOpeningState(unittest.TestCase):
             ),
             patch("modules.modes.opening.context", opening_context),
         ):
-            list(mode._advance_phase(OpeningSequenceState.ROUTE_101))
+            handoff = mode._advance_phase(OpeningSequenceState.ROUTE_101)
+            with self.assertRaises(StopIteration) as stopped:
+                next(handoff)
+            self.assertTrue(stopped.exception.value)
 
         navigate.assert_called_once_with(
             MapRSE.ROUTE101,
@@ -1225,10 +1303,47 @@ class TestEmeraldOpeningState(unittest.TestCase):
             expecting_script=True,
         )
         face.assert_called_once_with((7, 14))
-        save.assert_called_once_with()
-        self.assertIs(mode.phase, OpeningSequenceState.STARTER_SELECTION)
+        self.assertIs(mode.phase, OpeningSequenceState.ROUTE_101)
         self.assertEqual(opening_context.bot_mode, "Starters")
         self.assertTrue(consume_starter_handoff())
+
+    def test_route101_handoff_completes_opening_mode_generator(self):
+        from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.ROUTE_101
+        opening_context = types.SimpleNamespace(
+            bot_mode="Start New Game",
+            emulator=unittest.mock.Mock(),
+            debug=False,
+            rom=types.SimpleNamespace(is_emerald=True),
+        )
+        with (
+            patch.object(mode, "_report_diagnostics"),
+            patch.object(mode, "_report_dialogue_detection"),
+            patch.object(mode, "_report_route101_lifecycle"),
+            patch.object(mode, "_report_route101_runtime"),
+            patch.object(mode, "_report_phase_dispatch"),
+            patch.object(mode, "_advance_startup_dialogue", return_value=iter(())),
+            patch.object(mode, "_can_navigate", return_value=True),
+            patch("modules.modes.opening.get_opening_sequence_state", return_value=OpeningSequenceState.ROUTE_101),
+            patch("modules.modes.opening._route101_ready_for_navigation", return_value=True),
+            patch("modules.modes.opening._starter_bag_interaction", return_value=((7, 15), (7, 14))),
+            patch("modules.modes.opening.navigate_to", return_value=iter(())),
+            patch("modules.modes.opening.ensure_facing_direction", return_value=iter(())),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch(
+                "modules.modes.opening.get_player_avatar",
+                return_value=types.SimpleNamespace(local_coordinates=(7, 15)),
+            ),
+            patch("modules.modes.opening.context", opening_context),
+        ):
+            with self.assertRaises(StopIteration):
+                next(mode.run())
+
+        self.assertEqual(opening_context.bot_mode, "Starters")
+        opening_context.emulator.press_button.assert_not_called()
 
     def test_route101_waits_for_printing_arrival_script_before_navigation(self):
         from modules.memory import GameState
@@ -1398,7 +1513,6 @@ class TestEmeraldOpeningState(unittest.TestCase):
             patch("modules.modes.opening._starter_bag_interaction", return_value=((7, 15), (7, 14))),
             patch("modules.modes.opening.navigate_to", return_value=iter(())),
             patch("modules.modes.opening.ensure_facing_direction") as face,
-            patch("modules.modes.opening.save_the_game") as save,
             patch(
                 "modules.modes.opening.get_player_avatar",
                 return_value=types.SimpleNamespace(
@@ -1410,7 +1524,6 @@ class TestEmeraldOpeningState(unittest.TestCase):
             list(mode._advance_phase(OpeningSequenceState.ROUTE_101))
 
         face.assert_not_called()
-        save.assert_not_called()
 
     def test_choose_starter_callback_on_route_101_is_explicit_handoff(self):
         from modules.memory import GameState

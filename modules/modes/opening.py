@@ -23,7 +23,6 @@ from modules.memory import (
     unpack_uint16,
     unpack_uint32,
 )
-from modules.modes.util.higher_level_actions import save_the_game
 from modules.modes.util.tasks_scripts import wait_for_fade_to_finish
 from modules.modes.util.walking import ensure_facing_direction, navigate_to
 from modules.player import (
@@ -34,6 +33,7 @@ from modules.player import (
     player_avatar_is_controllable,
     player_avatar_is_standing_still,
 )
+from modules.pokemon_party import get_party_size
 from modules.text_printer import get_text_printer
 from modules.config.schemas_v1 import WallClockTimeMode
 from modules.start_game import RandomSource, resolve_start_game_initialization
@@ -102,6 +102,7 @@ class OpeningSequenceState(Enum):
     SCRIPTED_INTRO = auto()
     UNKNOWN = auto()
     OPTIONS_MENU = auto()
+    COMPLETE = auto()
 
 
 @dataclass(frozen=True)
@@ -471,7 +472,23 @@ def get_opening_sequence_state(player_gender: object | None = None) -> OpeningSe
         return OpeningSequenceState.BIRCH_HOUSE_2F
     if map_id == MapRSE.ROUTE101.value:
         return OpeningSequenceState.ROUTE_101
+    if _opening_complete():
+        return OpeningSequenceState.COMPLETE
     return OpeningSequenceState.SCRIPTED_INTRO
+
+
+def _opening_complete() -> bool:
+    """Whether the starter opening has returned to Birch's lab.
+
+    The starter is written to the party before the opening battle, and the
+    battle's post-battle warp returns the player to this ROM-defined map. The
+    combination avoids treating an arbitrary coordinate in the lab as the
+    completion marker.
+    """
+    try:
+        return _current_map_id() == MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value and get_party_size() > 0
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        return False
 
 
 def _truck_has_left() -> bool:
@@ -1081,6 +1098,7 @@ class EmeraldOpeningMode(BotMode):
         self._pending_house_warp_destination: MapRSE | None = None
         self._clock_interaction_started = False
         self._clock_target: tuple[int, int] | None = None
+        self._clock_held_direction: str | None = None
         self._last_clock_task: str | None = None
         self._clock_a_sent = False
         self._clock_confirm_yes_prepared = False
@@ -1169,6 +1187,16 @@ class EmeraldOpeningMode(BotMode):
             self._report_dialogue_detection(observed)
             self._report_route101_lifecycle(observed)
             self._report_route101_runtime(observed)
+            if observed is OpeningSequenceState.COMPLETE:
+                self._report_phase_dispatch(
+                    observed,
+                    phase_before=self.phase,
+                    resulting_phase=observed,
+                    dialogue_action=False,
+                    dispatch="complete",
+                    decision="opening complete: starter received and returned to Birch's lab",
+                )
+                return
             if observed is OpeningSequenceState.STARTER_SELECTION:
                 global _starter_handoff_pending
                 _starter_handoff_pending = True
@@ -1242,7 +1270,9 @@ class EmeraldOpeningMode(BotMode):
                 dialogue_action=False,
                 dispatch=self.phase.name,
             )
-            yield from self._advance_phase(observed, diagnostics)
+            phase_completed = yield from self._advance_phase(observed, diagnostics)
+            if phase_completed:
+                return
 
     @staticmethod
     def _message_speed_observation() -> tuple[int | None, int | None, int | None, str | None]:
@@ -2374,21 +2404,19 @@ class EmeraldOpeningMode(BotMode):
                 yield
                 return
             yield from ensure_facing_direction(starter_bag)
-            yield from save_the_game()
             global _starter_handoff_pending
             _starter_handoff_pending = True
-            self.phase = OpeningSequenceState.STARTER_SELECTION
             self._report_phase_dispatch(
                 observed,
                 phase_before=OpeningSequenceState.ROUTE_101,
-                resulting_phase=self.phase,
+                resulting_phase=OpeningSequenceState.ROUTE_101,
                 dialogue_action=False,
                 dispatch="handoff",
                 navigation_target=starter_target,
-                decision="saved: hand off to Starters before opening bag",
+                decision="handoff: positioned and facing starter bag; opening complete",
             )
             context.bot_mode = "Starters"
-            return
+            return True
 
         yield from _advance_scripted_input()
 
@@ -2419,6 +2447,7 @@ class EmeraldOpeningMode(BotMode):
         self._clock_target = _emerald_clock_time(_clock_time_mode(), rng=self._rng)
         self._clock_interaction_started = True
         self._last_clock_task = None
+        self._clock_held_direction = None
         self._clock_a_sent = False
         self._clock_confirm_yes_prepared = False
         yield
@@ -2555,11 +2584,19 @@ class EmeraldOpeningMode(BotMode):
 
     def _set_clock(self) -> Generator:
         """Drive Emerald's existing clock tasks toward the resolved target."""
+
+        def release_clock_direction() -> None:
+            held_direction = getattr(self, "_clock_held_direction", None)
+            if held_direction is not None:
+                context.emulator.release_button(held_direction)
+                self._clock_held_direction = None
+
         if self._clock_target is None:
             self._clock_target = _emerald_clock_time(_clock_time_mode(), rng=self._rng)
         target_hour, target_minute = self._clock_target
         clock_task = _active_clock_task()
         if clock_task is None:
+            release_clock_direction()
             self._last_clock_task = None
             self._clock_a_sent = False
             self._last_truck_decision = "wait: clock task unavailable during transition"
@@ -2568,6 +2605,7 @@ class EmeraldOpeningMode(BotMode):
             return
 
         if clock_task != self._last_clock_task:
+            release_clock_direction()
             self._last_clock_task = clock_task
             self._clock_a_sent = False
             self._clock_confirm_yes_prepared = False
@@ -2583,6 +2621,7 @@ class EmeraldOpeningMode(BotMode):
                 if minute_hand_angle % 6:
                     self._last_truck_decision = "wait: clock hand animation"
                 elif (hours, minutes) == self._clock_target:
+                    release_clock_direction()
                     self._last_truck_decision = f"clock: confirm selected {target_hour:02d}:{target_minute:02d}"
                     if not self._clock_a_sent:
                         _report_opening_a_decision(
@@ -2595,15 +2634,20 @@ class EmeraldOpeningMode(BotMode):
                         self._last_truck_decision = f"clock input: A (confirm {target_hour:02d}:{target_minute:02d})"
                 else:
                     button = _clock_input_direction(hours, minutes, target_hour, target_minute)
-                    context.emulator.press_button(button)
+                    if getattr(self, "_clock_held_direction", None) != button:
+                        release_clock_direction()
+                        context.emulator.hold_button(button)
+                        self._clock_held_direction = button
                     self._clock_a_sent = False
                     self._last_truck_decision = (
                         f"clock input: {button} toward {target_hour:02d}:{target_minute:02d} "
                         f"(current={hours:02d}:{minutes:02d})"
                     )
         elif clock_task == _CLOCK_ASK_CONFIRM:
+            release_clock_direction()
             self._last_truck_decision = "clock: waiting for confirmation menu"
         elif clock_task == _CLOCK_HANDLE_CONFIRM_INPUT:
+            release_clock_direction()
             if not self._clock_confirm_yes_prepared:
                 # Emerald creates this menu with initialCursorPos=1 (NO).
                 # Move to YES before confirming; A on the initial cursor is
