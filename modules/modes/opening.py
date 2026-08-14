@@ -1101,6 +1101,7 @@ class EmeraldOpeningMode(BotMode):
         self._pending_house_warp_destination: MapRSE | None = None
         self._clock_interaction_started = False
         self._clock_target: tuple[int, int] | None = None
+        self._clock_held_direction: str | None = None
         self._last_clock_task: str | None = None
         self._clock_a_sent = False
         self._clock_confirm_yes_prepared = False
@@ -2449,6 +2450,7 @@ class EmeraldOpeningMode(BotMode):
         self._clock_target = _emerald_clock_time(_clock_time_mode(), rng=self._rng)
         self._clock_interaction_started = True
         self._last_clock_task = None
+        self._clock_held_direction = None
         self._clock_a_sent = False
         self._clock_confirm_yes_prepared = False
         yield
@@ -2585,11 +2587,18 @@ class EmeraldOpeningMode(BotMode):
 
     def _set_clock(self) -> Generator:
         """Drive Emerald's existing clock tasks toward the resolved target."""
+        def release_clock_direction() -> None:
+            held_direction = getattr(self, "_clock_held_direction", None)
+            if held_direction is not None:
+                context.emulator.release_button(held_direction)
+                self._clock_held_direction = None
+
         if self._clock_target is None:
             self._clock_target = _emerald_clock_time(_clock_time_mode(), rng=self._rng)
         target_hour, target_minute = self._clock_target
         clock_task = _active_clock_task()
         if clock_task is None:
+            release_clock_direction()
             self._last_clock_task = None
             self._clock_a_sent = False
             self._last_truck_decision = "wait: clock task unavailable during transition"
@@ -2598,6 +2607,7 @@ class EmeraldOpeningMode(BotMode):
             return
 
         if clock_task != self._last_clock_task:
+            release_clock_direction()
             self._last_clock_task = clock_task
             self._clock_a_sent = False
             self._clock_confirm_yes_prepared = False
@@ -2613,6 +2623,7 @@ class EmeraldOpeningMode(BotMode):
                 if minute_hand_angle % 6:
                     self._last_truck_decision = "wait: clock hand animation"
                 elif (hours, minutes) == self._clock_target:
+                    release_clock_direction()
                     self._last_truck_decision = f"clock: confirm selected {target_hour:02d}:{target_minute:02d}"
                     if not self._clock_a_sent:
                         _report_opening_a_decision(
@@ -2625,15 +2636,20 @@ class EmeraldOpeningMode(BotMode):
                         self._last_truck_decision = f"clock input: A (confirm {target_hour:02d}:{target_minute:02d})"
                 else:
                     button = _clock_input_direction(hours, minutes, target_hour, target_minute)
-                    context.emulator.press_button(button)
+                    if getattr(self, "_clock_held_direction", None) != button:
+                        release_clock_direction()
+                        context.emulator.hold_button(button)
+                        self._clock_held_direction = button
                     self._clock_a_sent = False
                     self._last_truck_decision = (
                         f"clock input: {button} toward {target_hour:02d}:{target_minute:02d} "
                         f"(current={hours:02d}:{minutes:02d})"
                     )
         elif clock_task == _CLOCK_ASK_CONFIRM:
+            release_clock_direction()
             self._last_truck_decision = "clock: waiting for confirmation menu"
         elif clock_task == _CLOCK_HANDLE_CONFIRM_INPUT:
+            release_clock_direction()
             if not self._clock_confirm_yes_prepared:
                 # Emerald creates this menu with initialCursorPos=1 (NO).
                 # Move to YES before confirming; A on the initial cursor is

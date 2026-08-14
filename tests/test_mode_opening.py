@@ -722,8 +722,11 @@ class TestEmeraldOpeningState(unittest.TestCase):
     def test_clock_handle_input_is_advanced_once_per_task_phase(self):
         from modules.modes.opening import EmeraldOpeningMode
 
-        mode = EmeraldOpeningMode()
+        mode = object.__new__(EmeraldOpeningMode)
         mode._clock_target = (10, 0)
+        mode._last_clock_task = None
+        mode._clock_a_sent = False
+        mode._clock_confirm_yes_prepared = False
         emulator = unittest.mock.Mock()
         with (
             patch(
@@ -755,8 +758,11 @@ class TestEmeraldOpeningState(unittest.TestCase):
     def test_clock_selection_uses_directional_input_until_target_time(self):
         from modules.modes.opening import EmeraldOpeningMode
 
-        mode = EmeraldOpeningMode()
+        mode = object.__new__(EmeraldOpeningMode)
         mode._clock_target = (10, 0)
+        mode._last_clock_task = None
+        mode._clock_a_sent = False
+        mode._clock_confirm_yes_prepared = False
         emulator = unittest.mock.Mock()
         task = types.SimpleNamespace(
             data_value=lambda index: {0: 0, 2: 9, 3: 59}[index],
@@ -768,7 +774,33 @@ class TestEmeraldOpeningState(unittest.TestCase):
         ):
             list(mode._set_clock())
 
-        emulator.press_button.assert_called_once_with("Right")
+        emulator.hold_button.assert_called_once_with("Right")
+        emulator.press_button.assert_not_called()
+
+    def test_clock_direction_remains_held_across_input_frames(self):
+        from modules.modes.opening import EmeraldOpeningMode
+
+        mode = object.__new__(EmeraldOpeningMode)
+        mode._clock_target = (10, 0)
+        mode._last_clock_task = None
+        mode._clock_a_sent = False
+        mode._clock_confirm_yes_prepared = False
+        emulator = unittest.mock.Mock()
+        state = {0: 0, 2: 9, 3: 59}
+        task = types.SimpleNamespace(data_value=state.__getitem__)
+        with (
+            patch("modules.modes.opening._active_clock_task", return_value="Task_SetClock_HandleInput"),
+            patch("modules.modes.opening.get_task", return_value=task),
+            patch.object(__import__("modules.modes.opening", fromlist=["context"]).context, "emulator", emulator),
+        ):
+            list(mode._set_clock())
+            list(mode._set_clock())
+            state[2], state[3] = mode._clock_target
+            list(mode._set_clock())
+
+        emulator.hold_button.assert_called_once_with("Right")
+        emulator.release_button.assert_called_once_with("Right")
+        emulator.press_button.assert_called_once_with("A")
 
     def test_clock_confirmed_and_exit_tasks_require_no_additional_input(self):
         from modules.modes.opening import EmeraldOpeningMode
@@ -933,7 +965,8 @@ class TestEmeraldOpeningState(unittest.TestCase):
             list(mode._set_clock())
 
         self.assertEqual(mode._clock_target, (16, 32))
-        emulator.press_button.assert_called_once_with("A")
+        emulator.hold_button.assert_called_once_with("Left")
+        emulator.press_button.assert_not_called()
 
     def test_random_target_reaches_clock_controller(self):
         from modules.config.schemas_v1 import WallClockTimeMode
@@ -989,7 +1022,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
                     ),
                 ):
                     list(mode._set_clock())
-                    self.assertEqual(emulator.press_button.call_args.args, (first_button,))
+                    self.assertEqual(emulator.hold_button.call_args.args, (first_button,))
 
                     state[2], state[3] = target
                     list(mode._set_clock())
