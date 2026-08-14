@@ -33,6 +33,7 @@ from modules.player import (
     player_avatar_is_controllable,
     player_avatar_is_standing_still,
 )
+from modules.pokemon_party import get_party_size
 from modules.text_printer import get_text_printer
 from modules.config.schemas_v1 import WallClockTimeMode
 from modules.start_game import RandomSource, resolve_start_game_initialization
@@ -101,6 +102,7 @@ class OpeningSequenceState(Enum):
     SCRIPTED_INTRO = auto()
     UNKNOWN = auto()
     OPTIONS_MENU = auto()
+    COMPLETE = auto()
 
 
 @dataclass(frozen=True)
@@ -470,7 +472,26 @@ def get_opening_sequence_state(player_gender: object | None = None) -> OpeningSe
         return OpeningSequenceState.BIRCH_HOUSE_2F
     if map_id == MapRSE.ROUTE101.value:
         return OpeningSequenceState.ROUTE_101
+    if _opening_complete():
+        return OpeningSequenceState.COMPLETE
     return OpeningSequenceState.SCRIPTED_INTRO
+
+
+def _opening_complete() -> bool:
+    """Whether the starter opening has returned to Birch's lab.
+
+    The starter is written to the party before the opening battle, and the
+    battle's post-battle warp returns the player to this ROM-defined map. The
+    combination avoids treating an arbitrary coordinate in the lab as the
+    completion marker.
+    """
+    try:
+        return (
+            _current_map_id() == MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value
+            and get_party_size() > 0
+        )
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        return False
 
 
 def _truck_has_left() -> bool:
@@ -1168,6 +1189,16 @@ class EmeraldOpeningMode(BotMode):
             self._report_dialogue_detection(observed)
             self._report_route101_lifecycle(observed)
             self._report_route101_runtime(observed)
+            if observed is OpeningSequenceState.COMPLETE:
+                self._report_phase_dispatch(
+                    observed,
+                    phase_before=self.phase,
+                    resulting_phase=observed,
+                    dialogue_action=False,
+                    dispatch="complete",
+                    decision="opening complete: starter received and returned to Birch's lab",
+                )
+                return
             if observed is OpeningSequenceState.STARTER_SELECTION:
                 global _starter_handoff_pending
                 _starter_handoff_pending = True

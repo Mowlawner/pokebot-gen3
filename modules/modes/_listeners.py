@@ -29,7 +29,7 @@ from modules.player import (
 )
 from modules.pokemon import StatusCondition, clear_opponent, get_opponent
 from modules.pokemon_party import get_party
-from modules.tasks import get_global_script_context, task_is_active, get_task
+from modules.tasks import get_global_script_context, task_is_active, get_task, get_tasks
 from ._interface import BattleAction, BotListener, BotMode, FrameInfo
 from .util import isolate_inputs, save_the_game, leave_safari_zone
 from ..battle_handler import handle_battle
@@ -113,7 +113,7 @@ class BattleListener(BotListener):
             native_callback = None
         try:
             active_tasks = [task.symbol for task in (get_tasks() or [])]
-        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        except Exception:
             active_tasks = None
         try:
             printer = get_text_printer()
@@ -177,9 +177,13 @@ class BattleListener(BotListener):
             if context.bot_mode == "Manual":
                 _ensure_plugin_hook_will_run(plugin_battle_started(self._active_wild_encounter))
             elif isinstance(action, BattleStrategy):
+                diagnostic_print("STARTER_FLOW: BattleListener appending fight(strategy)", trace=True)
                 context.controller_stack.append(self.fight(action))
+                diagnostic_print("STARTER_FLOW: BattleListener appended fight(strategy)", trace=True)
             elif action == BattleAction.Fight:
+                diagnostic_print("STARTER_FLOW: BattleListener appending fight(DefaultBattleStrategy)", trace=True)
                 context.controller_stack.append(self.fight(DefaultBattleStrategy()))
+                diagnostic_print("STARTER_FLOW: BattleListener appended fight(DefaultBattleStrategy)", trace=True)
             elif action == BattleAction.RunAway:
                 context.controller_stack.append(self.run_away_from_battle())
             elif action == BattleAction.Catch:
@@ -286,7 +290,16 @@ class BattleListener(BotListener):
         first_non_fainted_lead_before_battle = get_party().first_non_fainted.index
         yield from plugin_battle_started(self._active_wild_encounter)
         result = yield from handle_battle(strategy)
+        diagnostic_print(
+            lambda: "BATTLE_FIGHT_GENERATOR: before wait_until_battle_is_over " + self._controller_boundary_snapshot(),
+            trace=True,
+        )
         yield from self._wait_until_battle_is_over()
+        diagnostic_print(
+            lambda: "BATTLE_FIGHT_GENERATOR: wait_until_battle_is_over returned "
+            + self._controller_boundary_snapshot(),
+            trace=True,
+        )
 
         if len(result.party_indices_with_picked_up_items) > 0:
             context.stats.log_pickup_items(
@@ -309,6 +322,11 @@ class BattleListener(BotListener):
                         strategy.choose_new_lead_after_battle(),
                         first_non_fainted_lead_before_battle,
                     )
+
+        diagnostic_print(
+            lambda: "BATTLE_FIGHT_GENERATOR: fight returning " + self._controller_boundary_snapshot(),
+            trace=True,
+        )
 
     @debug.track
     def retrieve_held_items(self, result: HandledBattleResult):

@@ -86,7 +86,7 @@ class TestStarter(BotTestCase):
                     wait_for_bag.assert_called_once_with("Task_HandleStarterChooseInput", "A")
                     ask_for_choice.assert_called_once()
 
-    def test_opening_handoff_returns_to_manual_after_starter_sequence(self):
+    def test_opening_handoff_returns_to_opening_controller_after_starter_sequence(self):
         from modules.modes.starters import StartersMode
 
         starter_context = Mock()
@@ -102,7 +102,8 @@ class TestStarter(BotTestCase):
             ANY,
             reset_before_selection=False,
         )
-        starter_context.set_manual_mode.assert_called_once_with()
+        self.assertEqual(starter_context.bot_mode, "Start New Game")
+        starter_context.set_manual_mode.assert_not_called()
 
     def test_opening_handoff_delegates_battle_to_default_handler(self):
         from modules.modes import BattleAction
@@ -112,6 +113,35 @@ class TestStarter(BotTestCase):
         starters_mode._opening_handoff_active = True
 
         self.assertEqual(starters_mode.on_battle_started(None), BattleAction.Fight)
+
+    def test_opening_hoenn_generator_exits_visibility_loop_after_delegated_battle(self):
+        from modules.memory import GameState
+        from modules.modes.starters import run_rse_hoenn
+
+        starter_context = Mock()
+        starter_context.bot_mode = "Starters"
+        starter_context.rom.is_emerald = True
+        starter_context.rom.is_rs = False
+        starter_context.config.start_game.starter = "Torchic"
+        with (
+            patch("modules.modes.starters.context", starter_context),
+            patch("modules.modes.starters.get_player_avatar", return_value=Mock(local_coordinates=(7, 15))),
+            patch("modules.modes.starters.ensure_facing_direction", return_value=iter(())),
+            patch("modules.modes.starters.wait_until_task_is_active", return_value=iter(())),
+            patch("modules.modes.starters.get_game_state", return_value=GameState.OVERWORLD),
+            patch(
+                "modules.modes.starters.get_main_battle_callback",
+                return_value="ReturnFromBattleToOverworld",
+            ),
+            patch("modules.modes.starters.handle_encounter") as handle_encounter,
+            patch("modules.modes.starters._report_starters_state"),
+            patch("modules.modes.starters.diagnostic_print"),
+        ):
+            generator = run_rse_hoenn(lambda: Mock(), reset_before_selection=False)
+            with self.assertRaises(StopIteration):
+                next(generator)
+
+        handle_encounter.assert_called_once()
 
     def test_saved_game_starter_mode_keeps_custom_battle_handler(self):
         from modules.modes import BattleAction

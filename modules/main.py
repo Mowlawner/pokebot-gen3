@@ -172,9 +172,34 @@ def main_loop() -> None:
                             "[bold yellow]CONTROLLER STARTERS HANDOFF: " "advancing newly-created StartersMode[/]",
                             trace=True,
                         )
+                    active_controller_qualname = context.controller_stack[-1].__qualname__
+                    is_starter_flow_controller = active_controller_qualname in (
+                        "StartersMode.run",
+                        "BattleListener.fight",
+                        "isolate_inputs.<locals>.wrapper_function",
+                        "DebugUtil.track.<locals>.wrapper_function",
+                    )
+                    if is_starter_flow_controller:
+                        diagnostic_print(
+                            lambda: (
+                                "STARTER_FLOW: main_loop before next(controller) "
+                                f"controller={active_controller_qualname!r} "
+                                f"stack={[controller.__qualname__ for controller in context.controller_stack]!r}"
+                            ),
+                            trace=True,
+                        )
                     try:
                         next(context.controller_stack[-1])
                     finally:
+                        if is_starter_flow_controller:
+                            diagnostic_print(
+                                lambda: (
+                                    "STARTER_FLOW: main_loop after next(controller) "
+                                    f"controller={active_controller_qualname!r} "
+                                    f"stack={[controller.__qualname__ for controller in context.controller_stack]!r}"
+                                ),
+                                trace=True,
+                            )
                         if new_starters_mode_created:
                             diagnostic_print(
                                 "[bold yellow]CONTROLLER STARTERS HANDOFF: "
@@ -182,7 +207,21 @@ def main_loop() -> None:
                                 trace=True,
                             )
             except (StopIteration, GeneratorExit):
-                context.controller_stack.pop()
+                completed_controller = context.controller_stack.pop()
+                if completed_controller.__qualname__ in (
+                    "StartersMode.run",
+                    "BattleListener.fight",
+                    "isolate_inputs.<locals>.wrapper_function",
+                    "DebugUtil.track.<locals>.wrapper_function",
+                ):
+                    diagnostic_print(
+                        lambda: (
+                            "STARTER_FLOW: main_loop popped completed controller "
+                            f"controller={completed_controller.__qualname__!r} "
+                            f"stack={[controller.__qualname__ for controller in context.controller_stack]!r}"
+                        ),
+                        trace=True,
+                    )
             except BotModeError as e:
                 context.emulator.reset_held_buttons()
                 context.message = str(e)

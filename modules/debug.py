@@ -2,6 +2,8 @@ import inspect
 
 from functools import wraps
 
+from modules.console import diagnostic_print
+
 
 class DebugUtil:
     def __init__(self):
@@ -16,6 +18,7 @@ class DebugUtil:
     def track(self, generator_function):
         @wraps(generator_function)
         def wrapper_function(*args, **kwargs):
+            is_battle_fight = generator_function.__qualname__ == "BattleListener.fight"
             if self.enabled:
                 name = generator_function.__name__
                 formatted_args = []
@@ -33,6 +36,8 @@ class DebugUtil:
 
             try:
                 return_value = yield from generator_function(*args, **kwargs)
+                if is_battle_fight:
+                    diagnostic_print("STARTER_FLOW: debug.track fight wrapper returned", trace=True)
                 return return_value
             finally:
                 if self.enabled:

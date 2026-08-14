@@ -63,6 +63,49 @@ class TestEmeraldOpeningState(unittest.TestCase):
                 ):
                     self.assertIs(get_opening_sequence_state(), expected)
 
+    def test_birch_lab_with_a_party_is_the_post_starter_completion_state(self):
+        from modules.map_data import MapRSE
+        from modules.memory import GameState
+        from modules.modes.opening import OpeningSequenceState, get_opening_sequence_state
+
+        with (
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch(
+                "modules.modes.opening.get_map_data_for_current_position",
+                return_value=types.SimpleNamespace(
+                    map_group_and_number=MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value,
+                ),
+            ),
+            patch("modules.modes.opening.get_party_size", return_value=1),
+        ):
+            self.assertIs(get_opening_sequence_state(), OpeningSequenceState.COMPLETE)
+
+    def test_completed_opening_returns_without_input_or_navigation(self):
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        emulator = types.SimpleNamespace(press_button=unittest.mock.Mock())
+        opening_context = types.SimpleNamespace(
+            bot_mode="Start New Game",
+            emulator=emulator,
+            rom=types.SimpleNamespace(is_emerald=True),
+            debug=False,
+            config=types.SimpleNamespace(
+                start_game=types.SimpleNamespace(player_name="gibberish", player_gender="random")
+            ),
+        )
+        with (
+            patch("modules.modes.opening.context", opening_context),
+            patch(
+                "modules.modes.opening.get_opening_sequence_state",
+                return_value=OpeningSequenceState.COMPLETE,
+            ),
+        ):
+            with self.assertRaises(StopIteration):
+                next(EmeraldOpeningMode().run())
+
+        self.assertEqual(opening_context.bot_mode, "Start New Game")
+        emulator.press_button.assert_not_called()
+
     def test_clock_task_is_explicitly_detected(self):
         from modules.memory import GameState
         from modules.modes.opening import OpeningSequenceState, get_opening_sequence_state
