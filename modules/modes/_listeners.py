@@ -270,8 +270,7 @@ class BattleListener(BotListener):
                 diagnostic_print(
                     lambda: (
                         "BATTLE_CONTROLLER_WAIT: "
-                        f"frame={self._post_battle_wait_frames} input='B' "
-                        + self._controller_boundary_snapshot()
+                        f"frame={self._post_battle_wait_frames} input='B' " + self._controller_boundary_snapshot()
                     ),
                     trace=True,
                 )

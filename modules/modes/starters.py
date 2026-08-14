@@ -27,7 +27,6 @@ from .util import (
 )
 from ..battle_state import get_main_battle_callback, EncounterType
 
-
 HOENN_STARTERS = ("Treecko", "Torchic", "Mudkip")
 
 
@@ -227,9 +226,13 @@ def run_rse_hoenn(
             f"wait for {bag_task} and press A",
         )
         if context.rom.is_rs:
-            _report_starters_state("RSE_HOENN_BAG_INTERACTION", "yielding from wait_until_task_is_active(Task_StarterChoose2)")
+            _report_starters_state(
+                "RSE_HOENN_BAG_INTERACTION", "yielding from wait_until_task_is_active(Task_StarterChoose2)"
+            )
             yield from wait_until_task_is_active("Task_StarterChoose2", "A")
-            _report_starters_state("RSE_HOENN_BAG_INTERACTION", "resumed after wait_until_task_is_active(Task_StarterChoose2)")
+            _report_starters_state(
+                "RSE_HOENN_BAG_INTERACTION", "resumed after wait_until_task_is_active(Task_StarterChoose2)"
+            )
         else:
             _report_starters_state(
                 "RSE_HOENN_BAG_INTERACTION",

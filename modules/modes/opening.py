@@ -486,10 +486,7 @@ def _opening_complete() -> bool:
     completion marker.
     """
     try:
-        return (
-            _current_map_id() == MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value
-            and get_party_size() > 0
-        )
+        return _current_map_id() == MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value and get_party_size() > 0
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
         return False
 
@@ -2587,6 +2584,7 @@ class EmeraldOpeningMode(BotMode):
 
     def _set_clock(self) -> Generator:
         """Drive Emerald's existing clock tasks toward the resolved target."""
+
         def release_clock_direction() -> None:
             held_direction = getattr(self, "_clock_held_direction", None)
             if held_direction is not None:
