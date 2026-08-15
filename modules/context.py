@@ -53,6 +53,9 @@ class BotContext:
         # opening sequence can opt into high-volume diagnostic tracing when a
         # detailed ROM-state investigation is needed.
         self.debug_trace: bool = False
+        # Optional performance probe; unlike normal debug tracing this is
+        # intentionally off unless an operator explicitly enables it.
+        self.debug_profile: bool = False
         self.testing: bool = False
 
         self._current_message: str = ""

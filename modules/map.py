@@ -3,6 +3,7 @@ import string
 import struct
 from dataclasses import dataclass
 from functools import cached_property
+from types import MappingProxyType
 from typing import Literal, TYPE_CHECKING
 
 from modules.berry_trees import get_berry_tree_by_id
@@ -28,6 +29,7 @@ from modules.pokemon import (
 )
 from modules.pokemon_party import get_current_repel_level, get_party, Pokemon
 from modules.state_cache import state_cache
+from modules.profiler import count as profile_count, now as profile_now, profiled, timing as profile_timing
 
 if TYPE_CHECKING:
     from modules.battle_state import EncounterType
@@ -736,6 +738,38 @@ class MapBgEvent:
 
 
 _map_layout_cache: dict[str, dict[tuple[int, int], bytes]] = {}
+_map_objects_cache: dict[str, dict[tuple[int, int], list["ObjectEventTemplate"]]] = {}
+_map_metadata_cache: dict[str, dict[tuple[int, int], "MapMetadata"]] = {}
+
+
+@dataclass(frozen=True)
+class MapMetadata:
+    """Immutable static description of one ROM-backed map."""
+
+    map_id: tuple[int, int]
+    map_header: bytes
+    map_layout: bytes
+    event_list: bytes | None
+    connections: tuple["MapConnection", ...]
+    warps: tuple["MapWarp", ...]
+    coord_events: tuple["MapCoordEvent", ...]
+    bg_events: tuple["MapBgEvent", ...]
+    objects: tuple["ObjectEventTemplate", ...]
+
+    @cached_property
+    def _objects_by_local_id(self):
+        """Index immutable templates without changing duplicate-ID semantics."""
+        indexed = {}
+        for template in self.objects:
+            indexed.setdefault(template.local_id, template)
+        return MappingProxyType(indexed)
+
+    @property
+    def map_size(self) -> tuple[int, int]:
+        return unpack_uint32(self.map_layout[:4]), unpack_uint32(self.map_layout[4:8])
+
+    def object_template(self, local_id: int) -> "ObjectEventTemplate | None":
+        return self._objects_by_local_id.get(local_id)
 
 
 class MapLocation:
@@ -745,14 +779,21 @@ class MapLocation:
         map_group: int,
         map_number: int,
         local_position: tuple[int, int],
+        metadata: MapMetadata | None = None,
     ):
+        construction_start = profile_now()
         self._map_header = map_header
         self.map_group = map_group
         self.map_number = map_number
         self.local_position = local_position
+        self._metadata = metadata
+        profile_count("map_location_constructions")
+        profile_timing("map_location_construction", construction_start)
 
     @cached_property
     def _map_layout(self) -> bytes:
+        if self._metadata is not None:
+            return self._metadata.map_layout
         global _map_layout_cache
         if context.rom.id not in _map_layout_cache:
             _map_layout_cache[context.rom.id] = {}
@@ -825,11 +866,20 @@ class MapLocation:
 
     @cached_property
     def _event_list(self) -> bytes | None:
+        if self._metadata is not None:
+            return self._metadata.event_list
+        construction_start = profile_now()
+        profile_count("map_event_list_constructions")
         events_list_pointer = unpack_uint32(self._map_header[0x04:0x08])
         if events_list_pointer == 0:
+            profile_timing("map_event_list_construction", construction_start)
             return None
         else:
-            return context.emulator.read_bytes(events_list_pointer, 20)
+            read_start = profile_now()
+            event_list = context.emulator.read_bytes(events_list_pointer, 20)
+            profile_timing("map_event_list_emulator_read", read_start)
+            profile_timing("map_event_list_construction", construction_start)
+            return event_list
 
     @property
     def map_group_and_number(self) -> tuple[int, int]:
@@ -968,6 +1018,8 @@ class MapLocation:
 
     @property
     def connections(self) -> list[MapConnection]:
+        if self._metadata is not None:
+            return list(self._metadata.connections)
         list_of_connections_pointer = unpack_uint32(self._map_header[0x0C:0x10])
         if list_of_connections_pointer == 0:
             return []
@@ -985,30 +1037,50 @@ class MapLocation:
 
     @property
     def warps(self) -> list[MapWarp]:
+        if self._metadata is not None:
+            return list(self._metadata.warps)
+        access_start = profile_now()
+        profile_count("map_warps_accesses")
+        profile_count("map_event_list_accesses", 2)
         warp_count = self._event_list[1]
         warp_pointer = unpack_uint32(self._event_list[8:12])
         if warp_count == 0 or warp_pointer == 0:
+            profile_timing("map_warps_access", access_start)
             return []
 
         size_of_struct = 8
+        read_start = profile_now()
         data = context.emulator.read_bytes(warp_pointer, warp_count * size_of_struct)
+        profile_timing("map_warps_emulator_read", read_start)
 
-        return [MapWarp(data[size_of_struct * index : size_of_struct * (index + 1)]) for index in range(warp_count)]
+        result = [MapWarp(data[size_of_struct * index : size_of_struct * (index + 1)]) for index in range(warp_count)]
+        profile_timing("map_warps_access", access_start)
+        return result
 
     @property
     def objects(self) -> list["ObjectEventTemplate"]:
+        if self._metadata is not None:
+            return list(self._metadata.objects)
+        global _map_objects_cache
+        rom_objects = _map_objects_cache.setdefault(context.rom.id, {})
+        if self.map_group_and_number in rom_objects:
+            return rom_objects[self.map_group_and_number]
+
+        profile_count("map_event_list_accesses", 2)
         object_event_count = self._event_list[0]
         object_event_pointer = unpack_uint32(self._event_list[4:8])
         if object_event_count == 0 or object_event_pointer == 0:
-            return []
+            rom_objects[self.map_group_and_number] = []
+            return rom_objects[self.map_group_and_number]
 
         size_of_struct = 24
         data = context.emulator.read_bytes(object_event_pointer, size_of_struct * object_event_count)
 
-        return [
+        rom_objects[self.map_group_and_number] = [
             ObjectEventTemplate(data[size_of_struct * index : size_of_struct * (index + 1)])
             for index in range(object_event_count)
         ]
+        return rom_objects[self.map_group_and_number]
 
     def object_by_local_id(self, local_id: int) -> "ObjectEventTemplate | None":
         return next(
@@ -1024,32 +1096,52 @@ class MapLocation:
 
     @property
     def coord_events(self) -> list[MapCoordEvent]:
+        if self._metadata is not None:
+            return list(self._metadata.coord_events)
+        access_start = profile_now()
+        profile_count("map_coordinate_events_accesses")
+        profile_count("map_event_list_accesses", 2)
         coord_event_count = self._event_list[2]
         coord_event_pointer = unpack_uint32(self._event_list[12:16])
         if coord_event_count == 0 or coord_event_pointer == 0:
+            profile_timing("map_coordinate_events_access", access_start)
             return []
 
         size_of_struct = 16
+        read_start = profile_now()
         data = context.emulator.read_bytes(coord_event_pointer, size_of_struct * coord_event_count)
+        profile_timing("map_coordinate_events_emulator_read", read_start)
 
-        return [
+        result = [
             MapCoordEvent(data[size_of_struct * index : size_of_struct * (index + 1)])
             for index in range(coord_event_count)
         ]
+        profile_timing("map_coordinate_events_access", access_start)
+        return result
 
     @property
     def bg_events(self) -> list[MapBgEvent]:
+        if self._metadata is not None:
+            return list(self._metadata.bg_events)
+        access_start = profile_now()
+        profile_count("map_background_events_accesses")
+        profile_count("map_event_list_accesses", 2)
         bg_event_count = self._event_list[3]
         bg_event_pointer = unpack_uint32(self._event_list[16:20])
         if bg_event_count == 0 or bg_event_pointer == 0:
+            profile_timing("map_background_events_access", access_start)
             return []
 
         size_of_struct = 12
+        read_start = profile_now()
         data = context.emulator.read_bytes(bg_event_pointer, size_of_struct * bg_event_count)
+        profile_timing("map_background_events_emulator_read", read_start)
 
-        return [
+        result = [
             MapBgEvent(data[size_of_struct * index : size_of_struct * (index + 1)]) for index in range(bg_event_count)
         ]
+        profile_timing("map_background_events_access", access_start)
+        return result
 
     def all_tiles(self) -> list[list["MapLocation"]]:
         result = []
@@ -1581,9 +1673,9 @@ class ObjectEvent:
 
     @property
     def object_event_template(self) -> "ObjectEventTemplate":
-        for template in get_map_data(self.map_group_and_number, self.initial_coords).objects:
-            if template.local_id == self.local_id:
-                return template
+        template = get_map_metadata(self.map_group_and_number).object_template(self.local_id)
+        if template is not None:
+            return template
         raise RuntimeError(f"Could not find the template for local object #{self.local_id}.")
 
     def __str__(self) -> str:
@@ -1601,6 +1693,87 @@ class ObjectEvent:
                 return f"Trainer {defeated} at {self.current_coords} (ID: {self.local_id})"
         else:
             return f"Entity at {self.current_coords} (ID: {self.local_id})"
+
+
+@dataclass(frozen=True)
+class RuntimeObjectSlot:
+    """Diagnostic view of one fixed slot in the game's gObjectEvents table.
+
+    This intentionally remains separate from ``get_map_objects`` and the
+    overworld observation model.  In particular, inactive slots are retained
+    here so diagnostics can distinguish an object that was not spawned from a
+    reader that silently discarded it.
+    """
+
+    slot: int
+    active: bool
+    local_id: int | None = None
+    map_id: tuple[int, int] | None = None
+    initial_coordinates: tuple[int, int] | None = None
+    coordinates: tuple[int, int] | None = None
+    previous_coordinates: tuple[int, int] | None = None
+    flags: tuple[str, ...] = ()
+    script: str = ""
+    template_coordinates: tuple[int, int] | None = None
+    template_flag_id: int | None = None
+    template_flag_name: str = ""
+    hide_flag_set: bool | None = None
+
+
+def get_runtime_object_table(map_id: tuple[int, int] | None = None) -> tuple[RuntimeObjectSlot, ...]:
+    """Read all 16 runtime object slots for diagnostics without filtering.
+
+    Unlike ``get_map_objects``, this includes inactive slots.  Template data
+    is resolved only for active objects on the requested map, so a malformed
+    or stale inactive slot cannot affect the diagnostic read.
+    """
+
+    data = read_symbol("gObjectEvents", 0, 0x24 * 16)
+    result: list[RuntimeObjectSlot] = []
+    for slot in range(16):
+        event = ObjectEvent(data[slot * 0x24 : (slot + 1) * 0x24])
+        active = "active" in event.flags
+        if not active:
+            result.append(RuntimeObjectSlot(slot=slot, active=False))
+            continue
+
+        event_map_id = event.map_group_and_number
+        script = ""
+        template_coordinates = None
+        template_flag_id = None
+        template_flag_name = ""
+        hide_flag_set = None
+        if map_id is None or event_map_id == map_id:
+            try:
+                template = event.object_event_template
+                script = template.script_symbol
+                template_coordinates = template.local_coordinates
+                template_flag_id = template.flag_id
+                template_flag_name = get_event_flag_name(template_flag_id)
+                if template_flag_id:
+                    hide_flag_set = get_event_flag_by_number(template_flag_id)
+            except (RuntimeError, ValueError, IndexError):
+                # Keep the runtime row even if its map/template is transient.
+                pass
+
+        result.append(
+            RuntimeObjectSlot(
+                slot=slot,
+                active=True,
+                local_id=event.local_id,
+                map_id=event_map_id,
+                initial_coordinates=event.initial_coords,
+                coordinates=event.current_coords,
+                previous_coordinates=event.previous_coords,
+                flags=tuple(event.flags),
+                script=script,
+                template_coordinates=template_coordinates,
+                template_flag_id=template_flag_id,
+                template_flag_name=template_flag_name,
+                hide_flag_set=hide_flag_set,
+            )
+        )
+    return tuple(result)
 
 
 class ObjectEventTemplate:
@@ -1668,7 +1841,7 @@ class ObjectEventTemplate:
     def script_pointer(self) -> int:
         return unpack_uint32(self._data[16:20])
 
-    @property
+    @cached_property
     def script_symbol(self) -> str:
         if self.script_pointer == 0:
             return ""
@@ -1773,10 +1946,46 @@ def get_map_data_for_current_position() -> MapLocation | None:
 _map_header_cache: dict[str, dict[tuple[int, int], bytes]] = {}
 
 
+def _build_map_metadata(map_id: tuple[int, int], map_header: bytes) -> MapMetadata:
+    """Materialize static map data once, using the existing MapLocation readers."""
+    location = MapLocation(map_header, map_id[0], map_id[1], (0, 0))
+    return MapMetadata(
+        map_id=map_id,
+        map_header=map_header,
+        map_layout=location._map_layout,
+        event_list=location._event_list,
+        connections=tuple(location.connections),
+        warps=tuple(location.warps),
+        coord_events=tuple(location.coord_events),
+        bg_events=tuple(location.bg_events),
+        objects=tuple(location.objects),
+    )
+
+
+def get_map_metadata(map_group_and_number: "tuple[int, int] | MapFRLG | MapRSE") -> MapMetadata:
+    """Return the immutable static metadata for one ROM/map pair."""
+    if not isinstance(map_group_and_number, tuple):
+        map_group_and_number = map_group_and_number.value
+
+    rom_cache = _map_metadata_cache.setdefault(context.rom.id, {})
+    if map_group_and_number not in rom_cache:
+        if context.rom.id not in _map_header_cache or map_group_and_number not in _map_header_cache[context.rom.id]:
+            get_map_data(map_group_and_number, (0, 0))
+            if map_group_and_number in rom_cache:
+                return rom_cache[map_group_and_number]
+        rom_cache[map_group_and_number] = _build_map_metadata(
+            map_group_and_number,
+            _map_header_cache[context.rom.id][map_group_and_number],
+        )
+    return rom_cache[map_group_and_number]
+
+
 def get_map_data(
     map_group_and_number: "tuple[int, int] | MapFRLG | MapRSE",
     local_position: tuple[int, int],
 ) -> MapLocation:
+    total_start = profile_now()
+    profile_count("map_data_calls")
     global _map_header_cache
     if not isinstance(map_group_and_number, tuple):
         map_group_and_number = map_group_and_number.value
@@ -1785,6 +1994,7 @@ def get_map_data(
         _map_header_cache[context.rom.id] = {}
 
     if len(_map_header_cache[context.rom.id]) == 0:
+        profile_count("map_data_header_cache_populations")
         from modules.map_data import MapGroupFRLG, MapGroupRSE, MapRSE
 
         if context.rom.is_rse:
@@ -1806,19 +2016,30 @@ def get_map_data(
                 map_header = context.emulator.read_bytes(map_header_pointer, 0x1C)
                 _map_header_cache[context.rom.id][(group_index, map_index)] = map_header
 
-    if map_group_and_number not in _map_header_cache[context.rom.id]:
+    if map_group_and_number in _map_header_cache[context.rom.id]:
+        profile_count("map_data_header_cache_hits")
+    else:
+        profile_count("map_data_header_cache_misses")
         raise ValueError(f"Tried to access invalid map: ({map_group_and_number})")
 
-    return MapLocation(
+    result = MapLocation(
         _map_header_cache[context.rom.id][map_group_and_number],
         map_group_and_number[0],
         map_group_and_number[1],
         local_position,
+        metadata=get_map_metadata(map_group_and_number),
     )
+    profile_timing("map_data_total", total_start)
+    return result
 
 
 def get_map_objects() -> list[ObjectEvent]:
+    total_start = profile_now()
+    profile_count("map_objects_calls")
+    read_start = profile_now()
     data = read_symbol("gObjectEvents", 0, 0x24 * 16)
+    profile_timing("map_objects_emulator_read", read_start)
+    processing_start = profile_now()
     objects = []
     for i in range(16):
         offset = i * 0x24
@@ -1826,9 +2047,12 @@ def get_map_objects() -> list[ObjectEvent]:
         if is_active:
             map_object = ObjectEvent(data[offset : offset + 0x24])
             objects.append(map_object)
+    profile_timing("map_objects_python_processing", processing_start)
+    profile_timing("map_objects_total", total_start)
     return objects
 
 
+@profiled("player_map_object_total", "player_map_object_calls")
 def get_player_map_object() -> ObjectEvent | None:
     data = read_symbol("gObjectEvents", 0, 0x24)
     return ObjectEvent(data) if data[0] & 0x01 else None

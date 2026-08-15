@@ -59,6 +59,8 @@ class TestLibmgbaInputTransitions(unittest.TestCase):
         emulator._native_core = native_core
         emulator._performance_tracker = _FakeTracker()
         emulator._pressed_inputs = 0
+        emulator._fresh_input_pending = 0
+        emulator._fresh_pulse_pending = 0
         emulator._prev_pressed_inputs = 0
         emulator._held_inputs = 0
         emulator._previous_frame_inputs = 0
@@ -104,3 +106,17 @@ class TestLibmgbaInputTransitions(unittest.TestCase):
         emulator.run_single_frame()
         self.assertEqual(native_core.frames[-1], 0)
         self.assertEqual(emulator.get_released_inputs(), 0x1)
+
+    def test_fresh_button_inserts_neutral_frame_when_same_input_was_just_applied(self):
+        emulator, native_core = self._emulator()
+
+        emulator.press_button("Down")
+        emulator.run_single_frame()
+        emulator.press_button_fresh("Down")
+        emulator.run_single_frame()
+        self.assertEqual(native_core.frames[-1], 0)
+        self.assertEqual(emulator.get_released_inputs(), 0x80)
+
+        emulator.run_single_frame()
+        self.assertEqual(native_core.frames[-1], 0x80)
+        self.assertEqual(emulator.get_new_inputs(), 0x80)

@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from time import perf_counter_ns
 from typing import TYPE_CHECKING
 
 from rich.console import Console, Group
@@ -248,3 +249,16 @@ def diagnostic_print(message: str | Callable[[], str], *, trace: bool = False) -
     if not context.debug or (trace and not getattr(context, "debug_trace", False)):
         return
     console.print(message() if callable(message) else message)
+
+
+def profile_print(message: str | Callable[[], str]) -> None:
+    """Print performance output under the independent performance gate."""
+    from modules.context import context
+    from modules.profiler import count, timing
+
+    if not getattr(context, "debug_profile", False):
+        return
+    started_at = perf_counter_ns()
+    console.print(message() if callable(message) else message)
+    timing("profile_output", started_at)
+    count("profile_output_calls")

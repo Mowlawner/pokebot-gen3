@@ -12,6 +12,7 @@ from modules.game import (
     get_symbol_name_before,
 )
 from modules.state_cache import state_cache
+from modules.profiler import count as profile_count, profiled
 
 
 def unpack_sint8(value: bytes | int) -> int:
@@ -251,8 +252,10 @@ def get_game_state_symbol() -> str:
     return callback_name
 
 
+@profiled("game_state_total", "game_state_calls")
 def get_game_state() -> GameState:
     if state_cache.game_state.age_in_frames == 0:
+        profile_count("game_state_cached_calls")
         return state_cache.game_state.value
 
     match get_game_state_symbol():

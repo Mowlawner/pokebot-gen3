@@ -4,6 +4,30 @@ from unittest.mock import patch
 
 
 class TestDiagnosticPrint(unittest.TestCase):
+    def test_profile_output_is_disabled_without_profile_flag(self):
+        from modules.console import profile_print
+
+        sink = types.SimpleNamespace(print=unittest.mock.Mock())
+        message = unittest.mock.Mock(return_value="unused")
+        context = types.SimpleNamespace(debug=False, debug_trace=True, debug_profile=False)
+        with patch("modules.context.context", context), patch("modules.console.console", sink):
+            profile_print(message)
+
+        message.assert_not_called()
+        sink.print.assert_not_called()
+
+    def test_profile_output_does_not_require_trace_flag(self):
+        from modules.console import profile_print
+
+        sink = types.SimpleNamespace(print=unittest.mock.Mock())
+        message = unittest.mock.Mock(return_value="profile")
+        context = types.SimpleNamespace(debug=False, debug_trace=False, debug_profile=True)
+        with patch("modules.context.context", context), patch("modules.console.console", sink):
+            profile_print(message)
+
+        message.assert_called_once_with()
+        sink.print.assert_called_once_with("profile")
+
     def test_disabled_diagnostic_does_not_format_message(self):
         from modules.console import diagnostic_print
 

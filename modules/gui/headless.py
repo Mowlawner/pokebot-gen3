@@ -27,6 +27,7 @@ class PokebotHeadless:
         context.emulation_speed = startup_settings.emulation_speed
         context.debug = False
         context.debug_trace = False
+        context.debug_profile = startup_settings.debug_profile
         context.bot_mode = startup_settings.bot_mode
 
         self._main_loop()

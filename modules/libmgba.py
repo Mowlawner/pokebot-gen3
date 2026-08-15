@@ -22,6 +22,7 @@ from mgba import ffi, lib, libmgba_version_string
 from modules.console import console, diagnostic_print
 from modules.profiles import Profile
 from modules.tasks import task_is_active
+from modules.profiler import count, now, timing
 
 SAMPLE_RATE_MULTIPLIER = 59.727500569606 / 60
 
@@ -155,6 +156,8 @@ class LibmgbaEmulator:
 
         self._prev_pressed_inputs: int = 0
         self._pressed_inputs: int = 0
+        self._fresh_input_pending: int = 0
+        self._fresh_pulse_pending: int = 0
         self._held_inputs: int = 0
         # Input masks for the last two frames actually sent to mGBA.  Keep
         # these separate from _pressed_inputs, which is only a pending pulse.
@@ -521,6 +524,39 @@ class LibmgbaEmulator:
         self._report_birch_gender_input(button, button_inputs, path="press_button")
         self._pressed_inputs |= (self._prev_pressed_inputs & button_inputs) ^ button_inputs
 
+    def press_button_fresh(self, button: str = None, inputs: int = 0):
+        """Queue a button pulse with a neutral frame when necessary.
+
+        Some game actions, notably arrow warps in Emerald, require a new
+        JOY_NEW event even when the same direction was applied on the
+        immediately preceding frame.
+        """
+        button_inputs = inputs or input_map[button]
+        self._report_fresh_input("press_button_fresh", button, button_inputs)
+        if self._prev_pressed_inputs & button_inputs:
+            self._fresh_input_pending |= button_inputs
+            self._pressed_inputs &= ~button_inputs
+            self._report_fresh_input("neutral_frame_scheduled", button, button_inputs)
+            return
+        self.press_button(button, inputs)
+        self._report_fresh_input("pulse_queued_without_neutral", button, button_inputs)
+
+    def _report_fresh_input(self, event: str, button: str | None, inputs: int) -> None:
+        try:
+            from modules.context import context
+
+            if not context.debug or not getattr(context, "debug_trace", False):
+                return
+            diagnostic_print(
+                f"WARP_INPUT: event={event!r} button={button!r}"
+                f" inputs={inputs_to_strings(inputs)!r}"
+                f" previous={inputs_to_strings(self._prev_pressed_inputs)!r}"
+                f" frame={self.get_frame_count()}",
+                trace=True,
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return
+
     def _report_birch_gender_input(self, button: str | None, button_inputs: int, *, path: str = "press_button") -> None:
         """Trace all bot-generated inputs that overlap Birch's gender UI.
 
@@ -683,14 +719,24 @@ class LibmgbaEmulator:
         """
         Runs the emulation for a single frame, and then waits if necessary to hit the target FPS rate.
         """
-        applied_inputs = self._pressed_inputs | self._held_inputs
+        fresh_inputs = self._fresh_input_pending
+        applied_inputs = (self._pressed_inputs | self._held_inputs) & ~fresh_inputs
+        if fresh_inputs:
+            self._report_fresh_input("neutral_frame_applied", None, applied_inputs)
+        elif self._fresh_pulse_pending:
+            self._report_fresh_input("directional_pulse_applied", None, applied_inputs)
         self.set_inputs(applied_inputs)
         self._previous_frame_inputs = self._current_frame_inputs
         self._current_frame_inputs = applied_inputs
 
         begin = time.time_ns()
+        profile_begin = now()
         self._core.run_frame()
+        timing("emulator_frame_advancement", profile_begin)
+        count("emulator_frames_advanced")
         self._performance_tracker.time_spent_emulating += time.time_ns() - begin
+        if fresh_inputs or self._fresh_pulse_pending:
+            self._report_fresh_input("frame_advanced", None, applied_inputs)
 
         begin = time.time_ns()
         # Track what was actually applied, including a neutral frame.  Using
@@ -698,6 +744,9 @@ class LibmgbaEmulator:
         # so the next press_button("A") was incorrectly suppressed.
         self._prev_pressed_inputs = applied_inputs
         self._pressed_inputs = 0
+        self._pressed_inputs = fresh_inputs
+        self._fresh_pulse_pending = fresh_inputs
+        self._fresh_input_pending = 0
 
         samples_available = self._gba_audio.available
         audio_data = bytearray(samples_available * 4)
