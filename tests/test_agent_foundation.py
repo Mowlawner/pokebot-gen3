@@ -62,6 +62,26 @@ class GoalAwareNavigationTests(TestCase):
         self.assertIn(location, navigation_world.tiles)
         self.assertFalse(navigation_world.tiles[location].blocked)
 
+    def test_navigation_reuses_static_tiles_and_overlays_dynamic_blocking(self):
+        locations = (("test", (0, 0)), ("test", (1, 0)))
+        tiles = tuple(TileObservation(location, False, frozenset(Direction)) for location in locations)
+        observation = OverworldObservation(
+            map_id=("test", 0), player_coordinates=(0, 0), facing=Direction.East,
+            controllable=True, tiles=tiles, warps=(), objects=(), triggers=(),
+        )
+        first = NavigationWorld.from_overworld(observation)
+        second = NavigationWorld.from_overworld(observation)
+        self.assertIs(first.tiles, second.tiles)
+
+        blocked = OverworldObservation(
+            map_id=("test", 0), player_coordinates=(0, 0), facing=Direction.East,
+            controllable=True, tiles=tiles, warps=(), objects=(), triggers=(),
+            dynamic_blocked_coordinates=frozenset({(1, 0)}),
+        )
+        dynamic_world = NavigationWorld.from_overworld(blocked)
+        self.assertTrue(dynamic_world.tiles[("test", (1, 0))].blocked)
+        self.assertIs(dynamic_world.tiles[("test", (0, 0))], first.tiles[("test", (0, 0))])
+
     def test_prefers_shortest_matching_warp(self):
         start = (("test"), (0, 0))
         near = WarpObservation((("test"), (1, 0)), (("outside", 0), (0, 0)))

@@ -11,6 +11,7 @@ from typing import Any, Mapping
 from modules.memory import GameState, get_game_state
 from modules.player import player_avatar_is_controllable
 from modules.tasks import is_field_message_waiting_for_input
+from modules.profiler import count, now, timing
 
 
 class InteractionType(Enum):
@@ -80,12 +81,26 @@ def observe_interaction(
     callers can enrich this observation with their parsed options.
     """
 
+    interaction_start = now()
+    state_start = now()
     state = get_game_state()
+    timing("agent_interaction_game_state_read", state_start)
+    count("interaction_game_state_reads")
+    dialogue_start = now()
+    dialogue_waiting = state is GameState.OVERWORLD and is_field_message_waiting_for_input()
+    timing("agent_interaction_dialogue_check", dialogue_start)
+    count("interaction_dialogue_checks")
+    controllable_start = now()
+    controllable = player_avatar_is_controllable()
+    timing("agent_interaction_controllability_check", controllable_start)
+    count("interaction_controllability_checks")
+    timing("agent_interaction_observation", interaction_start)
+    count("interaction_observations")
     return InteractionObservation(
         game_state=state,
-        dialogue_waiting=state is GameState.OVERWORLD and is_field_message_waiting_for_input(),
+        dialogue_waiting=dialogue_waiting,
         choice_options=choice_options,
         menu_options=menu_options,
         special_interaction=special_interaction,
-        controllable=player_avatar_is_controllable(),
+        controllable=controllable,
     )

@@ -1,7 +1,8 @@
 from unittest import TestCase
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from modules.agent_control import (
+    ActionResult,
     ActionResultType,
     AgentActionExecutor,
     AgentActionType,
@@ -9,24 +10,34 @@ from modules.agent_control import (
     AgentObservation,
     GoalStatus,
     available_actions,
+    evaluate_goal,
     select_action,
 )
 from modules.goals import GoalConstraints, NavigationGoal, ReachLocation
 from modules.interaction_state import InteractionObservation
 from modules.map_path import Direction
 from modules.memory import GameState
-from modules.overworld import OverworldObservation, TileObservation, TriggerObservation
+from modules.navigation import NavigationActionType
+from modules.overworld import (
+    MovementState,
+    OverworldObservation,
+    TileObservation,
+    TriggerObservation,
+    WarpObservation,
+)
+from modules.world_navigation import WorldEdge, WorldMapGraph
 
 
 MAP = ("test", 0)
 
 
-def overworld(coordinates, start=(0, 0), *, triggers=(), controllable=True):
+def overworld(coordinates, start=(0, 0), *, triggers=(), controllable=True,
+              facing=Direction.South, movement_state=None):
     all_directions = frozenset(Direction)
     return OverworldObservation(
         map_id=MAP,
         player_coordinates=start,
-        facing=Direction.South,
+        facing=facing,
         controllable=controllable,
         tiles=tuple(
             TileObservation((MAP, coordinate), False, all_directions)
@@ -35,6 +46,7 @@ def overworld(coordinates, start=(0, 0), *, triggers=(), controllable=True):
         warps=(),
         objects=(),
         triggers=tuple(triggers),
+        movement_state=movement_state,
     )
 
 
@@ -53,6 +65,29 @@ def observation(state, *, dialogue_waiting=False, choices=(), menu=(), world=Non
 
 
 class AgentActionSelectionTests(TestCase):
+    def test_cached_world_signature_ignores_static_tile_topology(self):
+        first = observation(
+            GameState.OVERWORLD,
+            world=overworld({(0, 0), (1, 0)}),
+        )
+        changed_static_topology = observation(
+            GameState.OVERWORLD,
+            world=OverworldObservation(
+                map_id=MAP, player_coordinates=(0, 0), facing=Direction.South,
+                controllable=True,
+                tiles=(
+                    TileObservation((MAP, (0, 0)), False, frozenset({Direction.North})),
+                    TileObservation((MAP, (1, 0)), False, frozenset({Direction.West})),
+                ),
+                warps=(), objects=(), triggers=(),
+            ),
+        )
+
+        self.assertEqual(
+            AgentControlLoop._world_signature(first),
+            AgentControlLoop._world_signature(changed_static_topology),
+        )
+
     def test_dialogue_produces_advance_action_only_when_ready(self):
         ready = observation(GameState.OVERWORLD, dialogue_waiting=True)
         not_ready = observation(GameState.OVERWORLD, dialogue_waiting=False)
@@ -131,6 +166,44 @@ class AgentActionSelectionTests(TestCase):
 
 
 class AgentExecutionTests(TestCase):
+    def test_control_loop_retries_move_after_opposite_direction_turn(self):
+        observations = iter((
+            observation(
+                GameState.OVERWORLD,
+                world=overworld(
+                    {(6, 5), (6, 6)}, start=(6, 5), facing=Direction.North,
+                ),
+                goal=ReachLocation((MAP, (6, 6))),
+            ),
+            observation(
+                GameState.OVERWORLD,
+                world=overworld(
+                    {(6, 5), (6, 6)}, start=(6, 5), facing=Direction.South,
+                    movement_state=MovementState.STANDING,
+                ),
+                goal=ReachLocation((MAP, (6, 6))),
+            ),
+            observation(
+                GameState.OVERWORLD,
+                world=overworld(
+                    {(6, 5), (6, 6)}, start=(6, 6), facing=Direction.South,
+                    movement_state=MovementState.STANDING,
+                ),
+                goal=ReachLocation((MAP, (6, 6))),
+            ),
+        ))
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator):
+            loop = AgentControlLoop(lambda: next(observations))
+            first = loop.step()
+            second = loop.step()
+            arrived = loop.step()
+
+        self.assertEqual(first[1].action.direction, Direction.South)
+        self.assertEqual(second[1].action.direction, Direction.South)
+        self.assertEqual(arrived[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(emulator.press_button.call_args_list, [call("Down"), call("Down")])
+
     def test_control_loop_executes_selected_movement_and_reobserves(self):
         world = overworld({(0, 0), (1, 0)})
         observe = Mock(return_value=observation(
@@ -145,6 +218,201 @@ class AgentExecutionTests(TestCase):
         self.assertEqual(result.result_type, ActionResultType.EXECUTED)
         emulator.press_button.assert_called_once_with("Right")
         observe.assert_called_once_with()
+
+    def test_control_loop_reuses_plan_when_observed_position_advances(self):
+        observations = iter((
+            observation(GameState.OVERWORLD, world=overworld({(0, 0), (1, 0), (2, 0)}),
+                       goal=ReachLocation((MAP, (2, 0)))),
+            observation(GameState.OVERWORLD,
+                       world=overworld({(0, 0), (1, 0), (2, 0)}, start=(1, 0))),
+        ))
+        executor = Mock()
+        executor.execute.side_effect = lambda action, _: ActionResult(ActionResultType.EXECUTED, action)
+        with patch("modules.agent_control.context.emulator", Mock()), \
+                patch("modules.agent_control.evaluate_goal", wraps=evaluate_goal) as evaluate:
+            loop = AgentControlLoop(lambda: next(observations), executor)
+            first = loop.step()
+            second = loop.step()
+
+        self.assertEqual(first[1].action.direction, Direction.East)
+        self.assertEqual(second[1].action.direction, Direction.East)
+        self.assertEqual(evaluate.call_count, 1)
+
+    def test_control_loop_waits_for_move_destination_before_advancing_cached_plan(self):
+        observations = iter((
+            observation(
+                GameState.OVERWORLD,
+                world=overworld({(0, 0), (1, 0), (2, 0)}),
+                goal=ReachLocation((MAP, (2, 0))),
+            ),
+            observation(
+                GameState.OVERWORLD,
+                world=overworld({(0, 0), (1, 0), (2, 0)}),
+                goal=ReachLocation((MAP, (2, 0))),
+            ),
+            observation(
+                GameState.OVERWORLD,
+                world=overworld({(0, 0), (1, 0), (2, 0)}, start=(1, 0)),
+                goal=ReachLocation((MAP, (2, 0))),
+            ),
+        ))
+        emulator = Mock()
+        messages = []
+        with patch("modules.agent_control.context.emulator", emulator):
+            loop = AgentControlLoop(lambda: next(observations), logger=messages.append)
+            first = loop.step()
+            settling = loop.step()
+            arrived = loop.step()
+
+        self.assertEqual(first[1].action.navigation.action_type, NavigationActionType.MOVE)
+        self.assertEqual(first[1].action.navigation.source, (MAP, (0, 0)))
+        self.assertEqual(first[1].action.navigation.destination, (MAP, (1, 0)))
+        self.assertEqual(settling[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(settling[2].result_type, ActionResultType.WAITING)
+        self.assertEqual(arrived[1].action.navigation.action_type, NavigationActionType.MOVE)
+        self.assertEqual(arrived[1].action.navigation.source, (MAP, (1, 0)))
+        self.assertEqual(emulator.press_button.call_args_list, [call("Right"), call("Right")])
+        self.assertFalse(any("plan divergence" in message for message in messages))
+
+    def test_cached_warp_survives_dynamic_world_change_and_waits_for_destination(self):
+        source_map = (0, 0)
+        target_map = (0, 1)
+        goal = ReachLocation((target_map, (0, 0)))
+
+        def source_world(coordinates, dynamic=False):
+            return OverworldObservation(
+                map_id=source_map,
+                player_coordinates=coordinates,
+                facing=Direction.East,
+                controllable=True,
+                tiles=tuple(
+                    TileObservation((source_map, coordinate), False, frozenset(Direction))
+                    for coordinate in ((0, 0), (1, 0))
+                ),
+                warps=(WarpObservation(
+                    (source_map, (1, 0)),
+                    (target_map, (0, 0)),
+                    Direction.East,
+                ),),
+                objects=(),
+                triggers=(TriggerObservation("dynamic", frozenset()),) if dynamic else (),
+            )
+
+        target_world = OverworldObservation(
+            map_id=target_map,
+            player_coordinates=(0, 0),
+            facing=Direction.East,
+            controllable=True,
+            tiles=(TileObservation((target_map, (0, 0)), False, frozenset(Direction)),),
+            warps=(),
+            objects=(),
+            triggers=(),
+        )
+        observations = iter((
+            observation(GameState.OVERWORLD, world=source_world((0, 0)), goal=goal),
+            observation(GameState.OVERWORLD, world=source_world((0, 0)), goal=goal),
+            observation(GameState.OVERWORLD, world=source_world((1, 0), dynamic=True), goal=goal),
+            observation(GameState.OVERWORLD, world=source_world((1, 0), dynamic=True), goal=goal),
+            observation(GameState.OVERWORLD, world=source_world((1, 0), dynamic=True), goal=goal),
+            observation(GameState.OVERWORLD, world=target_world, goal=goal),
+        ))
+        graph = WorldMapGraph((WorldEdge(
+            source_map=source_map,
+            destination_map=target_map,
+            kind="warp",
+            source_coordinates=((1, 0),),
+            destination_coordinates=((0, 0),),
+        ),))
+        emulator = Mock()
+        with patch("modules.navigation.get_world_map_graph", return_value=graph), \
+                patch("modules.agent_control.context.emulator", emulator):
+            loop = AgentControlLoop(lambda: next(observations))
+            first = loop.step()
+            settling = loop.step()
+            warp = loop.step()
+            waiting = loop.step()
+            waiting_again = loop.step()
+            resumed = loop.step()
+
+        self.assertEqual(first[1].action.navigation.action_type, NavigationActionType.MOVE)
+        self.assertEqual(settling[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(warp[1].action.navigation.action_type, NavigationActionType.WARP)
+        self.assertEqual(warp[1].action.navigation.source, (source_map, (1, 0)))
+        self.assertEqual(warp[1].action.direction, Direction.East)
+        self.assertEqual(waiting[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(waiting_again[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(resumed[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(resumed[1].goal_evaluation.status, GoalStatus.COMPLETE)
+        self.assertIsNone(loop._expected_world_transition)
+        self.assertEqual(emulator.press_button.call_args_list, [call("Right"), call("Right")])
+
+    def test_warp_activation_waits_for_standing_on_warp_source(self):
+        source_map = (0, 0)
+        target_map = (0, 1)
+        goal = ReachLocation((target_map, (0, 0)))
+
+        def source_world(coordinates, movement_state):
+            return OverworldObservation(
+                map_id=source_map,
+                player_coordinates=coordinates,
+                facing=Direction.East,
+                controllable=True,
+                tiles=tuple(
+                    TileObservation((source_map, coordinate), False, frozenset(Direction))
+                    for coordinate in ((0, 0), (1, 0))
+                ),
+                warps=(WarpObservation(
+                    (source_map, (1, 0)), (target_map, (0, 0)), Direction.East,
+                ),),
+                objects=(),
+                triggers=(),
+                movement_state=movement_state,
+            )
+
+        target_world = OverworldObservation(
+            map_id=target_map,
+            player_coordinates=(0, 0),
+            facing=Direction.East,
+            controllable=True,
+            tiles=(TileObservation((target_map, (0, 0)), False, frozenset(Direction)),),
+            warps=(),
+            objects=(),
+            triggers=(),
+        )
+        graph = WorldMapGraph((WorldEdge(
+            source_map=source_map,
+            destination_map=target_map,
+            kind="warp",
+            source_coordinates=((1, 0),),
+            destination_coordinates=((0, 0),),
+        ),))
+        observations = iter((
+            observation(GameState.OVERWORLD, world=source_world((0, 0), MovementState.STANDING), goal=goal),
+            observation(GameState.OVERWORLD, world=source_world((1, 0), MovementState.MOVING), goal=goal),
+            observation(GameState.OVERWORLD, world=source_world((1, 0), MovementState.STANDING), goal=goal),
+            observation(GameState.OVERWORLD, world=target_world, goal=goal),
+        ))
+        emulator = Mock()
+        with patch("modules.navigation.get_world_map_graph", return_value=graph), \
+                patch("modules.agent_control.context.emulator", emulator):
+            loop = AgentControlLoop(lambda: next(observations))
+            move = loop.step()
+            deferred = loop.step()
+            deferred_transition = loop._expected_world_transition
+            deferred_inputs = list(emulator.press_button.call_args_list)
+            activated = loop.step()
+            completed = loop.step()
+
+        self.assertEqual(move[1].action.navigation.action_type, NavigationActionType.MOVE)
+        self.assertEqual(deferred[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(deferred[2].result_type, ActionResultType.WAITING)
+        self.assertIsNone(deferred_transition)
+        self.assertEqual(deferred_inputs, [call("Right")])
+        self.assertIsNone(loop._expected_world_transition)
+        self.assertEqual(activated[1].action.navigation.action_type, NavigationActionType.WARP)
+        self.assertEqual(activated[2].result_type, ActionResultType.EXECUTED)
+        self.assertEqual(completed[1].goal_evaluation.status, GoalStatus.COMPLETE)
+        self.assertEqual(emulator.press_button.call_args_list, [call("Right"), call("Right")])
 
     def test_executor_rejects_input_for_unknown_state(self):
         action = available_actions(observation(GameState.UNKNOWN))[0]

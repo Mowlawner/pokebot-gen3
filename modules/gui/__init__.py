@@ -148,6 +148,7 @@ class PokebotGui:
             context.emulation_speed = self._startup_settings.emulation_speed
             context.debug = self._startup_settings.debug
             context.debug_trace = self._startup_settings.debug_trace
+            context.debug_profile = self._startup_settings.debug_profile
             context.bot_mode = self._startup_settings.bot_mode
 
             if context.debug:

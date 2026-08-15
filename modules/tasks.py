@@ -11,6 +11,7 @@ from modules.game import get_symbol_name_before
 from modules.memory import get_symbol_name, read_symbol, unpack_uint16, unpack_uint32
 from modules.state_cache import state_cache
 from modules.text_printer import get_text_printer
+from modules.profiler import count as profile_count, profiled
 
 
 class Task:
@@ -162,10 +163,13 @@ class ScriptContext:
         )
 
 
+@profiled("task_list_total", "task_list_calls")
 def get_tasks() -> TaskList:
     if state_cache.tasks.age_in_frames == 0 and state_cache.tasks.value is not None:
+        profile_count("task_list_cached_calls")
         return state_cache.tasks.value
 
+    profile_count("task_list_fresh_calls")
     task_list = TaskList(read_symbol("gTasks"))
     state_cache.tasks = task_list
     return task_list
@@ -175,6 +179,7 @@ def get_task(task_name: str) -> Task | None:
     return get_tasks()[task_name]
 
 
+@profiled("task_state_check_total", "task_state_checks")
 def task_is_active(task_name: str) -> bool:
     return task_name in get_tasks()
 

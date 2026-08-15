@@ -19,6 +19,7 @@ def get_bot_modes() -> list[Type[BotMode]]:
 
     if len(_bot_modes) == 0:
         from .berry_blend import BerryBlendMode
+        from .agent_pilot import AgentRivalBattlePilot
         from .bunny_hop import BunnyHopMode
         from .daycare import DaycareMode
         from .ev_train import EVTrainMode
@@ -44,6 +45,7 @@ def get_bot_modes() -> list[Type[BotMode]]:
         from .sweet_scent import SweetScentMode
 
         _bot_modes = [
+            AgentRivalBattlePilot,
             BerryBlendMode,
             BunnyHopMode,
             DaycareMode,

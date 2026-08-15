@@ -49,6 +49,7 @@ class StartupSettings:
     always_on_top: bool
     config_path: str
     debug_trace: bool = False
+    debug_profile: bool = False
 
 
 def directory_arg(value: str) -> pathlib.Path:
@@ -128,6 +129,12 @@ def parse_arguments(bot_mode_names: list[str]) -> StartupSettings:
         action="store_true",
         help="Enable high-volume diagnostic tracing (implies --debug).",
     )
+    parser.add_argument(
+        "--debug-profile",
+        dest="debug_profile",
+        action="store_true",
+        help="Enable performance profiling without enabling trace diagnostics.",
+    )
     parser.add_argument("-c", "--config", type=directory_arg, dest="config_path", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -148,6 +155,7 @@ def parse_arguments(bot_mode_names: list[str]) -> StartupSettings:
         always_on_top=bool(args.always_on_top),
         config_path=args.config_path,
         debug_trace=bool(args.debug_trace),
+        debug_profile=bool(args.debug_profile),
     )
 
 

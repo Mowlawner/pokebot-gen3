@@ -23,6 +23,7 @@ from modules.memory import (
 )
 from modules.pokemon import Item, get_item_by_index
 from modules.state_cache import state_cache
+from modules.profiler import count as profile_count, now as profile_now, timing as profile_timing
 from modules.tasks import task_is_active
 
 
@@ -269,16 +270,27 @@ def get_player() -> Player:
 
 
 def get_player_avatar() -> PlayerAvatar:
-    if state_cache.player_avatar.age_in_frames == 0:
+    total_start = profile_now()
+    cache_age = state_cache.player_avatar.age_in_frames
+    profile_count("player_avatar_calls")
+    if cache_age == 0:
+        profile_count("player_avatar_cached_calls")
+        profile_timing("player_avatar_total", total_start)
         return state_cache.player_avatar.value
 
+    profile_count("player_avatar_fresh_calls")
+    read_start = profile_now()
     player_avatar_data = read_symbol("gPlayerAvatar")
     object_event_id = player_avatar_data[5]
     object_event = ObjectEvent(read_symbol("gObjectEvents", object_event_id * 0x24, 0x24))
     map_group_and_number = get_save_block(1, offset=4, size=2)
+    profile_timing("player_avatar_emulator_reads", read_start)
 
+    processing_start = profile_now()
     player_avatar = PlayerAvatar(object_event, player_avatar_data, map_group_and_number)
     state_cache.player_avatar = player_avatar
+    profile_timing("player_avatar_python_processing", processing_start)
+    profile_timing("player_avatar_total", total_start)
 
     return player_avatar
 

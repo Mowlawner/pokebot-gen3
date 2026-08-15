@@ -5,6 +5,9 @@ from dataclasses import dataclass, field
 from modules.overworld import Location, MapId
 
 
+INTRODUCTORY_RIVAL_TRIGGER_ID = "introductory_rival"
+
+
 class Goal:
     """Marker base class for objectives supplied by a higher-level planner."""
 
@@ -23,6 +26,11 @@ class ReachWarp(Goal):
 @dataclass(frozen=True)
 class ActivateTrigger(Goal):
     trigger_id: str
+
+
+def introductory_rival_goal() -> ActivateTrigger:
+    """Return the generic trigger goal used by the Emerald pilot."""
+    return ActivateTrigger(INTRODUCTORY_RIVAL_TRIGGER_ID)
 
 
 @dataclass(frozen=True)
