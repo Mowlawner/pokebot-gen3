@@ -23,16 +23,29 @@ class TestOverworldPerception(unittest.TestCase):
     def test_reuses_static_tiles_when_only_avatar_state_changes(self):
         map_id = (91, 7)
         map_data = MapMetadata(
-            map_id, b"header", (2).to_bytes(4, "little") + (1).to_bytes(4, "little"),
-            b"events", (), (), (), (), (),
+            map_id,
+            b"header",
+            (2).to_bytes(4, "little") + (1).to_bytes(4, "little"),
+            b"events",
+            (),
+            (),
+            (),
+            (),
+            (),
         )
         path_tiles = [
-            SimpleNamespace(local_coordinates=(x, 0), accessible_from_direction=[True] * 4,
-                             warps_to=None, traversal_cost=2 if x == 1 else 1)
+            SimpleNamespace(
+                local_coordinates=(x, 0),
+                accessible_from_direction=[True] * 4,
+                warps_to=None,
+                traversal_cost=2 if x == 1 else 1,
+            )
             for x in range(2)
         ]
         avatar = SimpleNamespace(
-            map_group_and_number=map_id, local_coordinates=(0, 0), facing_direction="Down",
+            map_group_and_number=map_id,
+            local_coordinates=(0, 0),
+            facing_direction="Down",
         )
         with (
             patch("modules.overworld.get_player_avatar", return_value=avatar),
@@ -56,12 +69,17 @@ class TestOverworldPerception(unittest.TestCase):
         object_event = _object_event()
         map_id = (1, 2)
         map_data = MapMetadata(
-            map_id, b"header", (3).to_bytes(4, "little") + (4).to_bytes(4, "little"),
-            b"events", (), (), (), (), (),
+            map_id,
+            b"header",
+            (3).to_bytes(4, "little") + (4).to_bytes(4, "little"),
+            b"events",
+            (),
+            (),
+            (),
+            (),
+            (),
         )
-        template_map = SimpleNamespace(
-            objects=[SimpleNamespace(local_id=7, script_symbol="Route101_EventScript_NPC")]
-        )
+        template_map = SimpleNamespace(objects=[SimpleNamespace(local_id=7, script_symbol="Route101_EventScript_NPC")])
         path_tile = SimpleNamespace(
             local_coordinates=(1, 2),
             accessible_from_direction=[True, True, True, True],
@@ -79,10 +97,14 @@ class TestOverworldPerception(unittest.TestCase):
             patch("modules.overworld.get_map_metadata", return_value=map_data),
             patch("modules.overworld.get_map_objects", return_value=[object_event]),
             patch("modules.overworld.player_avatar_is_controllable", return_value=True),
-            patch("modules.map.get_map_metadata", return_value=SimpleNamespace(
-                object_template=lambda local_id: template_map.objects[0]
-                if local_id == template_map.objects[0].local_id else None,
-            )),
+            patch(
+                "modules.map.get_map_metadata",
+                return_value=SimpleNamespace(
+                    object_template=lambda local_id: (
+                        template_map.objects[0] if local_id == template_map.objects[0].local_id else None
+                    ),
+                ),
+            ),
         ):
             observation = perceive_overworld()
 

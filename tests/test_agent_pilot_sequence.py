@@ -16,7 +16,6 @@ from modules.map_path import Direction
 from modules.memory import GameState
 from modules.overworld import OverworldObservation, TileObservation, TriggerObservation
 
-
 MAP = ("test", 0)
 
 
@@ -26,10 +25,7 @@ def world(coordinates, start):
         player_coordinates=start,
         facing=Direction.East,
         controllable=True,
-        tiles=tuple(
-            TileObservation((MAP, coordinate), False, frozenset(Direction))
-            for coordinate in coordinates
-        ),
+        tiles=tuple(TileObservation((MAP, coordinate), False, frozenset(Direction)) for coordinate in coordinates),
         warps=(),
         objects=(),
         triggers=(),
@@ -61,18 +57,22 @@ class AgentPilotSequenceTests(TestCase):
                 TileObservation((MAP, coordinate), False, frozenset(Direction))
                 for coordinate in ((0, 0), (1, 0), (2, 0))
             ),
-            warps=(), objects=(), triggers=(rival_trigger,),
+            warps=(),
+            objects=(),
+            triggers=(rival_trigger,),
         )
         goal = ActivateTrigger("rival")
-        observations = iter((
-            AgentObservation(InteractionObservation(GameState.OVERWORLD, dialogue_waiting=True), goal=goal),
-            AgentObservation(InteractionObservation(GameState.OVERWORLD), route_world((0, 0))),
-            AgentObservation(InteractionObservation(GameState.BATTLE)),
-            AgentObservation(InteractionObservation(GameState.OVERWORLD), route_world((1, 0))),
-            AgentObservation(InteractionObservation(GameState.OVERWORLD), route_world((2, 0))),
-            AgentObservation(InteractionObservation(GameState.OVERWORLD, dialogue_waiting=True)),
-            AgentObservation(InteractionObservation(GameState.BATTLE)),
-        ))
+        observations = iter(
+            (
+                AgentObservation(InteractionObservation(GameState.OVERWORLD, dialogue_waiting=True), goal=goal),
+                AgentObservation(InteractionObservation(GameState.OVERWORLD), route_world((0, 0))),
+                AgentObservation(InteractionObservation(GameState.BATTLE)),
+                AgentObservation(InteractionObservation(GameState.OVERWORLD), route_world((1, 0))),
+                AgentObservation(InteractionObservation(GameState.OVERWORLD), route_world((2, 0))),
+                AgentObservation(InteractionObservation(GameState.OVERWORLD, dialogue_waiting=True)),
+                AgentObservation(InteractionObservation(GameState.BATTLE)),
+            )
+        )
         executor = RecordingExecutor()
         loop = AgentControlLoop(lambda: next(observations), executor, goal=goal)
 
@@ -80,26 +80,33 @@ class AgentPilotSequenceTests(TestCase):
 
         self.assertEqual(
             [decision.action.action_type for _, decision, _ in results],
-            [AgentActionType.ADVANCE_DIALOGUE, AgentActionType.NAVIGATE_TOWARD_GOAL,
-             AgentActionType.DELEGATE_BATTLE, AgentActionType.NAVIGATE_TOWARD_GOAL,
-             AgentActionType.INTERACT, AgentActionType.ADVANCE_DIALOGUE,
-             AgentActionType.DELEGATE_BATTLE],
+            [
+                AgentActionType.ADVANCE_DIALOGUE,
+                AgentActionType.NAVIGATE_TOWARD_GOAL,
+                AgentActionType.DELEGATE_BATTLE,
+                AgentActionType.NAVIGATE_TOWARD_GOAL,
+                AgentActionType.INTERACT,
+                AgentActionType.ADVANCE_DIALOGUE,
+                AgentActionType.DELEGATE_BATTLE,
+            ],
         )
 
     def test_goal_survives_wild_battle_and_navigation_resumes(self):
         goal = ReachLocation((MAP, (2, 0)))
-        observations = iter((
-            AgentObservation(
-                InteractionObservation(GameState.OVERWORLD),
-                world({(0, 0), (1, 0), (2, 0)}, (0, 0)),
-                goal,
-            ),
-            AgentObservation(InteractionObservation(GameState.BATTLE)),
-            AgentObservation(
-                InteractionObservation(GameState.OVERWORLD),
-                world({(0, 0), (1, 0), (2, 0)}, (1, 0)),
-            ),
-        ))
+        observations = iter(
+            (
+                AgentObservation(
+                    InteractionObservation(GameState.OVERWORLD),
+                    world({(0, 0), (1, 0), (2, 0)}, (0, 0)),
+                    goal,
+                ),
+                AgentObservation(InteractionObservation(GameState.BATTLE)),
+                AgentObservation(
+                    InteractionObservation(GameState.OVERWORLD),
+                    world({(0, 0), (1, 0), (2, 0)}, (1, 0)),
+                ),
+            )
+        )
         executor = RecordingExecutor()
         logs = []
         loop = AgentControlLoop(lambda: next(observations), executor, logger=logs.append)
@@ -115,8 +122,11 @@ class AgentPilotSequenceTests(TestCase):
         self.assertEqual(resumed[1].action.direction, Direction.East)
         self.assertEqual(
             [action.action_type for action, _ in executor.actions],
-            [AgentActionType.NAVIGATE_TOWARD_GOAL, AgentActionType.DELEGATE_BATTLE,
-             AgentActionType.NAVIGATE_TOWARD_GOAL],
+            [
+                AgentActionType.NAVIGATE_TOWARD_GOAL,
+                AgentActionType.DELEGATE_BATTLE,
+                AgentActionType.NAVIGATE_TOWARD_GOAL,
+            ],
         )
         self.assertTrue(any("BATTLE_RETURN" in message for message in logs))
 
@@ -135,7 +145,9 @@ class AgentPilotSequenceTests(TestCase):
                     TileObservation((MAP, (0, 0)), False, frozenset(Direction)),
                     TileObservation((MAP, (1, 0)), False, frozenset(Direction)),
                 ),
-                warps=(), objects=(), triggers=(trigger,),
+                warps=(),
+                objects=(),
+                triggers=(trigger,),
             ),
             ActivateTrigger("rival"),
         )
@@ -145,6 +157,6 @@ class AgentPilotSequenceTests(TestCase):
 
     def test_battle_action_is_not_replaced_by_overworld_input(self):
         decision = select_action(AgentObservation(InteractionObservation(GameState.BATTLE)))
-        self.assertEqual(decision.action, AgentAction(
-            AgentActionType.DELEGATE_BATTLE, reason="BattleListener owns battle execution"
-        ))
+        self.assertEqual(
+            decision.action, AgentAction(AgentActionType.DELEGATE_BATTLE, reason="BattleListener owns battle execution")
+        )

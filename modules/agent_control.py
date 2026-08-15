@@ -107,12 +107,13 @@ def prewarm_warp_destination(
     navigation: NavigationAction | None,
 ) -> bool:
     """Warm static caches for the observed destination of an imminent warp."""
-    if (navigation is None
-            or navigation.action_type is not NavigationActionType.WARP
-            or observation.overworld is None
-            or navigation.source[0] != observation.overworld.map_id
-            or not any(warp.destination == navigation.destination
-                       for warp in observation.overworld.warps)):
+    if (
+        navigation is None
+        or navigation.action_type is not NavigationActionType.WARP
+        or observation.overworld is None
+        or navigation.source[0] != observation.overworld.map_id
+        or not any(warp.destination == navigation.destination for warp in observation.overworld.warps)
+    ):
         return False
     try:
         tiles = prewarm_static_map_observation(navigation.destination[0])
@@ -181,8 +182,7 @@ def _choice_actions(observation: AgentObservation) -> tuple[AgentAction, ...]:
 def _menu_actions(observation: AgentObservation) -> tuple[AgentAction, ...]:
     if observation.interaction.menu_options:
         return tuple(
-            AgentAction(AgentActionType.NAVIGATE_MENU, option=option)
-            for option in observation.interaction.menu_options
+            AgentAction(AgentActionType.NAVIGATE_MENU, option=option) for option in observation.interaction.menu_options
         )
     return (AgentAction(AgentActionType.WAIT_REOBSERVE, reason="menu options are not available yet"),)
 
@@ -239,8 +239,11 @@ def evaluate_goal(observation: AgentObservation) -> GoalEvaluation:
     world_diagnostics = ()
     if isinstance(observation.goal, (ActivateTrigger, ReachInteractionPosition)):
         resolution = next(
-            (binding for binding in observation.overworld.bindings
-             if binding.binding.trigger_id == observation.goal.trigger_id),
+            (
+                binding
+                for binding in observation.overworld.bindings
+                if binding.binding.trigger_id == observation.goal.trigger_id
+            ),
             None,
         )
         if resolution is not None:
@@ -248,8 +251,7 @@ def evaluate_goal(observation: AgentObservation) -> GoalEvaluation:
                 f"trigger={resolution.binding.trigger_id!r}"
                 f" map={resolution.binding.map_id!r}"
                 f" script={resolution.binding.script_symbol!r}",
-                f"runtime_match={resolution.runtime_match}"
-                f" object_id={resolution.object_ids!r}",
+                f"runtime_match={resolution.runtime_match}" f" object_id={resolution.object_ids!r}",
                 f"static_match={resolution.static_match}"
                 f" static_available={resolution.static_available}"
                 f" static_ambiguous={resolution.static_ambiguous}"
@@ -277,32 +279,41 @@ def evaluate_goal(observation: AgentObservation) -> GoalEvaluation:
 
     if isinstance(observation.goal, (ReachLocation, ReachWarp, ReachInteractionPosition)) and not plan.actions:
         return GoalEvaluation(
-            GoalStatus.COMPLETE, plan=plan, reason="goal position reached",
+            GoalStatus.COMPLETE,
+            plan=plan,
+            reason="goal position reached",
             binding_diagnostics=binding_diagnostics,
             world_diagnostics=world_diagnostics,
         )
     if isinstance(observation.goal, ActivateTrigger):
         resolution = next(
-            (binding for binding in observation.overworld.bindings
-             if binding.binding.trigger_id == observation.goal.trigger_id),
+            (
+                binding
+                for binding in observation.overworld.bindings
+                if binding.binding.trigger_id == observation.goal.trigger_id
+            ),
             None,
         )
         activated = observation.interaction.metadata.get("activated_trigger_ids", ())
         if observation.goal.trigger_id in activated:
             return GoalEvaluation(
-                GoalStatus.COMPLETE, plan=plan, reason="trigger is already activated",
+                GoalStatus.COMPLETE,
+                plan=plan,
+                reason="trigger is already activated",
                 binding_diagnostics=binding_diagnostics,
                 world_diagnostics=world_diagnostics,
             )
         if resolution is not None and not resolution.runtime_match:
             return GoalEvaluation(
-                GoalStatus.REACHABLE, plan=plan,
+                GoalStatus.REACHABLE,
+                plan=plan,
                 reason="static target reached; waiting for runtime object",
                 binding_diagnostics=binding_diagnostics,
                 world_diagnostics=world_diagnostics,
             )
     return GoalEvaluation(
-        GoalStatus.REACHABLE, plan=plan,
+        GoalStatus.REACHABLE,
+        plan=plan,
         binding_diagnostics=binding_diagnostics,
         world_diagnostics=world_diagnostics,
     )
@@ -317,17 +328,11 @@ def select_action(observation: AgentObservation) -> ActionDecision:
         return ActionDecision(available_actions(observation)[0])
     evaluation = evaluate_goal(observation)
     if evaluation.status is GoalStatus.COMPLETE:
-        return ActionDecision(
-            AgentAction(AgentActionType.WAIT_REOBSERVE, reason=evaluation.reason), evaluation
-        )
+        return ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE, reason=evaluation.reason), evaluation)
     if evaluation.status is GoalStatus.UNREACHABLE:
-        return ActionDecision(
-            AgentAction(AgentActionType.WAIT_REOBSERVE, reason=evaluation.reason), evaluation
-        )
+        return ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE, reason=evaluation.reason), evaluation)
     if evaluation.status is GoalStatus.NOT_APPLICABLE:
-        return ActionDecision(
-            AgentAction(AgentActionType.WAIT_REOBSERVE, reason=evaluation.reason), evaluation
-        )
+        return ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE, reason=evaluation.reason), evaluation)
     if (
         isinstance(observation.goal, ActivateTrigger)
         and evaluation.status is GoalStatus.REACHABLE
@@ -335,21 +340,24 @@ def select_action(observation: AgentObservation) -> ActionDecision:
         and not evaluation.plan.actions
     ):
         resolution = next(
-            (binding for binding in observation.overworld.bindings
-             if binding.binding.trigger_id == observation.goal.trigger_id),
+            (
+                binding
+                for binding in observation.overworld.bindings
+                if binding.binding.trigger_id == observation.goal.trigger_id
+            ),
             None,
         )
         runtime_available = (
-            resolution.runtime_match if resolution is not None else any(
-                trigger.trigger_id == observation.goal.trigger_id
-                and trigger.activation_locations
+            resolution.runtime_match
+            if resolution is not None
+            else any(
+                trigger.trigger_id == observation.goal.trigger_id and trigger.activation_locations
                 for trigger in observation.overworld.triggers
             )
         )
         if not runtime_available:
             return ActionDecision(
-                AgentAction(AgentActionType.WAIT_REOBSERVE,
-                            reason="static target reached; waiting for runtime object"),
+                AgentAction(AgentActionType.WAIT_REOBSERVE, reason="static target reached; waiting for runtime object"),
                 evaluation,
             )
         return ActionDecision(
@@ -410,8 +418,9 @@ class _MovementBatch:
 class AgentActionExecutor:
     """Translate semantic actions to input only after selection is complete."""
 
-    def __init__(self, *, choose_option: Callable[[str], None] | None = None,
-                 navigate_menu: Callable[[str], None] | None = None):
+    def __init__(
+        self, *, choose_option: Callable[[str], None] | None = None, navigate_menu: Callable[[str], None] | None = None
+    ):
         self._choose_option = choose_option
         self._navigate_menu = navigate_menu
 
@@ -422,11 +431,15 @@ class AgentActionExecutor:
         if action.action_type is AgentActionType.DELEGATE_BATTLE:
             return ActionResult(ActionResultType.DELEGATED, action, action.reason)
         if observation.interaction_type in (InteractionType.UNKNOWN, InteractionType.SPECIAL_INTERACTION):
-            return ActionResult(ActionResultType.WAITING, AgentAction(AgentActionType.WAIT_REOBSERVE,
-                                                                       reason="unsafe interaction state"),
-                                "unsafe interaction state")
+            return ActionResult(
+                ActionResultType.WAITING,
+                AgentAction(AgentActionType.WAIT_REOBSERVE, reason="unsafe interaction state"),
+                "unsafe interaction state",
+            )
         if context.emulator is None and action.action_type not in (
-                AgentActionType.CHOOSE_DIALOGUE_OPTION, AgentActionType.NAVIGATE_MENU):
+            AgentActionType.CHOOSE_DIALOGUE_OPTION,
+            AgentActionType.NAVIGATE_MENU,
+        ):
             return ActionResult(ActionResultType.UNSUPPORTED, action, "no emulator is attached")
 
         if action.action_type is AgentActionType.ADVANCE_DIALOGUE:
@@ -449,9 +462,11 @@ class AgentActionExecutor:
             if action.direction is None:
                 return ActionResult(ActionResultType.UNSUPPORTED, action, "movement direction is missing")
             press_button_fresh = getattr(type(context.emulator), "press_button_fresh", None)
-            if (action.navigation is not None
-                    and action.navigation.action_type is NavigationActionType.WARP
-                    and callable(press_button_fresh)):
+            if (
+                action.navigation is not None
+                and action.navigation.action_type is NavigationActionType.WARP
+                and callable(press_button_fresh)
+            ):
                 context.emulator.press_button_fresh(action.direction.button_name)
             else:
                 context.emulator.press_button(action.direction.button_name)
@@ -481,10 +496,13 @@ class AgentControlLoop:
         self._last_navigation_diagnostics: tuple[str, ...] | None = None
         self._last_binding_diagnostics: tuple[str, ...] | None = None
         self._last_world_diagnostics: tuple[str, ...] | None = None
-        self._expected_world_transition: tuple[
-            tuple[tuple[int, int], tuple[int, int]],
-            tuple[tuple[int, int], tuple[int, int]],
-        ] | None = None
+        self._expected_world_transition: (
+            tuple[
+                tuple[tuple[int, int], tuple[int, int]],
+                tuple[tuple[int, int], tuple[int, int]],
+            ]
+            | None
+        ) = None
         self._warp_settling = False
         self._warp_wait_observations = 0
         self._cached_evaluation: GoalEvaluation | None = None
@@ -510,9 +528,9 @@ class AgentControlLoop:
             return ()
         world = observation.overworld
         checkpoints = {
-            location for trigger in world.triggers
-            for locations in (trigger.locations, trigger.activation_locations,
-                              trigger.navigation_locations)
+            location
+            for trigger in world.triggers
+            for locations in (trigger.locations, trigger.activation_locations, trigger.navigation_locations)
             for location in locations
         }
         # Treat the tiles occupied by, and immediately surrounding, runtime
@@ -520,13 +538,17 @@ class AgentControlLoop:
         # normal interaction path instead of carrying the player past it.
         for obj in world.objects:
             x, y = obj.location[1]
-            checkpoints.update({
-                obj.location,
-                (obj.location[0], (x - 1, y)), (obj.location[0], (x + 1, y)),
-                (obj.location[0], (x, y - 1)), (obj.location[0], (x, y + 1)),
-            })
+            checkpoints.update(
+                {
+                    obj.location,
+                    (obj.location[0], (x - 1, y)),
+                    (obj.location[0], (x + 1, y)),
+                    (obj.location[0], (x, y - 1)),
+                    (obj.location[0], (x, y + 1)),
+                }
+            )
         result: list[NavigationAction] = []
-        for action in self._cached_actions[self._cached_action_index:]:
+        for action in self._cached_actions[self._cached_action_index :]:
             if len(result) >= 8 or action.action_type is not NavigationActionType.MOVE:
                 break
             if action.source[0] != world.map_id or action.destination[0] != world.map_id:
@@ -604,9 +626,7 @@ class AgentControlLoop:
         self._logger(f"AGENT_{message}")
 
     def _diagnostics_enabled(self) -> bool:
-        return self._custom_logger or (
-            context.debug and getattr(context, "debug_trace", False)
-        )
+        return self._custom_logger or (context.debug and getattr(context, "debug_trace", False))
 
     def _diagnose_route103_objects(self, observation: AgentObservation) -> None:
         """Log Route 103's complete runtime object table at stable points.
@@ -702,14 +722,21 @@ class AgentControlLoop:
         return (
             world.map_id,
             tuple((warp.entry, warp.destination, warp.required_facing) for warp in world.warps),
-            tuple((trigger.trigger_id, trigger.activation_locations,
-                   trigger.navigation_locations, trigger.target_map)
-                  for trigger in world.triggers),
+            tuple(
+                (trigger.trigger_id, trigger.activation_locations, trigger.navigation_locations, trigger.target_map)
+                for trigger in world.triggers
+            ),
             world.dynamic_blocked_coordinates,
             tuple((obj.local_id, obj.location, obj.script) for obj in world.objects),
-            tuple((binding.binding.trigger_id, binding.static_location,
-                   binding.runtime_match, binding.interaction_positions)
-                  for binding in world.bindings),
+            tuple(
+                (
+                    binding.binding.trigger_id,
+                    binding.static_location,
+                    binding.runtime_match,
+                    binding.interaction_positions,
+                )
+                for binding in world.bindings
+            ),
         )
 
     def _invalidate_plan(self, reason: str = "unspecified") -> None:
@@ -748,34 +775,47 @@ class AgentControlLoop:
             return None
 
         if self._cached_action_index >= len(self._cached_actions):
-            if (self._cached_evaluation.plan is not None
-                    and location == self._cached_evaluation.plan.destination):
+            if self._cached_evaluation.plan is not None and location == self._cached_evaluation.plan.destination:
                 if isinstance(self._goal, ActivateTrigger):
                     resolution = next(
-                        (binding for binding in observation.overworld.bindings
-                         if binding.binding.trigger_id == self._goal.trigger_id),
+                        (
+                            binding
+                            for binding in observation.overworld.bindings
+                            if binding.binding.trigger_id == self._goal.trigger_id
+                        ),
                         None,
                     )
                     runtime_available = (
-                        resolution.runtime_match if resolution is not None else any(
-                            trigger.trigger_id == self._goal.trigger_id
-                            and trigger.activation_locations
+                        resolution.runtime_match
+                        if resolution is not None
+                        else any(
+                            trigger.trigger_id == self._goal.trigger_id and trigger.activation_locations
                             for trigger in observation.overworld.triggers
                         )
                     )
                     if not runtime_available:
-                        return ActionDecision(AgentAction(
-                            AgentActionType.WAIT_REOBSERVE,
-                            reason="static target reached; waiting for runtime object",
-                        ), self._cached_evaluation)
-                    return ActionDecision(AgentAction(
-                        AgentActionType.INTERACT, option=self._goal.trigger_id,
-                        reason="cached goal activation position reached",
-                    ), self._cached_evaluation)
-                return ActionDecision(AgentAction(
-                    AgentActionType.WAIT_REOBSERVE,
-                    reason="cached goal position reached",
-                ), self._cached_evaluation)
+                        return ActionDecision(
+                            AgentAction(
+                                AgentActionType.WAIT_REOBSERVE,
+                                reason="static target reached; waiting for runtime object",
+                            ),
+                            self._cached_evaluation,
+                        )
+                    return ActionDecision(
+                        AgentAction(
+                            AgentActionType.INTERACT,
+                            option=self._goal.trigger_id,
+                            reason="cached goal activation position reached",
+                        ),
+                        self._cached_evaluation,
+                    )
+                return ActionDecision(
+                    AgentAction(
+                        AgentActionType.WAIT_REOBSERVE,
+                        reason="cached goal position reached",
+                    ),
+                    self._cached_evaluation,
+                )
             self._invalidate_plan("cached_plan_exhausted")
             return None
         navigation = cached_action
@@ -783,11 +823,15 @@ class AgentControlLoop:
             self._report(f"REPLAN: reason='plan divergence' expected={navigation.source!r} observed={location!r}")
             self._invalidate_plan("plan_divergence")
             return None
-        return ActionDecision(AgentAction(
-            AgentActionType.NAVIGATE_TOWARD_GOAL,
-            direction=navigation.direction, navigation=navigation,
-            reason="continue cached goal plan",
-        ), self._cached_evaluation)
+        return ActionDecision(
+            AgentAction(
+                AgentActionType.NAVIGATE_TOWARD_GOAL,
+                direction=navigation.direction,
+                navigation=navigation,
+                reason="continue cached goal plan",
+            ),
+            self._cached_evaluation,
+        )
 
     def step(self) -> tuple[AgentObservation, ActionDecision, ActionResult]:
         profiling = getattr(context, "debug_profile", False)
@@ -858,9 +902,7 @@ class AgentControlLoop:
                 wait_result = self._executor.execute(wait_action, observation)
                 return observation, wait_decision, wait_result
 
-        if (self._warp_settling
-                and interaction_type is InteractionType.OVERWORLD
-                and observation.overworld is not None):
+        if self._warp_settling and interaction_type is InteractionType.OVERWORLD and observation.overworld is not None:
             if not observation.overworld.controllable:
                 wait_action = AgentAction(
                     AgentActionType.WAIT_REOBSERVE,
@@ -894,8 +936,7 @@ class AgentControlLoop:
                     self._in_flight_move_initial_facing = None
                 elif movement_state is MovementState.STANDING:
                     self._report(
-                        "REPLAN: reason='movement blocked'"
-                        f" requested={self._in_flight_move.direction.name!r}"
+                        "REPLAN: reason='movement blocked'" f" requested={self._in_flight_move.direction.name!r}"
                     )
                     self._invalidate_plan("movement_blocked")
                 else:
@@ -928,9 +969,11 @@ class AgentControlLoop:
         decision = self._cached_decision(observation)
         if decision is None:
             decision = select_action(observation)
-            if (decision.goal_evaluation is not None
-                    and decision.goal_evaluation.status is GoalStatus.REACHABLE
-                    and decision.goal_evaluation.plan is not None):
+            if (
+                decision.goal_evaluation is not None
+                and decision.goal_evaluation.status is GoalStatus.REACHABLE
+                and decision.goal_evaluation.plan is not None
+            ):
                 self._cached_evaluation = decision.goal_evaluation
                 self._cached_actions = decision.goal_evaluation.plan.actions
                 self._cached_action_index = 0
@@ -943,9 +986,7 @@ class AgentControlLoop:
         timing("navigation_total_decision", navigation_start)
         decision_elapsed = perf_counter_ns() - profile_start - observe_elapsed if profiling else 0
         if decision.goal_evaluation is not None and self._diagnostics_enabled():
-            self._report(
-                f"GOAL: {observation.goal!r} status={decision.goal_evaluation.status.name}"
-            )
+            self._report(f"GOAL: {observation.goal!r} status={decision.goal_evaluation.status.name}")
             diagnostics = decision.goal_evaluation.diagnostics
             if diagnostics and diagnostics != self._last_navigation_diagnostics:
                 for diagnostic in diagnostics:
@@ -961,13 +1002,23 @@ class AgentControlLoop:
                 for diagnostic in world_diagnostics:
                     self._report(f"WORLD: {diagnostic}")
                 self._last_world_diagnostics = world_diagnostics
-        if (decision.action.navigation is not None
-                and decision.action.navigation.action_type is NavigationActionType.WARP):
-            warp = next((warp for warp in (observation.overworld.warps if observation.overworld else ())
-                          if warp.destination == decision.action.navigation.destination), None)
+        if (
+            decision.action.navigation is not None
+            and decision.action.navigation.action_type is NavigationActionType.WARP
+        ):
+            warp = next(
+                (
+                    warp
+                    for warp in (observation.overworld.warps if observation.overworld else ())
+                    if warp.destination == decision.action.navigation.destination
+                ),
+                None,
+            )
             self._report(f"WORLD: approaching_warp={warp.entry if warp else decision.action.navigation.destination!r}")
             self._report(f"WORLD: source_position={decision.action.navigation.source!r}")
-            self._report(f"WORLD: warp_ready={decision.action.navigation.source == (observation.overworld.map_id, observation.overworld.player_coordinates) if observation.overworld else False}")
+            self._report(
+                f"WORLD: warp_ready={decision.action.navigation.source == (observation.overworld.map_id, observation.overworld.player_coordinates) if observation.overworld else False}"
+            )
         if self._diagnostics_enabled():
             self._report(
                 f"ACTION: {decision.action.action_type.name}"
@@ -976,12 +1027,16 @@ class AgentControlLoop:
             )
         if decision.goal_evaluation is not None:
             if decision.goal_evaluation.status is GoalStatus.COMPLETE:
-                return observation, decision, ActionResult(
-                    ActionResultType.GOAL_COMPLETE, decision.action, decision.goal_evaluation.reason
+                return (
+                    observation,
+                    decision,
+                    ActionResult(ActionResultType.GOAL_COMPLETE, decision.action, decision.goal_evaluation.reason),
                 )
             if decision.goal_evaluation.status is GoalStatus.UNREACHABLE:
-                return observation, decision, ActionResult(
-                    ActionResultType.UNREACHABLE, decision.action, decision.goal_evaluation.reason
+                return (
+                    observation,
+                    decision,
+                    ActionResult(ActionResultType.UNREACHABLE, decision.action, decision.goal_evaluation.reason),
                 )
         if (
             decision.action.navigation is not None
@@ -991,8 +1046,7 @@ class AgentControlLoop:
             and observation.overworld.movement_state is not MovementState.STANDING
         ):
             self._report(
-                "WARP_WAIT: activation_deferred"
-                f" movement_state={observation.overworld.movement_state.name!r}"
+                "WARP_WAIT: activation_deferred" f" movement_state={observation.overworld.movement_state.name!r}"
             )
             wait_action = AgentAction(
                 AgentActionType.WAIT_REOBSERVE,
@@ -1006,11 +1060,13 @@ class AgentControlLoop:
         result = self._executor.execute(decision.action, observation)
         if profiling:
             total_elapsed = perf_counter_ns() - profile_start
-            profile_print(lambda: f"AGENT_PROFILE: {format_snapshot()} "
-                                  f"step_observe_ms={observe_elapsed / 1_000_000:.3f} "
-                                  f"step_decision_ms={decision_elapsed / 1_000_000:.3f} "
-                                  f"step_execute_ms={(total_elapsed - observe_elapsed - decision_elapsed) / 1_000_000:.3f} "
-                                  f"step_total_ms={total_elapsed / 1_000_000:.3f}")
+            profile_print(
+                lambda: f"AGENT_PROFILE: {format_snapshot()} "
+                f"step_observe_ms={observe_elapsed / 1_000_000:.3f} "
+                f"step_decision_ms={decision_elapsed / 1_000_000:.3f} "
+                f"step_execute_ms={(total_elapsed - observe_elapsed - decision_elapsed) / 1_000_000:.3f} "
+                f"step_total_ms={total_elapsed / 1_000_000:.3f}"
+            )
         if decision.action.navigation is not None:
             if result.result_type is ActionResultType.EXECUTED:
                 if decision.action.navigation.action_type is NavigationActionType.MOVE:
@@ -1026,7 +1082,7 @@ class AgentControlLoop:
                 else:
                     self._cached_action_index += 1
             else:
-                    self._invalidate_plan("action_execution_failed")
+                self._invalidate_plan("action_execution_failed")
         if (
             result.result_type is ActionResultType.EXECUTED
             and decision.action.navigation is not None

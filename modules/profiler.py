@@ -33,6 +33,7 @@ def timing(name: str, started_at: int) -> None:
 
 def profiled(timing_name: str, counter_name: str):
     """Decorate a coarse boundary without timing it when profiling is off."""
+
     def decorator(function):
         @wraps(function)
         def wrapped(*args, **kwargs):
@@ -44,7 +45,9 @@ def profiled(timing_name: str, counter_name: str):
                 return function(*args, **kwargs)
             finally:
                 timing(timing_name, started_at)
+
         return wrapped
+
     return decorator
 
 

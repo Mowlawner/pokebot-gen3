@@ -1756,21 +1756,23 @@ def get_runtime_object_table(map_id: tuple[int, int] | None = None) -> tuple[Run
                 # Keep the runtime row even if its map/template is transient.
                 pass
 
-        result.append(RuntimeObjectSlot(
-            slot=slot,
-            active=True,
-            local_id=event.local_id,
-            map_id=event_map_id,
-            initial_coordinates=event.initial_coords,
-            coordinates=event.current_coords,
-            previous_coordinates=event.previous_coords,
-            flags=tuple(event.flags),
-            script=script,
-            template_coordinates=template_coordinates,
-            template_flag_id=template_flag_id,
-            template_flag_name=template_flag_name,
-            hide_flag_set=hide_flag_set,
-        ))
+        result.append(
+            RuntimeObjectSlot(
+                slot=slot,
+                active=True,
+                local_id=event.local_id,
+                map_id=event_map_id,
+                initial_coordinates=event.initial_coords,
+                coordinates=event.current_coords,
+                previous_coordinates=event.previous_coords,
+                flags=tuple(event.flags),
+                script=script,
+                template_coordinates=template_coordinates,
+                template_flag_id=template_flag_id,
+                template_flag_name=template_flag_name,
+                hide_flag_set=hide_flag_set,
+            )
+        )
     return tuple(result)
 
 

@@ -60,7 +60,8 @@ def resolve_trigger_binding(
 
     static_start = now()
     static_matches = tuple(
-        object_template for object_template in static_objects
+        object_template
+        for object_template in static_objects
         if (binding.local_id is None or object_template.local_id == binding.local_id)
         and object_template.script_symbol == binding.script_symbol
     )
@@ -77,32 +78,38 @@ def resolve_trigger_binding(
     static_available = bool(static_template is not None and not hide_flag_set)
     timing("trigger_hide_flag_evaluation", hide_flag_start)
     count("hide_flag_evaluations")
-    static_location = (
-        (binding.map_id, static_template.local_coordinates)
-        if static_available else None
-    )
+    static_location = (binding.map_id, static_template.local_coordinates) if static_available else None
     runtime_start = now()
-    matches = () if static_match and not static_available else tuple(
-        object_observation for object_observation in objects
-        if object_observation.location[0] == binding.map_id
-        and (binding.local_id is None or object_observation.local_id == binding.local_id)
-        and object_observation.script == binding.script_symbol
+    matches = (
+        ()
+        if static_match and not static_available
+        else tuple(
+            object_observation
+            for object_observation in objects
+            if object_observation.location[0] == binding.map_id
+            and (binding.local_id is None or object_observation.local_id == binding.local_id)
+            and object_observation.script == binding.script_symbol
+        )
     )
     timing("trigger_runtime_binding_matching", runtime_start)
     count("runtime_binding_matches")
     geometry_start = now()
-    interaction_positions = tuple(sorted({
-        (candidate_x, candidate_y)
-        for object_observation in matches
-        for object_x, object_y in (object_observation.location[1],)
-        for candidate_x, candidate_y in (
-            (object_x, object_y - 1),
-            (object_x + 1, object_y),
-            (object_x, object_y + 1),
-            (object_x - 1, object_y),
+    interaction_positions = tuple(
+        sorted(
+            {
+                (candidate_x, candidate_y)
+                for object_observation in matches
+                for object_x, object_y in (object_observation.location[1],)
+                for candidate_x, candidate_y in (
+                    (object_x, object_y - 1),
+                    (object_x + 1, object_y),
+                    (object_x, object_y + 1),
+                    (object_x - 1, object_y),
+                )
+                if 0 <= candidate_x < map_size[0] and 0 <= candidate_y < map_size[1]
+            }
         )
-        if 0 <= candidate_x < map_size[0] and 0 <= candidate_y < map_size[1]
-    }))
+    )
     timing("trigger_geometry_matching", geometry_start)
     count("trigger_geometry_matches")
     timing("trigger_static_resolution", total_start)

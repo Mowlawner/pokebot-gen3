@@ -48,13 +48,15 @@ class TestWorldMapGraph(unittest.TestCase):
         self.assertEqual(route.edges[0].source_coordinates, ((0, 0),))
 
     def test_multi_map_route_and_shortest_branch(self):
-        graph = WorldMapGraph((
-            edge((0, 0), (0, 1)),
-            edge((0, 1), (0, 2)),
-            edge((0, 0), (0, 3)),
-            edge((0, 3), (0, 4)),
-            edge((0, 4), (0, 2)),
-        ))
+        graph = WorldMapGraph(
+            (
+                edge((0, 0), (0, 1)),
+                edge((0, 1), (0, 2)),
+                edge((0, 0), (0, 3)),
+                edge((0, 3), (0, 4)),
+                edge((0, 4), (0, 2)),
+            )
+        )
 
         route = graph.route((0, 0), (0, 2))
 
@@ -77,11 +79,16 @@ class TestWorldMapGraph(unittest.TestCase):
 
     def test_connection_edge_derives_only_boundary_pairs(self):
         source = SimpleNamespace(
-            map_size=(4, 3), warps=[],
-            connections=[SimpleNamespace(
-                destination_map_group=0, destination_map_number=1,
-                direction="North", offset=1,
-            )],
+            map_size=(4, 3),
+            warps=[],
+            connections=[
+                SimpleNamespace(
+                    destination_map_group=0,
+                    destination_map_number=1,
+                    direction="North",
+                    offset=1,
+                )
+            ],
         )
         destination = SimpleNamespace(map_size=(3, 2), warps=[], connections=[])
 
@@ -96,22 +103,30 @@ class TestWorldMapGraph(unittest.TestCase):
 class TestWorldGoalIntegration(unittest.TestCase):
     def test_offscreen_static_target_is_navigable(self):
         map_id = (0, 18)
-        tiles = tuple(
-            TileObservation((map_id, (x, 0)), False, frozenset(Direction))
-            for x in range(3)
-        )
+        tiles = tuple(TileObservation((map_id, (x, 0)), False, frozenset(Direction)) for x in range(3))
         binding = TriggerBinding("rival", map_id, "RivalScript", local_id=2)
         world = NavigationWorld(
-            tiles={tile.location: NavigableTile(
-                tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles},
-            triggers=(TriggerObservation(
-                "rival", frozenset(), frozenset(), "semantic_object", map_id,
-                frozenset({(map_id, (2, 0))}),
-            ),),
-            bindings=(BindingResolution(
-                binding=binding, static_match=True,
-                static_location=(map_id, (2, 0)), static_available=True,
-            ),),
+            tiles={
+                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles
+            },
+            triggers=(
+                TriggerObservation(
+                    "rival",
+                    frozenset(),
+                    frozenset(),
+                    "semantic_object",
+                    map_id,
+                    frozenset({(map_id, (2, 0))}),
+                ),
+            ),
+            bindings=(
+                BindingResolution(
+                    binding=binding,
+                    static_match=True,
+                    static_location=(map_id, (2, 0)),
+                    static_available=True,
+                ),
+            ),
         )
 
         plan, _ = plan_with_world_navigation(world, (map_id, (0, 0)), ActivateTrigger("rival"))
@@ -127,12 +142,17 @@ class TestWeightedNavigation(unittest.TestCase):
     def world(cls, coordinates, grass=(), blocked=()):
         coordinates = set(coordinates)
         all_directions = frozenset(Direction)
-        return NavigationWorld(tiles={
-            (cls.MAP, coordinate): NavigableTile(
-                (cls.MAP, coordinate), coordinate in blocked, all_directions,
-                2 if coordinate in grass else 1,
-            ) for coordinate in coordinates
-        })
+        return NavigationWorld(
+            tiles={
+                (cls.MAP, coordinate): NavigableTile(
+                    (cls.MAP, coordinate),
+                    coordinate in blocked,
+                    all_directions,
+                    2 if coordinate in grass else 1,
+                )
+                for coordinate in coordinates
+            }
+        )
 
     def test_normal_terrain_has_baseline_cost(self):
         world = self.world({(0, 0)})
@@ -141,17 +161,13 @@ class TestWeightedNavigation(unittest.TestCase):
     def test_grass_route_is_avoided_when_normal_detour_is_cheaper(self):
         coordinates = {(x, y) for y in (0, 1) for x in range(5)}
         world = self.world(coordinates, grass={(1, 0), (2, 0), (3, 0)})
-        plan = GoalAwareNavigator(world).plan(
-            (self.MAP, (0, 0)), ReachLocation((self.MAP, (4, 0)))
-        )
+        plan = GoalAwareNavigator(world).plan((self.MAP, (0, 0)), ReachLocation((self.MAP, (4, 0))))
         self.assertTrue(all(action.destination[1][1] == 1 for action in plan.actions[1:-1]))
 
     def test_grass_is_used_when_it_is_the_only_route(self):
         coordinates = {(x, 0) for x in range(4)}
         world = self.world(coordinates, grass={(1, 0), (2, 0)})
-        plan = GoalAwareNavigator(world).plan(
-            (self.MAP, (0, 0)), ReachLocation((self.MAP, (3, 0)))
-        )
+        plan = GoalAwareNavigator(world).plan((self.MAP, (0, 0)), ReachLocation((self.MAP, (3, 0))))
         self.assertEqual([action.destination[1] for action in plan.actions], [(1, 0), (2, 0), (3, 0)])
 
     def test_large_normal_detour_beats_grass_route_only_when_cheaper(self):
@@ -171,32 +187,41 @@ class TestWeightedNavigation(unittest.TestCase):
             ((4, 2), Direction.East, 1),
             ((4, 1), Direction.South, 1),
         )
-        world = NavigationWorld(tiles={
-            (self.MAP, coordinate): NavigableTile(
-                (self.MAP, coordinate), False,
-                direction if isinstance(direction, frozenset) else frozenset({direction}), cost
-            ) for coordinate, direction, cost in path
-        })
-        plan = GoalAwareNavigator(world).plan(
-            (self.MAP, (0, 0)), ReachLocation((self.MAP, (4, 0)))
+        world = NavigationWorld(
+            tiles={
+                (self.MAP, coordinate): NavigableTile(
+                    (self.MAP, coordinate),
+                    False,
+                    direction if isinstance(direction, frozenset) else frozenset({direction}),
+                    cost,
+                )
+                for coordinate, direction, cost in path
+            }
         )
+        plan = GoalAwareNavigator(world).plan((self.MAP, (0, 0)), ReachLocation((self.MAP, (4, 0))))
         self.assertTrue(any(action.destination[1] in {(1, 0), (2, 0), (3, 0)} for action in plan.actions))
 
     def test_equal_cost_normal_tiles_retain_shortest_route(self):
         coordinates = {(x, y) for y in (0, 1) for x in range(3)}
         world = self.world(coordinates)
-        plan = GoalAwareNavigator(world).plan(
-            (self.MAP, (0, 0)), ReachLocation((self.MAP, (2, 0)))
-        )
+        plan = GoalAwareNavigator(world).plan((self.MAP, (0, 0)), ReachLocation((self.MAP, (2, 0))))
         self.assertEqual([action.destination[1] for action in plan.actions], [(1, 0), (2, 0)])
 
     def test_dynamic_blocking_does_not_change_static_terrain_cost(self):
         location = (self.MAP, (1, 0))
         observation = OverworldObservation(
-            self.MAP, (0, 0), Direction.East, True,
-            (TileObservation((self.MAP, (0, 0)), False, frozenset(Direction)),
-             TileObservation(location, False, frozenset(Direction), traversal_cost=2)),
-            (), (), (), dynamic_blocked_coordinates=frozenset({(1, 0)}),
+            self.MAP,
+            (0, 0),
+            Direction.East,
+            True,
+            (
+                TileObservation((self.MAP, (0, 0)), False, frozenset(Direction)),
+                TileObservation(location, False, frozenset(Direction), traversal_cost=2),
+            ),
+            (),
+            (),
+            (),
+            dynamic_blocked_coordinates=frozenset({(1, 0)}),
         )
         world = NavigationWorld.from_overworld(observation)
         self.assertTrue(world.tiles[location].blocked)
@@ -214,15 +239,26 @@ class TestWeightedNavigation(unittest.TestCase):
                 facing=Direction.South,
                 controllable=True,
                 tiles=(TileObservation(location, False, frozenset(Direction)),),
-                warps=(), objects=(),
-                triggers=(TriggerObservation(
-                    "rival", frozenset(), frozenset(), "semantic_object", map_id,
-                    frozenset({location}),
-                ),),
-                bindings=(BindingResolution(
-                    binding=binding, static_match=True,
-                    static_location=location, static_available=True,
-                ),),
+                warps=(),
+                objects=(),
+                triggers=(
+                    TriggerObservation(
+                        "rival",
+                        frozenset(),
+                        frozenset(),
+                        "semantic_object",
+                        map_id,
+                        frozenset({location}),
+                    ),
+                ),
+                bindings=(
+                    BindingResolution(
+                        binding=binding,
+                        static_match=True,
+                        static_location=location,
+                        static_available=True,
+                    ),
+                ),
             ),
             goal=ActivateTrigger("rival"),
         )
@@ -237,13 +273,11 @@ class TestWeightedNavigation(unittest.TestCase):
     def test_warp_action_is_the_step_onto_a_normal_warp_tile(self):
         source_map = (0, 0)
         target_map = (0, 1)
-        tiles = tuple(
-            TileObservation((source_map, (x, 0)), False, frozenset(Direction))
-            for x in range(3)
-        )
+        tiles = tuple(TileObservation((source_map, (x, 0)), False, frozenset(Direction)) for x in range(3))
         world = NavigationWorld(
-            tiles={tile.location: NavigableTile(
-                tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles},
+            tiles={
+                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles
+            },
             warps=(WarpObservation((source_map, (2, 0)), (target_map, (0, 0))),),
         )
         graph = WorldMapGraph((edge(source_map, target_map, source_coordinate=(2, 0)),))
@@ -259,13 +293,11 @@ class TestWeightedNavigation(unittest.TestCase):
     def test_arrow_warp_steps_onto_tile_then_uses_required_facing(self):
         source_map = (0, 0)
         target_map = (0, 1)
-        tiles = tuple(
-            TileObservation((source_map, (x, 0)), False, frozenset(Direction))
-            for x in range(3)
-        )
+        tiles = tuple(TileObservation((source_map, (x, 0)), False, frozenset(Direction)) for x in range(3))
         world = NavigationWorld(
-            tiles={tile.location: NavigableTile(
-                tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles},
+            tiles={
+                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles
+            },
             warps=(WarpObservation((source_map, (2, 0)), (target_map, (0, 0)), Direction.North),),
         )
         graph = WorldMapGraph((edge(source_map, target_map, source_coordinate=(2, 0)),))
@@ -282,10 +314,7 @@ class TestWeightedNavigation(unittest.TestCase):
     def test_cross_map_semantic_goal_gets_world_transition_plan(self):
         current_map = (1, 4)
         target_map = (0, 18)
-        tiles = tuple(
-            TileObservation((current_map, (x, 0)), False, frozenset(Direction))
-            for x in range(3)
-        )
+        tiles = tuple(TileObservation((current_map, (x, 0)), False, frozenset(Direction)) for x in range(3))
         overworld = OverworldObservation(
             map_id=current_map,
             player_coordinates=(0, 0),
@@ -294,13 +323,19 @@ class TestWeightedNavigation(unittest.TestCase):
             tiles=tiles,
             warps=(),
             objects=(),
-            triggers=(TriggerObservation(
-                "introductory_rival", frozenset(), frozenset(),
-                "semantic_object", target_map=target_map,
-            ),),
+            triggers=(
+                TriggerObservation(
+                    "introductory_rival",
+                    frozenset(),
+                    frozenset(),
+                    "semantic_object",
+                    target_map=target_map,
+                ),
+            ),
         )
         observation = AgentObservation(
-            InteractionObservation(GameState.OVERWORLD), overworld=overworld,
+            InteractionObservation(GameState.OVERWORLD),
+            overworld=overworld,
             goal=ActivateTrigger("introductory_rival"),
         )
         graph = WorldMapGraph((edge(current_map, target_map, source_coordinate=(2, 0)),))
@@ -314,10 +349,12 @@ class TestWeightedNavigation(unittest.TestCase):
         self.assertEqual(evaluation.plan.actions[-1].destination, (target_map, (0, 0)))
 
     def test_replanning_uses_observed_destination_as_new_source(self):
-        graph = WorldMapGraph((
-            edge((0, 0), (0, 1)),
-            edge((0, 1), (0, 2)),
-        ))
+        graph = WorldMapGraph(
+            (
+                edge((0, 0), (0, 1)),
+                edge((0, 1), (0, 2)),
+            )
+        )
 
         first = graph.route((0, 0), (0, 2))
         second = graph.route(first.edges[0].destination_map, (0, 2))
@@ -335,11 +372,17 @@ class TestWeightedNavigation(unittest.TestCase):
             facing=Direction.South,
             controllable=True,
             tiles=(TileObservation((source_map, (0, 0)), False, frozenset(Direction)),),
-            warps=(), objects=(),
-            triggers=(TriggerObservation(
-                "introductory_rival", frozenset(), frozenset(),
-                "semantic_object", target_map=target_map,
-            ),),
+            warps=(),
+            objects=(),
+            triggers=(
+                TriggerObservation(
+                    "introductory_rival",
+                    frozenset(),
+                    frozenset(),
+                    "semantic_object",
+                    target_map=target_map,
+                ),
+            ),
         )
         target_world = OverworldObservation(
             map_id=target_map,
@@ -347,11 +390,17 @@ class TestWeightedNavigation(unittest.TestCase):
             facing=Direction.South,
             controllable=True,
             tiles=(TileObservation((target_map, (0, 0)), False, frozenset(Direction)),),
-            warps=(), objects=(),
-            triggers=(TriggerObservation(
-                "introductory_rival", frozenset({(target_map, (0, 0))}),
-                frozenset({(target_map, (0, 0))}), "semantic_object", target_map=target_map,
-            ),),
+            warps=(),
+            objects=(),
+            triggers=(
+                TriggerObservation(
+                    "introductory_rival",
+                    frozenset({(target_map, (0, 0))}),
+                    frozenset({(target_map, (0, 0))}),
+                    "semantic_object",
+                    target_map=target_map,
+                ),
+            ),
         )
         observations = iter((source_world, source_world, target_world))
         graph = WorldMapGraph((edge(source_map, target_map),))
@@ -359,13 +408,15 @@ class TestWeightedNavigation(unittest.TestCase):
         loop = AgentControlLoop(
             lambda: AgentObservation(
                 InteractionObservation(GameState.OVERWORLD),
-                overworld=next(observations), goal=goal,
+                overworld=next(observations),
+                goal=goal,
             ),
             AgentActionExecutor(),
         )
 
-        with patch("modules.navigation.get_world_map_graph", return_value=graph), \
-                patch("modules.agent_control.context.emulator", emulator):
+        with patch("modules.navigation.get_world_map_graph", return_value=graph), patch(
+            "modules.agent_control.context.emulator", emulator
+        ):
             first = loop.step()
             settling = loop.step()
             resumed = loop.step()

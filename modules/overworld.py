@@ -115,15 +115,17 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
         by_coordinate = {tile.local_coordinates: tile for tile in path_tiles}
         warps: list[WarpObservation] = []
         for warp in map_data.warps:
-            destination = ((warp.destination_location.map_group, warp.destination_location.map_number),
-                           warp.destination_location.local_position)
+            destination = (
+                (warp.destination_location.map_group, warp.destination_location.map_number),
+                warp.destination_location.local_position,
+            )
             path_tile = by_coordinate.get(warp.local_coordinates)
             required_facing = None
             if path_tile is not None and path_tile.warps_to is not None:
                 required_facing = path_tile.warps_to[2]
-            warps.append(WarpObservation(
-                (map_id, warp.local_coordinates), destination, required_facing=required_facing
-            ))
+            warps.append(
+                WarpObservation((map_id, warp.local_coordinates), destination, required_facing=required_facing)
+            )
         warps_by_entry = {warp.entry[1]: warp for warp in warps}
         static_trigger_ids_by_location: dict[Coordinate, set[str]] = {}
         for index, event in enumerate(map_data.coord_events):
@@ -139,17 +141,18 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
         static_tiles: list[TileObservation] = []
         for coordinate, tile in by_coordinate.items():
             walkable = frozenset(
-                direction for direction in Direction
-                if tile.accessible_from_direction[direction.value]
+                direction for direction in Direction if tile.accessible_from_direction[direction.value]
             )
-            static_tiles.append(TileObservation(
-                location=(map_id, coordinate),
-                blocked=not walkable and tile.warps_to is None,
-                walkable_neighbors=walkable,
-                warp=warps_by_entry.get(coordinate),
-                trigger_ids=frozenset(static_trigger_ids_by_location.get(coordinate, set())),
-                traversal_cost=getattr(tile, "traversal_cost", 1),
-            ))
+            static_tiles.append(
+                TileObservation(
+                    location=(map_id, coordinate),
+                    blocked=not walkable and tile.warps_to is None,
+                    walkable_neighbors=walkable,
+                    warp=warps_by_entry.get(coordinate),
+                    trigger_ids=frozenset(static_trigger_ids_by_location.get(coordinate, set())),
+                    traversal_cost=getattr(tile, "traversal_cost", 1),
+                )
+            )
         tiles = tuple(static_tiles)
         static = _StaticMapObservation(path_tiles, map_data, by_coordinate, tuple(warps), tiles)
         _static_map_observations[map_id] = static
@@ -188,12 +191,14 @@ def perceive_overworld() -> OverworldObservation:
         if event.type == "weather":
             continue
         location = (map_id, event.local_coordinates)
-        triggers.append(TriggerObservation(
-            trigger_id=f"coord:{index}:{event.trigger_var_number}:{event.trigger_value}",
-            locations=frozenset({location}),
-            activation_locations=frozenset({location}),
-            kind=event.type,
-        ))
+        triggers.append(
+            TriggerObservation(
+                trigger_id=f"coord:{index}:{event.trigger_var_number}:{event.trigger_value}",
+                locations=frozenset({location}),
+                activation_locations=frozenset({location}),
+                kind=event.type,
+            )
+        )
     runtime_start = now()
     objects = tuple(
         ObjectObservation(
@@ -221,12 +226,14 @@ def perceive_overworld() -> OverworldObservation:
             for candidate_x, candidate_y in ((x, y - 1), (x + 1, y), (x, y + 1), (x - 1, y))
             if 0 <= candidate_x < map_width and 0 <= candidate_y < map_height
         )
-        triggers.append(TriggerObservation(
-            trigger_id=f"object:{object_observation.local_id}:{object_observation.script}",
-            locations=frozenset({object_observation.location}),
-            activation_locations=activation_locations,
-            kind="object_interaction",
-        ))
+        triggers.append(
+            TriggerObservation(
+                trigger_id=f"object:{object_observation.local_id}:{object_observation.script}",
+                locations=frozenset({object_observation.location}),
+                activation_locations=activation_locations,
+                kind="object_interaction",
+            )
+        )
 
     timing("perception_active_runtime_objects", runtime_start)
     count("runtime_object_scans")
@@ -246,17 +253,20 @@ def perceive_overworld() -> OverworldObservation:
     timing("trigger_binding_resolution", binding_start)
     for resolution in bindings:
         binding = resolution.binding
-        triggers.append(TriggerObservation(
-            trigger_id=binding.trigger_id,
-            locations=frozenset((map_id, coordinates) for coordinates in resolution.runtime_locations),
-            activation_locations=frozenset((map_id, coordinates)
-                                            for coordinates in resolution.interaction_positions),
-            kind=f"semantic_{binding.event_type}",
-            target_map=binding.map_id,
-            navigation_locations=frozenset(
-                {resolution.static_location} if resolution.static_location is not None else set()
-            ),
-        ))
+        triggers.append(
+            TriggerObservation(
+                trigger_id=binding.trigger_id,
+                locations=frozenset((map_id, coordinates) for coordinates in resolution.runtime_locations),
+                activation_locations=frozenset(
+                    (map_id, coordinates) for coordinates in resolution.interaction_positions
+                ),
+                kind=f"semantic_{binding.event_type}",
+                target_map=binding.map_id,
+                navigation_locations=frozenset(
+                    {resolution.static_location} if resolution.static_location is not None else set()
+                ),
+            )
+        )
 
     # Tile interaction events (signs, scripted tiles, hidden items, and
     # secret-base entrances) are MapBgEvents, not ObjectEvents.  Preserve
@@ -292,12 +302,14 @@ def perceive_overworld() -> OverworldObservation:
                 if 0 <= activation[0] < map_width and 0 <= activation[1] < map_height:
                     activation_locations = frozenset({(map_id, activation)})
         script = event.script_symbol if event.kind == "Script" else ""
-        triggers.append(TriggerObservation(
-            trigger_id=f"bg:{index}:{event.kind}:{script}",
-            locations=frozenset({location}),
-            activation_locations=activation_locations,
-            kind=f"bg_{event.kind.lower().replace(' ', '_')}",
-        ))
+        triggers.append(
+            TriggerObservation(
+                trigger_id=f"bg:{index}:{event.kind}:{script}",
+                locations=frozenset({location}),
+                activation_locations=activation_locations,
+                kind=f"bg_{event.kind.lower().replace(' ', '_')}",
+            )
+        )
 
     # Static topology is reused. Object positions remain a per-observation
     # overlay; they must never be folded into the cached tile objects.
@@ -307,17 +319,21 @@ def perceive_overworld() -> OverworldObservation:
     tile_transition_state = getattr(avatar, "tile_transition_state", None)
     if getattr(running_state, "name", None) == "TURN_DIRECTION":
         movement_state = MovementState.TURNING
-    elif (getattr(running_state, "name", None) == "MOVING"
-          or getattr(tile_transition_state, "name", "NOT_MOVING") != "NOT_MOVING"):
+    elif (
+        getattr(running_state, "name", None) == "MOVING"
+        or getattr(tile_transition_state, "name", "NOT_MOVING") != "NOT_MOVING"
+    ):
         movement_state = MovementState.MOVING
     else:
         movement_state = MovementState.STANDING
 
     if profiling:
         timing("perception_total", profile_start)
-        profile_print(lambda: f"OVERWORLD_PROFILE: {format_snapshot()} "
-                              f"map={map_id!r} position={player_coordinates!r} "
-                              f"movement={movement_state.name!r}")
+        profile_print(
+            lambda: f"OVERWORLD_PROFILE: {format_snapshot()} "
+            f"map={map_id!r} position={player_coordinates!r} "
+            f"movement={movement_state.name!r}"
+        )
 
     return OverworldObservation(
         map_id=map_id,

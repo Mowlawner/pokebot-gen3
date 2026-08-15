@@ -54,19 +54,23 @@ def _connection_coordinates(
         last = min(source_width, offset + destination_width)
         for source_x in range(first, last):
             destination_x = source_x - offset
-            pairs.append((
-                (source_x, 0 if direction == "North" else source_height - 1),
-                (destination_x, destination_height - 1 if direction == "North" else 0),
-            ))
+            pairs.append(
+                (
+                    (source_x, 0 if direction == "North" else source_height - 1),
+                    (destination_x, destination_height - 1 if direction == "North" else 0),
+                )
+            )
     elif direction in ("East", "West"):
         first = max(0, offset)
         last = min(source_height, offset + destination_height)
         for source_y in range(first, last):
             destination_y = source_y - offset
-            pairs.append((
-                (source_width - 1 if direction == "East" else 0, source_y),
-                (0 if direction == "East" else destination_width - 1, destination_y),
-            ))
+            pairs.append(
+                (
+                    (source_width - 1 if direction == "East" else 0, source_y),
+                    (0 if direction == "East" else destination_width - 1, destination_y),
+                )
+            )
     return tuple(pairs)
 
 
@@ -85,14 +89,16 @@ class WorldMapGraph:
             for warp_index, warp in enumerate(map_data.warps):
                 destination = warp.destination_location
                 destination_map = destination.map_group_and_number
-                edges.append(WorldEdge(
-                    source_map=source_map,
-                    destination_map=destination_map,
-                    kind="warp",
-                    source_coordinates=(warp.local_coordinates,),
-                    destination_coordinates=(destination.local_position,),
-                    warp_index=warp_index,
-                ))
+                edges.append(
+                    WorldEdge(
+                        source_map=source_map,
+                        destination_map=destination_map,
+                        kind="warp",
+                        source_coordinates=(warp.local_coordinates,),
+                        destination_coordinates=(destination.local_position,),
+                        warp_index=warp_index,
+                    )
+                )
             for connection in map_data.connections:
                 destination_map = (connection.destination_map_group, connection.destination_map_number)
                 destination_data = maps.get(destination_map)
@@ -106,14 +112,16 @@ class WorldMapGraph:
                 )
                 if not pairs:
                     continue
-                edges.append(WorldEdge(
-                    source_map=source_map,
-                    destination_map=destination_map,
-                    kind="connection",
-                    source_coordinates=tuple(source for source, _ in pairs),
-                    destination_coordinates=tuple(destination for _, destination in pairs),
-                    connection_direction=connection.direction,
-                ))
+                edges.append(
+                    WorldEdge(
+                        source_map=source_map,
+                        destination_map=destination_map,
+                        kind="connection",
+                        source_coordinates=tuple(source for source, _ in pairs),
+                        destination_coordinates=tuple(destination for _, destination in pairs),
+                        connection_direction=connection.direction,
+                    )
+                )
         return cls(tuple(edges))
 
     def outgoing(self, map_id: MapId) -> tuple[WorldEdge, ...]:

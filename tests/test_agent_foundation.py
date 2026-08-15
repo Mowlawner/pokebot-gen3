@@ -26,8 +26,10 @@ from modules.overworld import (
 def world(coordinates, *, blocked=(), warps=(), triggers=()):
     blocked = set(blocked)
     return NavigationWorld(
-        tiles={("test", coordinate): NavigableTile(("test", coordinate), coordinate in blocked)
-               for coordinate in coordinates},
+        tiles={
+            ("test", coordinate): NavigableTile(("test", coordinate), coordinate in blocked)
+            for coordinate in coordinates
+        },
         warps=tuple(warps),
         triggers=tuple(triggers),
     )
@@ -64,8 +66,9 @@ class GoalAwareNavigationTests(TestCase):
         )
         path_map = SimpleNamespace(tiles=[path_tile])
         map_data = SimpleNamespace(map_size=(1, 1), warps=(), coord_events=(), bg_events=())
-        with patch("modules.overworld._get_map_metadata", return_value=path_map), \
-                patch("modules.overworld.get_map_metadata", return_value=map_data):
+        with patch("modules.overworld._get_map_metadata", return_value=path_map), patch(
+            "modules.overworld.get_map_metadata", return_value=map_data
+        ):
             tiles = prewarm_static_map_observation(map_id)
         self.assertEqual(len(tiles), 1)
         self.assertEqual(tiles[0].traversal_cost, 2)
@@ -74,27 +77,46 @@ class GoalAwareNavigationTests(TestCase):
     def test_prewarm_navigation_tiles_reuses_static_index(self):
         map_id = ("prewarm", 0)
         tiles = tuple(
-            TileObservation((map_id, coordinate), False, frozenset(Direction))
-            for coordinate in ((0, 0), (1, 0))
+            TileObservation((map_id, coordinate), False, frozenset(Direction)) for coordinate in ((0, 0), (1, 0))
         )
         prewarm_navigation_tiles(map_id, tiles)
-        first = NavigationWorld.from_overworld(OverworldObservation(
-            map_id=map_id, player_coordinates=(0, 0), facing=Direction.East,
-            controllable=True, tiles=tiles, warps=(), objects=(), triggers=(),
-        ))
-        second = NavigationWorld.from_overworld(OverworldObservation(
-            map_id=map_id, player_coordinates=(1, 0), facing=Direction.West,
-            controllable=True, tiles=tiles, warps=(), objects=(), triggers=(),
-        ))
+        first = NavigationWorld.from_overworld(
+            OverworldObservation(
+                map_id=map_id,
+                player_coordinates=(0, 0),
+                facing=Direction.East,
+                controllable=True,
+                tiles=tiles,
+                warps=(),
+                objects=(),
+                triggers=(),
+            )
+        )
+        second = NavigationWorld.from_overworld(
+            OverworldObservation(
+                map_id=map_id,
+                player_coordinates=(1, 0),
+                facing=Direction.West,
+                controllable=True,
+                tiles=tiles,
+                warps=(),
+                objects=(),
+                triggers=(),
+            )
+        )
         self.assertIs(first.tiles, second.tiles)
 
     def test_overworld_observation_adapts_to_navigation_world(self):
         location = (("test"), (0, 0))
         observation = OverworldObservation(
-            map_id=("test", 0), player_coordinates=(0, 0), facing=Direction.East,
+            map_id=("test", 0),
+            player_coordinates=(0, 0),
+            facing=Direction.East,
             controllable=True,
             tiles=(TileObservation(location, False, frozenset({Direction.East})),),
-            warps=(), objects=(), triggers=(),
+            warps=(),
+            objects=(),
+            triggers=(),
         )
         navigation_world = NavigationWorld.from_overworld(observation)
         self.assertIn(location, navigation_world.tiles)
@@ -104,16 +126,28 @@ class GoalAwareNavigationTests(TestCase):
         locations = (("test", (0, 0)), ("test", (1, 0)))
         tiles = tuple(TileObservation(location, False, frozenset(Direction)) for location in locations)
         observation = OverworldObservation(
-            map_id=("test", 0), player_coordinates=(0, 0), facing=Direction.East,
-            controllable=True, tiles=tiles, warps=(), objects=(), triggers=(),
+            map_id=("test", 0),
+            player_coordinates=(0, 0),
+            facing=Direction.East,
+            controllable=True,
+            tiles=tiles,
+            warps=(),
+            objects=(),
+            triggers=(),
         )
         first = NavigationWorld.from_overworld(observation)
         second = NavigationWorld.from_overworld(observation)
         self.assertIs(first.tiles, second.tiles)
 
         blocked = OverworldObservation(
-            map_id=("test", 0), player_coordinates=(0, 0), facing=Direction.East,
-            controllable=True, tiles=tiles, warps=(), objects=(), triggers=(),
+            map_id=("test", 0),
+            player_coordinates=(0, 0),
+            facing=Direction.East,
+            controllable=True,
+            tiles=tiles,
+            warps=(),
+            objects=(),
+            triggers=(),
             dynamic_blocked_coordinates=frozenset({(1, 0)}),
         )
         dynamic_world = NavigationWorld.from_overworld(blocked)

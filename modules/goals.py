@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 
 from modules.overworld import Location, MapId
 
-
 INTRODUCTORY_RIVAL_TRIGGER_ID = "introductory_rival"
 
 

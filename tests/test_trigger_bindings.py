@@ -35,15 +35,21 @@ class TestTriggerBindings(unittest.TestCase):
     def test_real_object_event_template_script_matches_binding(self):
         object_event = _route103_object_event()
         template_map = SimpleNamespace(
-            objects=[SimpleNamespace(
-                local_id=object_event.local_id,
-                script_symbol="Route103_EventScript_Rival",
-            )]
+            objects=[
+                SimpleNamespace(
+                    local_id=object_event.local_id,
+                    script_symbol="Route103_EventScript_Rival",
+                )
+            ]
         )
-        with patch("modules.map.get_map_metadata", return_value=SimpleNamespace(
-            object_template=lambda local_id: template_map.objects[0]
-            if local_id == template_map.objects[0].local_id else None,
-        )):
+        with patch(
+            "modules.map.get_map_metadata",
+            return_value=SimpleNamespace(
+                object_template=lambda local_id: (
+                    template_map.objects[0] if local_id == template_map.objects[0].local_id else None
+                ),
+            ),
+        ):
             runtime_object = ObjectObservation(
                 local_id=object_event.local_id,
                 location=(object_event.map_group_and_number, object_event.current_coords),
@@ -73,9 +79,7 @@ class TestTriggerBindings(unittest.TestCase):
             flag_id=0,
         )
 
-        resolution = resolve_trigger_binding(
-            binding, (), map_size=(30, 30), static_objects=(static_template,)
-        )
+        resolution = resolve_trigger_binding(binding, (), map_size=(30, 30), static_objects=(static_template,))
 
         self.assertTrue(resolution.static_match)
         self.assertTrue(resolution.static_available)
@@ -119,11 +123,13 @@ class TestTriggerBindings(unittest.TestCase):
         with patch("modules.trigger_bindings.get_event_flag_by_number", return_value=True):
             resolution = resolve_trigger_binding(
                 binding,
-                (ObjectObservation(
-                    local_id=2,
-                    location=(MapRSE.ROUTE103.value, (10, 3)),
-                    script="Route103_EventScript_Rival",
-                ),),
+                (
+                    ObjectObservation(
+                        local_id=2,
+                        location=(MapRSE.ROUTE103.value, (10, 3)),
+                        script="Route103_EventScript_Rival",
+                    ),
+                ),
                 map_size=(30, 30),
                 static_objects=(static_template,),
             )
@@ -136,32 +142,26 @@ class TestTriggerBindings(unittest.TestCase):
     def test_local_id_disambiguates_static_templates(self):
         binding = get_trigger_binding("introductory_rival")
         templates = (
-            SimpleNamespace(local_id=8, local_coordinates=(2, 2),
-                            script_symbol="Route103_EventScript_Rival", flag_id=0),
-            SimpleNamespace(local_id=2, local_coordinates=(10, 3),
-                            script_symbol="Route103_EventScript_Rival", flag_id=0),
+            SimpleNamespace(
+                local_id=8, local_coordinates=(2, 2), script_symbol="Route103_EventScript_Rival", flag_id=0
+            ),
+            SimpleNamespace(
+                local_id=2, local_coordinates=(10, 3), script_symbol="Route103_EventScript_Rival", flag_id=0
+            ),
         )
 
-        resolution = resolve_trigger_binding(
-            binding, (), map_size=(30, 30), static_objects=templates
-        )
+        resolution = resolve_trigger_binding(binding, (), map_size=(30, 30), static_objects=templates)
 
         self.assertEqual(resolution.static_location, (MapRSE.ROUTE103.value, (10, 3)))
 
     def test_script_only_ambiguous_static_templates_are_not_selected(self):
-        binding = TriggerBinding(
-            "rival", MapRSE.ROUTE103.value, "Route103_EventScript_Rival"
-        )
+        binding = TriggerBinding("rival", MapRSE.ROUTE103.value, "Route103_EventScript_Rival")
         templates = (
-            SimpleNamespace(local_id=2, local_coordinates=(10, 3),
-                            script_symbol=binding.script_symbol, flag_id=0),
-            SimpleNamespace(local_id=3, local_coordinates=(11, 3),
-                            script_symbol=binding.script_symbol, flag_id=0),
+            SimpleNamespace(local_id=2, local_coordinates=(10, 3), script_symbol=binding.script_symbol, flag_id=0),
+            SimpleNamespace(local_id=3, local_coordinates=(11, 3), script_symbol=binding.script_symbol, flag_id=0),
         )
 
-        resolution = resolve_trigger_binding(
-            binding, (), map_size=(30, 30), static_objects=templates
-        )
+        resolution = resolve_trigger_binding(binding, (), map_size=(30, 30), static_objects=templates)
 
         self.assertTrue(resolution.static_match)
         self.assertTrue(resolution.static_ambiguous)
@@ -175,12 +175,18 @@ class TestTriggerBindings(unittest.TestCase):
             facing_direction="North",
         )
         map_data = SimpleNamespace(
-            map_size=(30, 20), warps=[], coord_events=[], bg_events=[], objects=[SimpleNamespace(
-                local_id=2,
-                local_coordinates=(10, 3),
-                script_symbol="Route103_EventScript_Rival",
-                flag_id=0,
-            )]
+            map_size=(30, 20),
+            warps=[],
+            coord_events=[],
+            bg_events=[],
+            objects=[
+                SimpleNamespace(
+                    local_id=2,
+                    local_coordinates=(10, 3),
+                    script_symbol="Route103_EventScript_Rival",
+                    flag_id=0,
+                )
+            ],
         )
         path_tile = SimpleNamespace(
             local_coordinates=(10, 3),
@@ -188,10 +194,12 @@ class TestTriggerBindings(unittest.TestCase):
             warps_to=None,
         )
         template_map = SimpleNamespace(
-            objects=[SimpleNamespace(
-                local_id=object_event.local_id,
-                script_symbol="Route103_EventScript_Rival",
-            )]
+            objects=[
+                SimpleNamespace(
+                    local_id=object_event.local_id,
+                    script_symbol="Route103_EventScript_Rival",
+                )
+            ]
         )
         with (
             patch("modules.overworld.get_player_avatar", return_value=avatar),
@@ -199,26 +207,31 @@ class TestTriggerBindings(unittest.TestCase):
             patch("modules.overworld.get_map_metadata", return_value=map_data),
             patch("modules.overworld.get_map_objects", return_value=[object_event]),
             patch("modules.overworld.player_avatar_is_controllable", return_value=True),
-            patch("modules.map.get_map_metadata", return_value=SimpleNamespace(
-                object_template=lambda local_id: template_map.objects[0]
-                if local_id == template_map.objects[0].local_id else None,
-            )),
+            patch(
+                "modules.map.get_map_metadata",
+                return_value=SimpleNamespace(
+                    object_template=lambda local_id: (
+                        template_map.objects[0] if local_id == template_map.objects[0].local_id else None
+                    ),
+                ),
+            ),
         ):
             observation = perceive_overworld()
 
         semantic_trigger = next(
-            trigger for trigger in observation.triggers
-            if trigger.trigger_id == "introductory_rival"
+            trigger for trigger in observation.triggers if trigger.trigger_id == "introductory_rival"
         )
         self.assertEqual(semantic_trigger.target_map, MapRSE.ROUTE103.value)
         self.assertEqual(
             semantic_trigger.activation_locations,
-            frozenset({
-                (MapRSE.ROUTE103.value, (10, 2)),
-                (MapRSE.ROUTE103.value, (11, 3)),
-                (MapRSE.ROUTE103.value, (10, 4)),
-                (MapRSE.ROUTE103.value, (9, 3)),
-            }),
+            frozenset(
+                {
+                    (MapRSE.ROUTE103.value, (10, 2)),
+                    (MapRSE.ROUTE103.value, (11, 3)),
+                    (MapRSE.ROUTE103.value, (10, 4)),
+                    (MapRSE.ROUTE103.value, (9, 3)),
+                }
+            ),
         )
         self.assertEqual(
             semantic_trigger.navigation_locations,

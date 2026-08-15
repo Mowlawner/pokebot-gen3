@@ -74,9 +74,7 @@ def prewarm_navigation_tiles(map_id, tiles: tuple) -> None:
         _static_navigation_tiles[map_id] = (
             tiles,
             {
-                tile.location: NavigableTile(
-                    tile.location, tile.blocked, tile.walkable_neighbors, tile.traversal_cost
-                )
+                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors, tile.traversal_cost)
                 for tile in tiles
             },
         )
@@ -113,14 +111,21 @@ class NavigationWorld:
         if tile is None or tile.blocked:
             return ()
         x, y = location[1]
-        candidates = ((Direction.North, (x, y - 1)), (Direction.East, (x + 1, y)),
-                      (Direction.South, (x, y + 1)), (Direction.West, (x - 1, y)))
+        candidates = (
+            (Direction.North, (x, y - 1)),
+            (Direction.East, (x + 1, y)),
+            (Direction.South, (x, y + 1)),
+            (Direction.West, (x - 1, y)),
+        )
         result: list[tuple[Direction, Location, bool]] = []
         for direction, coordinate in candidates:
             destination = (location[0], coordinate)
             neighbour = self.tiles.get(destination)
-            if (neighbour is not None and not neighbour.blocked
-                    and (neighbour.allowed_directions is None or direction in neighbour.allowed_directions)):
+            if (
+                neighbour is not None
+                and not neighbour.blocked
+                and (neighbour.allowed_directions is None or direction in neighbour.allowed_directions)
+            ):
                 result.append((direction, destination, False))
         for warp in self.warps:
             if warp.entry == location:
@@ -196,29 +201,29 @@ def plan_with_world_navigation(
     # the adjacent activation positions instead of treating the warp tile as
     # the source of a second, repeated input.
     candidate_plans: list[tuple[int, NavigationPlan, tuple[int, int], Direction]] = []
-    runtime_warps = {warp.entry[1]: warp for warp in world.warps
-                     if warp.entry[0] == edge.source_map and warp.destination[0] == edge.destination_map}
+    runtime_warps = {
+        warp.entry[1]: warp
+        for warp in world.warps
+        if warp.entry[0] == edge.source_map and warp.destination[0] == edge.destination_map
+    }
     for _, coordinates in candidates:
-        activation_candidates = ((coordinates[0], coordinates[1] - 1, Direction.South),
-                                 (coordinates[0] + 1, coordinates[1], Direction.West),
-                                 (coordinates[0], coordinates[1] + 1, Direction.North),
-                                 (coordinates[0] - 1, coordinates[1], Direction.East))
+        activation_candidates = (
+            (coordinates[0], coordinates[1] - 1, Direction.South),
+            (coordinates[0] + 1, coordinates[1], Direction.West),
+            (coordinates[0], coordinates[1] + 1, Direction.North),
+            (coordinates[0] - 1, coordinates[1], Direction.East),
+        )
         warp = runtime_warps.get(coordinates)
         choices = activation_candidates if warp is not None else ((coordinates[0], coordinates[1], None),)
         for x, y, activation_direction in choices:
             try:
-                local_plan = GoalAwareNavigator(world).plan(
-                    start, ReachLocation((start[0], (x, y)))
-                )
+                local_plan = GoalAwareNavigator(world).plan(start, ReachLocation((start[0], (x, y))))
             except NavigationError:
                 continue
-            candidate_plans.append((len(local_plan.actions), local_plan,
-                                    coordinates, activation_direction))
+            candidate_plans.append((len(local_plan.actions), local_plan, coordinates, activation_direction))
             break
     if not candidate_plans:
-        raise NavigationError(
-            f"No reachable transition entry on {start[0]!r} for {edge.destination_map!r}"
-        )
+        raise NavigationError(f"No reachable transition entry on {start[0]!r} for {edge.destination_map!r}")
     _, local_plan, source_coordinates, activation_direction = min(candidate_plans, key=lambda item: item[0])
     destination_index = edge.source_coordinates.index(source_coordinates)
     destination_coordinates = edge.destination_coordinates[destination_index]
@@ -227,28 +232,36 @@ def plan_with_world_navigation(
     activation_position = None
     if activation_direction is not None:
         activation_position = (
-            source_coordinates[0] - (activation_direction is Direction.East) +
-            (activation_direction is Direction.West),
-            source_coordinates[1] - (activation_direction is Direction.South) +
-            (activation_direction is Direction.North),
+            source_coordinates[0] - (activation_direction is Direction.East) + (activation_direction is Direction.West),
+            source_coordinates[1]
+            - (activation_direction is Direction.South)
+            + (activation_direction is Direction.North),
         )
     if runtime_warp is not None and runtime_warp.required_facing is not None:
         # Arrow warps first step onto the warp and then accept the ROM-defined
         # direction as their activation input.
         if activation_direction is not None:
             local_plan = NavigationPlan(
-                local_plan.actions + (NavigationAction(
-                    NavigationActionType.MOVE, activation_direction,
-                    (start[0], activation_position),
-                    (start[0], source_coordinates)),),
+                local_plan.actions
+                + (
+                    NavigationAction(
+                        NavigationActionType.MOVE,
+                        activation_direction,
+                        (start[0], activation_position),
+                        (start[0], source_coordinates),
+                    ),
+                ),
                 local_plan.destination,
             )
         transition_direction = runtime_warp.required_facing
     transition = NavigationAction(
         NavigationActionType.WARP,
         transition_direction,
-        (start[0], source_coordinates) if runtime_warp is not None and runtime_warp.required_facing is not None
-        else (start[0], activation_position or source_coordinates),
+        (
+            (start[0], source_coordinates)
+            if runtime_warp is not None and runtime_warp.required_facing is not None
+            else (start[0], activation_position or source_coordinates)
+        ),
         (edge.destination_map, destination_coordinates),
     )
     return NavigationPlan(local_plan.actions + (transition,), local_plan.destination), route
@@ -266,49 +279,54 @@ def navigation_diagnostics(world: NavigationWorld, start: Location, goal: Goal) 
     target_positions: tuple[Location, ...] = ()
     target_maps: tuple[MapId, ...] = ()
     if isinstance(target, ActivateTrigger):
-        matching_triggers = tuple(
-            trigger for trigger in world.triggers if trigger.trigger_id == target.trigger_id
-        )
+        matching_triggers = tuple(trigger for trigger in world.triggers if trigger.trigger_id == target.trigger_id)
         target_positions = tuple(
-            sorted({position for trigger in matching_triggers for position in trigger.activation_locations},
-                   key=repr)
+            sorted({position for trigger in matching_triggers for position in trigger.activation_locations}, key=repr)
         )
         if not target_positions:
             target_positions = tuple(
-                sorted({position for trigger in matching_triggers for position in trigger.navigation_locations},
-                       key=repr)
+                sorted(
+                    {position for trigger in matching_triggers for position in trigger.navigation_locations}, key=repr
+                )
             )
-        target_maps = tuple(sorted(
-            {position[0] for position in target_positions}
-            | {trigger.target_map for trigger in matching_triggers if trigger.target_map is not None},
-            key=repr,
-        ))
+        target_maps = tuple(
+            sorted(
+                {position[0] for position in target_positions}
+                | {trigger.target_map for trigger in matching_triggers if trigger.target_map is not None},
+                key=repr,
+            )
+        )
     elif isinstance(target, ReachInteractionPosition):
-        matching_triggers = tuple(
-            trigger for trigger in world.triggers if trigger.trigger_id == target.trigger_id
-        )
+        matching_triggers = tuple(trigger for trigger in world.triggers if trigger.trigger_id == target.trigger_id)
         target_positions = tuple(
-            sorted({position for trigger in matching_triggers for position in trigger.activation_locations},
-                   key=repr)
+            sorted({position for trigger in matching_triggers for position in trigger.activation_locations}, key=repr)
         )
         if not target_positions:
             target_positions = tuple(
-                sorted({position for trigger in matching_triggers for position in trigger.navigation_locations},
-                       key=repr)
+                sorted(
+                    {position for trigger in matching_triggers for position in trigger.navigation_locations}, key=repr
+                )
             )
-        target_maps = tuple(sorted(
-            {position[0] for position in target_positions}
-            | {trigger.target_map for trigger in matching_triggers if trigger.target_map is not None},
-            key=repr,
-        ))
+        target_maps = tuple(
+            sorted(
+                {position[0] for position in target_positions}
+                | {trigger.target_map for trigger in matching_triggers if trigger.target_map is not None},
+                key=repr,
+            )
+        )
     elif isinstance(target, ReachLocation):
         target_positions = (target.location,)
         target_maps = (target.location[0],)
     elif isinstance(target, ReachWarp):
         target_maps = tuple(
-            sorted({warp.destination[0] for warp in world.warps
-                    if target.destination_map is None or warp.destination[0] == target.destination_map},
-                   key=repr)
+            sorted(
+                {
+                    warp.destination[0]
+                    for warp in world.warps
+                    if target.destination_map is None or warp.destination[0] == target.destination_map
+                },
+                key=repr,
+            )
         )
 
     current_map_goal = bool(target_maps) and set(target_maps) == {start[0]}
@@ -317,18 +335,24 @@ def navigation_diagnostics(world: NavigationWorld, start: Location, goal: Goal) 
         for warp in world.warps
     )
     matching_bindings = tuple(
-        binding for binding in world.bindings
-        if binding.binding.trigger_id == getattr(target, "trigger_id", None)
+        binding for binding in world.bindings if binding.binding.trigger_id == getattr(target, "trigger_id", None)
     )
     reason = (
-        "TRIGGER_NOT_PRESENT_IN_PERCEPTION" if isinstance(target, (ActivateTrigger, ReachInteractionPosition))
-        and not matching_triggers else
-        "STATIC_TARGET_AMBIGUOUS" if any(binding.static_ambiguous for binding in matching_bindings) else
-        "STATIC_TARGET_HIDDEN" if any(
-            binding.static_match and not binding.static_available
-            for binding in matching_bindings
-        ) else "CROSS_MAP_GOAL_NOT_SUPPORTED" if target_maps and not current_map_goal
-        else "NO_ROUTE_IN_CURRENT_MAP"
+        "TRIGGER_NOT_PRESENT_IN_PERCEPTION"
+        if isinstance(target, (ActivateTrigger, ReachInteractionPosition)) and not matching_triggers
+        else (
+            "STATIC_TARGET_AMBIGUOUS"
+            if any(binding.static_ambiguous for binding in matching_bindings)
+            else (
+                "STATIC_TARGET_HIDDEN"
+                if any(binding.static_match and not binding.static_available for binding in matching_bindings)
+                else (
+                    "CROSS_MAP_GOAL_NOT_SUPPORTED"
+                    if target_maps and not current_map_goal
+                    else "NO_ROUTE_IN_CURRENT_MAP"
+                )
+            )
+        )
     )
     return (
         f"current_map={start[0]!r}",
@@ -384,20 +408,26 @@ class GoalAwareNavigator:
                 for trigger in self.world.triggers
             )
         if isinstance(target, ReachInteractionPosition):
-            return any(target.trigger_id == trigger.trigger_id and location in trigger.activation_locations
-                       for trigger in self.world.triggers)
+            return any(
+                target.trigger_id == trigger.trigger_id and location in trigger.activation_locations
+                for trigger in self.world.triggers
+            )
         if isinstance(target, ReachWarp):
-            return any(warp.entry == location and
-                       (target.destination is None or warp.destination == target.destination) and
-                       (target.destination_map is None or warp.destination[0] == target.destination_map)
-                       for warp in self.world.warps)
+            return any(
+                warp.entry == location
+                and (target.destination is None or warp.destination == target.destination)
+                and (target.destination_map is None or warp.destination[0] == target.destination_map)
+                for warp in self.world.warps
+            )
         raise TypeError(f"Unsupported goal type: {type(target).__name__}")
 
     def _is_undesirable(self, location: Location, constraints) -> bool:
         if location in constraints.avoid_locations:
             return True
-        return any(location in trigger.locations and trigger.trigger_id in constraints.avoid_trigger_ids
-                   for trigger in self.world.triggers)
+        return any(
+            location in trigger.locations and trigger.trigger_id in constraints.avoid_trigger_ids
+            for trigger in self.world.triggers
+        )
 
     @staticmethod
     def _unroll(came_from, destination: Location) -> tuple[NavigationAction, ...]:
@@ -405,10 +435,14 @@ class GoalAwareNavigator:
         current = destination
         while came_from[current] is not None:
             source, direction, is_warp = came_from[current]
-            actions.append(NavigationAction(
-                NavigationActionType.WARP if is_warp else NavigationActionType.MOVE,
-                direction, source, current,
-            ))
+            actions.append(
+                NavigationAction(
+                    NavigationActionType.WARP if is_warp else NavigationActionType.MOVE,
+                    direction,
+                    source,
+                    current,
+                )
+            )
             current = source
         actions.reverse()
         return tuple(actions)

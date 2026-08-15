@@ -6,11 +6,13 @@ ENCOUNTER_TERRAIN_COST = 2
 # These names are the ROM tile types for walkable tall grass across the
 # supported Gen 3 games.  Keep the mapping here so navigation does not need
 # to interpret ROM/map data itself.
-TALL_GRASS_TILE_TYPES = frozenset({
-    "Tall Grass",
-    "Long Grass",
-    "Long Grass South Edge",
-})
+TALL_GRASS_TILE_TYPES = frozenset(
+    {
+        "Tall Grass",
+        "Long Grass",
+        "Long Grass South Edge",
+    }
+)
 
 
 def terrain_cost(tile_type: str) -> int:

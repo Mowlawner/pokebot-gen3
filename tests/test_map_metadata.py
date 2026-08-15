@@ -67,11 +67,16 @@ class TestMapMetadata(unittest.TestCase):
         with (
             patch("modules.map.context", SimpleNamespace(rom=self.rom_a)),
             patch("modules.map._map_metadata_cache", {}),
-            patch("modules.map._map_header_cache", {
-                "rom-a": {self.map_a: b"header-a", self.map_b: b"header-b"},
-                "rom-b": {self.map_a: b"header-other"},
-            }),
-            patch("modules.map._build_map_metadata", side_effect=[self.metadata_a, self.metadata_b, self.metadata_a]) as build,
+            patch(
+                "modules.map._map_header_cache",
+                {
+                    "rom-a": {self.map_a: b"header-a", self.map_b: b"header-b"},
+                    "rom-b": {self.map_a: b"header-other"},
+                },
+            ),
+            patch(
+                "modules.map._build_map_metadata", side_effect=[self.metadata_a, self.metadata_b, self.metadata_a]
+            ) as build,
         ):
             map_a = get_map_metadata(self.map_a)
             map_b = get_map_metadata(self.map_b)
@@ -104,8 +109,15 @@ class TestMapMetadata(unittest.TestCase):
         first = SimpleNamespace(local_id=2)
         duplicate = SimpleNamespace(local_id=2)
         metadata = MapMetadata(
-            self.map_a, b"header-a", struct.pack("<II", 30, 20), b"events-a",
-            (), (), (), (), (first, duplicate),
+            self.map_a,
+            b"header-a",
+            struct.pack("<II", 30, 20),
+            b"events-a",
+            (),
+            (),
+            (),
+            (),
+            (first, duplicate),
         )
 
         self.assertIs(metadata.object_template(2), first)
