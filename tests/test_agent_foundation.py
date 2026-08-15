@@ -1,4 +1,6 @@
 from unittest import TestCase
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from modules.goals import ActivateTrigger, GoalConstraints, NavigationGoal, ReachLocation, ReachWarp
 from modules.interaction_state import InteractionObservation, InteractionType, classify_interaction
@@ -10,12 +12,14 @@ from modules.navigation import (
     NavigationWorld,
     NavigableTile,
     NavigationError,
+    prewarm_navigation_tiles,
 )
 from modules.overworld import (
     OverworldObservation,
     TileObservation,
     TriggerObservation,
     WarpObservation,
+    prewarm_static_map_observation,
 )
 
 
@@ -50,6 +54,40 @@ class InteractionStateTests(TestCase):
 
 
 class GoalAwareNavigationTests(TestCase):
+    def test_prewarm_static_observation_materializes_static_cache(self):
+        map_id = ("static-prewarm", 0)
+        path_tile = SimpleNamespace(
+            local_coordinates=(0, 0),
+            accessible_from_direction=[True, True, True, True],
+            warps_to=None,
+            traversal_cost=2,
+        )
+        path_map = SimpleNamespace(tiles=[path_tile])
+        map_data = SimpleNamespace(map_size=(1, 1), warps=(), coord_events=(), bg_events=())
+        with patch("modules.overworld._get_map_metadata", return_value=path_map), \
+                patch("modules.overworld.get_map_metadata", return_value=map_data):
+            tiles = prewarm_static_map_observation(map_id)
+        self.assertEqual(len(tiles), 1)
+        self.assertEqual(tiles[0].traversal_cost, 2)
+        self.assertEqual(tiles[0].location, (map_id, (0, 0)))
+
+    def test_prewarm_navigation_tiles_reuses_static_index(self):
+        map_id = ("prewarm", 0)
+        tiles = tuple(
+            TileObservation((map_id, coordinate), False, frozenset(Direction))
+            for coordinate in ((0, 0), (1, 0))
+        )
+        prewarm_navigation_tiles(map_id, tiles)
+        first = NavigationWorld.from_overworld(OverworldObservation(
+            map_id=map_id, player_coordinates=(0, 0), facing=Direction.East,
+            controllable=True, tiles=tiles, warps=(), objects=(), triggers=(),
+        ))
+        second = NavigationWorld.from_overworld(OverworldObservation(
+            map_id=map_id, player_coordinates=(1, 0), facing=Direction.West,
+            controllable=True, tiles=tiles, warps=(), objects=(), triggers=(),
+        ))
+        self.assertIs(first.tiles, second.tiles)
+
     def test_overworld_observation_adapts_to_navigation_world(self):
         location = (("test"), (0, 0))
         observation = OverworldObservation(

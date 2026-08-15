@@ -55,6 +55,9 @@ class TileObservation:
     walkable_neighbors: frozenset[Direction]
     warp: WarpObservation | None = None
     trigger_ids: frozenset[str] = frozenset()
+    # Static map data. Dynamic object blocking is represented separately on
+    # OverworldObservation and must not invalidate this value.
+    traversal_cost: int = 1
 
 
 @dataclass(frozen=True)
@@ -97,30 +100,16 @@ class _StaticMapObservation:
 _static_map_observations: dict[MapId, _StaticMapObservation] = {}
 
 
-def perceive_overworld() -> OverworldObservation:
-    """Read the current map and avatar without changing emulator state.
+def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]:
+    """Populate and return static perception data for one known map.
 
-    Collision and directional access come from the existing PathMap metadata;
-    active object positions are reported separately so a planner can choose to
-    treat them as dynamic obstacles.
+    This deliberately does not read the player, object events, or interaction
+    state.  It is safe to call before a warp because it only materializes data
+    derived from the destination map's ROM metadata.
     """
-
-    profiling = enabled()
-    profile_start = now()
-    stage_start = now()
-    avatar = get_player_avatar()
-    map_id = avatar.map_group_and_number
-    player_coordinates = avatar.local_coordinates
-    timing("perception_player_avatar", stage_start)
-    count("player_avatar_observations")
-    stage_start = now()
     path_map = _get_map_metadata(map_id)
     path_tiles = path_map.tiles
     map_data = get_map_metadata(map_id)
-    map_width, map_height = map_data.map_size
-    timing("perception_map_data_lookup", stage_start)
-    count("map_data_lookups")
-
     static = _static_map_observations.get(map_id)
     if static is None or static.path_tiles is not path_tiles or static.map_data is not map_data:
         by_coordinate = {tile.local_coordinates: tile for tile in path_tiles}
@@ -159,10 +148,39 @@ def perceive_overworld() -> OverworldObservation:
                 walkable_neighbors=walkable,
                 warp=warps_by_entry.get(coordinate),
                 trigger_ids=frozenset(static_trigger_ids_by_location.get(coordinate, set())),
+                traversal_cost=getattr(tile, "traversal_cost", 1),
             ))
         tiles = tuple(static_tiles)
         static = _StaticMapObservation(path_tiles, map_data, by_coordinate, tuple(warps), tiles)
         _static_map_observations[map_id] = static
+    return static.tiles
+
+
+def perceive_overworld() -> OverworldObservation:
+    """Read the current map and avatar without changing emulator state.
+
+    Collision and directional access come from the existing PathMap metadata;
+    active object positions are reported separately so a planner can choose to
+    treat them as dynamic obstacles.
+    """
+
+    profiling = enabled()
+    profile_start = now()
+    stage_start = now()
+    avatar = get_player_avatar()
+    map_id = avatar.map_group_and_number
+    player_coordinates = avatar.local_coordinates
+    timing("perception_player_avatar", stage_start)
+    count("player_avatar_observations")
+    stage_start = now()
+    _get_map_metadata(map_id).tiles
+    map_data = get_map_metadata(map_id)
+    map_width, map_height = map_data.map_size
+    timing("perception_map_data_lookup", stage_start)
+    count("map_data_lookups")
+
+    tiles = prewarm_static_map_observation(map_id)
+    static = _static_map_observations[map_id]
     warps = static.warps
 
     triggers: list[TriggerObservation] = []

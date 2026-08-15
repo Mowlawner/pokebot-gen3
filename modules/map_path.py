@@ -12,6 +12,7 @@ from modules.memory import (
     get_event_var_by_number,
 )
 from modules.pokemon_party import get_party
+from modules.terrain import terrain_cost
 
 LocationType: TypeAlias = MapLocation | tuple[tuple[int, int] | MapFRLG | MapRSE, tuple[int, int]]
 
@@ -60,6 +61,7 @@ class PathTile:
     local_coordinates: tuple[int, int]
     elevation: int
     has_encounters: bool
+    traversal_cost: int
     accessible_from_direction: list[bool]
     dynamic_collision_flag: int | None
     dynamic_object_id: int | None
@@ -347,6 +349,7 @@ class PathMap:
                         tile.local_position,
                         tile.elevation,
                         tile.has_encounters,
+                        terrain_cost(tile.tile_type),
                         accessible_from_direction,
                         None,
                         None,

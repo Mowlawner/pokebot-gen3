@@ -1,6 +1,7 @@
 """Deterministic goal-aware navigation over a small abstract world model."""
 
-from collections import deque
+import heapq
+from itertools import count
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Mapping
@@ -38,6 +39,7 @@ class NavigableTile:
     location: Location
     blocked: bool = False
     allowed_directions: frozenset[Direction] | None = None
+    traversal_cost: int = 1
 
 
 class _DynamicTileMapping(Mapping[Location, NavigableTile]):
@@ -49,7 +51,7 @@ class _DynamicTileMapping(Mapping[Location, NavigableTile]):
         tile = self._static_tiles[location]
         if location[1] not in self._blocked or tile.blocked:
             return tile
-        return NavigableTile(tile.location, True, tile.allowed_directions)
+        return NavigableTile(tile.location, True, tile.allowed_directions, tile.traversal_cost)
 
     def __iter__(self):
         return iter(self._static_tiles)
@@ -59,6 +61,25 @@ class _DynamicTileMapping(Mapping[Location, NavigableTile]):
 
 
 _static_navigation_tiles: dict[object, tuple[tuple, dict[Location, NavigableTile]]] = {}
+
+
+def prewarm_navigation_tiles(map_id, tiles: tuple) -> None:
+    """Populate the static navigation index for one already-known map.
+
+    ``tiles`` must come from static overworld perception.  Dynamic blocking
+    is intentionally absent here and remains an observation-time overlay.
+    """
+    cache = _static_navigation_tiles.get(map_id)
+    if cache is None or cache[0] is not tiles:
+        _static_navigation_tiles[map_id] = (
+            tiles,
+            {
+                tile.location: NavigableTile(
+                    tile.location, tile.blocked, tile.walkable_neighbors, tile.traversal_cost
+                )
+                for tile in tiles
+            },
+        )
 
 
 @dataclass(frozen=True)
@@ -73,11 +94,8 @@ class NavigationWorld:
         """Adapt the live perception model without coupling the search to emulator APIs."""
         cache = _static_navigation_tiles.get(observation.map_id)
         if cache is None or cache[0] is not observation.tiles:
-            static_tiles = {
-                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors)
-                for tile in observation.tiles
-            }
-            _static_navigation_tiles[observation.map_id] = (observation.tiles, static_tiles)
+            prewarm_navigation_tiles(observation.map_id, observation.tiles)
+            static_tiles = _static_navigation_tiles[observation.map_id][1]
         else:
             static_tiles = cache[1]
         tiles: Mapping[Location, NavigableTile] = static_tiles
@@ -330,17 +348,30 @@ class GoalAwareNavigator:
     @profiled("navigation_pathfinding", "pathfinding_calls")
     def plan(self, start: Location, goal: NavigationGoal | Goal) -> NavigationPlan:
         navigation_goal = goal if isinstance(goal, NavigationGoal) else NavigationGoal(goal)
-        queue = deque([start])
+        # Dijkstra's algorithm is the smallest change from the previous BFS:
+        # with every traversal_cost == 1, insertion order remains the same as
+        # the old FIFO queue, while positive terrain weights are minimized.
+        sequence = count()
+        queue = [(0, next(sequence), start)]
+        costs: dict[Location, int] = {start: 0}
         came_from: dict[Location, tuple[Location, Direction, bool] | None] = {start: None}
         while queue:
-            current = queue.popleft()
+            current_cost, _, current = heapq.heappop(queue)
+            if current_cost != costs[current]:
+                continue
             if self._satisfies(current, navigation_goal.target):
                 return NavigationPlan(self._unroll(came_from, current), current)
             for direction, neighbour, is_warp in self.world.neighbors(current):
-                if neighbour in came_from or self._is_undesirable(neighbour, navigation_goal.constraints):
+                if self._is_undesirable(neighbour, navigation_goal.constraints):
                     continue
+                tile = self.world.tiles.get(neighbour)
+                step_cost = 0 if is_warp else tile.traversal_cost
+                new_cost = current_cost + step_cost
+                if new_cost >= costs.get(neighbour, float("inf")):
+                    continue
+                costs[neighbour] = new_cost
                 came_from[neighbour] = (current, direction, is_warp)
-                queue.append(neighbour)
+                heapq.heappush(queue, (new_cost, next(sequence), neighbour))
         raise NavigationError(f"No legal route from {start} to {navigation_goal.target!r}")
 
     def _satisfies(self, location: Location, target: Goal) -> bool:

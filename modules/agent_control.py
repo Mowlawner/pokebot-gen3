@@ -42,8 +42,15 @@ from modules.navigation import (
     goal_target_map,
     plan_with_world_navigation,
     navigation_diagnostics,
+    prewarm_navigation_tiles,
 )
-from modules.overworld import MovementState, OverworldObservation, perceive_overworld
+from modules.overworld import (
+    MovementState,
+    OverworldObservation,
+    perceive_overworld,
+    prewarm_static_map_observation,
+)
+from modules.player import get_player_avatar
 from modules.profiler import count, invalidation, now, profiled, timing, format_snapshot
 
 
@@ -93,6 +100,28 @@ class AgentObservation:
     @property
     def interaction_type(self) -> InteractionType:
         return classify_interaction(self.interaction)
+
+
+def prewarm_warp_destination(
+    observation: AgentObservation,
+    navigation: NavigationAction | None,
+) -> bool:
+    """Warm static caches for the observed destination of an imminent warp."""
+    if (navigation is None
+            or navigation.action_type is not NavigationActionType.WARP
+            or observation.overworld is None
+            or navigation.source[0] != observation.overworld.map_id
+            or not any(warp.destination == navigation.destination
+                       for warp in observation.overworld.warps)):
+        return False
+    try:
+        tiles = prewarm_static_map_observation(navigation.destination[0])
+        prewarm_navigation_tiles(navigation.destination[0], tiles)
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        # Cache preparation is an optimization and must never prevent the
+        # existing warp dispatch from running.
+        return False
+    return True
 
 
 @profiled("agent_observation", "agent_observations")
@@ -360,6 +389,24 @@ class ActionResult:
     message: str = ""
 
 
+@dataclass
+class _MovementBatch:
+    """A bounded suffix of a cached plan being driven frame-by-frame.
+
+    This deliberately contains navigation actions, rather than raw buttons.  A
+    warp (and any action after it) can therefore never be sent through this
+    fast path.
+    """
+
+    actions: tuple[NavigationAction, ...]
+    index: int = 0
+    frames_waiting: int = 0
+
+    @property
+    def current(self) -> NavigationAction:
+        return self.actions[self.index]
+
+
 class AgentActionExecutor:
     """Translate semantic actions to input only after selection is complete."""
 
@@ -438,6 +485,7 @@ class AgentControlLoop:
             tuple[tuple[int, int], tuple[int, int]],
             tuple[tuple[int, int], tuple[int, int]],
         ] | None = None
+        self._warp_settling = False
         self._warp_wait_observations = 0
         self._cached_evaluation: GoalEvaluation | None = None
         self._cached_actions: tuple[NavigationAction, ...] = ()
@@ -449,6 +497,108 @@ class AgentControlLoop:
         self._route103_stable_observations = 0
         self._route103_object_dumped_at: set[int] = set()
         self._last_world_transition_source: tuple[tuple[int, int], tuple[int, int]] | None = None
+        self._movement_batch: _MovementBatch | None = None
+
+    def _safe_movement_batch(self, observation: AgentObservation) -> tuple[NavigationAction, ...]:
+        """Return a short, same-map movement segment from the cached plan.
+
+        Checkpoints are the end of the plan, a warp, and any tile known to be
+        meaningful to a trigger/object interaction.  The bound also ensures
+        that dynamic assumptions are periodically handed back to perception.
+        """
+        if observation.overworld is None or self._cached_action_index >= len(self._cached_actions):
+            return ()
+        world = observation.overworld
+        checkpoints = {
+            location for trigger in world.triggers
+            for locations in (trigger.locations, trigger.activation_locations,
+                              trigger.navigation_locations)
+            for location in locations
+        }
+        # Treat the tiles occupied by, and immediately surrounding, runtime
+        # objects as checkpoints.  This keeps an NPC/trainer encounter in the
+        # normal interaction path instead of carrying the player past it.
+        for obj in world.objects:
+            x, y = obj.location[1]
+            checkpoints.update({
+                obj.location,
+                (obj.location[0], (x - 1, y)), (obj.location[0], (x + 1, y)),
+                (obj.location[0], (x, y - 1)), (obj.location[0], (x, y + 1)),
+            })
+        result: list[NavigationAction] = []
+        for action in self._cached_actions[self._cached_action_index:]:
+            if len(result) >= 8 or action.action_type is not NavigationActionType.MOVE:
+                break
+            if action.source[0] != world.map_id or action.destination[0] != world.map_id:
+                break
+            result.append(action)
+            if action.destination in checkpoints:
+                break
+        return tuple(result)
+
+    def _cancel_movement_batch(self, reason: str) -> None:
+        if self._movement_batch is not None:
+            self._report(f"MOVE_BATCH: interrupted reason={reason!r}")
+        self._movement_batch = None
+        self._in_flight_move = None
+        self._in_flight_move_initial_facing = None
+        reset_held_buttons = getattr(context.emulator, "reset_held_buttons", None)
+        if callable(reset_held_buttons):
+            reset_held_buttons()
+
+    def _advance_movement_batch(self) -> bool:
+        """Advance a batch for one emulator frame, returning whether it remains active.
+
+        Only cheap state reads occur here.  Full perception, world signatures,
+        goal evaluation, and pathfinding are deferred until the batch ends or
+        an interruption is detected.
+        """
+        batch = self._movement_batch
+        if batch is None:
+            return False
+        try:
+            interaction = observe_interaction()
+            if classify_interaction(interaction) is not InteractionType.OVERWORLD:
+                self._cancel_movement_batch("non_overworld_state")
+                return False
+            avatar = get_player_avatar()
+            location = (avatar.map_group_and_number, avatar.local_coordinates)
+            action = batch.current
+            if location[0] != action.source[0]:
+                self._cancel_movement_batch("map_transition")
+                return False
+            if location == action.destination:
+                self._cached_action_index += 1
+                batch.index += 1
+                batch.frames_waiting = 0
+                if batch.index >= len(batch.actions):
+                    self._movement_batch = None
+                    self._in_flight_move = None
+                    self._in_flight_move_initial_facing = None
+                    reset_held_buttons = getattr(context.emulator, "reset_held_buttons", None)
+                    if callable(reset_held_buttons):
+                        reset_held_buttons()
+                    return False
+                action = batch.current
+                reset_held_buttons = getattr(context.emulator, "reset_held_buttons", None)
+                if callable(reset_held_buttons):
+                    reset_held_buttons()
+            elif location != action.source:
+                self._cancel_movement_batch("position_divergence")
+                return False
+
+            batch.frames_waiting += 1
+            if batch.frames_waiting > 24:
+                self._cancel_movement_batch("movement_blocked")
+                return False
+            if avatar.facing_direction != action.direction.button_name:
+                context.emulator.press_button(action.direction.button_name)
+            else:
+                context.emulator.hold_button(action.direction.button_name)
+            return True
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            self._cancel_movement_batch("state_read_failed")
+            return False
 
     def _report(self, message: str) -> None:
         self._logger(f"AGENT_{message}")
@@ -571,6 +721,10 @@ class AgentControlLoop:
         self._in_flight_move_initial_facing = None
         self._cached_goal = None
         self._cached_world_signature = None
+        self._movement_batch = None
+        reset_held_buttons = getattr(context.emulator, "reset_held_buttons", None)
+        if callable(reset_held_buttons):
+            reset_held_buttons()
 
     def _cached_decision(self, observation: AgentObservation) -> ActionDecision | None:
         if self._cached_evaluation is None or self._cached_goal != self._goal:
@@ -668,6 +822,7 @@ class AgentControlLoop:
                 self._last_world_transition_source = expected_source
                 self._warp_wait_observations = 0
                 self._invalidate_plan("warp_destination_confirmed")
+                self._warp_settling = True
             elif observed_map != expected_source[0]:
                 # A map transition happened, but not the one predicted by the
                 # static route.  Clear the expectation so the next decision
@@ -677,6 +832,7 @@ class AgentControlLoop:
                     f" expected={expected_destination[0]!r} observed={observed_map!r}"
                 )
                 self._expected_world_transition = None
+                self._warp_settling = False
                 self._invalidate_plan("warp_destination_mismatch")
             elif interaction_type is InteractionType.OVERWORLD:
                 self._warp_wait_observations += 1
@@ -701,6 +857,19 @@ class AgentControlLoop:
                 wait_decision = ActionDecision(wait_action)
                 wait_result = self._executor.execute(wait_action, observation)
                 return observation, wait_decision, wait_result
+
+        if (self._warp_settling
+                and interaction_type is InteractionType.OVERWORLD
+                and observation.overworld is not None):
+            if not observation.overworld.controllable:
+                wait_action = AgentAction(
+                    AgentActionType.WAIT_REOBSERVE,
+                    reason="waiting for post-warp exit transition to settle",
+                )
+                wait_decision = ActionDecision(wait_action)
+                wait_result = self._executor.execute(wait_action, observation)
+                return observation, wait_decision, wait_result
+            self._warp_settling = False
 
         # Diagnostic-only snapshotting happens after transition handling and
         # requires a standing, in-bounds Route 103 observation.  It does not
@@ -832,6 +1001,8 @@ class AgentControlLoop:
             wait_decision = ActionDecision(wait_action, decision.goal_evaluation)
             wait_result = self._executor.execute(wait_action, observation)
             return observation, wait_decision, wait_result
+        if decision.action.navigation is not None:
+            prewarm_warp_destination(observation, decision.action.navigation)
         result = self._executor.execute(decision.action, observation)
         if profiling:
             total_elapsed = perf_counter_ns() - profile_start
@@ -845,6 +1016,13 @@ class AgentControlLoop:
                 if decision.action.navigation.action_type is NavigationActionType.MOVE:
                     self._in_flight_move = decision.action.navigation
                     self._in_flight_move_initial_facing = observation.overworld.facing
+                    safe_segment = self._safe_movement_batch(observation)
+                    if len(safe_segment) > 1:
+                        self._movement_batch = _MovementBatch(safe_segment)
+                        self._report(
+                            f"MOVE_BATCH: started steps={len(safe_segment)}"
+                            f" from={safe_segment[0].source!r} to={safe_segment[-1].destination!r}"
+                        )
                 else:
                     self._cached_action_index += 1
             else:
@@ -879,5 +1057,12 @@ class AgentControlLoop:
 
     def run(self) -> Generator:
         while True:
+            if self._movement_batch is not None:
+                # The batch owns only the current emulator frame.  If it ends
+                # or is interrupted, immediately return to the normal loop on
+                # the next iteration so existing handlers process the cause.
+                if self._advance_movement_batch():
+                    yield
+                    continue
             self.step()
             yield
