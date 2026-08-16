@@ -16,6 +16,12 @@ Visit the [wiki](wiki/Readme.md) for information:
 - 🎮 [Emulator Input Mapping](wiki/pages/Configuration%20-%20Key%20Mappings.md)
 - 🔎 [Pokémon by Bot Mode](wiki/pages/Pokemon%20By%20Bot%20Mode.md)
 
+For development and reproduction, `--stutter-trace` writes opt-in rolling
+frame traces to the selected profile. Use `--stutter-threshold-ms` to adjust
+the frame-duration trigger. `--no-save-state` leaves the emulator's retained
+state unchanged when the bot exits; this is useful when reproducing a stateful
+runtime issue or running a regression check against the current emulator state.
+
 # ✨ Preamble
 
 You are welcome to use or stream the bot in any way you want, including streaming your own 24/7 Prof. Oak challenge streams.

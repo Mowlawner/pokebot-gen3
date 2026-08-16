@@ -14,6 +14,14 @@ from typing import TYPE_CHECKING
 
 from .identity import PokemonIdentity
 
+# ``get_pokemon_storage`` already reuses an unchanged raw-storage object, but
+# the Nuzlocke snapshot used to materialize all readable PC slots again every
+# frame.  Keep the derived immutable representation alongside that source
+# object.  A new PokemonStorage object is produced when the raw block changes,
+# so this cache naturally refreshes without weakening storage observations.
+_last_storage_source: object | None = None
+_last_storage_snapshot: "StorageSnapshot | None" = None
+
 if TYPE_CHECKING:
     from modules.memory import GameState
 
@@ -285,6 +293,44 @@ def _battle(game_state: GameState) -> BattleSnapshot | None:
     )
 
 
+def _storage_snapshot(storage) -> StorageSnapshot:
+    global _last_storage_source, _last_storage_snapshot
+
+    from modules.context import context
+    from modules.profiler import count as profile_count
+
+    if storage is _last_storage_source and _last_storage_snapshot is not None:
+        profile_count("nuzlocke_storage_snapshot_cache_hits")
+        trace = getattr(context, "stutter_trace", None)
+        if trace is not None:
+            trace.mark("storage_snapshot_cache_hit", True)
+        return _last_storage_snapshot
+
+    trace = getattr(context, "stutter_trace", None)
+    started = trace.now() if trace is not None else 0
+    profile_count("nuzlocke_storage_snapshot_builds")
+    readable_slots = 0
+    boxes = []
+    for box in (storage.boxes if storage is not None else ()):
+        slots = []
+        for slot in box.slots:
+            if not _storage_pokemon_is_readable(slot.pokemon):
+                continue
+            readable_slots += 1
+            slots.append(StoragePokemonSnapshot(box.number, slot.slot_index, _pokemon(slot.pokemon)))
+        boxes.extend(slots)
+    profile_count("nuzlocke_storage_snapshot_slots", readable_slots)
+    result = StorageSnapshot(
+        active_box=storage.active_box_index if storage is not None else 0,
+        pokemon=tuple(boxes),
+    )
+    _last_storage_source = storage
+    _last_storage_snapshot = result
+    if trace is not None:
+        trace.duration("storage_snapshot_duration_ms", started)
+    return result
+
+
 def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
     """Read current observable state without performing any emulator action."""
     from modules.context import context
@@ -293,11 +339,35 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
     from modules.pokemon_party import get_party
     from modules.pokemon_storage import get_pokemon_storage
 
+    trace = getattr(context, "stutter_trace", None)
+    stage = trace.now() if trace is not None else 0
     game_state = get_game_state()
+    if trace is not None:
+        trace.duration("nuzlocke_game_state_duration_ms", stage)
+    stage = trace.now() if trace is not None else 0
     party = get_party()
+    if trace is not None:
+        trace.duration("nuzlocke_party_duration_ms", stage)
+    stage = trace.now() if trace is not None else 0
     bag = get_item_bag()
+    if trace is not None:
+        trace.duration("nuzlocke_bag_duration_ms", stage)
+    stage = trace.now() if trace is not None else 0
     storage = get_pokemon_storage()
+    if trace is not None:
+        trace.duration("nuzlocke_storage_access_duration_ms", stage)
+    stage = trace.now() if trace is not None else 0
     player, player_available = _player()
+    if trace is not None:
+        trace.duration("nuzlocke_player_duration_ms", stage)
+    stage = trace.now() if trace is not None else 0
+    battle = _battle(game_state)
+    if trace is not None:
+        trace.duration("nuzlocke_battle_duration_ms", stage)
+    stage = trace.now() if trace is not None else 0
+    progression = tuple(NamedFlag(f"BADGE{i:02d}_GET", get_event_flag(f"BADGE{i:02d}_GET")) for i in range(1, 9))
+    if trace is not None:
+        trace.duration("nuzlocke_progression_duration_ms", stage)
     return NuzlockeSnapshot(
         frame=context.emulator.get_frame_count(),
         game_id=getattr(context.rom, "game_name", None),
@@ -316,19 +386,9 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
             _items(bag.poke_balls) if bag is not None else (),
             _items(bag.key_items) if bag is not None else (),
         ),
-        battle=_battle(game_state),
-        pc=StorageSnapshot(
-            active_box=storage.active_box_index if storage is not None else 0,
-            pokemon=tuple(
-                StoragePokemonSnapshot(box.number, slot.slot_index, _pokemon(slot.pokemon))
-                for box in (storage.boxes if storage is not None else ())
-                for slot in box.slots
-                if _storage_pokemon_is_readable(slot.pokemon)
-            ),
-        ),
-        progression=ProgressionSnapshot(
-            tuple(NamedFlag(f"BADGE{i:02d}_GET", get_event_flag(f"BADGE{i:02d}_GET")) for i in range(1, 9))
-        ),
+        battle=battle,
+        pc=_storage_snapshot(storage),
+        progression=ProgressionSnapshot(progression),
         game_state_available=game_state is not None,
         player_available=player_available,
         party_available=party is not None,

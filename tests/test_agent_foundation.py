@@ -19,6 +19,7 @@ from modules.overworld import (
     TileObservation,
     TriggerObservation,
     WarpObservation,
+    WarpActivation,
     prewarm_static_map_observation,
 )
 
@@ -73,6 +74,177 @@ class GoalAwareNavigationTests(TestCase):
         self.assertEqual(len(tiles), 1)
         self.assertEqual(tiles[0].traversal_cost, 2)
         self.assertEqual(tiles[0].location, (map_id, (0, 0)))
+
+    def test_rom_arrow_warp_is_directional_step_while_other_warps_step_on(self):
+        map_id = ("warp-semantics", 0)
+        destination = ("warp-semantics", 1)
+        warp_data = SimpleNamespace(
+            local_coordinates=(0, 0),
+            destination_location=SimpleNamespace(
+                map_group=destination[0], map_number=destination[1], local_position=(1, 1)
+            ),
+        )
+        path_tile = SimpleNamespace(
+            local_coordinates=(0, 0),
+            accessible_from_direction=[True] * 4,
+            warps_to=((destination[0], destination[1]), (1, 1), Direction.North),
+            traversal_cost=1,
+            has_encounters=False,
+            tile_type="North Arrow Warp",
+        )
+        path_map = SimpleNamespace(tiles=[path_tile])
+        map_data = SimpleNamespace(map_size=(1, 1), warps=(warp_data,), coord_events=(), bg_events=())
+        with patch("modules.overworld._get_map_metadata", return_value=path_map), patch(
+            "modules.overworld.get_map_metadata", return_value=map_data
+        ):
+            tiles = prewarm_static_map_observation(map_id)
+        self.assertEqual(tiles[0].warp.activation, WarpActivation.DIRECTIONAL_STEP)
+        self.assertEqual(tiles[0].warp.required_facing, Direction.North)
+
+    def test_escalator_derives_one_valid_source_tile_from_rom_tile_behavior(self):
+        map_id = ("escalator", 0)
+        destination = ("escalator", 1)
+        warp_data = SimpleNamespace(
+            local_coordinates=(1, 1),
+            destination_location=SimpleNamespace(
+                map_group=destination[0], map_number=destination[1], local_position=(2, 2)
+            ),
+        )
+        tiles = [
+            SimpleNamespace(
+                local_coordinates=(x, y),
+                accessible_from_direction=[True] * 4,
+                warps_to=None,
+                traversal_cost=1,
+                has_encounters=False,
+                tile_type="Escalator Up" if (x, y) == (1, 1) else "Floor",
+            )
+            for y in range(3)
+            for x in range(3)
+        ]
+        path_map = SimpleNamespace(tiles=tiles)
+        map_data = SimpleNamespace(map_size=(3, 3), warps=(warp_data,), coord_events=(), bg_events=())
+        with patch("modules.overworld._get_map_metadata", return_value=path_map), patch(
+            "modules.overworld.get_map_metadata", return_value=map_data
+        ):
+            observed_tiles = prewarm_static_map_observation(map_id)
+        warp = next(tile.warp for tile in observed_tiles if tile.warp is not None)
+        self.assertEqual(warp.activation_locations, frozenset({(map_id, (2, 1))}))
+        self.assertIs(warp.activation_direction, Direction.West)
+        self.assertIs(warp.required_facing, Direction.West)
+
+    def test_escalator_goal_requires_right_source_and_left_facing(self):
+        map_id = ("escalator-goal", 0)
+        entry = (map_id, (1, 1))
+        source = (map_id, (2, 1))
+        destination = (("escalator-goal", 1), (0, 0))
+        warp = WarpObservation(
+            entry,
+            destination,
+            required_facing=Direction.West,
+            activation_locations=frozenset({source}),
+            activation_direction=Direction.West,
+        )
+        world = NavigationWorld(
+            tiles={(map_id, (x, y)): NavigableTile((map_id, (x, y))) for y in range(3) for x in range(3)},
+            warps=(warp,),
+            facing=Direction.North,
+        )
+        navigator = GoalAwareNavigator(world)
+
+        self.assertFalse(
+            navigator.satisfies((map_id, (1, 0)), Direction.South, ReachWarp(destination_map=destination[0]))
+        )
+        self.assertFalse(
+            navigator.satisfies((map_id, (1, 2)), Direction.North, ReachWarp(destination_map=destination[0]))
+        )
+        self.assertTrue(navigator.satisfies(source, Direction.West, ReachWarp(destination_map=destination[0])))
+        plan = navigator.plan((map_id, (1, 0)), ReachWarp(destination_map=destination[0]))
+        self.assertEqual(plan.destination, source)
+        self.assertEqual(plan.actions[-1].action_type, NavigationActionType.TURN)
+        self.assertEqual(plan.actions[-1].direction, Direction.West)
+
+    def test_interaction_goal_requires_turn_and_never_finishes_on_adjacency_alone(self):
+        map_id = ("npc-facing", 0)
+        source = (map_id, (1, 1))
+        trigger = TriggerObservation(
+            "npc",
+            frozenset({(map_id, (1, 0))}),
+            frozenset({source}),
+            "object_interaction",
+            activation_requirements=((source, Direction.North),),
+        )
+        navigation_world = NavigationWorld(
+            tiles={
+                (map_id, (1, 1)): NavigableTile((map_id, (1, 1))),
+                (map_id, (1, 0)): NavigableTile((map_id, (1, 0))),
+            },
+            triggers=(trigger,),
+            facing=Direction.East,
+        )
+        plan = GoalAwareNavigator(navigation_world).plan(source, ActivateTrigger("npc"))
+        self.assertEqual(
+            [(action.action_type, action.direction) for action in plan.actions],
+            [(NavigationActionType.TURN, Direction.North)],
+        )
+        self.assertTrue(GoalAwareNavigator(navigation_world).satisfies(source, Direction.North, ActivateTrigger("npc")))
+        self.assertFalse(GoalAwareNavigator(navigation_world).satisfies(source, Direction.East, ActivateTrigger("npc")))
+
+    def test_interaction_goal_requires_the_target_facing_from_each_side(self):
+        map_id = ("npc-sides", 0)
+        npc = (2, 2)
+        requirements = {
+            (2, 1): Direction.South,
+            (3, 2): Direction.West,
+            (2, 3): Direction.North,
+            (1, 2): Direction.East,
+        }
+        for source_coordinates, required in requirements.items():
+            source = (map_id, source_coordinates)
+            trigger = TriggerObservation(
+                "npc",
+                frozenset({(map_id, npc)}),
+                frozenset({source}),
+                "object_interaction",
+                activation_requirements=((source, required),),
+            )
+            world = NavigationWorld(
+                tiles={source: NavigableTile(source), (map_id, npc): NavigableTile((map_id, npc))},
+                triggers=(trigger,),
+                facing=required.opposite(),
+            )
+            with self.subTest(source=source_coordinates):
+                plan = GoalAwareNavigator(world).plan(source, ActivateTrigger("npc"))
+                self.assertEqual(plan.actions[-1].action_type, NavigationActionType.TURN)
+                self.assertEqual(plan.actions[-1].direction, required)
+
+    def test_interaction_source_state_must_be_walkable(self):
+        map_id = ("npc-source-validation", 0)
+        trigger = TriggerObservation(
+            "npc",
+            frozenset({(map_id, (1, 1))}),
+            frozenset({(map_id, (0, 1)), (map_id, (2, 1))}),
+            "object_interaction",
+            activation_requirements=(
+                ((map_id, (0, 1)), Direction.East),
+                ((map_id, (2, 1)), Direction.West),
+            ),
+        )
+        world = NavigationWorld(
+            tiles={
+                (map_id, (0, 1)): NavigableTile((map_id, (0, 1)), blocked=True),
+                (map_id, (1, 1)): NavigableTile((map_id, (1, 1))),
+                (map_id, (2, 1)): NavigableTile((map_id, (2, 1))),
+            },
+            triggers=(trigger,),
+            facing=Direction.South,
+        )
+
+        plan = GoalAwareNavigator(world).plan((map_id, (2, 1)), ActivateTrigger("npc"))
+
+        self.assertEqual(plan.destination, (map_id, (2, 1)))
+        self.assertEqual(plan.actions[-1].action_type, NavigationActionType.TURN)
+        self.assertEqual(plan.actions[-1].direction, Direction.West)
 
     def test_prewarm_navigation_tiles_reuses_static_index(self):
         map_id = ("prewarm", 0)

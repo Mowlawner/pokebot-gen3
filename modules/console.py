@@ -251,12 +251,14 @@ def diagnostic_print(message: str | Callable[[], str], *, trace: bool = False) -
     console.print(message() if callable(message) else message)
 
 
-def profile_print(message: str | Callable[[], str]) -> None:
+def profile_print(message: str | Callable[[], str], *, every: int = 1) -> None:
     """Print performance output under the independent performance gate."""
     from modules.context import context
-    from modules.profiler import count, timing
+    from modules.profiler import count, timing, should_emit_output
 
     if not getattr(context, "debug_profile", False):
+        return
+    if not should_emit_output(every):
         return
     started_at = perf_counter_ns()
     console.print(message() if callable(message) else message)

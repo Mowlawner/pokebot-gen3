@@ -1,5 +1,6 @@
 from unittest import TestCase
 from unittest.mock import Mock, call, patch
+from types import SimpleNamespace
 
 from modules.agent_control import (
     ActionResult,
@@ -168,6 +169,91 @@ class AgentActionSelectionTests(TestCase):
         ):
             self.assertFalse(loop._advance_movement_batch())
         emulator.reset_held_buttons.assert_called_once_with()
+
+    def _movement_batch_loop(self, *, coordinates=(0, 0), destination=(1, 0)):
+        from modules.agent_control import _MovementBatch
+
+        loop = AgentControlLoop(lambda: None)
+        loop._movement_batch = _MovementBatch(
+            (
+                NavigationAction(
+                    NavigationActionType.MOVE,
+                    Direction.East,
+                    (MAP, (0, 0)),
+                    (MAP, destination),
+                ),
+            )
+        )
+        avatar = SimpleNamespace(
+            map_group_and_number=MAP,
+            local_coordinates=coordinates,
+            facing_direction="Right",
+        )
+        return loop, avatar
+
+    def test_unchanged_batch_uses_fast_path_without_full_interaction_observation(self):
+        loop, avatar = self._movement_batch_loop()
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator), patch(
+            "modules.agent_control.get_game_state", return_value=GameState.OVERWORLD
+        ), patch("modules.agent_control.is_field_message_waiting_for_input", return_value=False), patch(
+            "modules.agent_control.get_player_avatar", return_value=avatar
+        ), patch(
+            "modules.agent_control.observe_interaction", side_effect=AssertionError("full observation")
+        ), patch(
+            "modules.agent_control.evaluate_goal", side_effect=AssertionError("goal evaluation")
+        ), patch(
+            "modules.agent_control.plan_with_world_navigation", side_effect=AssertionError("pathfinding")
+        ):
+            self.assertTrue(loop._advance_movement_batch())
+        emulator.hold_button.assert_called_once_with("Right")
+
+    def test_batch_position_mismatch_falls_back(self):
+        loop, avatar = self._movement_batch_loop(coordinates=(9, 9))
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator), patch(
+            "modules.agent_control.get_game_state", return_value=GameState.OVERWORLD
+        ), patch("modules.agent_control.is_field_message_waiting_for_input", return_value=False), patch(
+            "modules.agent_control.get_player_avatar", return_value=avatar
+        ):
+            self.assertFalse(loop._advance_movement_batch())
+        self.assertIsNone(loop._movement_batch)
+        emulator.reset_held_buttons.assert_called_once_with()
+
+    def test_batch_dialogue_falls_back(self):
+        loop, avatar = self._movement_batch_loop()
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator), patch(
+            "modules.agent_control.get_game_state", return_value=GameState.OVERWORLD
+        ), patch("modules.agent_control.is_field_message_waiting_for_input", return_value=True), patch(
+            "modules.agent_control.get_player_avatar", return_value=avatar
+        ):
+            self.assertFalse(loop._advance_movement_batch())
+        self.assertIsNone(loop._movement_batch)
+
+    def test_batch_map_transition_falls_back(self):
+        loop, avatar = self._movement_batch_loop()
+        avatar.map_group_and_number = ("other", 0)
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator), patch(
+            "modules.agent_control.get_game_state", return_value=GameState.OVERWORLD
+        ), patch("modules.agent_control.is_field_message_waiting_for_input", return_value=False), patch(
+            "modules.agent_control.get_player_avatar", return_value=avatar
+        ):
+            self.assertFalse(loop._advance_movement_batch())
+        self.assertIsNone(loop._movement_batch)
+
+    def test_batch_blocked_movement_falls_back_after_existing_timeout(self):
+        loop, avatar = self._movement_batch_loop()
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator), patch(
+            "modules.agent_control.get_game_state", return_value=GameState.OVERWORLD
+        ), patch("modules.agent_control.is_field_message_waiting_for_input", return_value=False), patch(
+            "modules.agent_control.get_player_avatar", return_value=avatar
+        ):
+            self.assertTrue(all(loop._advance_movement_batch() for _ in range(24)))
+            self.assertFalse(loop._advance_movement_batch())
+        self.assertIsNone(loop._movement_batch)
 
     def test_safe_batch_ends_before_warp_action(self):
         source = (0, 0)

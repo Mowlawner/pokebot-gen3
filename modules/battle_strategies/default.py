@@ -5,6 +5,9 @@ from modules.context import context
 from modules.modes._interface import BotModeError
 from modules.pokemon import Pokemon, Move, LearnedMove
 from modules.pokemon_party import get_party
+from modules.battle_observation import default_battle_recorder
+from modules.battle_planner import PlannerAction, PlannerConfidence, PlannerDecisionClass, plan_battle_state
+from modules.console import diagnostic_print
 from ._interface import BattleStrategy, TurnAction, SafariTurnAction
 from ._util import BattleStrategyUtil
 
@@ -151,16 +154,104 @@ class DefaultBattleStrategy(BattleStrategy):
         """
         util = BattleStrategyUtil(battle_state)
 
+        # Strategic ownership starts with the planner on every single-battle
+        # action-selection turn.  The HP threshold remains a safety policy for
+        # the compatibility fallback below; it is no longer the planner's
+        # invocation trigger.
+        planner_decision = plan_battle_state(battle_state, default_battle_recorder.knowledge)
+        classification = getattr(planner_decision, "classification", None)
+        safe = bool(getattr(planner_decision, "is_safe_to_execute", False))
+        if classification is None and safe:
+            # Compatibility with decision-like test doubles and older callers
+            # that predate the explicit classification field.
+            classification = PlannerDecisionClass.SAFE
+        planner_action = self._turn_action_from_planner_decision(planner_decision)
+        best_available = classification is PlannerDecisionClass.BEST_AVAILABLE and planner_decision.confidence in (
+            PlannerConfidence.HIGH,
+            PlannerConfidence.MEDIUM,
+        )
+        accepted = (safe or best_available) and planner_action is not None
+        diagnostic_print(
+            lambda: (
+                "BATTLE_PLANNER: "
+                f"classification={getattr(classification, 'name', classification)} "
+                f"action={planner_decision.action.value} target={planner_decision.target!r} "
+                f"confidence={planner_decision.confidence.value} is_safe_to_execute={safe} "
+                f"accepted={accepted} rationale={planner_decision.rationale}"
+            ),
+            trace=True,
+        )
+        if accepted:
+            source = f"PLANNER {classification.name}"
+            context.battle_decision_source = source
+            context.battle_decision_detail = planner_decision.rationale
+            context.message = f"{source}: {self._planner_action_name(planner_decision)} — {planner_decision.rationale}"
+            diagnostic_print(lambda: f"BATTLE_DECISION: source={source} returned={planner_action!r}", trace=True)
+            return planner_action
+
+        # BEST_AVAILABLE is intentionally not gated by is_safe_to_execute.
+        # That property describes safety, while this policy describes whether
+        # a legal planner action may be sent to the executor.
+        fallback_reason = (
+            "planner returned ABORT"
+            if classification is PlannerDecisionClass.ABORT
+            else "planner decision was not executable"
+        )
+
+        # An insufficient/unsafe planner result must not make a healthy battle
+        # flee merely because the planner lacks enough visible opponent facts
+        # yet.  Preserve the established heuristic attack path above the old
+        # threshold, while retaining its existing safety handling below it.
         if not util.pokemon_has_enough_hp(battle_state.own_side.active_battler):
-            return self._handle_lead_cannot_battle(battle_state, util, reason="HP below threshold")
+            context.battle_decision_source = "LEGACY FALLBACK"
+            context.battle_decision_detail = fallback_reason
+            return self._handle_lead_cannot_battle(
+                battle_state, util, reason="planner could not establish a safe action"
+            )
 
         strongest_move = util.get_strongest_move_against(
             battle_state.own_side.active_battler, battle_state.opponent.active_battler
         )
         if strongest_move is not None:
+            active = battle_state.own_side.active_battler
+            move_name = "move"
+            try:
+                move_name = active.moves[strongest_move].move.name
+            except (AttributeError, IndexError, TypeError):
+                pass
+            context.battle_decision_source = "LEGACY FALLBACK"
+            context.battle_decision_detail = fallback_reason
+            context.message = f"LEGACY FALLBACK: {move_name} — {planner_decision.rationale} (legacy selector chose move index {strongest_move})"
+            diagnostic_print(
+                lambda: f"BATTLE_DECISION: source=LEGACY FALLBACK returned={TurnAction.use_move(strongest_move)!r} reason={fallback_reason}",
+                trace=True,
+            )
             return TurnAction.use_move(strongest_move)
 
+        context.battle_decision_source = "LEGACY FALLBACK"
+        context.battle_decision_detail = fallback_reason
+        context.message = f"LEGACY FALLBACK: no damaging move — {planner_decision.rationale}"
         return self._handle_lead_cannot_battle(battle_state, util, reason="No damaging moves available")
+
+    @staticmethod
+    def _planner_action_name(planner_decision) -> str:
+        if planner_decision.action is PlannerAction.UseMove:
+            return planner_decision.rationale.split(":", 1)[0] or str(planner_decision.target)
+        return planner_decision.action.value
+
+    @staticmethod
+    def _turn_action_from_planner_decision(planner_decision):
+        """Adapt a safe planner result to the existing battle executor API."""
+        match planner_decision.action:
+            case PlannerAction.UseMove:
+                return TurnAction.use_move(planner_decision.target)
+            case PlannerAction.SwitchPokemon:
+                return TurnAction.rotate_lead(planner_decision.target)
+            case PlannerAction.UseItem:
+                return TurnAction.use_item_on(*planner_decision.target)
+            case PlannerAction.RunAway:
+                return TurnAction.run_away()
+        return None
 
     def decide_turn_in_double_battle(self, battle_state: BattleState, battler_index: int) -> tuple["TurnAction", any]:
         util = BattleStrategyUtil(battle_state)

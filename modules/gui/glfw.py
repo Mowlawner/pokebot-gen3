@@ -34,7 +34,11 @@ class GlfwGui:
         context.profile = startup_settings.profile
         context.config.load(startup_settings.profile.path, strict=False)
         set_rom(startup_settings.profile.rom)
-        context.emulator = LibmgbaEmulator(startup_settings.profile, self._on_frame)
+        context.emulator = LibmgbaEmulator(
+            startup_settings.profile,
+            self._on_frame,
+            save_state_on_shutdown=not startup_settings.no_save_state,
+        )
         context.audio = not startup_settings.no_audio
         context.video = not startup_settings.no_video
         context.emulation_speed = startup_settings.emulation_speed
@@ -177,3 +181,6 @@ class GlfwGui:
             or context.emulator._performance_tracker.time_since_last_render() >= (1 / 60) * 1_000_000_000
         ):
             context.emulator._performance_tracker.track_render()
+            trace = getattr(context, "stutter_trace", None)
+            if trace is not None:
+                trace.mark("gui_frame_presented", True)

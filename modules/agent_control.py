@@ -8,6 +8,7 @@ is ready to do so.
 
 from dataclasses import dataclass, replace
 from enum import Enum, auto
+from contextlib import nullcontext
 from time import perf_counter_ns
 from typing import Callable, Generator
 
@@ -30,7 +31,7 @@ from modules.map_path import Direction
 from modules.map import get_event_flag, get_map_data, get_runtime_object_table
 from modules.map_data import MapRSE, get_map_enum
 from modules.game import get_event_flag_name
-from modules.memory import get_save_block
+from modules.memory import GameState, get_game_state, get_save_block
 from modules.navigation import (
     GoalAwareNavigator,
     NavigationAction,
@@ -52,6 +53,7 @@ from modules.overworld import (
 )
 from modules.player import get_player_avatar
 from modules.profiler import count, invalidation, now, profiled, timing, format_snapshot
+from modules.tasks import is_field_message_waiting_for_input
 
 
 class AgentActionType(Enum):
@@ -115,13 +117,21 @@ def prewarm_warp_destination(
         or not any(warp.destination == navigation.destination for warp in observation.overworld.warps)
     ):
         return False
+    trace = getattr(context, "stutter_trace", None)
+    trace_start = trace.now() if trace is not None else 0
     try:
         tiles = prewarm_static_map_observation(navigation.destination[0])
         prewarm_navigation_tiles(navigation.destination[0], tiles)
     except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
         # Cache preparation is an optimization and must never prevent the
         # existing warp dispatch from running.
+        if trace is not None:
+            trace.mark("warp_destination_prewarm_failed", True)
+            trace.duration("warp_destination_prewarm_duration_ms", trace_start)
         return False
+    if trace is not None:
+        trace.mark("warp_destination_prewarm_used", True)
+        trace.duration("warp_destination_prewarm_duration_ms", trace_start)
     return True
 
 
@@ -134,7 +144,24 @@ def observe_agent(
     special_interaction: str | None = None,
 ) -> AgentObservation:
     """Create one live observation, reading overworld data only when relevant."""
+    trace = getattr(context, "stutter_trace", None)
+    span = trace.span("observation") if trace is not None else nullcontext()
+    with span:
+        return _observe_agent_instrumented(
+            goal=goal,
+            choice_options=choice_options,
+            menu_options=menu_options,
+            special_interaction=special_interaction,
+        )
 
+
+def _observe_agent_instrumented(
+    *,
+    goal: Goal | None = None,
+    choice_options: tuple[str, ...] = (),
+    menu_options: tuple[str, ...] = (),
+    special_interaction: str | None = None,
+) -> AgentObservation:
     interaction_start = now()
     interaction = observe_interaction(
         choice_options=choice_options,
@@ -147,10 +174,19 @@ def observe_agent(
     interaction_type = classify_interaction(interaction)
     timing("agent_interaction_classification", classification_start)
     count("agent_interaction_classifications")
+    trace = getattr(context, "stutter_trace", None)
+    perception_trace_start = trace.now() if trace is not None else 0
     perception_start = now()
     overworld = perceive_overworld() if interaction_type is InteractionType.OVERWORLD else None
     timing("agent_overworld_perception", perception_start)
     count("agent_overworld_perceptions")
+    if trace is not None:
+        trace.mark("full_perception_ran", overworld is not None)
+        if overworld is not None:
+            trace.mark("map_id", overworld.map_id)
+            trace.mark("player_position", overworld.player_coordinates)
+        if trace.enabled:
+            trace.mark("perception_duration_ms", round((trace.now() - perception_trace_start) / 1_000_000, 3))
     finalize_start = now()
     observation = AgentObservation(interaction=interaction, overworld=overworld, goal=goal)
     timing("agent_observation_finalize", finalize_start)
@@ -228,16 +264,31 @@ def available_actions(observation: AgentObservation) -> tuple[AgentAction, ...]:
 def evaluate_goal(observation: AgentObservation) -> GoalEvaluation:
     """Evaluate a tactical goal against the current overworld observation."""
 
+    trace = getattr(context, "stutter_trace", None)
+    span = trace.span("goal_evaluation") if trace is not None else nullcontext()
+    with span:
+        return _evaluate_goal_instrumented(observation)
+
+
+def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation:
     if observation.goal is None:
         return GoalEvaluation(GoalStatus.NOT_APPLICABLE, reason="no goal supplied")
     if observation.overworld is None or observation.interaction_type is not InteractionType.OVERWORLD:
         return GoalEvaluation(GoalStatus.NOT_APPLICABLE, reason="goal requires an overworld observation")
 
+    world_start = now()
+    trace_world_start = getattr(context, "stutter_trace", None)
+    trace_world_start_ns = trace_world_start.now() if trace_world_start is not None else 0
     world = NavigationWorld.from_overworld(observation.overworld)
+    if trace_world_start is not None:
+        trace_world_start.duration("navigation_world_construction_duration_ms", trace_world_start_ns)
+    timing("goal_world_construction", world_start)
+    count("goal_world_constructions")
     start = (observation.overworld.map_id, observation.overworld.player_coordinates)
+    diagnostics_enabled = bool(context.debug and getattr(context, "debug_trace", False))
     binding_diagnostics = ()
     world_diagnostics = ()
-    if isinstance(observation.goal, (ActivateTrigger, ReachInteractionPosition)):
+    if diagnostics_enabled and isinstance(observation.goal, (ActivateTrigger, ReachInteractionPosition)):
         resolution = next(
             (
                 binding
@@ -258,17 +309,27 @@ def evaluate_goal(observation: AgentObservation) -> GoalEvaluation:
                 f" static_location={resolution.static_location!r}",
                 f"target_positions={resolution.interaction_positions!r}",
             )
+    planning_start = now()
+    trace_planning_start = trace_world_start.now() if trace_world_start is not None else 0
     try:
         plan, world_route = plan_with_world_navigation(world, start, observation.goal)
         target_map = goal_target_map(world, observation.goal)
-        if world_route is not None and target_map is not None:
+        if diagnostics_enabled and world_route is not None and target_map is not None:
             world_diagnostics = (
                 f"current_map={start[0]!r} target_map={target_map!r}",
                 f"maps={world_route.maps!r}",
                 f"edges={tuple((edge.kind, edge.source_map, edge.destination_map,
                                 edge.source_coordinates) for edge in world_route.edges)!r}",
             )
+        if diagnostics_enabled and plan.metrics is not None:
+            world_diagnostics += (f"route_selected: {plan.metrics.summary()}",)
+            if plan.candidate_metrics:
+                world_diagnostics += (
+                    "route_candidates: " + " | ".join(candidate.summary() for candidate in plan.candidate_metrics),
+                )
     except (NavigationError, WorldNavigationError) as error:
+        timing("goal_planning", planning_start)
+        count("goal_planning_attempts")
         return GoalEvaluation(
             GoalStatus.UNREACHABLE,
             reason=str(error),
@@ -276,6 +337,10 @@ def evaluate_goal(observation: AgentObservation) -> GoalEvaluation:
             binding_diagnostics=binding_diagnostics,
             world_diagnostics=world_diagnostics,
         )
+    timing("goal_planning", planning_start)
+    if trace_world_start is not None:
+        trace_world_start.duration("navigation_planning_duration_ms", trace_planning_start)
+    count("goal_planning_attempts")
 
     if isinstance(observation.goal, (ReachLocation, ReachWarp, ReachInteractionPosition)) and not plan.actions:
         return GoalEvaluation(
@@ -323,6 +388,13 @@ def evaluate_goal(observation: AgentObservation) -> GoalEvaluation:
 def select_action(observation: AgentObservation) -> ActionDecision:
     """Select one deterministic action after state-specific affordance generation."""
 
+    trace = getattr(context, "stutter_trace", None)
+    span = trace.span("action_selection") if trace is not None else nullcontext()
+    with span:
+        return _select_action_instrumented(observation)
+
+
+def _select_action_instrumented(observation: AgentObservation) -> ActionDecision:
     interaction_type = observation.interaction_type
     if interaction_type is not InteractionType.OVERWORLD:
         return ActionDecision(available_actions(observation)[0])
@@ -426,6 +498,12 @@ class AgentActionExecutor:
 
     @profiled("agent_action_execution", "actions_executed")
     def execute(self, action: AgentAction, observation: AgentObservation) -> ActionResult:
+        trace = getattr(context, "stutter_trace", None)
+        span = trace.span("action_construction_and_execution") if trace is not None else nullcontext()
+        with span:
+            return self._execute_instrumented(action, observation)
+
+    def _execute_instrumented(self, action: AgentAction, observation: AgentObservation) -> ActionResult:
         if action.action_type is AgentActionType.WAIT_REOBSERVE:
             return ActionResult(ActionResultType.WAITING, action, action.reason)
         if action.action_type is AgentActionType.DELEGATE_BATTLE:
@@ -516,6 +594,7 @@ class AgentControlLoop:
         self._route103_object_dumped_at: set[int] = set()
         self._last_world_transition_source: tuple[tuple[int, int], tuple[int, int]] | None = None
         self._movement_batch: _MovementBatch | None = None
+        self._movement_blocked_retries = 0
 
     def _safe_movement_batch(self, observation: AgentObservation) -> tuple[NavigationAction, ...]:
         """Return a short, same-map movement segment from the cached plan.
@@ -559,6 +638,17 @@ class AgentControlLoop:
         return tuple(result)
 
     def _cancel_movement_batch(self, reason: str) -> None:
+        trace = getattr(context, "stutter_trace", None)
+        if trace is not None:
+            trace.mark("route_invalidated", True)
+            trace.mark("invalidation_reason", reason)
+            trace.mark("state_transition", f"cached_route -> fallback: {reason}")
+            if "map" in reason or "warp" in reason:
+                trace.mark("map_warp_transition", True)
+        count("cached_route_batch_interruptions")
+        count(f"cached_route_batch_interruptions_{reason}")
+        count("cached_route_invalidations")
+        count(f"cached_route_invalidations_{reason}")
         if self._movement_batch is not None:
             self._report(f"MOVE_BATCH: interrupted reason={reason!r}")
         self._movement_batch = None
@@ -568,6 +658,7 @@ class AgentControlLoop:
         if callable(reset_held_buttons):
             reset_held_buttons()
 
+    @profiled("cached_route_execution", "cached_route_frames")
     def _advance_movement_batch(self) -> bool:
         """Advance a batch for one emulator frame, returning whether it remains active.
 
@@ -578,15 +669,35 @@ class AgentControlLoop:
         batch = self._movement_batch
         if batch is None:
             return False
+        fast_path_start = now()
+        trace = getattr(context, "stutter_trace", None)
+        trace_fast_path_start = trace.now() if trace is not None else 0
+        if trace is not None:
+            trace.mark("cached_route_active", True)
+            trace.mark("cached_route_actions_remaining", len(self._cached_actions) - self._cached_action_index)
+        fast_path_completed = False
         try:
-            interaction = observe_interaction()
-            if classify_interaction(interaction) is not InteractionType.OVERWORLD:
+            # Do not call observe_interaction here.  It is the general-purpose
+            # observation boundary and performs controllability, map-object,
+            # task, and avatar checks intended for full planning decisions.
+            # These reads are the minimum needed to fail closed while a known
+            # same-map movement suffix is in flight.
+            if get_game_state() is not GameState.OVERWORLD:
+                count("cached_route_fast_path_fallback_frames")
                 self._cancel_movement_batch("non_overworld_state")
+                return False
+            if is_field_message_waiting_for_input():
+                count("cached_route_fast_path_fallback_frames")
+                self._cancel_movement_batch("dialogue_started")
                 return False
             avatar = get_player_avatar()
             location = (avatar.map_group_and_number, avatar.local_coordinates)
+            if trace is not None:
+                trace.mark("map_id", location[0])
+                trace.mark("player_position", location[1])
             action = batch.current
             if location[0] != action.source[0]:
+                count("cached_route_fast_path_fallback_frames")
                 self._cancel_movement_batch("map_transition")
                 return False
             if location == action.destination:
@@ -594,6 +705,7 @@ class AgentControlLoop:
                 batch.index += 1
                 batch.frames_waiting = 0
                 if batch.index >= len(batch.actions):
+                    count("cached_route_batch_completions")
                     self._movement_batch = None
                     self._in_flight_move = None
                     self._in_flight_move_initial_facing = None
@@ -606,21 +718,37 @@ class AgentControlLoop:
                 if callable(reset_held_buttons):
                     reset_held_buttons()
             elif location != action.source:
+                count("cached_route_fast_path_fallback_frames")
                 self._cancel_movement_batch("position_divergence")
                 return False
 
             batch.frames_waiting += 1
             if batch.frames_waiting > 24:
+                count("cached_route_fast_path_fallback_frames")
                 self._cancel_movement_batch("movement_blocked")
                 return False
             if avatar.facing_direction != action.direction.button_name:
                 context.emulator.press_button(action.direction.button_name)
             else:
                 context.emulator.hold_button(action.direction.button_name)
+            fast_path_completed = True
+            count("cached_route_fast_path_frames")
+            # These counters intentionally remain zero on the fast path.  They
+            # make the absence of expensive work visible in debug snapshots.
+            count("cached_route_full_overworld_perceptions", 0)
+            count("cached_route_goal_evaluations", 0)
+            count("cached_route_pathfinding_calls", 0)
             return True
         except (AttributeError, RuntimeError, TypeError, ValueError):
+            count("cached_route_fast_path_fallback_frames")
             self._cancel_movement_batch("state_read_failed")
             return False
+        finally:
+            if trace is not None:
+                trace.mark("fast_path_used", fast_path_completed)
+                trace.duration("fast_path_duration_ms", trace_fast_path_start)
+            if fast_path_completed:
+                timing("cached_route_fast_path_execution", fast_path_start)
 
     def _report(self, message: str) -> None:
         self._logger(f"AGENT_{message}")
@@ -721,9 +849,25 @@ class AgentControlLoop:
             return None
         return (
             world.map_id,
-            tuple((warp.entry, warp.destination, warp.required_facing) for warp in world.warps),
             tuple(
-                (trigger.trigger_id, trigger.activation_locations, trigger.navigation_locations, trigger.target_map)
+                (
+                    warp.entry,
+                    warp.destination,
+                    warp.required_facing,
+                    warp.activation,
+                    warp.activation_locations,
+                    warp.activation_direction,
+                )
+                for warp in world.warps
+            ),
+            tuple(
+                (
+                    trigger.trigger_id,
+                    trigger.activation_locations,
+                    trigger.navigation_locations,
+                    trigger.activation_requirements,
+                    trigger.target_map,
+                )
                 for trigger in world.triggers
             ),
             world.dynamic_blocked_coordinates,
@@ -739,7 +883,55 @@ class AgentControlLoop:
             ),
         )
 
+    @staticmethod
+    def _signature_change_affects_remaining_route(
+        previous: tuple,
+        current: tuple,
+        remaining_actions: tuple[NavigationAction, ...],
+    ) -> tuple[bool, str]:
+        """Determine whether a live-world change can affect cached movement.
+
+        Runtime object observations can change while a player is traversing a
+        route.  Only changes on the remaining route can invalidate movement;
+        static topology and bindings remain conservatively invalidating.
+        """
+        changed = {index for index, (old, new) in enumerate(zip(previous, current)) if old != new}
+        route_locations = {location for action in remaining_actions for location in (action.source, action.destination)}
+        names = {0: "map", 1: "warps", 2: "triggers", 3: "dynamic_blocked", 4: "objects", 5: "bindings"}
+        detail = f"changed={tuple(names[index] for index in sorted(changed))!r} route_locations={len(route_locations)}"
+        if not changed:
+            return False, detail
+        if changed - {2, 3, 4}:
+            return True, detail + " relevant=static_or_topology"
+
+        if 3 in changed:
+            changed_blocked = set(previous[3]) ^ set(current[3])
+            if changed_blocked & {location[1] for location in route_locations}:
+                return True, detail + " relevant=blocked_route_tile"
+        if 4 in changed:
+            old_objects = {item[1] for item in previous[4]}
+            new_objects = {item[1] for item in current[4]}
+            if (old_objects ^ new_objects) & route_locations:
+                return True, detail + " relevant=route_object"
+        if 2 in changed:
+            old_triggers = {item[0]: item for item in previous[2]}
+            new_triggers = {item[0]: item for item in current[2]}
+            for trigger_id in old_triggers.keys() | new_triggers.keys():
+                if old_triggers.get(trigger_id) == new_triggers.get(trigger_id):
+                    continue
+                for trigger in (old_triggers.get(trigger_id), new_triggers.get(trigger_id)):
+                    if trigger is not None and (set(trigger[1]) | set(trigger[2])) & route_locations:
+                        return True, detail + " relevant=route_trigger"
+        return False, detail + " relevant=none"
+
     def _invalidate_plan(self, reason: str = "unspecified") -> None:
+        trace = getattr(context, "stutter_trace", None)
+        if trace is not None:
+            trace.mark("route_invalidated", True)
+            trace.mark("invalidation_reason", reason)
+            trace.mark("state_transition", f"cached_plan -> replanning: {reason}")
+            if "warp" in reason or "map" in reason:
+                trace.mark("map_warp_transition", True)
         invalidation(reason)
         self._cached_evaluation = None
         self._cached_actions = ()
@@ -749,15 +941,23 @@ class AgentControlLoop:
         self._cached_goal = None
         self._cached_world_signature = None
         self._movement_batch = None
+        self._movement_blocked_retries = 0
         reset_held_buttons = getattr(context.emulator, "reset_held_buttons", None)
         if callable(reset_held_buttons):
             reset_held_buttons()
 
     def _cached_decision(self, observation: AgentObservation) -> ActionDecision | None:
+        trace = getattr(context, "stutter_trace", None)
+        span = trace.span("cached_route_validation") if trace is not None else nullcontext()
+        with span:
+            return self._cached_decision_instrumented(observation)
+
+    def _cached_decision_instrumented(self, observation: AgentObservation) -> ActionDecision | None:
         if self._cached_evaluation is None or self._cached_goal != self._goal:
             return None
 
         count("cached_plan_validations")
+        count("cached_plan_hits")
 
         location = (observation.overworld.map_id, observation.overworld.player_coordinates)
         cached_action = (
@@ -765,18 +965,51 @@ class AgentControlLoop:
             if self._cached_action_index < len(self._cached_actions)
             else None
         )
-        world_signature_changed = self._cached_world_signature != self._world_signature(observation)
+        current_world_signature = self._world_signature(observation)
+        world_signature_changed = self._cached_world_signature != current_world_signature
         if world_signature_changed and not (
             cached_action is not None
             and cached_action.action_type is NavigationActionType.WARP
             and location == cached_action.source
         ):
+            affects_route, signature_detail = self._signature_change_affects_remaining_route(
+                self._cached_world_signature,
+                current_world_signature,
+                self._cached_actions[self._cached_action_index :],
+            )
+            trace = getattr(context, "stutter_trace", None)
+            if trace is not None:
+                trace.mark(
+                    "route_invalidation_detail",
+                    f"world_signature_changed current={location!r} "
+                    f"cached_source={cached_action.source if cached_action else None!r} "
+                    f"cached_destination={cached_action.destination if cached_action else None!r} "
+                    f"{signature_detail} affects_route={affects_route}",
+                )
+            if cached_action is not None and not affects_route:
+                self._cached_world_signature = current_world_signature
+                return ActionDecision(
+                    AgentAction(
+                        AgentActionType.NAVIGATE_TOWARD_GOAL,
+                        direction=cached_action.direction,
+                        navigation=cached_action,
+                        reason="continue cached route; irrelevant world change",
+                    ),
+                    self._cached_evaluation,
+                )
             invalidation("world_signature_changed")
             return None
 
         if self._cached_action_index >= len(self._cached_actions):
             if self._cached_evaluation.plan is not None and location == self._cached_evaluation.plan.destination:
-                if isinstance(self._goal, ActivateTrigger):
+                if isinstance(self._goal, (ActivateTrigger, ReachInteractionPosition)):
+                    world = NavigationWorld.from_overworld(observation.overworld)
+                    if not GoalAwareNavigator(world).satisfies(location, observation.overworld.facing, self._goal):
+                        # A plan may have reached the source tile without the
+                        # final turn being accepted by the emulator. Never
+                        # issue A on geometric adjacency alone.
+                        self._invalidate_plan("interaction_precondition_not_ready")
+                        return None
                     resolution = next(
                         (
                             binding
@@ -793,6 +1026,15 @@ class AgentControlLoop:
                             for trigger in observation.overworld.triggers
                         )
                     )
+                    if isinstance(self._goal, ReachInteractionPosition):
+                        return ActionDecision(
+                            AgentAction(
+                                AgentActionType.INTERACT,
+                                option=self._goal.trigger_id,
+                                reason="cached interaction source state reached",
+                            ),
+                            self._cached_evaluation,
+                        )
                     if not runtime_available:
                         return ActionDecision(
                             AgentAction(
@@ -834,8 +1076,18 @@ class AgentControlLoop:
         )
 
     def step(self) -> tuple[AgentObservation, ActionDecision, ActionResult]:
+        trace = getattr(context, "stutter_trace", None)
+        span = trace.span("post_transition_replan_or_decision") if trace is not None else nullcontext()
+        with span:
+            return self._step_instrumented()
+
+    def _step_instrumented(self) -> tuple[AgentObservation, ActionDecision, ActionResult]:
         profiling = getattr(context, "debug_profile", False)
         profile_start = perf_counter_ns() if profiling else 0
+        trace = getattr(context, "stutter_trace", None)
+        if trace is not None and self._cached_action_index < len(self._cached_actions):
+            trace.mark("cached_route_active", True)
+            trace.mark("cached_route_actions_remaining", len(self._cached_actions) - self._cached_action_index)
         observation = self._observe()
         observe_elapsed = perf_counter_ns() - profile_start if profiling else 0
         if observation.goal is not None:
@@ -864,6 +1116,9 @@ class AgentControlLoop:
                 self._report(f"WORLD: warp_destination_confirmed={observed_map!r}")
                 self._expected_world_transition = None
                 self._last_world_transition_source = expected_source
+                trace = getattr(context, "stutter_trace", None)
+                if trace is not None:
+                    trace.mark("map_changed_event", True)
                 self._warp_wait_observations = 0
                 self._invalidate_plan("warp_destination_confirmed")
                 self._warp_settling = True
@@ -935,10 +1190,31 @@ class AgentControlLoop:
                     self._in_flight_move = None
                     self._in_flight_move_initial_facing = None
                 elif movement_state is MovementState.STANDING:
-                    self._report(
-                        "REPLAN: reason='movement blocked'" f" requested={self._in_flight_move.direction.name!r}"
+                    trace = getattr(context, "stutter_trace", None)
+                    if trace is not None:
+                        trace.mark(
+                            "route_invalidation_detail",
+                            f"movement_blocked current={location!r} "
+                            f"expected_source={self._in_flight_move.source!r} "
+                            f"expected_destination={self._in_flight_move.destination!r} "
+                            f"direction={self._in_flight_move.direction.name!r} "
+                            f"destination_blocked={self._in_flight_move.destination[1] in observation.overworld.dynamic_blocked_coordinates!r}",
+                        )
+                    destination_blocked = (
+                        self._in_flight_move.destination[1] in observation.overworld.dynamic_blocked_coordinates
                     )
-                    self._invalidate_plan("movement_blocked")
+                    if not destination_blocked and self._movement_blocked_retries == 0:
+                        # A standing frame can be a transient script/input
+                        # boundary. Retry a legal, unoccupied destination once
+                        # before paying for synchronous replanning.
+                        self._movement_blocked_retries = 1
+                        self._in_flight_move = None
+                        self._in_flight_move_initial_facing = None
+                    else:
+                        self._report(
+                            "REPLAN: reason='movement blocked'" f" requested={self._in_flight_move.direction.name!r}"
+                        )
+                        self._invalidate_plan("movement_blocked")
                 else:
                     wait_action = AgentAction(
                         AgentActionType.WAIT_REOBSERVE,
@@ -949,9 +1225,19 @@ class AgentControlLoop:
                     return observation, wait_decision, wait_result
             if self._in_flight_move is not None and location == self._in_flight_move.destination:
                 self._cached_action_index += 1
+                self._movement_blocked_retries = 0
                 self._in_flight_move = None
                 self._in_flight_move_initial_facing = None
             elif self._in_flight_move is not None:
+                trace = getattr(context, "stutter_trace", None)
+                if trace is not None:
+                    trace.mark(
+                        "route_invalidation_detail",
+                        f"movement_divergence current={location!r} "
+                        f"expected_source={self._in_flight_move.source!r} "
+                        f"expected_destination={self._in_flight_move.destination!r} "
+                        f"direction={self._in_flight_move.direction.name!r}",
+                    )
                 self._report(
                     f"REPLAN: reason='movement divergence'"
                     f" expected={self._in_flight_move.destination!r} observed={location!r}"
@@ -979,6 +1265,10 @@ class AgentControlLoop:
                 self._cached_action_index = 0
                 self._cached_goal = self._goal
                 self._cached_world_signature = self._world_signature(observation)
+                count("navigation_replans")
+                trace = getattr(context, "stutter_trace", None)
+                if trace is not None:
+                    trace.mark("route_replanned", True)
                 if self._diagnostics_enabled():
                     self._report("PLAN: replanned")
         elif self._diagnostics_enabled():
@@ -1065,7 +1355,8 @@ class AgentControlLoop:
                 f"step_observe_ms={observe_elapsed / 1_000_000:.3f} "
                 f"step_decision_ms={decision_elapsed / 1_000_000:.3f} "
                 f"step_execute_ms={(total_elapsed - observe_elapsed - decision_elapsed) / 1_000_000:.3f} "
-                f"step_total_ms={total_elapsed / 1_000_000:.3f}"
+                f"step_total_ms={total_elapsed / 1_000_000:.3f}",
+                every=60,
             )
         if decision.action.navigation is not None:
             if result.result_type is ActionResultType.EXECUTED:
@@ -1075,6 +1366,8 @@ class AgentControlLoop:
                     safe_segment = self._safe_movement_batch(observation)
                     if len(safe_segment) > 1:
                         self._movement_batch = _MovementBatch(safe_segment)
+                        count("cached_route_batch_starts")
+                        count("cached_route_batch_actions", len(safe_segment))
                         self._report(
                             f"MOVE_BATCH: started steps={len(safe_segment)}"
                             f" from={safe_segment[0].source!r} to={safe_segment[-1].destination!r}"

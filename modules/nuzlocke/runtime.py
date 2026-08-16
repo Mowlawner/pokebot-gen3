@@ -44,7 +44,12 @@ class NuzlockeRuntime:
         observer is replaced and the current snapshot becomes a new baseline,
         so the reset cannot manufacture transitions between unrelated states.
         """
+        trace = getattr(__import__("modules.context", fromlist=["context"]), "context", None)
+        trace = getattr(trace, "stutter_trace", None)
+        observe_started = trace.now() if trace is not None else 0
         current = self._snapshot_provider() if snapshot is None else snapshot
+        if trace is not None:
+            trace.duration("nuzlocke_observer_duration_ms", observe_started)
         if self._last_frame is not None and current.frame < self._last_frame:
             self._observer = NuzlockeEventObserver()
             self._events.clear()
@@ -52,7 +57,10 @@ class NuzlockeRuntime:
             self._event_sequence = 0
 
         self._last_frame = current.frame
+        observer_started = trace.now() if trace is not None else 0
         events = self._observer.observe(current)
+        if trace is not None:
+            trace.duration("nuzlocke_observer_duration_ms", observer_started)
         self._events.extend(events)
         for event in events:
             self._event_sequence += 1

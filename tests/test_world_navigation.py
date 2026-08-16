@@ -11,18 +11,19 @@ from modules.agent_control import (
     evaluate_goal,
     select_action,
 )
-from modules.goals import ActivateTrigger, ReachLocation
+from modules.goals import ActivateTrigger, NavigationGoal, ReachInteractionPosition, ReachLocation, EncounterMode
 from modules.interaction_state import InteractionObservation
 from modules.map_path import Direction
 from modules.memory import GameState
 from modules.navigation import (
     GoalAwareNavigator,
+    NavigationAction,
     NavigationActionType,
     NavigationWorld,
     NavigableTile,
     plan_with_world_navigation,
 )
-from modules.overworld import OverworldObservation, TileObservation, TriggerObservation
+from modules.overworld import OverworldObservation, TileObservation, TriggerObservation, WarpActivation
 from modules.overworld import WarpObservation
 from modules.trigger_bindings import BindingResolution, TriggerBinding
 from modules.world_navigation import WorldEdge, WorldMapGraph
@@ -158,6 +159,196 @@ class TestWeightedNavigation(unittest.TestCase):
         world = self.world({(0, 0)})
         self.assertEqual(world.tiles[(self.MAP, (0, 0))].traversal_cost, 1)
 
+    def test_same_length_route_prefers_fewer_encounter_opportunities(self):
+        coordinates = {(x, y) for y in range(3) for x in range(3)}
+        world = NavigationWorld(
+            tiles={
+                (self.MAP, coordinate): NavigableTile(
+                    (self.MAP, coordinate),
+                    False,
+                    frozenset(Direction),
+                    1,
+                    coordinate in {(0, 0), (1, 0), (1, 2)},
+                )
+                for coordinate in coordinates
+                if coordinate != (1, 1)
+            },
+            facing=Direction.North,
+        )
+        plan = GoalAwareNavigator(world).plan((self.MAP, (0, 1)), ReachLocation((self.MAP, (2, 1))))
+        self.assertEqual(plan.metrics.encounter_opportunities, 1)
+        self.assertEqual(plan.metrics.movement_actions, 4)
+
+    def test_normal_prefers_fewer_opportunities_over_shorter_route(self):
+        # The upper branch is shorter (4 moves) but crosses two encounter
+        # tiles.  The lower branch takes 6 moves and has no exposure.
+        coordinates = {(x, y) for y in range(3) for x in range(5)}
+        grass = {(1, 0), (2, 0)}
+        world = NavigationWorld(
+            tiles={
+                (self.MAP, coordinate): NavigableTile(
+                    (self.MAP, coordinate), False, frozenset(Direction), 1, coordinate in grass
+                )
+                for coordinate in coordinates
+            }
+        )
+        plan = GoalAwareNavigator(world).plan((self.MAP, (0, 0)), ReachLocation((self.MAP, (4, 0))))
+
+        self.assertEqual(plan.metrics.encounter_opportunities, 0)
+        self.assertEqual(plan.metrics.movement_actions, 6)
+        self.assertEqual(plan.metrics.ordinary_movement_steps, 6)
+
+    def test_first_grass_patch_geometry_selects_lower_zero_exposure_branch(self):
+        # This is the shape of the first patch decision: the direct upper
+        # branch crosses two grass tiles, while the lower branch adds no
+        # grass and has the same number of movement actions.
+        coordinates = {
+            (0, 1),
+            (3, 1),
+            (0, 0),
+            (1, 0),
+            (2, 0),
+            (3, 0),
+            (0, 2),
+            (1, 2),
+            (2, 2),
+            (3, 2),
+        }
+        grass = {(1, 0), (2, 0)}
+        world = NavigationWorld(
+            tiles={
+                (self.MAP, coordinate): NavigableTile(
+                    (self.MAP, coordinate), False, frozenset(Direction), 1, coordinate in grass
+                )
+                for coordinate in coordinates
+            },
+            facing=Direction.East,
+        )
+        plan = GoalAwareNavigator(world).plan((self.MAP, (0, 1)), ReachLocation((self.MAP, (3, 1))))
+
+        self.assertEqual(plan.metrics.movement_actions, 5)
+        self.assertEqual(plan.metrics.encounter_terrain_moves, 0)
+        self.assertEqual(plan.metrics.turns_on_encounter_terrain, 0)
+        self.assertEqual(plan.metrics.turns_on_non_encounter_terrain, 3)
+        self.assertEqual(plan.metrics.encounter_opportunities, 0)
+        self.assertEqual(plan.metrics.total_route_cost, 8)
+        self.assertTrue(all(action.destination[1] not in grass for action in plan.actions))
+
+        # Isolate the competing direct branch using the same map geometry so
+        # this regression records why the branch is rejected, not just which
+        # coordinates happen to be returned.
+        upper_coordinates = {(0, 1), (3, 1), (0, 0), (1, 0), (2, 0), (3, 0)}
+        upper_world = NavigationWorld(
+            tiles={location: world.tiles[location] for location in world.tiles if location[1] in upper_coordinates},
+            facing=Direction.East,
+        )
+        upper = GoalAwareNavigator(upper_world).plan((self.MAP, (0, 1)), ReachLocation((self.MAP, (3, 1))))
+        self.assertEqual(upper.metrics.movement_actions, 5)
+        self.assertEqual(upper.metrics.encounter_terrain_moves, 2)
+        self.assertGreater(upper.metrics.encounter_opportunities, plan.metrics.encounter_opportunities)
+
+    def test_first_grass_patch_seek_mode_does_not_apply_exposure_penalty(self):
+        coordinates = {
+            (0, 1),
+            (3, 1),
+            (0, 0),
+            (1, 0),
+            (2, 0),
+            (3, 0),
+            (0, 2),
+            (1, 2),
+            (2, 2),
+            (3, 2),
+        }
+        grass = {(1, 0), (2, 0)}
+        world = NavigationWorld(
+            tiles={
+                (self.MAP, coordinate): NavigableTile(
+                    (self.MAP, coordinate), False, frozenset(Direction), 1, coordinate in grass
+                )
+                for coordinate in coordinates
+            },
+            facing=Direction.East,
+        )
+        plan = GoalAwareNavigator(world).plan(
+            (self.MAP, (0, 1)),
+            NavigationGoal(ReachLocation((self.MAP, (3, 1))), encounter_mode=EncounterMode.SEEK),
+        )
+        self.assertTrue(any(action.destination[1] in grass for action in plan.actions))
+
+    def test_turns_on_encounter_terrain_are_reported_as_encounter_opportunities(self):
+        world = NavigationWorld(
+            tiles={
+                (self.MAP, coordinate): NavigableTile(
+                    (self.MAP, coordinate), False, frozenset(Direction), 1, coordinate == (0, 0)
+                )
+                for coordinate in ((0, 0), (1, 0), (1, 1))
+            },
+            facing=Direction.North,
+        )
+        plan = GoalAwareNavigator(world).plan((self.MAP, (0, 0)), ReachLocation((self.MAP, (1, 1))))
+        self.assertEqual(plan.metrics.encounter_opportunities, 1)
+        self.assertEqual(plan.metrics.turns_on_encounter_terrain, 1)
+        self.assertEqual(plan.metrics.turns_on_non_encounter_terrain, 1)
+
+    def test_turning_on_grass_is_an_encounter_opportunity(self):
+        world = NavigationWorld(
+            tiles={
+                (self.MAP, (0, 0)): NavigableTile((self.MAP, (0, 0)), False, frozenset(Direction), 1, True),
+                (self.MAP, (0, 1)): NavigableTile((self.MAP, (0, 1)), False, frozenset(Direction), 1, False),
+            },
+            facing=Direction.East,
+        )
+        plan = GoalAwareNavigator(world).plan((self.MAP, (0, 0)), ReachLocation((self.MAP, (0, 1))))
+        self.assertEqual(plan.metrics.encounter_opportunities, 1)
+        self.assertEqual(plan.metrics.turns_on_encounter_terrain, 1)
+
+    def test_interaction_route_includes_turn_before_adjacent_move(self):
+        trigger = TriggerObservation(
+            "npc",
+            frozenset({(self.MAP, (2, 0))}),
+            frozenset({(self.MAP, (1, 0))}),
+            activation_requirements=(((self.MAP, (1, 0)), Direction.East),),
+        )
+        world = NavigationWorld(
+            tiles={
+                (self.MAP, (x, 0)): NavigableTile((self.MAP, (x, 0)), False, frozenset(Direction)) for x in range(3)
+            },
+            triggers=(trigger,),
+            facing=Direction.North,
+        )
+        plan = GoalAwareNavigator(world).plan((self.MAP, (0, 0)), ReachInteractionPosition("npc"))
+        self.assertEqual(plan.actions[0].action_type, NavigationActionType.TURN)
+        self.assertEqual(plan.actions[0].source, plan.actions[0].destination)
+        self.assertEqual(plan.actions[1].action_type, NavigationActionType.MOVE)
+        self.assertEqual(plan.actions[1].direction, Direction.East)
+
+    def test_semantic_interaction_route_preserves_required_facing(self):
+        trigger = TriggerObservation(
+            "rival",
+            frozenset({(self.MAP, (1, 1))}),
+            frozenset({(self.MAP, (1, 0)), (self.MAP, (2, 1)), (self.MAP, (1, 2)), (self.MAP, (0, 1))}),
+            activation_requirements=(
+                ((self.MAP, (1, 0)), Direction.South),
+                ((self.MAP, (2, 1)), Direction.West),
+                ((self.MAP, (1, 2)), Direction.North),
+                ((self.MAP, (0, 1)), Direction.East),
+            ),
+        )
+        world = NavigationWorld(
+            tiles={(self.MAP, (x, y)): NavigableTile((self.MAP, (x, y))) for x in range(3) for y in range(3)},
+            triggers=(trigger,),
+            facing=Direction.East,
+        )
+
+        plan = GoalAwareNavigator(world).plan((self.MAP, (1, 2)), ActivateTrigger("rival"))
+
+        self.assertEqual(plan.destination, (self.MAP, (1, 2)))
+        self.assertEqual(
+            plan.actions,
+            (NavigationAction(NavigationActionType.TURN, Direction.North, (self.MAP, (1, 2)), (self.MAP, (1, 2))),),
+        )
+
     def test_grass_route_is_avoided_when_normal_detour_is_cheaper(self):
         coordinates = {(x, y) for y in (0, 1) for x in range(5)}
         world = self.world(coordinates, grass={(1, 0), (2, 0), (3, 0)})
@@ -289,6 +480,7 @@ class TestWeightedNavigation(unittest.TestCase):
         self.assertEqual(plan.actions[-1].action_type, NavigationActionType.WARP)
         self.assertEqual(plan.actions[-1].source, (source_map, (1, 0)))
         self.assertEqual(plan.actions[-1].direction, Direction.East)
+        self.assertEqual(world.warps[0].activation, WarpActivation.STEP_ON)
 
     def test_arrow_warp_steps_onto_tile_then_uses_required_facing(self):
         source_map = (0, 0)

@@ -3,6 +3,13 @@
 from dataclasses import dataclass, field
 
 from modules.overworld import Location, MapId
+from enum import Enum, auto
+
+
+class EncounterMode(Enum):
+    NORMAL = auto()
+    SEEK = auto()
+
 
 INTRODUCTORY_RIVAL_TRIGGER_ID = "introductory_rival"
 
@@ -47,3 +54,4 @@ class GoalConstraints:
 class NavigationGoal(Goal):
     target: Goal
     constraints: GoalConstraints = field(default_factory=GoalConstraints)
+    encounter_mode: EncounterMode = EncounterMode.NORMAL

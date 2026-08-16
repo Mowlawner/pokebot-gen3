@@ -140,7 +140,11 @@ class PokebotGui:
         context.profile = profile
         context.config.load(profile.path, strict=False)
         set_rom(profile.rom)
-        context.emulator = LibmgbaEmulator(profile, self._emulator_screen.update)
+        context.emulator = LibmgbaEmulator(
+            profile,
+            self._emulator_screen.update,
+            save_state_on_shutdown=not self._startup_settings.no_save_state if self._startup_settings else True,
+        )
 
         if self._startup_settings:
             context.audio = not self._startup_settings.no_audio
@@ -149,6 +153,8 @@ class PokebotGui:
             context.debug = self._startup_settings.debug
             context.debug_trace = self._startup_settings.debug_trace
             context.debug_profile = self._startup_settings.debug_profile
+            context.debug_stutter_trace = self._startup_settings.stutter_trace
+            context.stutter_trace_threshold_ms = self._startup_settings.stutter_threshold_ms
             context.bot_mode = self._startup_settings.bot_mode
 
             if context.debug:

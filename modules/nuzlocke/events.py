@@ -176,6 +176,7 @@ class NuzlockeEventObserver:
         self._previous_game_state: NuzlockeSnapshot | None = None
         self._previous_party: NuzlockeSnapshot | None = None
         self._fainted: set[tuple[Any, ...]] = set()
+        self._storage_location_cache: dict[int, tuple[object, dict[PokemonIdentity, PokemonStorageLocation]]] = {}
 
     def observe(self, snapshot: NuzlockeSnapshot) -> tuple[Event, ...]:
         previous = self._previous
@@ -342,18 +343,28 @@ class NuzlockeEventObserver:
 
         return ([event] if event is not None else []) + faint_events
 
-    @staticmethod
-    def _storage_events(previous: NuzlockeSnapshot, snapshot: NuzlockeSnapshot) -> list[Event]:
-        def locations(
-            value: NuzlockeSnapshot,
-        ) -> dict[PokemonIdentity, PokemonStorageLocation]:
-            return {
-                item.pokemon.identity: PokemonStorageLocation(item.pokemon.identity, item.box, item.slot)
-                for item in value.pc.pokemon
-                if item.pokemon.identity is not None
-            }
+    def _storage_locations(self, value: NuzlockeSnapshot) -> dict[PokemonIdentity, PokemonStorageLocation]:
+        source = value.pc
+        key = id(source)
+        cached = self._storage_location_cache.get(key)
+        if cached is not None and cached[0] is source:
+            return cached[1]
+        from modules.context import context
 
-        old, new = locations(previous), locations(snapshot)
+        trace = getattr(context, "stutter_trace", None)
+        started = trace.now() if trace is not None else 0
+        locations = {
+            item.pokemon.identity: PokemonStorageLocation(item.pokemon.identity, item.box, item.slot)
+            for item in source.pokemon
+            if item.pokemon.identity is not None
+        }
+        if trace is not None:
+            trace.duration("nuzlocke_storage_event_index_duration_ms", started)
+        self._storage_location_cache[key] = (source, locations)
+        return locations
+
+    def _storage_events(self, previous: NuzlockeSnapshot, snapshot: NuzlockeSnapshot) -> list[Event]:
+        old, new = self._storage_locations(previous), self._storage_locations(snapshot)
         entered = tuple(new[identity] for identity in new.keys() - old.keys())
         left = tuple(old[identity] for identity in old.keys() - new.keys())
         moved = tuple(
