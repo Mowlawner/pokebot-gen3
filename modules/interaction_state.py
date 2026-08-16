@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 from modules.memory import GameState, get_game_state
 from modules.player import player_avatar_is_controllable
-from modules.tasks import is_field_message_waiting_for_input
+from modules.tasks import get_global_script_context, is_field_message_waiting_for_input, task_is_active
 from modules.profiler import count, now, timing
 
 
@@ -34,7 +34,44 @@ class InteractionObservation:
     menu_options: tuple[str, ...] = ()
     special_interaction: str | None = None
     controllable: bool = False
+    field_message_lifecycle_active: bool = False
+    field_message_advance_ready: bool = False
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+_field_message_lifecycle_active = False
+_field_message_advance_ready = False
+
+_FIELD_MESSAGE_TRANSITION_NATIVES = frozenset({"IsFieldMessageBoxHidden"})
+
+
+def _observe_field_message_waiting(state: GameState | Any) -> bool:
+    """Carry Emerald's field-message lifecycle across script native waits."""
+    global _field_message_lifecycle_active, _field_message_advance_ready
+    if state is not GameState.OVERWORLD:
+        _field_message_lifecycle_active = False
+        _field_message_advance_ready = False
+        return False
+    try:
+        draw_task_active = task_is_active("Task_DrawFieldMessage")
+        waiting = is_field_message_waiting_for_input(_field_message_lifecycle_active or draw_task_active)
+        script_context = None
+        native_name = None
+        if not waiting:
+            script_context = get_global_script_context()
+            native_name = script_context.native_function_name if script_context is not None else None
+        if draw_task_active or waiting:
+            _field_message_lifecycle_active = True
+        else:
+            if script_context is None or native_name not in ("WaitForAorBPress", *_FIELD_MESSAGE_TRANSITION_NATIVES):
+                _field_message_lifecycle_active = False
+        _field_message_advance_ready = (
+            _field_message_lifecycle_active and not waiting and native_name in _FIELD_MESSAGE_TRANSITION_NATIVES
+        )
+        return waiting
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        _field_message_advance_ready = False
+        return False
 
 
 def classify_interaction(observation: InteractionObservation) -> InteractionType:
@@ -87,7 +124,7 @@ def observe_interaction(
     timing("agent_interaction_game_state_read", state_start)
     count("interaction_game_state_reads")
     dialogue_start = now()
-    dialogue_waiting = state is GameState.OVERWORLD and is_field_message_waiting_for_input()
+    dialogue_waiting = _observe_field_message_waiting(state)
     timing("agent_interaction_dialogue_check", dialogue_start)
     count("interaction_dialogue_checks")
     controllable_start = now()
@@ -103,4 +140,6 @@ def observe_interaction(
         menu_options=menu_options,
         special_interaction=special_interaction,
         controllable=controllable,
+        field_message_lifecycle_active=_field_message_lifecycle_active,
+        field_message_advance_ready=_field_message_advance_ready,
     )

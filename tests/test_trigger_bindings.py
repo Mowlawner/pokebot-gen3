@@ -255,6 +255,35 @@ class TestTriggerBindings(unittest.TestCase):
     def test_unknown_semantic_goal_has_no_arbitrary_binding(self):
         self.assertIsNone(get_trigger_binding("not_in_rom"))
 
+    def test_early_pokeball_binding_matches_both_gender_scripts(self):
+        binding = get_trigger_binding("early_pokeballs")
+        self.assertIsNotNone(binding)
+        self.assertEqual(binding.map_id, MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value)
+        self.assertEqual(binding.local_id, 2)
+        self.assertEqual(binding.script_symbol, "LittlerootTown_ProfessorBirchsLab_EventScript_Birch")
+        self.assertIn(binding.script_symbol, binding.script_symbols)
+        self.assertIn("LittlerootTown_ProfessorBirchsLab_EventScript_BrendanGivePokeBalls", binding.script_symbols)
+        self.assertIn("LittlerootTown_ProfessorBirchsLab_EventScript_MayGivePokeBalls", binding.script_symbols)
+
+        for script in binding.script_symbols:
+            resolution = resolve_trigger_binding(
+                binding,
+                (ObjectObservation(2, (binding.map_id, (5, 5)), script=script),),
+                map_size=(20, 20),
+            )
+            self.assertTrue(resolution.runtime_match)
+
+    def test_early_pokeball_birch_runtime_position_and_facing(self):
+        binding = get_trigger_binding("early_pokeballs")
+        resolution = resolve_trigger_binding(
+            binding,
+            (ObjectObservation(2, (binding.map_id, (6, 4)), script=binding.script_symbol),),
+            map_size=(20, 20),
+        )
+        self.assertTrue(resolution.runtime_match)
+        self.assertEqual(resolution.runtime_locations, ((6, 4),))
+        self.assertEqual(set(resolution.interaction_positions), {(6, 3), (7, 4), (6, 5), (5, 4)})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -43,6 +43,21 @@ from .rules import (
     load_rules,
     reduce_rules,
 )
+from .campaign_state import CampaignState, Fact, FactStatus, RunStatus
+from .campaign_objectives import (
+    CampaignObjective,
+    CampaignPredicate,
+    ObjectiveSelection,
+    ObjectiveStatus,
+    initial_emerald_campaign,
+    select_campaign_objective,
+)
+from .campaign_execution import (
+    CampaignExecutionAdapter,
+    CampaignExecutionResult,
+    CampaignExecutionStatus,
+    adapt_campaign_execution,
+)
 
 __all__ = [
     "BattleSnapshot",
@@ -82,4 +97,18 @@ __all__ = [
     "RuleViolation",
     "load_rules",
     "reduce_rules",
+    "CampaignState",
+    "Fact",
+    "FactStatus",
+    "RunStatus",
+    "CampaignObjective",
+    "CampaignPredicate",
+    "ObjectiveSelection",
+    "ObjectiveStatus",
+    "initial_emerald_campaign",
+    "select_campaign_objective",
+    "CampaignExecutionAdapter",
+    "CampaignExecutionResult",
+    "CampaignExecutionStatus",
+    "adapt_campaign_execution",
 ]

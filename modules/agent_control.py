@@ -398,6 +398,18 @@ def _select_action_instrumented(observation: AgentObservation) -> ActionDecision
     interaction_type = observation.interaction_type
     if interaction_type is not InteractionType.OVERWORLD:
         return ActionDecision(available_actions(observation)[0])
+    # A semantic trigger can remain geometrically reachable while its script
+    # owns the avatar.  Do not send the goal's interaction input again until
+    # the script has returned control to the player.
+    if not observation.interaction.controllable:
+        if observation.interaction.field_message_advance_ready:
+            return ActionDecision(
+                AgentAction(
+                    AgentActionType.ADVANCE_DIALOGUE,
+                    reason="field dialogue transition requires input",
+                )
+            )
+        return ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE, reason="player avatar is not controllable"))
     evaluation = evaluate_goal(observation)
     if evaluation.status is GoalStatus.COMPLETE:
         return ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE, reason=evaluation.reason), evaluation)
@@ -521,7 +533,7 @@ class AgentActionExecutor:
             return ActionResult(ActionResultType.UNSUPPORTED, action, "no emulator is attached")
 
         if action.action_type is AgentActionType.ADVANCE_DIALOGUE:
-            if not observation.interaction.dialogue_waiting:
+            if not (observation.interaction.dialogue_waiting or observation.interaction.field_message_advance_ready):
                 return ActionResult(ActionResultType.WAITING, action, "dialogue is not ready")
             context.emulator.press_button("A")
         elif action.action_type is AgentActionType.CHOOSE_DIALOGUE_OPTION:
@@ -595,6 +607,7 @@ class AgentControlLoop:
         self._last_world_transition_source: tuple[tuple[int, int], tuple[int, int]] | None = None
         self._movement_batch: _MovementBatch | None = None
         self._movement_blocked_retries = 0
+        self._dialogue_input_in_flight = False
 
     def _safe_movement_batch(self, observation: AgentObservation) -> tuple[NavigationAction, ...]:
         """Return a short, same-map movement segment from the cached plan.
@@ -1096,6 +1109,19 @@ class AgentControlLoop:
             observation = replace(observation, goal=self._goal)
 
         interaction_type = observation.interaction_type
+        if self._dialogue_input_in_flight:
+            if not observation.interaction.field_message_lifecycle_active:
+                self._dialogue_input_in_flight = False
+            elif observation.interaction.dialogue_waiting:
+                self._dialogue_input_in_flight = False
+            else:
+                wait_action = AgentAction(
+                    AgentActionType.WAIT_REOBSERVE,
+                    reason="waiting for field dialogue transition after input",
+                )
+                wait_decision = ActionDecision(wait_action)
+                wait_result = self._executor.execute(wait_action, observation)
+                return observation, wait_decision, wait_result
         if interaction_type is not InteractionType.OVERWORLD:
             self._invalidate_plan("non_overworld_interaction")
         if interaction_type is not self._last_interaction_type:
@@ -1348,6 +1374,13 @@ class AgentControlLoop:
         if decision.action.navigation is not None:
             prewarm_warp_destination(observation, decision.action.navigation)
         result = self._executor.execute(decision.action, observation)
+        if (
+            result.result_type is ActionResultType.EXECUTED
+            and decision.action.action_type is AgentActionType.ADVANCE_DIALOGUE
+            and not observation.interaction.controllable
+            and observation.interaction.field_message_advance_ready
+        ):
+            self._dialogue_input_in_flight = True
         if profiling:
             total_elapsed = perf_counter_ns() - profile_start
             profile_print(
