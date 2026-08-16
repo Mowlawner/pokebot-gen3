@@ -1,9 +1,10 @@
 import queue
 import sys
+import time
 from collections import deque
 from typing import Generator
 
-from modules.console import console, diagnostic_print
+from modules.console import console, diagnostic_print, profile_print
 from modules.context import context
 from modules.memory import get_game_state
 from modules.modes import (
@@ -19,6 +20,14 @@ from modules.stats import StatsDatabase
 from modules.tasks import get_global_script_context, get_tasks
 from modules.nuzlocke.runtime import NuzlockeRuntime
 from modules.nuzlocke.persistence import JsonEventStore
+from modules.profiler import count as profile_count
+from modules.profiler import (
+    enabled as profiling_enabled,
+    format_snapshot,
+    now as profile_now,
+    timing as profile_timing,
+)
+from modules.stutter_trace import StutterTrace
 
 # Contains a queue of tasks that should be run the next time a frame completes.
 # This is currently used by the HTTP server component (which runs in a separate thread) to trigger things
@@ -76,10 +85,18 @@ def main_loop() -> None:
 
         context.bot_listeners = get_bot_listeners(context.rom)
         context.nuzlocke_runtime = NuzlockeRuntime(event_sink=nuzlocke_event_store)
+        trace_output = context.profile.path / "stutter_trace.jsonl" if context.debug_stutter_trace else None
+        context.stutter_trace = StutterTrace(
+            enabled=context.debug_stutter_trace,
+            threshold_ms=context.stutter_trace_threshold_ms,
+            output=trace_output,
+        )
         previous_frame_info: FrameInfo | None = None
         last_controller_boundary: tuple | None = None
 
         while True:
+            loop_start = profile_now()
+            profile_count("main_loop_iterations")
             # Process work queue, which can be used to get the main thread to access the emulator
             # at a 'safe' time (i.e. not in the middle of emulating a frame.)
             while not work_queue.empty():
@@ -88,7 +105,12 @@ def main_loop() -> None:
                 work_queue.task_done()
 
             context.frame += 1
+            trace = context.stutter_trace
+            if trace is not None and trace.enabled:
+                trace.begin(context.frame, context.emulator.get_frame_count())
+                trace_loop_start = trace.now()
 
+            stage_start = profile_now()
             game_state = get_game_state()
             script_context = get_global_script_context()
             script_stack = script_context.stack if script_context is not None and script_context.is_active else []
@@ -97,7 +119,11 @@ def main_loop() -> None:
                 active_tasks = [task.symbol.lower() for task in task_list]
             else:
                 active_tasks = []
+            if profiling_enabled():
+                profile_timing("main_frame_state_reads", stage_start)
+            state_reads_elapsed = profile_now() - stage_start if profiling_enabled() else 0
 
+            frame_setup_start = profile_now()
             frame_info = FrameInfo(
                 frame_count=context.emulator.get_frame_count(),
                 game_state=game_state,
@@ -132,11 +158,21 @@ def main_loop() -> None:
                 state_cache.reset()
                 context.bot_listeners = get_bot_listeners(context.rom)
                 context.nuzlocke_runtime = NuzlockeRuntime(event_sink=nuzlocke_event_store)
+            if profiling_enabled():
+                profile_timing("main_frame_setup", frame_setup_start)
+            frame_setup_elapsed = profile_now() - frame_setup_start if profiling_enabled() else 0
 
             # Capture normalized state at the application frame boundary,
             # before the emulator advances. This is passive and independent of
             # bot modes, listeners, GUI rendering, and HTTP consumers.
+            stage_start = profile_now()
+            trace_nuzlocke_start = trace.now() if trace is not None else 0
             context.nuzlocke_runtime.update()
+            if trace is not None and trace.enabled:
+                trace.duration("nuzlocke_duration_ms", trace_nuzlocke_start)
+            if profiling_enabled():
+                profile_timing("main_frame_nuzlocke", stage_start)
+            nuzlocke_elapsed = profile_now() - stage_start if profiling_enabled() else 0
 
             new_starters_mode_created = False
             if context.bot_mode == "Manual":
@@ -161,12 +197,16 @@ def main_loop() -> None:
                         trace=True,
                     )
 
+            controller_elapsed = 0
             try:
+                stage_start = profile_now()
+                trace_controller_start = trace.now() if trace is not None else 0
                 for listener in context.bot_listeners.copy():
                     listener.handle_frame(context.bot_mode_instance, frame_info)
                 if context.bot_mode == "Manual":
                     context.controller_stack = []
                 if len(context.controller_stack) > 0:
+                    profile_count("controller_next_calls")
                     if new_starters_mode_created:
                         diagnostic_print(
                             "[bold yellow]CONTROLLER STARTERS HANDOFF: " "advancing newly-created StartersMode[/]",
@@ -200,12 +240,17 @@ def main_loop() -> None:
                                 ),
                                 trace=True,
                             )
-                        if new_starters_mode_created:
-                            diagnostic_print(
-                                "[bold yellow]CONTROLLER STARTERS HANDOFF: "
-                                "newly-created StartersMode advance returned or raised[/]",
-                                trace=True,
-                            )
+                    if new_starters_mode_created:
+                        diagnostic_print(
+                            "[bold yellow]CONTROLLER STARTERS HANDOFF: "
+                            "newly-created StartersMode advance returned or raised[/]",
+                            trace=True,
+                        )
+                if profiling_enabled():
+                    profile_timing("main_frame_controller", stage_start)
+                controller_elapsed = profile_now() - stage_start if profiling_enabled() else 0
+                if trace is not None and trace.enabled:
+                    trace.duration("controller_duration_ms", trace_controller_start)
             except (StopIteration, GeneratorExit):
                 completed_controller = context.controller_stack.pop()
                 if completed_controller.__qualname__ in (
@@ -240,8 +285,47 @@ def main_loop() -> None:
                 else:
                     context.set_manual_mode()
 
+            stage_start = profile_now()
+            trace_emulator_start = trace.now() if trace is not None else 0
+            if trace is not None and trace.enabled:
+                trace.mark("emulator_advance_start_wall_ns", time.time_ns())
             inputs_each_frame.append(context.emulator.get_inputs())
             context.emulator.run_single_frame()
+            if trace is not None and trace.enabled:
+                advance_end_wall_ns = time.time_ns()
+                trace.mark("emulator_advance_end_wall_ns", advance_end_wall_ns)
+                previous_end_wall_ns = getattr(trace, "_last_advance_end_wall_ns", None)
+                advance_start_wall_ns = trace.current.get("emulator_advance_start_wall_ns")
+                if previous_end_wall_ns is not None and advance_start_wall_ns is not None:
+                    trace.mark(
+                        "inter_frame_interval_ms",
+                        round((advance_start_wall_ns - previous_end_wall_ns) / 1_000_000, 3),
+                    )
+                trace._last_advance_end_wall_ns = advance_end_wall_ns
+                trace.duration("emulator_advancement_duration_ms", trace_emulator_start)
+                trace.duration("total_frame_duration_ms", trace_loop_start)
+                trace.mark("application_frame", context.frame)
+                trace.mark("emulator_frame", context.emulator.get_frame_count())
+                trace.finish()
+            if profiling_enabled():
+                profile_timing("main_frame_emulator", stage_start)
+                profile_timing("main_frame_total", loop_start)
+                emulator_elapsed = profile_now() - stage_start
+                total_elapsed = profile_now() - loop_start
+                if total_elapsed >= 20_000_000:
+                    profile_print(
+                        lambda: (
+                            f"FRAME_STALL frame={context.frame} emulator_frame={context.emulator.get_frame_count()} "
+                            f"total_ms={total_elapsed / 1_000_000:.3f} "
+                            f"state_reads_ms={state_reads_elapsed / 1_000_000:.3f} "
+                            f"setup_ms={frame_setup_elapsed / 1_000_000:.3f} "
+                            f"nuzlocke_ms={nuzlocke_elapsed / 1_000_000:.3f} "
+                            f"controller_ms={controller_elapsed / 1_000_000:.3f} "
+                            f"emulator_ms={emulator_elapsed / 1_000_000:.3f} "
+                            f"stack_depth={len(context.controller_stack)} "
+                            f"profile={format_snapshot()}"
+                        )
+                    )
             previous_frame_info = frame_info
             previous_frame_info.previous_frame = None
 

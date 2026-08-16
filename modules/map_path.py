@@ -13,6 +13,7 @@ from modules.memory import (
 )
 from modules.pokemon_party import get_party
 from modules.terrain import terrain_cost
+from modules.profiler import profiled
 
 LocationType: TypeAlias = MapLocation | tuple[tuple[int, int] | MapFRLG | MapRSE, tuple[int, int]]
 
@@ -73,6 +74,9 @@ class PathTile:
     needs_acro_bike: bool
     needs_bunny_hop: bool
     cannot_run: bool
+    # Preserve the ROM tile behavior for consumers that need interaction
+    # semantics (for example escalator entry direction), not only collision.
+    tile_type: str = ""
 
     @property
     def global_coordinates(self) -> tuple[int, int]:
@@ -371,6 +375,7 @@ class PathMap:
                                 "Fortree Bridge",
                             )
                         ),
+                        tile_type=tile.tile_type,
                     )
                 )
             for map_object in map_data.objects:
@@ -689,6 +694,7 @@ class Waypoint:
         }[self.direction]
 
 
+@profiled("legacy_pathfinding", "legacy_pathfinding_calls")
 def calculate_path(
     source: LocationType,
     destination: LocationType,

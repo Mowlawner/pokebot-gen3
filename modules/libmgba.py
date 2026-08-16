@@ -20,6 +20,7 @@ import mgba.png
 import mgba.vfs
 from mgba import ffi, lib, libmgba_version_string
 from modules.console import console, diagnostic_print
+from modules.context import context
 from modules.profiles import Profile
 from modules.tasks import task_is_active
 from modules.profiler import count, now, timing
@@ -111,7 +112,13 @@ class LibmgbaEmulator:
     _audio_sample_rate: int = 32768
     _last_audio_data: Queue[bytes]
 
-    def __init__(self, profile: Profile, on_frame_callback: callable, is_test_run: bool = False):
+    def __init__(
+        self,
+        profile: Profile,
+        on_frame_callback: callable,
+        is_test_run: bool = False,
+        save_state_on_shutdown: bool = True,
+    ):
         if not is_test_run:
             console.print(f"Running [cyan]{libmgba_version_string()}[/]")
 
@@ -119,6 +126,7 @@ class LibmgbaEmulator:
         mgba.log.silence()
 
         self._profile = profile
+        self._save_state_on_shutdown = save_state_on_shutdown
         self._core = mgba.core.load_path(str(profile.rom.file))
         if not self._core:
             raise RuntimeError(f"Could not load ROM file {str(profile.rom.file)}")
@@ -247,7 +255,10 @@ class LibmgbaEmulator:
         """
         console.print("[yellow]Shutting down...[/]")
 
-        self.create_save_state()
+        if self._save_state_on_shutdown:
+            self.create_save_state()
+        else:
+            console.print("Save state disabled; leaving current_state.ss1 unchanged.")
 
     def backup_current_save_game(self) -> None:
         """
@@ -729,9 +740,13 @@ class LibmgbaEmulator:
         self._previous_frame_inputs = self._current_frame_inputs
         self._current_frame_inputs = applied_inputs
 
+        trace = getattr(context, "stutter_trace", None)
+        trace_core_start = trace.now() if trace is not None else 0
         begin = time.time_ns()
         profile_begin = now()
         self._core.run_frame()
+        if trace is not None:
+            trace.duration("emulator_core_run_duration_ms", trace_core_start)
         timing("emulator_frame_advancement", profile_begin)
         count("emulator_frames_advanced")
         self._performance_tracker.time_spent_emulating += time.time_ns() - begin
@@ -761,7 +776,10 @@ class LibmgbaEmulator:
             self._last_audio_data.get()
             self._last_audio_data.put_nowait(audio_data)
 
+        trace_callback_start = trace.now() if trace is not None else 0
         self._on_frame_callback()
+        if trace is not None:
+            trace.duration("emulator_frame_callback_duration_ms", trace_callback_start)
 
         # Limiting FPS is achieved by using a blocking API for audio playback -- meaning we give it
         # the audio data for one frame and the `write()` call will only return once it processed the
@@ -775,6 +793,7 @@ class LibmgbaEmulator:
         # reason, not be initialised, we fall back to a sleep-based throttling mechanism. This is less
         # reliable, though, as the OS does not guarantee `sleep()` to return after the specified amount
         # of time. It just will sleep for _at least_ that time.
+        trace_throttle_start = trace.now() if trace is not None else 0
         if self._throttled:
             if self._audio_stream:
                 try:
@@ -787,6 +806,9 @@ class LibmgbaEmulator:
                 time_since_last_frame = self._performance_tracker.time_since_last_frame() / 1_000_000_000
                 if time_since_last_frame < target_frame_duration:
                     time.sleep(target_frame_duration - time_since_last_frame)
+
+        if trace is not None:
+            trace.duration("emulator_throttle_duration_ms", trace_throttle_start)
 
         self._performance_tracker.time_spent_total -= time.time_ns() - begin
         self._performance_tracker.track_frame()

@@ -13,6 +13,7 @@ from modules.battle_state import (
     get_last_battle_outcome,
     HandledBattleResult,
 )
+from modules.battle_observation import observe_current_battle
 from modules.battle_strategies import BattleStrategy
 from modules.context import context
 from modules.debug import debug
@@ -54,6 +55,9 @@ def handle_battle(
     items_before_pickup: list[Item | None] | None = None
 
     while battle_is_active() and context.bot_mode != "Manual":
+        # Keep the planner's knowledge current immediately before any battle
+        # strategy/action-selection callback.
+        observe_current_battle()
         instruction = get_current_battle_script_instruction()
         if get_main_battle_callback() in (
             "HandleTurnActionSelectionState",
@@ -88,6 +92,10 @@ def handle_battle(
         else:
             context.emulator.press_button("B")
             yield
+
+    # Capture the terminal/transition frame so BattleEnded can be derived
+    # without making the handler's result or control flow depend on it.
+    observe_current_battle()
 
     outcome = get_last_battle_outcome()
     party_indices_with_picked_up_items = []

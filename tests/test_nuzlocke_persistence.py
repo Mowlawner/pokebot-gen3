@@ -73,6 +73,96 @@ class TestNuzlockePersistence(unittest.TestCase):
 
             self.assertEqual(JsonEventStore(path).iter_events(), (event,))
 
+    def test_new_store_is_line_appended_and_durable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            store = JsonEventStore(path, session_id="session-a")
+            header_size = path.stat().st_size
+            event = MapChanged(1, (1, 2), (1, 3))
+            self.assertTrue(store.append(event))
+            self.assertGreater(path.stat().st_size, header_size)
+            self.assertEqual(len(path.read_bytes().splitlines()), 2)
+            self.assertEqual(JsonEventStore(path).iter_events(), (event,))
+
+    def test_legacy_store_uses_append_sidecar_without_rewriting_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            first = MapChanged(1, (1, 2), (1, 3))
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "events": [
+                            {
+                                "event_id": "legacy",
+                                "session_id": "old",
+                                "sequence": 1,
+                                "frame": first.frame,
+                                "type": "MapChanged",
+                                "payload": serialize_event(first)["payload"],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            original = path.read_bytes()
+            second = MapChanged(2, (1, 3), (1, 4))
+            store = JsonEventStore(path)
+            self.assertTrue(store.append(second, "new"))
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(JsonEventStore(path).iter_events(), (first, second))
+            self.assertTrue(store._append_path.exists())
+
+    def test_truncated_final_record_is_recovered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            store = JsonEventStore(path)
+            event = MapChanged(1, (1, 2), (1, 3))
+            store.append(event)
+            with path.open("ab") as handle:
+                handle.write(b'{"event_id":"partial"')
+            recovered = JsonEventStore(path)
+            self.assertEqual(recovered.iter_events(), (event,))
+            self.assertFalse(path.read_bytes().endswith(b"partial"))
+
+    def test_malformed_final_record_is_recovered_but_middle_corruption_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            store = JsonEventStore(path)
+            event = MapChanged(1, (1, 2), (1, 3))
+            store.append(event)
+            with path.open("ab") as handle:
+                handle.write(b'{"not":"an event"}\n')
+            self.assertEqual(JsonEventStore(path).iter_events(), (event,))
+
+            path.write_bytes(
+                b'{"schema_version":2}\n{"not":"an event"}\n'
+                + json.dumps(
+                    {
+                        "event_id": "later",
+                        "session_id": "s",
+                        "sequence": 2,
+                        "frame": 2,
+                        "type": "MapChanged",
+                        "payload": serialize_event(MapChanged(2, (1, 3), (1, 4)))["payload"],
+                    }
+                ).encode()
+                + b"\n"
+            )
+            with self.assertRaises(EventStoreCorruptionError):
+                JsonEventStore(path)
+
+    def test_append_failure_does_not_mark_event_committed_in_memory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            store = JsonEventStore(path)
+            event = MapChanged(1, (1, 2), (1, 3))
+            with patch.object(persistence.os, "fsync", side_effect=OSError("disk full")):
+                with self.assertRaises(persistence.EventStoreError):
+                    store.append(event)
+            self.assertEqual(store.iter_events(), ())
+
     def test_sessions_allow_repeated_frames_and_runtime_sink(self):
         with tempfile.TemporaryDirectory() as directory:
             store = JsonEventStore(Path(directory) / "events.json")

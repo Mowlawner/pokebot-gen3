@@ -80,6 +80,23 @@ def _ensure_plugin_hook_will_run(generator: Iterable) -> None:
         context.controller_stack.append(generator)
 
 
+def _battle_return_to_field_complete(frame: FrameInfo) -> bool:
+    """Whether the ROM has finished its battle-to-field transition.
+
+    Avatar motion is deliberately not part of this boundary.  The return
+    callback/tasks are the synchronization points owned by the battle engine;
+    waiting for the avatar to be standing still can keep the battle controller
+    above a surrounding scripted dialogue indefinitely.
+    """
+    return (
+        get_game_state_symbol() not in ("CB2_RETURNTOFIELD", "CB2_RETURNTOFIELDLOCAL")
+        and "Task_ReturnToFieldNoScript" not in frame.active_tasks
+        and "Task_ReturnToFieldContinueScriptPlayMapMusic" not in frame.active_tasks
+        and "task_mpl_807E3C8" not in frame.active_tasks
+        and len(get_map_objects()) > 0
+    )
+
+
 class BattleListener(BotListener):
     battle_states = (
         GameState.BATTLE,
@@ -209,15 +226,7 @@ class BattleListener(BotListener):
                 if self._active_wild_encounter is not None:
                     context.stats.log_end_of_battle(outcome, self._active_wild_encounter)
 
-            if (
-                get_game_state_symbol() != "CB2_RETURNTOFIELD"
-                and get_game_state_symbol() != "CB2_RETURNTOFIELDLOCAL"
-                and "Task_ReturnToFieldNoScript" not in frame.active_tasks
-                and "Task_ReturnToFieldContinueScriptPlayMapMusic" not in frame.active_tasks
-                and "task_mpl_807E3C8" not in frame.active_tasks
-                and len(get_map_objects()) > 0
-                and player_avatar_is_standing_still()
-            ):
+            if _battle_return_to_field_complete(frame):
                 self._in_battle = False
                 diagnostic_print(
                     lambda: "BATTLE_CONTROLLER_FINISHED: " + self._controller_boundary_snapshot(),

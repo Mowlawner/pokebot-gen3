@@ -50,6 +50,9 @@ class StartupSettings:
     config_path: str
     debug_trace: bool = False
     debug_profile: bool = False
+    stutter_trace: bool = False
+    stutter_threshold_ms: float = 50.0
+    no_save_state: bool = False
 
 
 def directory_arg(value: str) -> pathlib.Path:
@@ -135,6 +138,22 @@ def parse_arguments(bot_mode_names: list[str]) -> StartupSettings:
         action="store_true",
         help="Enable performance profiling without enabling trace diagnostics.",
     )
+    parser.add_argument(
+        "--stutter-trace",
+        action="store_true",
+        help="Capture rolling frame traces around stalls and cached-route events.",
+    )
+    parser.add_argument(
+        "--stutter-threshold-ms",
+        type=float,
+        default=50.0,
+        help="Stutter trace total-frame threshold in milliseconds (default: 50).",
+    )
+    parser.add_argument(
+        "--no-save-state",
+        action="store_true",
+        help="Do not write a save state when the bot shuts down.",
+    )
     parser.add_argument("-c", "--config", type=directory_arg, dest="config_path", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -156,6 +175,9 @@ def parse_arguments(bot_mode_names: list[str]) -> StartupSettings:
         config_path=args.config_path,
         debug_trace=bool(args.debug_trace),
         debug_profile=bool(args.debug_profile),
+        stutter_trace=bool(args.stutter_trace),
+        stutter_threshold_ms=float(args.stutter_threshold_ms),
+        no_save_state=bool(args.no_save_state),
     )
 
 

@@ -83,6 +83,7 @@ def handle_battle_action_selection(strategy: BattleStrategy) -> Generator:
         diagnostic_print(
             lambda: (
                 "BATTLE_ACTION: "
+                f"source={getattr(context, 'battle_decision_source', None)} "
                 f"menu_ready={get_battle_controller_callback(battler_index)} "
                 f"selected={getattr(action, 'name', action)} move_index={index}"
             ),
@@ -253,6 +254,14 @@ def battle_action_use_pokeblock(poke_block_index: int):
 def battle_action_use_move(
     action: TurnAction, battler_index: int, move_index: int, battle_state: BattleState
 ) -> Generator:
+    diagnostic_print(
+        lambda: (
+            "BATTLE_EXECUTOR: "
+            f"source={getattr(context, 'battle_decision_source', None)} "
+            f"action={getattr(action, 'name', action)} move_index={move_index}"
+        ),
+        trace=True,
+    )
     if context.rom.is_rs:
         yield
 

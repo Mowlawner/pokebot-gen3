@@ -56,7 +56,13 @@ class BotContext:
         # Optional performance probe; unlike normal debug tracing this is
         # intentionally off unless an operator explicitly enables it.
         self.debug_profile: bool = False
+        # Opt-in, rolling frame trace for correlating visible emulator stalls.
+        self.debug_stutter_trace: bool = False
+        self.stutter_trace_threshold_ms: float = 50.0
+        self.stutter_trace = None
         self.testing: bool = False
+        self.battle_decision_source: str | None = None
+        self.battle_decision_detail: str | None = None
 
         self._current_message: str = ""
 

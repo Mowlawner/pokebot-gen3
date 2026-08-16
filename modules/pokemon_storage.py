@@ -6,6 +6,26 @@ from modules.game import decode_string, get_symbol
 from modules.memory import read_symbol, unpack_uint32
 from modules.pokemon import Pokemon, Species, parse_pokemon
 from modules.state_cache import state_cache
+from modules.profiler import count as profile_count
+
+
+def _trace_now() -> int:
+    trace = getattr(context, "stutter_trace", None)
+    return trace.now() if trace is not None else 0
+
+
+def _trace_duration(name: str, started: int) -> None:
+    trace = getattr(context, "stutter_trace", None)
+    if trace is not None:
+        trace.duration(name, started)
+
+
+# The storage block is large (and contains 420 slots), but it is normally
+# unchanged for hundreds of overworld frames.  Keep the last raw block so a
+# fresh emulator read can be compared without reparsing every slot.
+_last_storage_pointer: int | None = None
+_last_storage_data: bytes | None = None
+_last_storage_value: "PokemonStorage | None" = None
 
 
 @dataclass
@@ -85,7 +105,9 @@ class PokemonStorage:
 
     @cached_property
     def boxes(self) -> list[PokemonStorageBox]:
+        started = _trace_now()
         boxes = []
+        parsed_slots = 0
         for box_index in range(14):
             name_offset = 0x8344 + (box_index * 9)
             name = decode_string(self._data[name_offset : name_offset + 9])
@@ -99,9 +121,14 @@ class PokemonStorage:
                 offset = pokemon_offset + (slot_index * 80)
                 pokemon = parse_pokemon(self._data[offset : offset + 80])
                 if pokemon is not None:
+                    parsed_slots += 1
                     slots.append(PokemonStorageSlot(slot_index, pokemon))
 
             boxes.append(PokemonStorageBox(box_index, name, wallpaper_id, slots))
+        trace = getattr(context, "stutter_trace", None)
+        if trace is not None:
+            trace.duration("storage_box_parse_duration_ms", started)
+            trace.mark("storage_slots_parsed", parsed_slots)
         return boxes
 
     @property
@@ -138,6 +165,8 @@ class PokemonStorage:
 
 
 def get_pokemon_storage() -> PokemonStorage | None:
+    global _last_storage_pointer, _last_storage_data, _last_storage_value
+
     if state_cache.pokemon_storage.age_in_frames == 0:
         return state_cache.pokemon_storage.value
 
@@ -155,6 +184,22 @@ def get_pokemon_storage() -> PokemonStorage | None:
     if offset == 0:
         return None
 
-    pokemon_storage = PokemonStorage(offset, context.emulator.read_bytes(offset, length))
+    raw_read_started = _trace_now()
+    raw_data = context.emulator.read_bytes(offset, length)
+    _trace_duration("storage_raw_read_duration_ms", raw_read_started)
+    profile_count("pokemon_storage_raw_reads")
+    compare_started = _trace_now()
+    if offset == _last_storage_pointer and raw_data == _last_storage_data and _last_storage_value is not None:
+        _trace_duration("storage_raw_compare_duration_ms", compare_started)
+        profile_count("pokemon_storage_cache_hits")
+        state_cache.pokemon_storage = _last_storage_value
+        return _last_storage_value
+
+    _trace_duration("storage_raw_compare_duration_ms", compare_started)
+    profile_count("pokemon_storage_reparses")
+    pokemon_storage = PokemonStorage(offset, raw_data)
+    _last_storage_pointer = offset
+    _last_storage_data = raw_data
+    _last_storage_value = pokemon_storage
     state_cache.pokemon_storage = pokemon_storage
     return pokemon_storage

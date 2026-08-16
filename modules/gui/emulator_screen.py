@@ -115,6 +115,9 @@ class EmulatorScreen:
             else:
                 self._update_window()
             context.emulator._performance_tracker.track_render()
+            trace = getattr(context, "stutter_trace", None)
+            if trace is not None:
+                trace.mark("gui_frame_presented", True)
 
         previous_step = self._current_step
         while self._stepping_mode and previous_step == self._current_step:

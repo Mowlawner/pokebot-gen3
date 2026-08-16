@@ -2,6 +2,7 @@ import queue
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 
 class _FakeCore:
@@ -93,6 +94,15 @@ class TestLibmgbaInputTransitions(unittest.TestCase):
         emulator.run_single_frame()
         self.assertEqual(native_core.frames[-1], 0x1)
         self.assertEqual(emulator.get_new_inputs(), 0x1)
+
+    def test_shutdown_can_leave_current_state_unchanged(self):
+        from modules.libmgba import LibmgbaEmulator
+
+        emulator = LibmgbaEmulator.__new__(LibmgbaEmulator)
+        emulator._save_state_on_shutdown = False
+        with patch.object(emulator, "create_save_state") as create_save_state:
+            emulator.shutdown()
+        create_save_state.assert_not_called()
 
     def test_release_button_removes_held_a_on_next_frame(self):
         emulator, native_core = self._emulator()

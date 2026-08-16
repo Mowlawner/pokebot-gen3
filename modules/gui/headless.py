@@ -21,13 +21,19 @@ class PokebotHeadless:
         context.profile = startup_settings.profile
         context.config.load(startup_settings.profile.path, strict=False)
         set_rom(startup_settings.profile.rom)
-        context.emulator = LibmgbaEmulator(startup_settings.profile, self._on_frame)
+        context.emulator = LibmgbaEmulator(
+            startup_settings.profile,
+            self._on_frame,
+            save_state_on_shutdown=not startup_settings.no_save_state,
+        )
         context.audio = not startup_settings.no_audio
         context.video = not startup_settings.no_video
         context.emulation_speed = startup_settings.emulation_speed
         context.debug = False
         context.debug_trace = False
         context.debug_profile = startup_settings.debug_profile
+        context.debug_stutter_trace = startup_settings.stutter_trace
+        context.stutter_trace_threshold_ms = startup_settings.stutter_threshold_ms
         context.bot_mode = startup_settings.bot_mode
 
         self._main_loop()

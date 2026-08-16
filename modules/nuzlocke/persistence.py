@@ -1,9 +1,10 @@
 """Durable storage for immutable Nuzlocke events.
 
-This module stores observations, not campaign state.  The JSON document is a
-versioned append log.  Writes replace the previous document only after the
-complete new document has been flushed and synced, so a truncated write cannot
-look like a valid state.
+This module stores observations, not campaign state. New stores use a small
+header followed by one JSON record per line. Each accepted event is appended,
+flushed, and synced before ``append`` returns. Legacy schema-1 JSON documents
+remain immutable and receive new records in a sibling append log, so opening a
+large existing campaign never makes the next emulator frame rewrite history.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from .events import (
 from .identity import PokemonIdentity
 
 SCHEMA_VERSION = 1
+LINE_SCHEMA_VERSION = 2
 _EVENT_TYPES = {
     cls.__name__: cls
     for cls in (
@@ -124,7 +126,7 @@ def deserialize_event(data: dict[str, Any]) -> Event:
 
 
 class JsonEventStore:
-    """Versioned, atomic, inspectable event log.
+    """Versioned, inspectable, synchronously durable event log.
 
     ``session_id`` identifies the runtime/emulator timeline, not a permanent
     Nuzlocke campaign.  A runtime may pass its session ID to ``append``;
@@ -137,13 +139,29 @@ class JsonEventStore:
         self.session_id = session_id or str(uuid.uuid4())
         self._records: list[dict[str, Any]] = []
         self._ids: set[str] = set()
-        # The temporary filename is intentionally stable.  Serialize writes so
-        # concurrent callers cannot overwrite or remove one another's temp file.
+        self._legacy = False
+        self._append_path = self.path.with_name(self.path.name + ".append")
         self._write_lock = RLock()
         if self.path.exists():
             self._load()
+        else:
+            self._write_header()
 
     def _load(self) -> None:
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                first_line = handle.readline()
+        except OSError as error:
+            raise EventStoreCorruptionError(f"Could not load event store: {self.path}") from error
+        if first_line.lstrip().startswith("{"):
+            try:
+                first = json.loads(first_line)
+            except json.JSONDecodeError:
+                first = None
+            if isinstance(first, dict) and first.get("schema_version") == LINE_SCHEMA_VERSION:
+                self._load_lines(self.path)
+                return
+        self._legacy = True
         try:
             document = json.loads(self.path.read_text(encoding="utf-8"))
             if document.get("schema_version") != SCHEMA_VERSION or not isinstance(document.get("events"), list):
@@ -166,6 +184,81 @@ class JsonEventStore:
         ) as error:
             raise EventStoreCorruptionError(f"Could not load event store: {self.path}") from error
 
+        if self._append_path.exists():
+            self._load_lines(self._append_path, allow_missing_header=True)
+        self._validate_sequence()
+
+    def _load_lines(self, path: Path, *, allow_missing_header: bool = False) -> None:
+        try:
+            with path.open("rb") as handle:
+                raw_lines = handle.readlines()
+            if not raw_lines:
+                if allow_missing_header:
+                    return
+                raise EventStoreCorruptionError("Empty event store")
+            start = 0
+            if not allow_missing_header:
+                header = json.loads(raw_lines[0].decode("utf-8"))
+                if header != {"schema_version": LINE_SCHEMA_VERSION}:
+                    raise EventStoreCorruptionError("Unsupported event-line schema")
+                start = 1
+            for index, raw_line in enumerate(raw_lines[start:], start=start):
+                if not raw_line.endswith(b"\n"):
+                    if index == len(raw_lines) - 1:
+                        self._truncate_partial_line(path, sum(len(line) for line in raw_lines[:index]))
+                        break
+                    raise EventStoreCorruptionError("Truncated event record")
+                try:
+                    record = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    if index == len(raw_lines) - 1:
+                        self._truncate_partial_line(path, sum(len(line) for line in raw_lines[:index]))
+                        break
+                    raise EventStoreCorruptionError("Malformed event record") from error
+                try:
+                    self._validate_record(record)
+                except EventStoreCorruptionError as error:
+                    if index == len(raw_lines) - 1:
+                        self._truncate_partial_line(path, sum(len(line) for line in raw_lines[:index]))
+                        break
+                    raise error
+                self._records.append(record)
+                self._ids.add(record["event_id"])
+            self._validate_sequence()
+        except EventStoreCorruptionError:
+            raise
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise EventStoreCorruptionError(f"Could not load event store: {path}") from error
+
+    @staticmethod
+    def _truncate_partial_line(path: Path, size: int) -> None:
+        try:
+            with path.open("r+b") as handle:
+                handle.truncate(size)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as error:
+            raise EventStoreCorruptionError(f"Could not recover event store: {path}") from error
+
+    def _validate_sequence(self) -> None:
+        if [record["sequence"] for record in self._records] != list(range(1, len(self._records) + 1)):
+            raise EventStoreCorruptionError("Event sequence is not contiguous")
+
+    def _write_header(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(self.path.name + ".tmp")
+        try:
+            with temporary.open("wb") as handle:
+                handle.write((json.dumps({"schema_version": LINE_SCHEMA_VERSION}) + "\n").encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            self._fsync_directory()
+        except OSError as error:
+            raise EventStoreError(f"Could not create event store: {self.path}") from error
+        finally:
+            temporary.unlink(missing_ok=True)
+
     @staticmethod
     def _validate_record(record: Any) -> None:
         required = {"event_id", "session_id", "sequence", "frame", "type", "payload"}
@@ -181,20 +274,21 @@ class JsonEventStore:
         serialized = serialize_event(event)
         canonical = json.dumps(serialized, sort_keys=True, separators=(",", ":"))
         event_id = hashlib.sha256(f"{session}\0{event.frame}\0{canonical}".encode()).hexdigest()
-        if event_id in self._ids:
-            return False
-        record = {
-            "event_id": event_id,
-            "session_id": session,
-            "sequence": len(self._records) + 1,
-            "frame": event.frame,
-            "type": serialized["type"],
-            "payload": serialized["payload"],
-        }
-        self._records.append(record)
-        self._ids.add(event_id)
-        self.flush()
-        return True
+        with self._write_lock:
+            if event_id in self._ids:
+                return False
+            record = {
+                "event_id": event_id,
+                "session_id": session,
+                "sequence": len(self._records) + 1,
+                "frame": event.frame,
+                "type": serialized["type"],
+                "payload": serialized["payload"],
+            }
+            self._append_record(record)
+            self._records.append(record)
+            self._ids.add(event_id)
+            return True
 
     def append_many(self, events: Iterable[Event], session_id: str | None = None) -> int:
         count = 0
@@ -212,38 +306,35 @@ class JsonEventStore:
         return len(self._records)
 
     def flush(self) -> None:
-        with self._write_lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_name(self.path.name + ".tmp")
-            document = (
-                json.dumps(
-                    {"schema_version": SCHEMA_VERSION, "events": self._records},
-                    sort_keys=True,
-                    indent=2,
-                )
-                + "\n"
-            )
+        """Retain the legacy API; every successful append is already synced."""
+        return None
+
+    def _append_record(self, record: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        target = self._append_path if self._legacy else self.path
+        line = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        try:
+            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             try:
-                with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-                    handle.write(document)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                # The context manager above must exit before replace.  This is
-                # required on Windows, where an open temp handle can block it.
-                os.replace(temporary, self.path)
-                try:
-                    directory_fd = os.open(self.path.parent, os.O_RDONLY)
-                    try:
-                        os.fsync(directory_fd)
-                    finally:
-                        os.close(directory_fd)
-                except OSError:
-                    pass
-            except OSError as error:
-                raise EventStoreError(f"Could not atomically write event store: {self.path}") from error
+                view = memoryview(line)
+                while view:
+                    view = view[os.write(descriptor, view) :]
+                os.fsync(descriptor)
             finally:
-                if temporary.exists():
-                    temporary.unlink(missing_ok=True)
+                os.close(descriptor)
+            self._fsync_directory()
+        except OSError as error:
+            raise EventStoreError(f"Could not append event record: {target}") from error
+
+    def _fsync_directory(self) -> None:
+        try:
+            directory_fd = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
 
     def __call__(self, event: Event, session_id: str) -> None:
         self.append(event, session_id)

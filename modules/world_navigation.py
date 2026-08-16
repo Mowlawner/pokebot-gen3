@@ -7,6 +7,7 @@ from typing import Mapping
 from modules.context import context
 from modules.map import get_map_data
 from modules.map_data import MapFRLG, MapRSE
+from modules.stutter_trace import traced
 
 MapId = tuple[int, int]
 Coordinate = tuple[int, int]
@@ -127,6 +128,7 @@ class WorldMapGraph:
     def outgoing(self, map_id: MapId) -> tuple[WorldEdge, ...]:
         return self._outgoing.get(map_id, ())
 
+    @traced("world_map_route_calculation")
     def route(self, source_map: MapId, target_map: MapId) -> WorldRoute:
         if source_map == target_map:
             return WorldRoute((source_map,), ())
@@ -161,6 +163,7 @@ class WorldMapGraph:
 _world_graph_cache: dict[str, WorldMapGraph] = {}
 
 
+@traced("WorldMapGraph_lookup_or_construction")
 def get_world_map_graph() -> WorldMapGraph:
     """Build/cache the static graph from the active ROM's map metadata."""
     game_key = context.rom.id
