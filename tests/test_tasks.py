@@ -2,6 +2,9 @@ import types
 import unittest
 from unittest.mock import patch
 
+from modules.interaction_state import observe_interaction
+from modules.memory import GameState
+
 
 class TestIsWaitingForInput(unittest.TestCase):
     def test_emerald_field_message_requires_task_and_input_wait(self):
@@ -123,3 +126,60 @@ class TestIsWaitingForInput(unittest.TestCase):
             patch("modules.tasks.read_symbol", return_value=bytes([8])),
         ):
             self.assertTrue(is_waiting_for_input())
+
+    def test_interaction_observer_carries_field_dialogue_through_native_wait(self):
+        import modules.interaction_state as interaction_state
+
+        interaction_state._field_message_lifecycle_active = False
+        interaction_state._field_message_advance_ready = False
+        with (
+            patch("modules.interaction_state.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.interaction_state.player_avatar_is_controllable", return_value=False),
+            patch("modules.interaction_state.task_is_active", side_effect=[True, False]),
+            patch("modules.interaction_state.is_field_message_waiting_for_input", side_effect=[False, True]),
+            patch(
+                "modules.interaction_state.get_global_script_context",
+                return_value=types.SimpleNamespace(native_function_name="WaitForAorBPress"),
+            ),
+        ):
+            first = observe_interaction()
+            second = observe_interaction()
+
+        self.assertFalse(first.dialogue_waiting)
+        self.assertTrue(second.dialogue_waiting)
+
+    def test_interaction_observer_preserves_ordinary_dialogue(self):
+        import modules.interaction_state as interaction_state
+
+        interaction_state._field_message_lifecycle_active = False
+        interaction_state._field_message_advance_ready = False
+        with (
+            patch("modules.interaction_state.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.interaction_state.player_avatar_is_controllable", return_value=False),
+            patch("modules.interaction_state.task_is_active", return_value=True),
+            patch("modules.interaction_state.is_field_message_waiting_for_input", return_value=True),
+        ):
+            observation = observe_interaction()
+
+        self.assertTrue(observation.dialogue_waiting)
+
+    def test_interaction_observer_marks_hidden_box_transition_as_dialogue_advance(self):
+        import modules.interaction_state as interaction_state
+
+        interaction_state._field_message_lifecycle_active = False
+        interaction_state._field_message_advance_ready = False
+        with (
+            patch("modules.interaction_state.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.interaction_state.player_avatar_is_controllable", return_value=False),
+            patch("modules.interaction_state.task_is_active", return_value=True),
+            patch("modules.interaction_state.is_field_message_waiting_for_input", return_value=False),
+            patch(
+                "modules.interaction_state.get_global_script_context",
+                return_value=types.SimpleNamespace(native_function_name="IsFieldMessageBoxHidden"),
+            ),
+        ):
+            observation = observe_interaction()
+
+        self.assertFalse(observation.dialogue_waiting)
+        self.assertTrue(observation.field_message_lifecycle_active)
+        self.assertTrue(observation.field_message_advance_ready)

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from modules.agent_control import (
     ActionResult,
     ActionResultType,
+    AgentAction,
     AgentActionExecutor,
     AgentActionType,
     AgentControlLoop,
@@ -50,7 +51,19 @@ def overworld(
     )
 
 
-def observation(state, *, dialogue_waiting=False, choices=(), menu=(), world=None, goal=None, metadata=None):
+def observation(
+    state,
+    *,
+    dialogue_waiting=False,
+    choices=(),
+    menu=(),
+    world=None,
+    goal=None,
+    metadata=None,
+    controllable=True,
+    field_message_lifecycle_active=False,
+    field_message_advance_ready=False,
+):
     return AgentObservation(
         InteractionObservation(
             state,
@@ -58,6 +71,9 @@ def observation(state, *, dialogue_waiting=False, choices=(), menu=(), world=Non
             choice_options=tuple(choices),
             menu_options=tuple(menu),
             metadata=metadata or {},
+            controllable=controllable,
+            field_message_lifecycle_active=field_message_lifecycle_active,
+            field_message_advance_ready=field_message_advance_ready,
         ),
         overworld=world,
         goal=goal,
@@ -130,6 +146,63 @@ class AgentActionSelectionTests(TestCase):
             prewarm_warp_destination(observation(GameState.OVERWORLD, world=world), navigation)
         self.assertEqual(world.objects, ())
         static_prewarm.assert_called_once_with(destination)
+
+    def test_goal_does_not_reinteract_while_avatar_is_not_controllable(self):
+        from modules.goals import ActivateTrigger
+
+        world = overworld(
+            {(0, 0)},
+            triggers=(
+                TriggerObservation(
+                    "early_pokeballs", frozenset({(MAP, (1, 0))}), activation_locations=frozenset({(MAP, (0, 0))})
+                ),
+            ),
+            controllable=False,
+        )
+        decision = select_action(
+            observation(GameState.OVERWORLD, world=world, goal=ActivateTrigger("early_pokeballs"), controllable=False)
+        )
+        self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
+
+    def test_uncontrollable_field_dialogue_transition_advances_once(self):
+        from modules.goals import ActivateTrigger
+
+        world = overworld({(0, 0)}, controllable=False)
+        transition = observation(
+            GameState.OVERWORLD,
+            world=world,
+            goal=ActivateTrigger("early_pokeballs"),
+            controllable=False,
+            field_message_lifecycle_active=True,
+            field_message_advance_ready=True,
+        )
+        ended = observation(
+            GameState.OVERWORLD,
+            world=world,
+            goal=ActivateTrigger("early_pokeballs"),
+            controllable=False,
+        )
+        emulator = Mock()
+        observations = iter((transition, transition, ended))
+        with patch("modules.agent_control.context.emulator", emulator):
+            loop = AgentControlLoop(lambda: next(observations), goal=ActivateTrigger("early_pokeballs"))
+            first = loop.step()
+            second = loop.step()
+            third = loop.step()
+
+        self.assertEqual(first[1].action.action_type, AgentActionType.ADVANCE_DIALOGUE)
+        self.assertEqual(first[2].result_type, ActionResultType.EXECUTED)
+        self.assertEqual(second[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(third[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
+        emulator.press_button.assert_called_once_with("A")
+
+    def test_controllable_dialogue_remains_unchanged(self):
+        emulator = Mock()
+        dialogue = observation(GameState.OVERWORLD, dialogue_waiting=True, controllable=True)
+        with patch("modules.agent_control.context.emulator", emulator):
+            result = AgentActionExecutor().execute(AgentAction(AgentActionType.ADVANCE_DIALOGUE), dialogue)
+        self.assertEqual(result.result_type, ActionResultType.EXECUTED)
+        emulator.press_button.assert_called_once_with("A")
 
     def test_safe_batch_groups_straight_and_turning_moves(self):
         world = overworld({(x, y) for x, y in ((0, 0), (1, 0), (2, 0), (2, 1))})

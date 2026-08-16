@@ -12,6 +12,7 @@ class EncounterMode(Enum):
 
 
 INTRODUCTORY_RIVAL_TRIGGER_ID = "introductory_rival"
+EARLY_POKEBALL_TRIGGER_ID = "early_pokeballs"
 
 
 class Goal:
@@ -37,6 +38,11 @@ class ActivateTrigger(Goal):
 def introductory_rival_goal() -> ActivateTrigger:
     """Return the generic trigger goal used by the Emerald pilot."""
     return ActivateTrigger(INTRODUCTORY_RIVAL_TRIGGER_ID)
+
+
+def early_pokeball_goal() -> ActivateTrigger:
+    """Return the Emerald Professor Birch Poké Ball interaction goal."""
+    return ActivateTrigger(EARLY_POKEBALL_TRIGGER_ID)
 
 
 @dataclass(frozen=True)

@@ -16,6 +16,11 @@ class TriggerBinding:
     script_symbol: str
     event_type: str = "object"
     local_id: int | None = None
+    alternate_script_symbols: tuple[str, ...] = ()
+
+    @property
+    def script_symbols(self) -> tuple[str, ...]:
+        return (self.script_symbol, *self.alternate_script_symbols)
 
 
 @dataclass(frozen=True)
@@ -40,6 +45,18 @@ TRIGGER_BINDINGS: tuple[TriggerBinding, ...] = (
         script_symbol="Route103_EventScript_Rival",
         local_id=2,
     ),
+    TriggerBinding(
+        trigger_id="early_pokeballs",
+        map_id=MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value,
+        # Birch is the live object that owns this interaction.  The gender
+        # scripts are variants of the interaction, not the object's identity.
+        script_symbol="LittlerootTown_ProfessorBirchsLab_EventScript_Birch",
+        local_id=2,
+        alternate_script_symbols=(
+            "LittlerootTown_ProfessorBirchsLab_EventScript_BrendanGivePokeBalls",
+            "LittlerootTown_ProfessorBirchsLab_EventScript_MayGivePokeBalls",
+        ),
+    ),
 )
 
 
@@ -63,7 +80,7 @@ def resolve_trigger_binding(
         object_template
         for object_template in static_objects
         if (binding.local_id is None or object_template.local_id == binding.local_id)
-        and object_template.script_symbol == binding.script_symbol
+        and object_template.script_symbol in binding.script_symbols
     )
     static_match = bool(static_matches)
     timing("trigger_static_template_matching", static_start)
@@ -88,7 +105,7 @@ def resolve_trigger_binding(
             for object_observation in objects
             if object_observation.location[0] == binding.map_id
             and (binding.local_id is None or object_observation.local_id == binding.local_id)
-            and object_observation.script == binding.script_symbol
+            and object_observation.script in binding.script_symbols
         )
     )
     timing("trigger_runtime_binding_matching", runtime_start)
