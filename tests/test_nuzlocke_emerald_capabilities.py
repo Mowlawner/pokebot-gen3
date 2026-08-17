@@ -10,6 +10,7 @@ from modules.nuzlocke.emerald_capabilities import (
     EmeraldCampaignObservation,
     choose_emerald_campaign_action,
     observation_driven_emerald_campaign,
+    _observed_exit_goal,
 )
 from modules.nuzlocke.emerald_confirmation import (
     EmeraldConfirmationChoice,
@@ -44,6 +45,16 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
 
     def test_main_menu_without_fast_text_speed_enters_options(self):
         action = choose_emerald_campaign_action(self.observation(OpeningSequenceState.MAIN_MENU))
+        self.assertIs(action, EmeraldCampaignAction.ENTER_OPTIONS)
+
+    def test_main_menu_input_remains_actionable_when_avatar_is_uncontrollable(self):
+        with (
+            patch("modules.nuzlocke.emerald_capabilities.player_avatar_is_controllable", return_value=False),
+            patch("modules.nuzlocke.emerald_capabilities.get_tasks", return_value=(SimpleNamespace(),)),
+        ):
+            action = choose_emerald_campaign_action(
+                self.observation(OpeningSequenceState.MAIN_MENU, fast=False)
+            )
         self.assertIs(action, EmeraldCampaignAction.ENTER_OPTIONS)
 
     def test_immediate_states_take_priority_over_campaign_menu_action(self):
@@ -88,6 +99,36 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
     def test_completed_setup_does_not_start_new_game_again(self):
         action = choose_emerald_campaign_action(self.observation(OpeningSequenceState.MAIN_MENU, fast=True, setup=True))
         self.assertIs(action, EmeraldCampaignAction.WAIT)
+
+    def test_observed_exit_preserves_one_specific_warp_with_equal_destination(self):
+        from modules.map_path import Direction
+        from modules.overworld import OverworldObservation, TileObservation, WarpObservation
+        from modules.navigation import GoalAwareNavigator, NavigationWorld
+
+        source = ((25, 40), (4, 1))
+        destination = ((0, 0), (10, 19))
+        first = WarpObservation(((25, 40), (4, 1)), destination, required_facing=Direction.East)
+        second = WarpObservation(((25, 40), (4, 2)), destination, required_facing=Direction.East)
+        third = WarpObservation(((25, 40), (4, 3)), destination, required_facing=Direction.East)
+        world = OverworldObservation(
+            source[0], source[1], Direction.East, True,
+            tuple(TileObservation(((25, 40), (x, y)), False, frozenset(Direction))
+                  for x, y in ((4, 1), (4, 2), (4, 3))),
+            (first, second, third), (), (),
+        )
+        navigator = GoalAwareNavigator(NavigationWorld.from_overworld(world))
+        goal = _observed_exit_goal(world, navigator)
+        self.assertIsNotNone(goal)
+        self.assertIs(goal.warp, first)
+        self.assertEqual(goal.destination, destination)
+
+    def test_observed_exit_requires_controllability(self):
+        from modules.overworld import OverworldObservation
+        from modules.navigation import GoalAwareNavigator, NavigationWorld
+
+        world = OverworldObservation((25, 40), (4, 1), None, False, (), (), (), ())
+        navigator = GoalAwareNavigator(NavigationWorld.from_overworld(world))
+        self.assertIsNone(_observed_exit_goal(world, navigator))
 
 
 class EmeraldCampaignLifecycleTests(unittest.TestCase):

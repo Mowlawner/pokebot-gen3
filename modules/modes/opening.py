@@ -1126,7 +1126,8 @@ class EmeraldOpeningCapability(BotMode):
         )
         self._resolved_player_gender = self._start_game_initialization.gender
         self._resolved_player_name = self._start_game_initialization.name
-        self.phase = OpeningSequenceState.TRUCK
+        # Synchronize the initial phase with the observed game state.
+        self.phase = get_opening_sequence_state(self._resolved_player_gender)
         self._ball_coordinates: tuple[int, int] | None = None
         self._last_diagnostics: OpeningDiagnostics | None = None
         self._last_truck_decision: str | None = None
@@ -2076,6 +2077,14 @@ class EmeraldOpeningCapability(BotMode):
                 self._last_truck_exit_destination = None
                 self._last_truck_decision = "complete: entered Littleroot; await arrival script"
                 self.phase = OpeningSequenceState.LITTLEROOT_TOWN
+                yield
+                return
+            if observed is OpeningSequenceState.PLAYER_HOUSE_1F:
+                self._last_truck_navigation_target = None
+                self._last_truck_exit_warp = None
+                self._last_truck_exit_destination = None
+                self._last_truck_decision = "complete: entered player's house; navigate to stairs"
+                self.phase = OpeningSequenceState.PLAYER_HOUSE_1F
                 yield
                 return
             if _normal_littleroot_overworld():

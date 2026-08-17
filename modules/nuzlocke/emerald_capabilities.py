@@ -17,6 +17,7 @@ from typing import Iterator
 from modules.context import context
 from modules.agent_control import AgentControlLoop, observe_agent
 from modules.goals import ReachWarp
+from modules.navigation import GoalAwareNavigator, NavigationError, NavigationWorld
 from modules.keyboard import type_in_naming_screen
 from modules.memory import GameState, get_game_state
 from modules.overworld import perceive_overworld
@@ -89,21 +90,10 @@ class EmeraldCampaignObservation:
 
 def choose_emerald_campaign_action(observation: EmeraldCampaignObservation) -> EmeraldCampaignAction:
     """Choose one conservative action from the current observation only."""
-    # A ROM-owned task can coexist with a stale/coarse game-state label (the
-    # truck fixture reports MAIN_MENU while the avatar is being transitioned).
-    # Treat that combination as a scripted, non-actionable state before any
-    # menu policy is considered.  This is intentionally task-agnostic.
-    try:
-        active_tasks = tuple(get_tasks() or ())
-        if (
-            observation.state is not OpeningSequenceState.TITLE
-            and active_tasks
-            and not player_avatar_is_controllable()
-            and not observation.dialogue_waiting
-        ):
-            return EmeraldCampaignAction.WAIT
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        pass
+    # Overworld avatar controllability is not a universal actionability test:
+    # menus, naming, confirmations, and dialogue can all legitimately accept
+    # input while the overworld avatar is not controllable.  Scripted waits
+    # fall through to WAIT below because they expose no actionable observation.
     if observation.state is OpeningSequenceState.TITLE:
         return EmeraldCampaignAction.ADVANCE_TITLE
     if observation.state is OpeningSequenceState.OPTIONS_MENU:
@@ -148,26 +138,55 @@ def choose_emerald_campaign_action(observation: EmeraldCampaignObservation) -> E
     return EmeraldCampaignAction.WAIT
 
 
-def _observed_exit_goal() -> ReachWarp | None:
+def _observed_exit_goal(world: OverworldObservation, navigator: GoalAwareNavigator) -> ReachWarp | None:
     """Choose a tactical exit from the currently observed map.
 
     This is deliberately map/warp driven.  It does not identify the truck,
     house, stairs, or any other opening phase; the next observation decides
     again after the map changes.
     """
-    try:
-        world = perceive_overworld()
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        return None
     if world is None or not world.controllable:
         return None
-    exits = sorted(
-        (warp for warp in world.warps if warp.destination[0] != world.map_id),
-        key=lambda warp: (warp.destination[0], warp.destination[1], warp.entry[1]),
-    )
+    exits = tuple(warp for warp in world.warps if warp.destination[0] != world.map_id)
     if not exits:
         return None
-    return ReachWarp(destination_map=exits[0].destination[0])
+
+    # Sort by Manhattan distance to minimize the number of expensive pathfinding
+    # calls.  A warp already under the player or very close is likely the
+    # intended one.
+    def distance(warp):
+        return abs(warp.entry[1][0] - world.player_coordinates[0]) + abs(
+            warp.entry[1][1] - world.player_coordinates[1]
+        )
+
+    candidates = sorted(exits, key=distance)
+    ranked: list[tuple[tuple, object]] = []
+    # Plan for at most the three closest candidates to avoid unthrottled spikes.
+    for warp in candidates[:3]:
+        target = ReachWarp(destination_map=warp.destination[0], destination=warp.destination, warp=warp)
+        try:
+            # Use A* for faster heuristic-guided search.
+            plan = navigator.plan((world.map_id, world.player_coordinates), target, algorithm="astar")
+        except NavigationError:
+            continue
+        metrics = plan.metrics
+        ranked.append(
+            (
+                (
+                    metrics.encounter_opportunities if metrics else float("inf"),
+                    metrics.total_route_cost if metrics else float("inf"),
+                    metrics.movement_actions if metrics else float("inf"),
+                    warp.entry[1],
+                ),
+                warp,
+            )
+        )
+    if not ranked:
+        # Fall back to Manhattan-closest if no path was found (e.g. dynamic blocking).
+        selected = candidates[0]
+    else:
+        selected = min(ranked, key=lambda item: item[0])[1]
+    return ReachWarp(destination_map=selected.destination[0], destination=selected.destination, warp=selected)
 
 
 def observation_driven_overworld_progression() -> Iterator[object]:
@@ -180,18 +199,27 @@ def observation_driven_overworld_progression() -> Iterator[object]:
     """
     loop: Iterator[object] | None = None
     source_map: tuple[int, int] | None = None
+    navigator: GoalAwareNavigator | None = None
     while True:
+        try:
+            current = perceive_overworld()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            current = None
+
         if loop is None:
-            goal = _observed_exit_goal()
+            if current is None or not current.controllable:
+                yield
+                continue
+            if navigator is None or navigator.world.facing is not None:
+                # GoalAwareNavigator and its World are cheap to create but
+                # we must provide current tiles.
+                navigator = GoalAwareNavigator(NavigationWorld.from_overworld(current))
+            goal = _observed_exit_goal(current, navigator)
             if goal is None:
                 yield
                 continue
             loop = AgentControlLoop(lambda: observe_agent(goal=goal), goal=goal).run()
-            try:
-                current = perceive_overworld()
-                source_map = current.map_id if current is not None else None
-            except (AttributeError, RuntimeError, TypeError, ValueError):
-                source_map = None
+            source_map = current.map_id
         try:
             next(loop)
         except StopIteration:
@@ -199,12 +227,7 @@ def observation_driven_overworld_progression() -> Iterator[object]:
             source_map = None
             yield
             continue
-        try:
-            current = perceive_overworld()
-            if current is None or current.map_id != source_map:
-                loop = None
-                source_map = None
-        except (AttributeError, RuntimeError, TypeError, ValueError):
+        if current is None or current.map_id != source_map:
             loop = None
             source_map = None
         yield
@@ -229,7 +252,18 @@ def _configured_name(target: EmeraldNamingTarget) -> str | None:
     return None
 
 
-def _resolve_player_campaign_name() -> str | None:
+def _resolve_player_campaign_initialization(rng: RandomSource | None = None) -> StartGameInitialization:
+    name_config, gender_config = _start_game_values()
+    if rng is None:
+        # Use a session-stable RNG so that re-mounting the capability for
+        # different objectives (e.g. set_wall_clock, meet_rival) produces
+        # the same choice.
+        session_id = getattr(context.nuzlocke_runtime, "session_id", None)
+        rng = random.Random(session_id)
+    return resolve_start_game_initialization(name_config, gender_config, rng)
+
+
+def _resolve_player_campaign_name(rng: RandomSource | None = None) -> str | None:
     configured, configured_gender = _start_game_values()
     if not isinstance(configured, str):
         return None
@@ -242,7 +276,10 @@ def _resolve_player_campaign_name() -> str | None:
     if gender is None:
         return None
     try:
-        return resolve_start_game_initialization(configured, gender, random.Random()).name
+        if rng is None:
+            session_id = getattr(context.nuzlocke_runtime, "session_id", None)
+            rng = random.Random(session_id)
+        return resolve_start_game_initialization(configured, gender, rng).name
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
         return None
 
@@ -284,6 +321,7 @@ def _main_menu_cursor() -> int | None:
 
 
 def _gender_input(target_gender: str) -> Iterator[object]:
+    """Choose the target gender from the Observed gender-selection task."""
     task = get_task("Task_NewGameBirchSpeech_ChooseGender")
     if task is None:
         yield
@@ -431,7 +469,9 @@ def observation_driven_emerald_campaign() -> Iterator[object]:
     pending_signature: tuple | None = None
     pending_waited = False
     overworld_progression = observation_driven_overworld_progression()
-    resolved_player_name: str | None = None
+    resolved_player_initialization: StartGameInitialization | None = None
+    session_id = getattr(getattr(context, "nuzlocke_runtime", None), "session_id", None)
+    rng = random.Random(session_id)
     while True:
         observation = _campaign_observation(field_message_lifecycle_active)
         field_message_lifecycle_active = observation.dialogue_lifecycle_active
@@ -542,18 +582,14 @@ def observation_driven_emerald_campaign() -> Iterator[object]:
             ):
                 yield
                 continue
-            if resolved_player_name is None:
-                configured = _configured_name(EmeraldNamingTarget.PLAYER_NAME)
-                if configured is not None:
-                    resolved_player_name = _resolve_player_campaign_name()
-            if resolved_player_name is None:
-                yield
-                continue
-            _naming_input(resolved_player_name)
+            if resolved_player_initialization is None:
+                resolved_player_initialization = _resolve_player_campaign_initialization(rng)
+            _naming_input(resolved_player_initialization.name)
             issued = True
         elif action is EmeraldCampaignAction.CHOOSE_GENDER:
-            _, gender = _start_game_values()
-            yield from _gender_input(gender)
+            if resolved_player_initialization is None:
+                resolved_player_initialization = _resolve_player_campaign_initialization(rng)
+            yield from _gender_input(resolved_player_initialization.gender.value)
             issued = True
         elif action is EmeraldCampaignAction.ADVANCE_NAME_PROMPT:
             yield from _advance_name_prompt()
@@ -617,7 +653,9 @@ def emerald_campaign_capability(objective_id: str) -> Iterator[object]:
     # extracted.
     from modules.modes.opening import EmeraldOpeningCapability
 
-    capability = EmeraldOpeningCapability(campaign_owned=True)
+    session_id = getattr(getattr(context, "nuzlocke_runtime", None), "session_id", None)
+    rng = random.Random(session_id)
+    capability = EmeraldOpeningCapability(rng=rng, campaign_owned=True)
     yield from capability.run()
     if objective_id == "obtain_starter":
         # Reuse the proven Hoenn starter interaction directly as a capability

@@ -151,7 +151,10 @@ class JsonEventStore:
 
     def _load(self) -> None:
         try:
-            with self.path.open("r", encoding="utf-8") as handle:
+            # ``utf-8-sig`` accepts ordinary UTF-8 and consumes a leading BOM.
+            # Some editors/exporters emit the BOM even though JSON itself does
+            # not treat it as whitespace.
+            with self.path.open("r", encoding="utf-8-sig") as handle:
                 first_line = handle.readline()
         except OSError as error:
             raise EventStoreCorruptionError(f"Could not load event store: {self.path}") from error
@@ -165,7 +168,7 @@ class JsonEventStore:
                 return
         self._legacy = True
         try:
-            document = json.loads(self.path.read_text(encoding="utf-8"))
+            document = json.loads(self.path.read_text(encoding="utf-8-sig"))
             if document.get("schema_version") != SCHEMA_VERSION or not isinstance(document.get("events"), list):
                 raise EventStoreCorruptionError("Unsupported or missing event-store schema version")
             records = document["events"]
@@ -200,7 +203,7 @@ class JsonEventStore:
                 raise EventStoreCorruptionError("Empty event store")
             start = 0
             if not allow_missing_header:
-                header = json.loads(raw_lines[0].decode("utf-8"))
+                header = json.loads(raw_lines[0].decode("utf-8-sig"))
                 if header != {"schema_version": LINE_SCHEMA_VERSION}:
                     raise EventStoreCorruptionError("Unsupported event-line schema")
                 start = 1

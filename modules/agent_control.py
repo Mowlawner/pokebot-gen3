@@ -42,6 +42,7 @@ from modules.navigation import (
     WorldNavigationError,
     goal_target_map,
     plan_with_world_navigation,
+    plan_observed_warp_locally,
     navigation_diagnostics,
     prewarm_navigation_tiles,
 )
@@ -328,6 +329,23 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
                     "route_candidates: " + " | ".join(candidate.summary() for candidate in plan.candidate_metrics),
                 )
     except (NavigationError, WorldNavigationError) as error:
+        # A selected WarpObservation is direct runtime evidence of a local
+        # exit.  If the world graph cannot prove a cross-map route, ask the
+        # local navigator to prove only the observed movement/activation path.
+        if isinstance(observation.goal, ReachWarp) and observation.goal.warp is not None:
+            try:
+                local_plan = plan_observed_warp_locally(world, start, observation.goal)
+            except NavigationError:
+                pass
+            else:
+                return GoalEvaluation(
+                    GoalStatus.REACHABLE if local_plan.actions else GoalStatus.COMPLETE,
+                    plan=local_plan,
+                    reason="locally actionable observed warp; global route unavailable",
+                    diagnostics=navigation_diagnostics(world, start, observation.goal),
+                    binding_diagnostics=binding_diagnostics,
+                    world_diagnostics=("global route unavailable; using observed local transition",),
+                )
         timing("goal_planning", planning_start)
         count("goal_planning_attempts")
         return GoalEvaluation(
@@ -595,6 +613,7 @@ class AgentControlLoop:
         ) = None
         self._warp_settling = False
         self._warp_wait_observations = 0
+        self._blocked_warp: WarpObservation | None = None
         self._cached_evaluation: GoalEvaluation | None = None
         self._cached_actions: tuple[NavigationAction, ...] = ()
         self._cached_action_index = 0
@@ -1161,6 +1180,23 @@ class AgentControlLoop:
                 self._invalidate_plan("warp_destination_mismatch")
             elif interaction_type is InteractionType.OVERWORLD:
                 self._warp_wait_observations += 1
+                if self._warp_wait_observations > 8:
+                    failed_warp = self._goal.warp if isinstance(self._goal, ReachWarp) else None
+                    self._blocked_warp = failed_warp
+                    self._expected_world_transition = None
+                    self._warp_wait_observations = 0
+                    self._invalidate_plan("warp_activation_not_observed")
+                    wait_action = AgentAction(
+                        AgentActionType.WAIT_REOBSERVE,
+                        reason="observed warp activation failed; waiting for a changed affordance",
+                    )
+                    wait_decision = ActionDecision(wait_action)
+                    wait_result = ActionResult(
+                        ActionResultType.UNREACHABLE,
+                        wait_action,
+                        wait_action.reason,
+                    )
+                    return observation, wait_decision, wait_result
                 if self._warp_wait_observations <= 3 or self._warp_wait_observations % 10 == 0:
                     try:
                         emulator_frame = context.emulator.get_frame_count()
@@ -1193,6 +1229,25 @@ class AgentControlLoop:
                 wait_result = self._executor.execute(wait_action, observation)
                 return observation, wait_decision, wait_result
             self._warp_settling = False
+
+        if self._blocked_warp is not None:
+            still_observed = observation.overworld is not None and any(
+                warp == self._blocked_warp for warp in observation.overworld.warps
+            )
+            if not still_observed:
+                self._blocked_warp = None
+            elif isinstance(observation.goal, ReachWarp) and observation.goal.warp == self._blocked_warp:
+                blocked_action = AgentAction(
+                    AgentActionType.WAIT_REOBSERVE,
+                    reason="selected warp previously failed; awaiting recovery or a new observation",
+                )
+                blocked_evaluation = GoalEvaluation(
+                    GoalStatus.UNREACHABLE,
+                    reason=blocked_action.reason,
+                )
+                return observation, ActionDecision(blocked_action, blocked_evaluation), ActionResult(
+                    ActionResultType.UNREACHABLE, blocked_action, blocked_action.reason
+                )
 
         # Diagnostic-only snapshotting happens after transition handling and
         # requires a standing, in-bounds Route 103 observation.  It does not

@@ -291,6 +291,9 @@ def plan_with_world_navigation(
         for coordinates, source_map in zip(edge.source_coordinates, (edge.source_map,) * len(edge.source_coordinates))
         if source_map == start[0]
     )
+    selected_warp = navigation_goal.target.warp if isinstance(navigation_goal.target, ReachWarp) else None
+    if selected_warp is not None:
+        candidates = tuple(candidate for candidate in candidates if candidate == selected_warp.entry)
     # Map warp records name the tile containing the warp, while the input
     # which activates a normal door warp is the step *onto* that tile.  Find
     # the adjacent activation positions instead of treating the warp tile as
@@ -556,6 +559,45 @@ def plan_with_world_navigation(
         ),
         route,
     )
+
+
+def plan_observed_warp_locally(
+    world: NavigationWorld,
+    start: Location,
+    goal: ReachWarp,
+) -> NavigationPlan:
+    """Plan to an exact observed warp without consulting the map graph."""
+    selected = goal.warp
+    if selected is None or selected not in world.warps:
+        raise NavigationError("observed warp is not present in the current perception")
+    if goal.destination is not None and selected.destination != goal.destination:
+        raise NavigationError("observed warp destination no longer matches the goal")
+    if goal.destination_map is not None and selected.destination[0] != goal.destination_map:
+        raise NavigationError("observed warp map no longer matches the goal")
+    # ReachWarp's local terminal condition is deliberately the entry/source
+    # state.  For directional-step warps that is not the transition itself:
+    # the ROM consumes one additional directional input while standing on the
+    # entry tile.  The cross-map planner normally appends this action after
+    # its local plan; preserve that contract for the graph-independent path.
+    local_plan = GoalAwareNavigator(world).plan(start, goal)
+    if selected.activation is WarpActivation.DIRECTIONAL_STEP:
+        direction = selected.activation_direction or selected.required_facing
+        if direction is None:
+            raise NavigationError("directional observed warp has no activation direction")
+        activation_source = selected.entry
+        activation = NavigationAction(
+            NavigationActionType.WARP,
+            direction,
+            activation_source,
+            selected.destination,
+        )
+        actions = local_plan.actions + (activation,)
+        return NavigationPlan(
+            actions,
+            local_plan.destination,
+            GoalAwareNavigator(world)._metrics(actions),
+        )
+    return local_plan
 
 
 def navigation_diagnostics(world: NavigationWorld, start: Location, goal: Goal) -> tuple[str, ...]:
@@ -1041,6 +1083,7 @@ class GoalAwareNavigator:
                 )
                 and (target.destination is None or warp.destination == target.destination)
                 and (target.destination_map is None or warp.destination[0] == target.destination_map)
+                and (target.warp is None or warp == target.warp)
                 for warp in self.world.warps
             )
         raise TypeError(f"Unsupported goal type: {type(target).__name__}")

@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-from modules.overworld import Location, MapId
+from modules.overworld import Location, MapId, WarpObservation
 from enum import Enum, auto
 
 
@@ -28,6 +28,9 @@ class ReachLocation(Goal):
 class ReachWarp(Goal):
     destination_map: MapId | None = None
     destination: Location | None = None
+    # The destination map is only a routing hint; preserve the observed
+    # source record so equal-destination warps remain distinguishable.
+    warp: WarpObservation | None = None
 
 
 @dataclass(frozen=True)

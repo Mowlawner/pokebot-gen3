@@ -42,6 +42,21 @@ def snapshot(frame, map_number=2):
 
 
 class TestNuzlockePersistence(unittest.TestCase):
+    def test_bom_prefixed_line_store_is_loaded_without_resetting_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            event = MapChanged(1, (1, 2), (1, 3))
+            store = JsonEventStore(path, session_id="session-a")
+            store.append(event)
+            original = path.read_bytes()
+            path.write_bytes(b"\xef\xbb\xbf" + original)
+
+            reloaded = JsonEventStore(path)
+
+            self.assertEqual(reloaded.iter_events(), (event,))
+            self.assertEqual(reloaded.last_sequence(), 1)
+            self.assertEqual(path.read_bytes(), b"\xef\xbb\xbf" + original)
+
     def test_reload_order_and_duplicate_delivery(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.json"

@@ -338,6 +338,35 @@ class GoalAwareNavigationTests(TestCase):
         self.assertEqual(len(plan.actions), 1)
         self.assertEqual(plan.actions[0].direction, Direction.East)
 
+    def test_reach_warp_preserves_source_identity_for_equal_destinations(self):
+        destination = (("outside", 0), (9, 9))
+        first = WarpObservation(("test", (1, 0)), destination)
+        second = WarpObservation(("test", (1, 2)), destination)
+        selected = ReachWarp(destination_map=("outside", 0), destination=destination, warp=second)
+        navigator = GoalAwareNavigator(world({(x, y) for x in range(3) for y in range(3)}, warps=(first, second)))
+
+        self.assertTrue(navigator.satisfies(("test", (1, 2)), None, selected))
+        self.assertFalse(navigator.satisfies(("test", (1, 0)), None, selected))
+        self.assertEqual(navigator.plan(("test", (0, 1)), selected).destination, ("test", (1, 2)))
+
+    def test_cross_map_plan_restricts_candidates_to_selected_warp(self):
+        source = "test"
+        outside = ("outside", 0)
+        first = WarpObservation((source, (1, 0)), (outside, (0, 0)))
+        second = WarpObservation((source, (1, 2)), (outside, (2, 0)))
+        selected = ReachWarp(destination_map=outside, destination=second.destination, warp=second)
+        navigation_world = world({(x, y) for x in range(3) for y in range(3)}, warps=(first, second))
+        from modules.navigation import plan_with_world_navigation
+        from modules.world_navigation import WorldEdge, WorldMapGraph
+
+        plan, _ = plan_with_world_navigation(
+            navigation_world,
+            (source, (0, 1)),
+            selected,
+            graph=WorldMapGraph((WorldEdge(source, outside, "warp", ((1, 0), (1, 2)), ((0, 0), (2, 0))),)),
+        )
+        self.assertEqual(plan.actions[-1].destination, (outside, (2, 0)))
+
     def test_routes_to_trigger_activation_position(self):
         start = (("test"), (0, 1))
         trigger = TriggerObservation(

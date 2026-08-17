@@ -17,7 +17,7 @@ from modules.agent_control import (
     prewarm_warp_destination,
     select_action,
 )
-from modules.goals import GoalConstraints, NavigationGoal, ReachLocation
+from modules.goals import GoalConstraints, NavigationGoal, ReachLocation, ReachWarp
 from modules.interaction_state import InteractionObservation
 from modules.map_path import Direction
 from modules.memory import GameState
@@ -28,6 +28,7 @@ from modules.overworld import (
     TileObservation,
     TriggerObservation,
     WarpObservation,
+    WarpActivation,
 )
 from modules.world_navigation import WorldEdge, WorldMapGraph
 
@@ -81,6 +82,125 @@ def observation(
 
 
 class AgentActionSelectionTests(TestCase):
+    def test_observed_warp_uses_local_plan_when_global_route_is_unreachable(self):
+        destination = (("destination", 0), (10, 19))
+        warp = WarpObservation((MAP, (1, 0)), destination, required_facing=Direction.East)
+        world = OverworldObservation(
+            map_id=MAP,
+            player_coordinates=(0, 0),
+            facing=Direction.East,
+            controllable=True,
+            tiles=tuple(
+                TileObservation((MAP, coordinate), False, frozenset(Direction), warp=warp if coordinate == (1, 0) else None)
+                for coordinate in ((0, 0), (1, 0))
+            ),
+            warps=(warp,),
+            objects=(),
+            triggers=(),
+        )
+        goal = ReachWarp(destination_map=destination[0], destination=destination, warp=warp)
+        with patch("modules.navigation.get_world_map_graph", return_value=WorldMapGraph(())):
+            decision = select_action(observation(GameState.OVERWORLD, world=world, goal=goal))
+
+        self.assertEqual(decision.goal_evaluation.status, GoalStatus.REACHABLE)
+        self.assertEqual(decision.action.action_type, AgentActionType.NAVIGATE_TOWARD_GOAL)
+        self.assertEqual(decision.action.navigation.action_type, NavigationActionType.MOVE)
+        self.assertEqual(decision.action.direction, Direction.East)
+        self.assertIn("global route unavailable; using observed local transition", decision.goal_evaluation.world_diagnostics)
+
+    def test_arrival_at_directional_observed_warp_emits_activation_input(self):
+        destination = (("destination", 0), (10, 19))
+        warp = WarpObservation(
+            (MAP, (1, 0)), destination, required_facing=Direction.East,
+            activation=WarpActivation.DIRECTIONAL_STEP,
+        )
+        world = OverworldObservation(
+            MAP, (1, 0), Direction.East, True,
+            (TileObservation((MAP, (1, 0)), False, frozenset(Direction), warp=warp),),
+            (warp,), (), (),
+        )
+        goal = ReachWarp(destination_map=destination[0], destination=destination, warp=warp)
+        with patch("modules.navigation.get_world_map_graph", return_value=WorldMapGraph(())):
+            decision = select_action(observation(GameState.OVERWORLD, world=world, goal=goal))
+
+        self.assertEqual(decision.goal_evaluation.status, GoalStatus.REACHABLE)
+        self.assertEqual(decision.action.navigation.action_type, NavigationActionType.WARP)
+        self.assertEqual(decision.action.direction, Direction.East)
+        self.assertEqual(decision.action.navigation.source, (MAP, (1, 0)))
+
+    def test_local_directional_warp_requires_reobserved_activation_and_destination(self):
+        destination = (("destination", 0), (10, 19))
+        warp = WarpObservation(
+            (MAP, (1, 0)), destination, required_facing=Direction.East,
+            activation=WarpActivation.DIRECTIONAL_STEP,
+        )
+
+        def source_world(coordinates):
+            return OverworldObservation(
+                MAP, coordinates, Direction.East, True,
+                tuple(TileObservation((MAP, coordinate), False, frozenset(Direction), warp=warp if coordinate == (1, 0) else None)
+                      for coordinate in ((0, 0), (1, 0))),
+                (warp,), (), (),
+            )
+
+        target_world = OverworldObservation(
+            destination[0], destination[1], Direction.South, True,
+            (TileObservation(destination, False, frozenset(Direction)),), (), (), (),
+        )
+        observations = iter((source_world((0, 0)), source_world((1, 0)), target_world))
+        goal = ReachWarp(destination_map=destination[0], destination=destination, warp=warp)
+        emulator = Mock()
+        loop = AgentControlLoop(
+            lambda: AgentObservation(
+                InteractionObservation(GameState.OVERWORLD, controllable=True),
+                overworld=next(observations),
+                goal=goal,
+            )
+        )
+        with patch("modules.navigation.get_world_map_graph", return_value=WorldMapGraph(())), patch(
+            "modules.agent_control.context.emulator", emulator
+        ):
+            movement = loop.step()
+            activation = loop.step()
+            arrived = loop.step()
+
+        self.assertEqual(movement[1].action.navigation.action_type, NavigationActionType.MOVE)
+        self.assertEqual(activation[1].action.navigation.action_type, NavigationActionType.WARP)
+        self.assertEqual(activation[1].action.direction, Direction.East)
+        self.assertEqual(arrived[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertIsNone(loop._expected_world_transition)
+        self.assertEqual(emulator.press_button.call_args_list, [call("Right"), call("Right")])
+
+    def test_failed_local_directional_activation_is_not_repeated_forever(self):
+        destination = (("destination", 0), (10, 19))
+        warp = WarpObservation(
+            (MAP, (1, 0)), destination, required_facing=Direction.East,
+            activation=WarpActivation.DIRECTIONAL_STEP,
+        )
+        world = OverworldObservation(
+            MAP, (1, 0), Direction.East, True,
+            (TileObservation((MAP, (1, 0)), False, frozenset(Direction), warp=warp),),
+            (warp,), (), (),
+        )
+        goal = ReachWarp(destination_map=destination[0], destination=destination, warp=warp)
+        observations = iter((world,) * 12)
+        emulator = Mock()
+        loop = AgentControlLoop(
+            lambda: AgentObservation(
+                InteractionObservation(GameState.OVERWORLD, controllable=True),
+                overworld=next(observations),
+                goal=goal,
+            )
+        )
+        with patch("modules.navigation.get_world_map_graph", return_value=WorldMapGraph(())), patch(
+            "modules.agent_control.context.emulator", emulator
+        ):
+            results = [loop.step() for _ in range(12)]
+
+        self.assertEqual(emulator.press_button.call_args_list, [call("Right")])
+        self.assertEqual(results[9][2].result_type, ActionResultType.UNREACHABLE)
+        self.assertIn("activation failed", results[9][2].message)
+
     def test_known_warp_prewarms_only_its_destination(self):
         destination = ("destination", 0)
         world = OverworldObservation(
