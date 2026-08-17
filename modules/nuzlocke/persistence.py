@@ -31,6 +31,7 @@ from .events import (
     PokemonFainted,
     StorageChanged,
     WhiteoutOccurred,
+    NuzlockeStarted,
 )
 from .identity import PokemonIdentity
 
@@ -48,6 +49,7 @@ _EVENT_TYPES = {
         PokemonFainted,
         WhiteoutOccurred,
         StorageChanged,
+        NuzlockeStarted,
     )
 }
 

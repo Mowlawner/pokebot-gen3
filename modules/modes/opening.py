@@ -42,6 +42,7 @@ from modules.tasks import (
     get_task,
     get_tasks,
     is_field_message_waiting_for_input,
+    is_emerald_field_dialogue_advanceable,
     is_waiting_for_input,
     task_is_active,
 )
@@ -916,15 +917,37 @@ def _report_opening_a_decision(
 def _advance_scripted_input() -> Generator:
     """Advance only when the game reports that an input is currently wanted."""
     global _last_scripted_input_trace
-    waiting_for_input = _scripted_input_waiting()
-    waiting_reason = "is_field_message_waiting_for_input()" if waiting_for_input else None
-    if not waiting_for_input:
-        try:
-            waiting_for_input = context.rom.is_emerald and task_is_active("Task_DrawFieldMessage")
-            if waiting_for_input:
-                waiting_reason = "Emerald Task_DrawFieldMessage fallback"
-        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
-            pass
+    state = EmeraldOpeningCapability._dialogue_state_snapshot()
+    waiting_for_input = False
+    waiting_reason = None
+    try:
+        waiting_for_input = context.rom.is_emerald and is_emerald_field_dialogue_advanceable(
+            task_active=state[0],
+            task_name=next(
+                (
+                    name
+                    for name in ((state[9] if len(state) > 9 else ()) or ())
+                    if name.startswith("Task_NewGameBirchSpeech")
+                ),
+                None,
+            ),
+            script_active=state[2],
+            native_function_name=state[3],
+            script_function_name=state[4],
+            input_waiting=state[5],
+            field_message_lifecycle_active=state[0],
+        )
+        if waiting_for_input:
+            waiting_reason = "Emerald field-message lifecycle is advanceable"
+        elif state[0] and state[2] is None:
+            # Keep the old conservative compatibility path for callers whose
+            # script context is genuinely unavailable, not for a known
+            # printing/transition state.
+            waiting_for_input = True
+            waiting_reason = "Emerald Task_DrawFieldMessage with unavailable script context"
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        waiting_for_input = _scripted_input_waiting()
+        waiting_reason = "is_field_message_waiting_for_input()" if waiting_for_input else None
     if waiting_for_input:
         before_inputs = None
         before_pending = (None, None, None)
@@ -996,7 +1019,21 @@ def _scripted_std_msgbox_waiting(state: tuple) -> bool:
     Require the script and native symbols together with the sampled input-wait
     state so an unrelated ``WaitForAorBPress`` native wait is not dialogue.
     """
-    return state[2] is True and state[3] == "WaitForAorBPress" and state[4] == "Std_MsgboxDefault" and state[5] is True
+    return is_emerald_field_dialogue_advanceable(
+        task_active=state[0],
+        task_name=next(
+            (
+                name
+                for name in ((state[9] if len(state) > 9 else ()) or ())
+                if name.startswith("Task_NewGameBirchSpeech")
+            ),
+            None,
+        ),
+        script_active=state[2],
+        native_function_name=state[3],
+        script_function_name=state[4],
+        input_waiting=state[5],
+    )
 
 
 def _birch_house_1f_ready_for_navigation() -> bool:
@@ -1070,7 +1107,7 @@ def _emerald_clock_time(
     return snapshot.hour, snapshot.minute
 
 
-class EmeraldOpeningMode(BotMode):
+class EmeraldOpeningCapability(BotMode):
     @staticmethod
     def name() -> str:
         return "Start New Game"
@@ -1079,8 +1116,9 @@ class EmeraldOpeningMode(BotMode):
     def is_selectable() -> bool:
         return context.rom.is_emerald
 
-    def __init__(self, rng: RandomSource | None = None):
+    def __init__(self, rng: RandomSource | None = None, *, campaign_owned: bool = False):
         super().__init__()
+        self.campaign_owned = campaign_owned
         self._rng = random.Random() if rng is None else rng
         # Resolve policy once per mode run; do not regenerate on naming-screen frames.
         self._start_game_initialization = resolve_start_game_initialization(
@@ -1199,6 +1237,10 @@ class EmeraldOpeningMode(BotMode):
                 return
             if observed is OpeningSequenceState.STARTER_SELECTION:
                 global _starter_handoff_pending
+                if self.campaign_owned:
+                    # CampaignProgression owns the next capability boundary;
+                    # never change the global mode to Starters here.
+                    return
                 _starter_handoff_pending = True
                 context.bot_mode = "Starters"
                 return
@@ -2444,7 +2486,7 @@ class EmeraldOpeningMode(BotMode):
             phase=OpeningSequenceState.CLOCK_SETTING,
         )
         context.emulator.press_button("A")
-        self._clock_target = _emerald_clock_time(_clock_time_mode(), rng=self._rng)
+        self._clock_target = _emerald_clock_time(_clock_time_mode(), rng=getattr(self, "_rng", None))
         self._clock_interaction_started = True
         self._last_clock_task = None
         self._clock_held_direction = None
@@ -2592,7 +2634,7 @@ class EmeraldOpeningMode(BotMode):
                 self._clock_held_direction = None
 
         if self._clock_target is None:
-            self._clock_target = _emerald_clock_time(_clock_time_mode(), rng=self._rng)
+            self._clock_target = _emerald_clock_time(_clock_time_mode(), rng=getattr(self, "_rng", None))
         target_hour, target_minute = self._clock_target
         clock_task = _active_clock_task()
         if clock_task is None:
@@ -2667,3 +2709,9 @@ class EmeraldOpeningMode(BotMode):
         else:
             self._last_truck_decision = f"clock: wait for task {clock_task}"
         yield
+
+
+# Compatibility name for callers and behavioral tests that exercise the
+# original selectable mode directly. CampaignProgression imports the
+# capability name and therefore never performs a mode handoff.
+EmeraldOpeningMode = EmeraldOpeningCapability

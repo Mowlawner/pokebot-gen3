@@ -1,7 +1,6 @@
 import unittest
 
-from modules.goals import ActivateTrigger, ReachWarp, EARLY_POKEBALL_TRIGGER_ID
-from modules.map_data import MapRSE
+from modules.goals import ActivateTrigger, EARLY_POKEBALL_TRIGGER_ID
 from modules.nuzlocke.campaign_execution import (
     CampaignExecutionStatus,
     adapt_campaign_execution,
@@ -24,12 +23,6 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
     def ready(objective):
         return ObjectiveSelection(objective, ObjectiveStatus.READY, "ready for test")
 
-    def test_reach_oldale_translates_to_existing_navigation_goal(self):
-        result = adapt_campaign_execution(self.ready(self.objectives["reach_oldale"]))
-        self.assertEqual(result.status, CampaignExecutionStatus.READY)
-        self.assertEqual(result.execution_id, "reach_oldale")
-        self.assertEqual(result.tactical_goal, ReachWarp(destination_map=MapRSE.OLDALE_TOWN.value))
-
     def test_introductory_rival_translates_to_existing_trigger_goal(self):
         result = adapt_campaign_execution(self.ready(self.objectives["complete_intro_rival"]))
         self.assertEqual(result.status, CampaignExecutionStatus.READY)
@@ -37,14 +30,42 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
         self.assertEqual(result.tactical_goal, ActivateTrigger("introductory_rival"))
 
     def test_pokeball_objective_translates_to_professor_birch_goal(self):
-        result = adapt_campaign_execution(self.ready(self.objectives["confirm_early_pokeballs"]))
+        result = adapt_campaign_execution(self.ready(self.objectives["receive_pokeballs"]))
         self.assertEqual(result.status, CampaignExecutionStatus.READY)
-        self.assertEqual(result.execution_id, "obtain_early_pokeballs")
+        self.assertEqual(result.execution_id, "receive_pokeballs")
         self.assertEqual(result.tactical_goal, ActivateTrigger(EARLY_POKEBALL_TRIGGER_ID))
         self.assertIn("Professor Birch", result.reason)
 
+    def test_opening_objectives_mount_capabilities(self):
+        supported = {
+            "set_text_speed",
+            "complete_new_game_setup",
+            "set_wall_clock",
+            "meet_rival",
+            "rescue_birch",
+            "obtain_starter",
+            "receive_pokedex",
+            "complete_intro_rival",
+            "receive_pokeballs",
+        }
+        for objective_id, objective in self.objectives.items():
+            if objective_id in supported:
+                result = adapt_campaign_execution(self.ready(objective))
+                self.assertEqual(result.status, CampaignExecutionStatus.READY, objective_id)
+                if objective_id not in {"complete_intro_rival", "receive_pokeballs"}:
+                    self.assertIsNotNone(result.capability, objective_id)
+                continue
+            result = adapt_campaign_execution(self.ready(objective))
+            self.assertEqual(result.status, CampaignExecutionStatus.UNSUPPORTED, objective_id)
+            self.assertEqual(result.execution_id, objective.execution_id, objective_id)
+
+    def test_receive_pokedex_navigates_to_birch_lab(self):
+        result = adapt_campaign_execution(self.ready(self.objectives["receive_pokedex"]))
+        self.assertEqual(result.status, CampaignExecutionStatus.READY)
+        self.assertEqual(result.tactical_goal.location[0], (1, 4))
+
     def test_selection_statuses_are_preserved_without_translation(self):
-        objective = self.objectives["reach_oldale"]
+        objective = self.objectives["set_text_speed"]
         for objective_status, execution_status in (
             (ObjectiveStatus.BLOCKED, CampaignExecutionStatus.BLOCKED),
             (ObjectiveStatus.UNKNOWN, CampaignExecutionStatus.UNKNOWN),
@@ -81,16 +102,16 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
 
     def test_known_objective_with_invalid_tactical_target_is_unsupported(self):
         objective = CampaignObjective(
-            "reach_oldale",
+            "complete_intro_rival",
             "Oldale",
             (),
-            self.objectives["reach_oldale"].completion,
-            execution_id="reach_oldale",
+            self.objectives["complete_intro_rival"].completion,
+            execution_id="intro_rival",
             tactical_target=ActivateTrigger("wrong"),
         )
         result = adapt_campaign_execution(self.ready(objective))
         self.assertEqual(result.status, CampaignExecutionStatus.UNSUPPORTED)
-        self.assertIn("valid Oldale navigation goal", result.reason)
+        self.assertIn("valid introductory rival goal", result.reason)
 
     def test_translation_is_deterministic_and_does_not_mutate_inputs(self):
         objective = self.objectives["complete_intro_rival"]
@@ -106,7 +127,7 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
     def test_adapter_has_no_execution_side_effects(self):
         # The adapter is intentionally importable and callable without an
         # initialized emulator, profile, persistence store, or runtime.
-        result = adapt_campaign_execution(self.ready(self.objectives["reach_oldale"]))
+        result = adapt_campaign_execution(self.ready(self.objectives["set_text_speed"]))
         self.assertIsNotNone(result)
 
 

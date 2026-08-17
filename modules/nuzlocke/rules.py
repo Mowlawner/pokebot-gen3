@@ -20,6 +20,7 @@ from .events import (
     PokemonCaptured,
     PokemonFainted,
     WhiteoutOccurred,
+    NuzlockeStarted,
 )
 from .identity import PokemonIdentity
 from .persistence import JsonEventStore, deserialize_event
@@ -91,10 +92,15 @@ class NuzlockeCampaignState:
 class NuzlockeRulesProjection:
     """Reduce an ordered event stream into immutable Nuzlocke state."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, encounters_active: bool = True) -> None:
         self._state = NuzlockeCampaignState()
         self._seen: set[tuple[Any, ...]] = set()
         self._active_wild: dict[tuple[int, int], tuple[PokemonIdentity, ...]] = {}
+        self._encounters_active = encounters_active
+
+    def set_encounters_active(self, active: bool) -> None:
+        """Enable the baseline rules boundary once Poké Balls exist."""
+        self._encounters_active = self._encounters_active or active
 
     @property
     def state(self) -> NuzlockeCampaignState:
@@ -113,6 +119,7 @@ class NuzlockeRulesProjection:
                 MapChanged,
                 PartyChanged,
                 StorageChanged,
+                NuzlockeStarted,
             ),
         ):
             raise TypeError(f"Unsupported Nuzlocke rules event: {type(event).__name__}")
@@ -132,8 +139,13 @@ class NuzlockeRulesProjection:
                 state = replace(state, dead_pokemon=state.dead_pokemon + (event.identity,))
         elif isinstance(event, WhiteoutOccurred):
             state = replace(state, run_lost=True)
+        elif isinstance(event, NuzlockeStarted):
+            # The campaign marker is reduced here only to keep the shared
+            # event sequence replayable; encounter activation remains driven
+            # by the observed Poké Ball boundary in NuzlockeRuntime.
+            pass
         elif isinstance(event, BattleStarted):
-            if event.is_wild and not event.is_trainer and event.location is not None:
+            if self._encounters_active and event.is_wild and not event.is_trainer and event.location is not None:
                 location = event.location
                 existing = next((e for e in state.encounters if e.location == location), None)
                 if existing is None:

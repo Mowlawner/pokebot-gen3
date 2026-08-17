@@ -118,6 +118,13 @@ class GameStateChanged:
     new_state: Any
 
 
+@dataclass(frozen=True, slots=True)
+class NuzlockeStarted:
+    """Nuzbot-owned campaign boundary; this is not an emulator observation."""
+
+    frame: int
+
+
 Event = (
     BattleStarted
     | BattleEnded
@@ -128,6 +135,7 @@ Event = (
     | StorageChanged
     | WhiteoutOccurred
     | GameStateChanged
+    | NuzlockeStarted
 )
 
 

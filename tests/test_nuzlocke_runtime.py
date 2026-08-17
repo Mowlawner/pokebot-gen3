@@ -1,8 +1,12 @@
 import unittest
 from dataclasses import replace
 from enum import Enum
+import tempfile
+from pathlib import Path
 
 from modules.nuzlocke.events import MapChanged
+from modules.nuzlocke.persistence import JsonEventStore
+from modules.nuzlocke.projection import load_campaign_projection
 from modules.nuzlocke.runtime import NuzlockeRuntime
 from modules.nuzlocke.snapshots import (
     BattleSnapshot,
@@ -103,6 +107,27 @@ class TestNuzlockeRuntime(unittest.TestCase):
         supplied = snapshot(1)
         runtime.update(supplied)
         self.assertEqual(supplied, snapshot(1))
+
+    def test_campaign_boundary_is_explicit_and_does_not_depend_on_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonEventStore(Path(directory) / "events.json", session_id="run")
+            runtime = NuzlockeRuntime(event_sink=store)
+            runtime.update(snapshot(1))
+            self.assertFalse(runtime.observed_projection.state.nuzlocke_started)
+            event = runtime.mark_nuzlocke_started()
+            self.assertEqual(event.frame, 1)
+            self.assertTrue(runtime.observed_projection.state.nuzlocke_started)
+            self.assertIsNone(runtime.mark_nuzlocke_started())
+            self.assertEqual(len(store.iter_events()), 1)
+            self.assertTrue(load_campaign_projection(JsonEventStore(store.path)).nuzlocke_started)
+            from modules.nuzlocke.campaign_state import CampaignState
+
+            state = CampaignState.from_runtime_state(
+                snapshot=snapshot(1),
+                observed_projection=runtime.observed_projection,
+                rules_projection=runtime.rules_projection,
+            )
+            self.assertTrue(state.campaign_facts.nuzlocke_started.value)
 
 
 if __name__ == "__main__":

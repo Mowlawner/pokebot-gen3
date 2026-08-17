@@ -126,33 +126,85 @@ def encounter_available() -> CampaignPredicate:
     return CampaignPredicate("encounter_available", "current area has an unused encounter", evaluate)
 
 
+def campaign_fact(name: str) -> CampaignPredicate:
+    return CampaignPredicate(f"campaign_fact:{name}", name.replace("_", " "), lambda state: state.campaign_facts[name])
+
+
 def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
-    """Return the deliberately small first campaign slice."""
+    """Return Emerald's ordered, declarative early campaign slice."""
 
     return (
         CampaignObjective(
-            objective_id="reach_oldale",
-            description="Reach Oldale Town",
+            objective_id="set_text_speed",
+            description="Set text speed to Fast",
             prerequisites=(),
-            completion=current_area_is("OLDALE_TOWN"),
-            execution_id="reach_oldale",
-            tactical_target=ReachWarp(destination_map=MapRSE.OLDALE_TOWN.value),
+            completion=campaign_fact("text_speed_fast"),
+            execution_id="set_text_speed",
         ),
         CampaignObjective(
-            objective_id="confirm_early_pokeballs",
-            description="Obtain or confirm the early-game Poké Balls",
-            prerequisites=(),
-            completion=has_item("Poke Ball"),
-            execution_id="obtain_early_pokeballs",
-            tactical_target=early_pokeball_goal(),
+            objective_id="complete_new_game_setup",
+            description="Complete the introductory name, gender, and house setup",
+            prerequisites=(campaign_fact("text_speed_fast"),),
+            completion=campaign_fact("new_game_setup_complete"),
+            execution_id="new_game_setup",
+        ),
+        CampaignObjective(
+            objective_id="set_wall_clock",
+            description="Set the wall clock",
+            prerequisites=(campaign_fact("new_game_setup_complete"),),
+            completion=campaign_fact("wall_clock_set"),
+            execution_id="set_wall_clock",
+        ),
+        CampaignObjective(
+            objective_id="meet_rival",
+            description="Meet the rival",
+            prerequisites=(campaign_fact("wall_clock_set"),),
+            completion=campaign_fact("rival_met"),
+            execution_id="meet_rival",
+        ),
+        CampaignObjective(
+            objective_id="rescue_birch",
+            description="Rescue Professor Birch",
+            prerequisites=(campaign_fact("rival_met"),),
+            completion=campaign_fact("birch_rescued"),
+            execution_id="rescue_birch",
+        ),
+        CampaignObjective(
+            objective_id="obtain_starter",
+            description="Obtain the starter Pokémon",
+            prerequisites=(campaign_fact("birch_rescued"),),
+            completion=campaign_fact("starter_obtained"),
+            execution_id="obtain_starter",
         ),
         CampaignObjective(
             objective_id="complete_intro_rival",
             description="Complete the introductory rival battle",
-            prerequisites=(party_has_usable_pokemon(),),
-            completion=battle_completed_at(MapRSE.ROUTE103.value, trainer=True),
+            prerequisites=(campaign_fact("starter_obtained"),),
+            completion=campaign_fact("intro_rival_battle_complete"),
             execution_id="intro_rival",
             tactical_target=introductory_rival_goal(),
+        ),
+        CampaignObjective(
+            objective_id="receive_pokedex",
+            description="Receive the Pokédex",
+            prerequisites=(campaign_fact("intro_rival_battle_complete"),),
+            completion=campaign_fact("pokedex_received"),
+            execution_id="receive_pokedex",
+        ),
+        CampaignObjective(
+            objective_id="receive_pokeballs",
+            description="Receive Poké Balls",
+            prerequisites=(campaign_fact("pokedex_received"),),
+            completion=campaign_fact("pokeballs_available"),
+            execution_id="receive_pokeballs",
+            tactical_target=early_pokeball_goal(),
+        ),
+        CampaignObjective(
+            objective_id="start_nuzlocke",
+            description="Begin the Nuzlocke ruleset",
+            prerequisites=(campaign_fact("pokeballs_available"),),
+            completion=campaign_fact("nuzlocke_started"),
+            execution_id="start_nuzlocke",
         ),
     )
 
