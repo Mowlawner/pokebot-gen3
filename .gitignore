@@ -4,3 +4,5 @@ profiles
 .last-requirements-check
 mgba
 audit_*
+roms
+trace.log
