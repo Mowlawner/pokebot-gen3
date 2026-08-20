@@ -6,3 +6,4 @@ mgba
 audit_*
 roms
 trace.log
+tests/last_frame_timeout.png
