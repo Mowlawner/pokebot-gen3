@@ -1,9 +1,1 @@
 # Created by venv; see https://docs.python.org/3/library/venv.html
-*
-!modules/
-!modules/nuzlocke/
-!modules/nuzlocke/policy.py
-!modules/nuzlocke/diagnostics.py
-!tests/
-!tests/test_nuzlocke_policy.py
-!tests/test_transition_execution.py
