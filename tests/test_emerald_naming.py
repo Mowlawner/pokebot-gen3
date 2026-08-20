@@ -135,9 +135,7 @@ class NamingCapabilityPolicyTests(unittest.TestCase):
 class EmeraldConfirmationObservationTests(unittest.TestCase):
     def test_starter_nickname_prompt_is_script_backed(self):
         task = types.SimpleNamespace(symbol="Task_HandleYesNoInput")
-        script = types.SimpleNamespace(
-            stack=["LittlerootTown_ProfessorBirchsLab_EventScript_GiveStarterEvent"]
-        )
+        script = types.SimpleNamespace(stack=["LittlerootTown_ProfessorBirchsLab_EventScript_GiveStarterEvent"])
         with (
             patch("modules.nuzlocke.emerald_confirmation.get_tasks", return_value=[task]),
             patch("modules.nuzlocke.emerald_confirmation.get_global_script_context", return_value=script),
@@ -159,9 +157,7 @@ class EmeraldConfirmationObservationTests(unittest.TestCase):
 
     def test_go_see_rival_prompt_is_classified_by_exact_script_identity(self):
         task = types.SimpleNamespace(symbol="Task_HandleYesNoInput")
-        script = types.SimpleNamespace(
-            stack=["LittlerootTown_ProfessorBirchsLab_EventScript_GoSeeRival"]
-        )
+        script = types.SimpleNamespace(stack=["LittlerootTown_ProfessorBirchsLab_EventScript_GoSeeRival"])
         with (
             patch("modules.nuzlocke.emerald_confirmation.get_tasks", return_value=[task]),
             patch("modules.nuzlocke.emerald_confirmation.get_global_script_context", return_value=script),
@@ -176,9 +172,7 @@ class EmeraldConfirmationObservationTests(unittest.TestCase):
 
     def test_similarly_named_prompt_is_not_go_see_rival(self):
         task = types.SimpleNamespace(symbol="Task_HandleYesNoInput")
-        script = types.SimpleNamespace(
-            stack=["LittlerootTown_ProfessorBirchsLab_EventScript_GoSeeRivalAgain"]
-        )
+        script = types.SimpleNamespace(stack=["LittlerootTown_ProfessorBirchsLab_EventScript_GoSeeRivalAgain"])
         with (
             patch("modules.nuzlocke.emerald_confirmation.get_tasks", return_value=[task]),
             patch("modules.nuzlocke.emerald_confirmation.get_global_script_context", return_value=script),

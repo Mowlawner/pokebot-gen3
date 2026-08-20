@@ -71,8 +71,7 @@ class CampaignFactsTests(unittest.TestCase):
     def test_pokedex_completion_accepts_either_authoritative_rom_flag(self):
         for flag_name in ("RECEIVED_POKEDEX_FROM_BIRCH", "SYS_POKEDEX_GET"):
             flags = tuple(
-                NamedFlag(name, name == flag_name)
-                for name in ("RECEIVED_POKEDEX_FROM_BIRCH", "SYS_POKEDEX_GET")
+                NamedFlag(name, name == flag_name) for name in ("RECEIVED_POKEDEX_FROM_BIRCH", "SYS_POKEDEX_GET")
             )
             facts = self.state(flags=flags).campaign_facts
             self.assertTrue(facts.pokedex_received.value, flag_name)

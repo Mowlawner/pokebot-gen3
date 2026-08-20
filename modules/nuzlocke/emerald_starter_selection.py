@@ -12,7 +12,6 @@ from modules.player import get_player_avatar
 from modules.tasks import get_task
 from typing import Protocol
 
-
 HOENN_STARTER_CHOICES = ("Treecko", "Torchic", "Mudkip")
 
 

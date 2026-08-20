@@ -43,6 +43,7 @@ class _Emulator:
         self.released.append(button)
         self.active.discard(button)
 
+
 def observation(map_id=(1, 0), position=(8, 8), controllable=True):
     return AgentObservation(
         InteractionObservation(GameState.OVERWORLD, controllable=controllable),
@@ -51,7 +52,10 @@ def observation(map_id=(1, 0), position=(8, 8), controllable=True):
             player_coordinates=position,
             facing=Direction.South,
             controllable=controllable,
-            tiles=(), warps=(), objects=(), triggers=(),
+            tiles=(),
+            warps=(),
+            objects=(),
+            triggers=(),
         ),
     )
 
@@ -116,7 +120,9 @@ class TestTransitionExecution(unittest.TestCase):
         with patch("modules.agent_control.context.emulator", emulator), patch(
             "modules.agent_control.select_action", return_value=selected
         ) as select:
-            loop.step(); loop.step(); loop.step()
+            loop.step()
+            loop.step()
+            loop.step()
         self.assertEqual(select.call_count, 1)
         self.assertTrue(loop._pending_transition.moved)
 
@@ -147,9 +153,7 @@ class TestTransitionExecution(unittest.TestCase):
                 navigation=first_tactical_move,
             )
         )
-        loop, emulator, selected = self.make_loop(
-            [observation(), observation(map_id=(0, 9), position=(5, 10))], action
-        )
+        loop, emulator, selected = self.make_loop([observation(), observation(map_id=(0, 9), position=(5, 10))], action)
         with patch("modules.agent_control.context.emulator", emulator), patch(
             "modules.agent_control.select_action", side_effect=(selected, resumed)
         ):
@@ -206,7 +210,8 @@ class TestTransitionExecution(unittest.TestCase):
         with patch("modules.agent_control.context.emulator", emulator), patch(
             "modules.agent_control.select_action", return_value=selected
         ):
-            loop.step(); loop.step()
+            loop.step()
+            loop.step()
         self.assertEqual(emulator.fresh, ["Down"])
         self.assertEqual(emulator.held, ["Down"])
         self.assertEqual(loop._pending_transition.transition_kind, "map_connection")
@@ -262,7 +267,8 @@ class TestTransitionExecution(unittest.TestCase):
         action = transition(destination=None)
         loop, emulator, selected = self.make_loop([observation(), observation(map_id=(2, 3))], action)
         with patch("modules.agent_control.context.emulator", emulator), patch(
-            "modules.agent_control.select_action", side_effect=(selected, ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE)))
+            "modules.agent_control.select_action",
+            side_effect=(selected, ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE))),
         ):
             loop.step()
             loop.step()

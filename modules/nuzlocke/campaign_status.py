@@ -30,7 +30,9 @@ def _target_text(target: SemanticTarget | None) -> str:
         return target.interaction_id or "interaction"
     if target.kind is SemanticTargetKind.LOCATION:
         return f"location {target.location}"
-    map_name = next((member.name.replace("_", " ").title() for member in MapRSE if member.value == target.target_map), None)
+    map_name = next(
+        (member.name.replace("_", " ").title() for member in MapRSE if member.value == target.target_map), None
+    )
     if map_name is not None and map_name.startswith("Route") and map_name[5:].isdigit():
         map_name = f"Route {map_name[5:]}"
     return f"map {target.target_map}" + (f" ({map_name})" if map_name is not None else "")

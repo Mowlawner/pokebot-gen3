@@ -50,17 +50,32 @@ class EmeraldObservationDispatchTests(unittest.TestCase):
 
     def test_dialogue_is_global_highest_priority(self):
         self.assertIs(
-            choose_emerald_observation_action(
-                self.observation(dialogue_actionable=True, rom_owned_movement=True)
-            ),
+            choose_emerald_observation_action(self.observation(dialogue_actionable=True, rom_owned_movement=True)),
             EmeraldCampaignAction.ADVANCE_DIALOGUE,
         )
 
     def test_ui_actions_preempt_navigation_and_rom_movement(self):
         cases = (
-            (dict(naming=EmeraldNamingObservation(EmeraldNamingTarget.PLAYER_NAME, 0, 1, True)), EmeraldCampaignAction.ENTER_NAME),
-            (dict(confirmation=EmeraldConfirmationObservation(True, EmeraldConfirmationChoice.YES, True, EmeraldConfirmationContext.PLAYER_NAME)), EmeraldCampaignAction.CONFIRM_PLAYER_NAME),
-            (dict(menu=EmeraldMenuObservation(EmeraldMenuKind.MAIN_MENU, 0, EmeraldMainMenuItem.NEW_GAME, True, "Task_HandleMainMenuInput", 0)), EmeraldCampaignAction.START_NEW_GAME),
+            (
+                dict(naming=EmeraldNamingObservation(EmeraldNamingTarget.PLAYER_NAME, 0, 1, True)),
+                EmeraldCampaignAction.ENTER_NAME,
+            ),
+            (
+                dict(
+                    confirmation=EmeraldConfirmationObservation(
+                        True, EmeraldConfirmationChoice.YES, True, EmeraldConfirmationContext.PLAYER_NAME
+                    )
+                ),
+                EmeraldCampaignAction.CONFIRM_PLAYER_NAME,
+            ),
+            (
+                dict(
+                    menu=EmeraldMenuObservation(
+                        EmeraldMenuKind.MAIN_MENU, 0, EmeraldMainMenuItem.NEW_GAME, True, "Task_HandleMainMenuInput", 0
+                    )
+                ),
+                EmeraldCampaignAction.START_NEW_GAME,
+            ),
         )
         for fields, expected in cases:
             with self.subTest(expected=expected):
@@ -158,9 +173,7 @@ class EmeraldObservationDispatchTests(unittest.TestCase):
 
     def test_gender_selection_is_observed_without_opening_history(self):
         self.assertIs(
-            choose_emerald_observation_action(
-                self.observation(gender_task="Task_NewGameBirchSpeech_ChooseGender")
-            ),
+            choose_emerald_observation_action(self.observation(gender_task="Task_NewGameBirchSpeech_ChooseGender")),
             EmeraldCampaignAction.CHOOSE_GENDER,
         )
 
@@ -242,10 +255,26 @@ class EmeraldObservationDispatchTests(unittest.TestCase):
         )
         with patch("modules.modes.opening.context", fake_context):
             from modules.modes.opening import _advance_scripted_input
+
             with patch.object(
                 __import__("modules.modes.opening", fromlist=["EmeraldOpeningCapability"]).EmeraldOpeningCapability,
                 "_dialogue_state_snapshot",
-                return_value=(False, None, True, "WaitForAorBPress", "Std_MsgboxDefault", True, False, False, None, (), None, None, None, None),
+                return_value=(
+                    False,
+                    None,
+                    True,
+                    "WaitForAorBPress",
+                    "Std_MsgboxDefault",
+                    True,
+                    False,
+                    False,
+                    None,
+                    (),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
             ), patch("modules.modes.opening.is_emerald_field_dialogue_advanceable", return_value=True):
                 step = _advance_scripted_input()
                 next(step)
@@ -270,7 +299,9 @@ class EmeraldObservationDispatchTests(unittest.TestCase):
             EmeraldMenuKind.MAIN_MENU, 0, EmeraldMainMenuItem.NEW_GAME, True, "Task_HandleMainMenuInput", 0
         )
         self.assertIs(
-            choose_emerald_observation_action(self.observation(menu=options, campaign_facts=(("text_speed_fast", False),))),
+            choose_emerald_observation_action(
+                self.observation(menu=options, campaign_facts=(("text_speed_fast", False),))
+            ),
             EmeraldCampaignAction.ENTER_OPTIONS,
         )
         new_game = EmeraldMenuObservation(
@@ -292,7 +323,12 @@ class EmeraldObservationDispatchTests(unittest.TestCase):
 
     def test_options_policy_starts_from_any_cursor_position(self):
         menu = EmeraldMenuObservation(
-            EmeraldMenuKind.OPTIONS_MENU, 3, None, True, "Task_OptionMenuProcessInput", 3,
+            EmeraldMenuKind.OPTIONS_MENU,
+            3,
+            None,
+            True,
+            "Task_OptionMenuProcessInput",
+            3,
             raw_option_values=(2, 0, 0, 0, 0, 0),
         )
         observation = self.observation(
@@ -304,7 +340,12 @@ class EmeraldObservationDispatchTests(unittest.TestCase):
 
     def test_options_ready_configuration_returns_to_menu_from_fresh_observation(self):
         menu = EmeraldMenuObservation(
-            EmeraldMenuKind.OPTIONS_MENU, 0, None, True, "Task_OptionMenuProcessInput", 0,
+            EmeraldMenuKind.OPTIONS_MENU,
+            0,
+            None,
+            True,
+            "Task_OptionMenuProcessInput",
+            0,
             raw_option_values=(2, 0, 0, 0, 0, 0),
         )
         observation = self.observation(

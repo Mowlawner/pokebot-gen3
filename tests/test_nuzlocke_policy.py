@@ -49,7 +49,9 @@ class TestNuzlockePolicy(unittest.TestCase):
         self.assertEqual(classify_event(MapChanged(1, None, (1, 2))), PersistenceClass.EPHEMERAL)
         self.assertEqual(classify_event(GameStateChanged(1, State.OVERWORLD, State.BATTLE)), PersistenceClass.EPHEMERAL)
         self.assertEqual(classify_event(BattleStarted(1, ("WILD",), False, True, False)), PersistenceClass.DURABLE)
-        self.assertEqual(classify_event(PokemonFainted(2, 0, "Poochyena", "Pup", 1, "battle")), PersistenceClass.DURABLE)
+        self.assertEqual(
+            classify_event(PokemonFainted(2, 0, "Poochyena", "Pup", 1, "battle")), PersistenceClass.DURABLE
+        )
         self.assertEqual(classify_event(WhiteoutOccurred(3)), PersistenceClass.DURABLE)
         self.assertEqual(classify_event(PartyChanged(4, (0,), (), False, ())), PersistenceClass.DURABLE)
         self.assertEqual(classify_event(PartyChanged(5, (), (), False, (0,))), PersistenceClass.EPHEMERAL)

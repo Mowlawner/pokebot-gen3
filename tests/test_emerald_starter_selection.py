@@ -63,8 +63,14 @@ class EmeraldStarterSelectionTests(unittest.TestCase):
         task.data_value.return_value = 1
         with (
             patch("modules.nuzlocke.emerald_starter_selection.get_game_state", return_value=GameState.CHOOSE_STARTER),
-            patch("modules.nuzlocke.emerald_starter_selection.get_player_avatar", return_value=SimpleNamespace(map_group_and_number=MapRSE.ROUTE101.value)),
-            patch("modules.nuzlocke.emerald_starter_selection.get_task", side_effect=lambda name: task if name == "Task_HandleStarterChooseInput" else None),
+            patch(
+                "modules.nuzlocke.emerald_starter_selection.get_player_avatar",
+                return_value=SimpleNamespace(map_group_and_number=MapRSE.ROUTE101.value),
+            ),
+            patch(
+                "modules.nuzlocke.emerald_starter_selection.get_task",
+                side_effect=lambda name: task if name == "Task_HandleStarterChooseInput" else None,
+            ),
         ):
             observed = observe_emerald_starter_selection()
         self.assertEqual(observed.choices, HOENN_STARTER_CHOICES)
@@ -91,8 +97,9 @@ class EmeraldStarterSelectionTests(unittest.TestCase):
             HOENN_STARTER_CHOICES, 1, EmeraldStarterSelectionPhase.CHOOSING, True
         )
         for configured, action in expected.items():
-            with self.subTest(configured=configured), patch(
-                "modules.nuzlocke.emerald_capabilities.configured_emerald_starter", return_value=configured
+            with (
+                self.subTest(configured=configured),
+                patch("modules.nuzlocke.emerald_capabilities.configured_emerald_starter", return_value=configured),
             ):
                 self.assertIs(choose_emerald_observation_action(self.observation(starter)), action)
 
@@ -104,7 +111,9 @@ class EmeraldStarterSelectionTests(unittest.TestCase):
             HOENN_STARTER_CHOICES, 1, EmeraldStarterSelectionPhase.CONFIRMING, True
         )
         self.assertIs(choose_emerald_observation_action(self.observation(animating)), EmeraldCampaignAction.WAIT)
-        self.assertIs(choose_emerald_observation_action(self.observation(confirming)), EmeraldCampaignAction.CONFIRM_STARTER)
+        self.assertIs(
+            choose_emerald_observation_action(self.observation(confirming)), EmeraldCampaignAction.CONFIRM_STARTER
+        )
 
     def test_executor_emits_one_selection_input_then_reobserves_without_movement(self):
         emulator = SimpleNamespace(press_button=Mock())
@@ -113,12 +122,12 @@ class EmeraldStarterSelectionTests(unittest.TestCase):
             config=SimpleNamespace(start_game=SimpleNamespace(starter="Torchic")),
             nuzlocke_runtime=SimpleNamespace(session_id="test"),
         )
-        choosing = self.observation(EmeraldStarterSelectionObservation(
-            HOENN_STARTER_CHOICES, 1, EmeraldStarterSelectionPhase.CHOOSING, True
-        ))
-        animating = self.observation(EmeraldStarterSelectionObservation(
-            HOENN_STARTER_CHOICES, 1, EmeraldStarterSelectionPhase.ANIMATING, False
-        ))
+        choosing = self.observation(
+            EmeraldStarterSelectionObservation(HOENN_STARTER_CHOICES, 1, EmeraldStarterSelectionPhase.CHOOSING, True)
+        )
+        animating = self.observation(
+            EmeraldStarterSelectionObservation(HOENN_STARTER_CHOICES, 1, EmeraldStarterSelectionPhase.ANIMATING, False)
+        )
         with (
             patch("modules.nuzlocke.emerald_capabilities.context", fake_context),
             patch("modules.nuzlocke.emerald_capabilities.configured_emerald_starter", return_value="Torchic"),
@@ -136,9 +145,9 @@ class EmeraldStarterSelectionTests(unittest.TestCase):
             config=SimpleNamespace(start_game=SimpleNamespace(starter="Mudkip")),
             nuzlocke_runtime=SimpleNamespace(session_id="stable"),
         )
-        choosing = self.observation(EmeraldStarterSelectionObservation(
-            HOENN_STARTER_CHOICES, 1, EmeraldStarterSelectionPhase.CHOOSING, True
-        ))
+        choosing = self.observation(
+            EmeraldStarterSelectionObservation(HOENN_STARTER_CHOICES, 1, EmeraldStarterSelectionPhase.CHOOSING, True)
+        )
         with (
             patch("modules.nuzlocke.emerald_capabilities.context", fake_context),
             patch("modules.nuzlocke.emerald_capabilities.configured_emerald_starter", return_value="Mudkip"),
@@ -156,9 +165,9 @@ class EmeraldStarterSelectionTests(unittest.TestCase):
             config=SimpleNamespace(start_game=SimpleNamespace(starter="Mudkip")),
             nuzlocke_runtime=SimpleNamespace(session_id="retry"),
         )
-        choosing = self.observation(EmeraldStarterSelectionObservation(
-            HOENN_STARTER_CHOICES, 1, EmeraldStarterSelectionPhase.CHOOSING, True
-        ))
+        choosing = self.observation(
+            EmeraldStarterSelectionObservation(HOENN_STARTER_CHOICES, 1, EmeraldStarterSelectionPhase.CHOOSING, True)
+        )
         with (
             patch("modules.nuzlocke.emerald_capabilities.context", fake_context),
             patch("modules.nuzlocke.emerald_capabilities.configured_emerald_starter", return_value="Mudkip"),
@@ -179,12 +188,12 @@ class EmeraldStarterSelectionTests(unittest.TestCase):
             config=SimpleNamespace(start_game=SimpleNamespace(starter="Random")),
             nuzlocke_runtime=SimpleNamespace(session_id="stable"),
         )
-        treecko_cursor = self.observation(EmeraldStarterSelectionObservation(
-            HOENN_STARTER_CHOICES, 1, EmeraldStarterSelectionPhase.CHOOSING, True
-        ))
-        moved = self.observation(EmeraldStarterSelectionObservation(
-            HOENN_STARTER_CHOICES, 0, EmeraldStarterSelectionPhase.CHOOSING, True
-        ))
+        treecko_cursor = self.observation(
+            EmeraldStarterSelectionObservation(HOENN_STARTER_CHOICES, 1, EmeraldStarterSelectionPhase.CHOOSING, True)
+        )
+        moved = self.observation(
+            EmeraldStarterSelectionObservation(HOENN_STARTER_CHOICES, 0, EmeraldStarterSelectionPhase.CHOOSING, True)
+        )
         with (
             patch("modules.nuzlocke.emerald_capabilities.context", fake_context),
             patch("modules.nuzlocke.emerald_capabilities.configured_emerald_starter", return_value="Random"),

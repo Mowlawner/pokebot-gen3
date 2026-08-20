@@ -155,7 +155,10 @@ def run_one(args: argparse.Namespace) -> dict:
                     while time.monotonic() < deadline:
                         records, offset = read_events(event_file, offset)
                         result["events"].extend(records)
-                        if any(event.get("type") == "BattleEnded" and event.get("payload", {}).get("is_trainer") for event in records):
+                        if any(
+                            event.get("type") == "BattleEnded" and event.get("payload", {}).get("is_trainer")
+                            for event in records
+                        ):
                             result["outcome"] = "RIVAL_TERMINAL"
                             terminal = result["outcome"]
                             state = "TERMINAL"

@@ -341,9 +341,7 @@ def _direction_between(source: tuple[int, int], destination: tuple[int, int]) ->
     return None
 
 
-def map_connection_approach_position(
-    boundary: tuple[int, int], direction: Direction | None
-) -> tuple[int, int]:
+def map_connection_approach_position(boundary: tuple[int, int], direction: Direction | None) -> tuple[int, int]:
     """Return the ordinary predecessor of a connection boundary tile.
 
     A ROM MapConnection describes the edge coordinate at which the field
@@ -441,15 +439,18 @@ def plan_with_world_navigation(
                 warp = selected_warp
         if edge.kind == "connection":
             connection_direction = (
-                warp.required_facing if warp is not None and warp.required_facing is not None
+                warp.required_facing
+                if warp is not None and warp.required_facing is not None
                 else _world_edge_direction(edge)
             )
             approach = map_connection_approach_position(coordinates, connection_direction)
-            choices = ((
-                approach[0],
-                approach[1],
-                connection_direction,
-            ),)
+            choices = (
+                (
+                    approach[0],
+                    approach[1],
+                    connection_direction,
+                ),
+            )
         elif warp is not None and warp.activation_locations:
             choices = tuple(
                 (
@@ -651,11 +652,13 @@ def plan_with_world_navigation(
         )
     destination_index = edge.source_coordinates.index(source_coordinates)
     destination_coordinates = edge.destination_coordinates[destination_index]
-    transition_direction = (
-        activation_direction if activation_direction is not None else _world_edge_direction(edge)
-    )
+    transition_direction = activation_direction if activation_direction is not None else _world_edge_direction(edge)
     runtime_warp = runtime_transitions.get(source_coordinates)
-    if runtime_warp is None and selected_warp is not None and selected_warp.entry == (edge.source_map, source_coordinates):
+    if (
+        runtime_warp is None
+        and selected_warp is not None
+        and selected_warp.entry == (edge.source_map, source_coordinates)
+    ):
         if selected_warp.destination is not None and selected_warp.destination[0] == edge.destination_map:
             runtime_warp = selected_warp
     activation_position = None
@@ -793,9 +796,7 @@ def plan_observed_warp_locally(
     local_plan = GoalAwareNavigator(world).plan(start, goal)
     if selected.activation is WarpActivation.DIRECTIONAL_STEP:
         direction = (
-            selected.activation_direction
-            if selected.activation_direction is not None
-            else selected.required_facing
+            selected.activation_direction if selected.activation_direction is not None else selected.required_facing
         )
         if direction is None:
             raise NavigationError("directional observed warp has no activation direction")
@@ -1297,7 +1298,9 @@ class GoalAwareNavigator:
                 (
                     location == transition_approach_position(warp)
                     if warp.kind == "map_connection"
-                    else (location in warp.activation_locations if warp.activation_locations else warp.entry == location)
+                    else (
+                        location in warp.activation_locations if warp.activation_locations else warp.entry == location
+                    )
                 )
                 and (
                     # A normal step-on warp is activated by the movement
@@ -1308,17 +1311,10 @@ class GoalAwareNavigator:
                     # only for warps whose activation is explicitly a second,
                     # directional input or whose observed source specifies an
                     # activation direction.
-                    (
-                        warp.activation is not WarpActivation.DIRECTIONAL_STEP
-                        and warp.activation_direction is None
-                    )
+                    (warp.activation is not WarpActivation.DIRECTIONAL_STEP and warp.activation_direction is None)
                     or facing is None
                     or (
-                        (
-                            warp.activation_direction
-                            if warp.activation_direction is not None
-                            else warp.required_facing
-                        )
+                        (warp.activation_direction if warp.activation_direction is not None else warp.required_facing)
                         is facing
                     )
                 )

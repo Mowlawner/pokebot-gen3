@@ -248,15 +248,8 @@ def choose_emerald_observation_action(observation: EmeraldObservation) -> Emeral
         return EmeraldCampaignAction.CHOOSE_GENDER
     if observation.gender_task == "Task_NewGameBirchSpeech_WaitPressBeforeNameChoice":
         return EmeraldCampaignAction.ADVANCE_NAME_PROMPT
-    if (
-        observation.naming is not None
-        and observation.naming.target is EmeraldNamingTarget.PLAYER_NAME
-    ):
-        return (
-            EmeraldCampaignAction.ENTER_NAME
-            if observation.naming.keyboard_ready
-            else EmeraldCampaignAction.WAIT
-        )
+    if observation.naming is not None and observation.naming.target is EmeraldNamingTarget.PLAYER_NAME:
+        return EmeraldCampaignAction.ENTER_NAME if observation.naming.keyboard_ready else EmeraldCampaignAction.WAIT
     confirmation = observation.confirmation
     if confirmation is not None and confirmation.active:
         if not confirmation.input_ready or confirmation.selected is None:
@@ -362,20 +355,18 @@ def _observed_exit_goal(
     # ``transitions`` rather than ``warps``; dropping them here means the
     # world graph can know a route that tactical policy never considers.
     exits = tuple(
-        transition for transition in (getattr(world, "transitions", ()) or world.warps)
+        transition
+        for transition in (getattr(world, "transitions", ()) or world.warps)
         if transition.destination is not None and transition.destination[0] != world.map_id
     )
     if not exits:
         return None
 
-
     # Sort by Manhattan distance to minimize the number of expensive pathfinding
     # calls.  A warp already under the player or very close is likely the
     # intended one.
     def distance(warp):
-        return abs(warp.entry[1][0] - world.player_coordinates[0]) + abs(
-            warp.entry[1][1] - world.player_coordinates[1]
-        )
+        return abs(warp.entry[1][0] - world.player_coordinates[0]) + abs(warp.entry[1][1] - world.player_coordinates[1])
 
     graph = None
     relevance = {
@@ -392,6 +383,7 @@ def _observed_exit_goal(
         if semantic_target is not None and semantic_target.target_map is not None:
             try:
                 from modules.world_navigation import get_world_map_graph
+
                 route = (graph or get_world_map_graph()).route(world.map_id, semantic_target.target_map)
             except (AttributeError, RuntimeError, TypeError, ValueError):
                 route = None
@@ -402,27 +394,41 @@ def _observed_exit_goal(
         trace.mark("navigation_target", repr(semantic_target))
         trace.mark(
             "navigation_world_route",
-            None if route is None else {
-                "maps": route.maps,
-                "edges": tuple({
-                    "type": edge.kind,
-                    "source": edge.source_map,
-                    "source_positions": edge.source_coordinates,
-                    "destination": edge.destination_map,
-                    "destination_positions": edge.destination_coordinates,
-                    "estimated_cost": edge.estimated_cost,
-                } for edge in route.edges),
-                "estimated_cost": route.estimated_cost,
-            },
+            (
+                None
+                if route is None
+                else {
+                    "maps": route.maps,
+                    "edges": tuple(
+                        {
+                            "type": edge.kind,
+                            "source": edge.source_map,
+                            "source_positions": edge.source_coordinates,
+                            "destination": edge.destination_map,
+                            "destination_positions": edge.destination_coordinates,
+                            "estimated_cost": edge.estimated_cost,
+                        }
+                        for edge in route.edges
+                    ),
+                    "estimated_cost": route.estimated_cost,
+                }
+            ),
         )
-        trace.mark("navigation_observed_transitions", tuple({
-            "type": transition.kind.upper(),
-            "source_position": transition.entry,
-            "destination": transition.destination,
-            "local_reachability": "not_evaluated",
-            "relevance": relevance[transition].name,
-            "survives_filtering": semantic_target is None or relevance[transition] is TransitionRelevance.RELEVANT,
-        } for transition in exits))
+        trace.mark(
+            "navigation_observed_transitions",
+            tuple(
+                {
+                    "type": transition.kind.upper(),
+                    "source_position": transition.entry,
+                    "destination": transition.destination,
+                    "local_reachability": "not_evaluated",
+                    "relevance": relevance[transition].name,
+                    "survives_filtering": semantic_target is None
+                    or relevance[transition] is TransitionRelevance.RELEVANT,
+                }
+                for transition in exits
+            ),
+        )
     if semantic_target is not None:
         relevant = tuple(transition for transition in exits if relevance[transition] is TransitionRelevance.RELEVANT)
         if relevant:
@@ -445,9 +451,7 @@ def _observed_exit_goal(
         # to its boundary.  Keeping it in the key prevents distinct strips to
         # the same map/direction from being merged.
         offset = (
-            destination_x - source_x
-            if direction in (Direction.North, Direction.South)
-            else destination_y - source_y
+            destination_x - source_x if direction in (Direction.North, Direction.South) else destination_y - source_y
         )
         return (
             transition.entry[0],
@@ -518,9 +522,7 @@ def _observed_exit_goal(
         warp = representative
         if len(group) > 1:
             matching = tuple(
-                transition
-                for transition in group
-                if transition_approach_position(transition) == plan.destination
+                transition for transition in group if transition_approach_position(transition) == plan.destination
             )
             if not matching:
                 continue
@@ -544,25 +546,28 @@ def _observed_exit_goal(
             )
         )
     if trace is not None:
-        trace.mark("navigation_candidate_evaluations", tuple({
-            "type": transition.kind.upper(),
-            "source_position": transition.entry,
-            "destination": transition.destination,
-            "local_reachability": any(candidate[1] is transition for candidate in ranked),
-            "local_movement_cost": next(
-                (candidate[0][3] for candidate in ranked if candidate[1] is transition), None
+        trace.mark(
+            "navigation_candidate_evaluations",
+            tuple(
+                {
+                    "type": transition.kind.upper(),
+                    "source_position": transition.entry,
+                    "destination": transition.destination,
+                    "local_reachability": any(candidate[1] is transition for candidate in ranked),
+                    "local_movement_cost": next(
+                        (candidate[0][3] for candidate in ranked if candidate[1] is transition), None
+                    ),
+                    "downstream_world_route_cost": (
+                        downstream_routes[transition].estimated_cost if transition in downstream_routes else None
+                    ),
+                    "total_cost": next((candidate[0][0] for candidate in ranked if candidate[1] is transition), None),
+                    "relevance": relevance[transition].name,
+                    "survives_filtering": transition in candidates,
+                    "selected": False,
+                }
+                for transition in exits
             ),
-            "downstream_world_route_cost": (
-                downstream_routes[transition].estimated_cost
-                if transition in downstream_routes else None
-            ),
-            "total_cost": next(
-                (candidate[0][0] for candidate in ranked if candidate[1] is transition), None
-            ),
-            "relevance": relevance[transition].name,
-            "survives_filtering": transition in candidates,
-            "selected": False,
-        } for transition in exits))
+        )
     if not ranked:
         # Preserve targetless escape behavior. With a semantic target, a
         # locally blocked relevant transition is explicit rather than an
@@ -573,12 +578,15 @@ def _observed_exit_goal(
     else:
         selected = min(ranked, key=lambda item: item[0])[1]
     if trace is not None:
-        trace.mark("navigation_selected_transition", {
-            "type": selected.kind.upper(),
-            "source_position": selected.entry,
-            "destination": selected.destination,
-            "relevance": relevance[selected].name,
-        })
+        trace.mark(
+            "navigation_selected_transition",
+            {
+                "type": selected.kind.upper(),
+                "source_position": selected.entry,
+                "destination": selected.destination,
+                "relevance": relevance[selected].name,
+            },
+        )
     return ReachWarp(destination_map=selected.destination[0], destination=selected.destination, warp=selected)
 
 
@@ -652,10 +660,7 @@ def observation_driven_overworld_progression(
                 continue
             yield
             continue
-        if (
-            objective_id == "receive_pokedex"
-            and current.map_id == MapRSE.LITTLEROOT_TOWN.value
-        ):
+        if objective_id == "receive_pokedex" and current.map_id == MapRSE.LITTLEROOT_TOWN.value:
             # Emerald starts the Pokédex sequence from the lab map's ROM
             # on-frame script after the player enters. Select only the
             # observed Littleroot -> Birch's Lab warp here; do not ask the
@@ -758,11 +763,7 @@ def _observed_interaction_goal(
         return None
     for trigger in world.triggers:
         identities = (trigger.trigger_id, trigger.affordance_id, trigger.script_symbol)
-        if (
-            interaction_id in identities
-            and trigger.condition_active is not False
-            and trigger.activation_locations
-        ):
+        if interaction_id in identities and trigger.condition_active is not False and trigger.activation_locations:
             return ActivateTrigger(trigger.trigger_id)
     return None
 
@@ -1023,15 +1024,20 @@ def _emerald_observation(
         startup_tasks = ()
     try:
         script = get_global_script_context()
-        script_stack = tuple(
-            symbol for symbol in (getattr(script, "stack", ()) or ())
-            if isinstance(symbol, str)
-        ) if script is not None else ()
+        script_stack = (
+            tuple(symbol for symbol in (getattr(script, "stack", ()) or ()) if isinstance(symbol, str))
+            if script is not None
+            else ()
+        )
         native_task_state = (
-            getattr(script, "native_function_name", None),
-            getattr(script, "script_function_name", None),
-            getattr(script, "is_active", None),
-        ) if script is not None else (None, None, None)
+            (
+                getattr(script, "native_function_name", None),
+                getattr(script, "script_function_name", None),
+                getattr(script, "is_active", None),
+            )
+            if script is not None
+            else (None, None, None)
+        )
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
         script_stack = ()
         native_task_state = (None, None, None)
@@ -1137,24 +1143,28 @@ def _semantic_target_for_objective(objective_id: str | None) -> SemanticTarget |
     if objective_id not in {"set_wall_clock", "meet_rival"}:
         return None
 
-
     try:
         gender = _opening_gender()
-        target_map = (_player_house_map(2, gender) if objective_id == "set_wall_clock" else _rival_house_map(2, gender)).value
+        target_map = (
+            _player_house_map(2, gender) if objective_id == "set_wall_clock" else _rival_house_map(2, gender)
+        ).value
         interaction_id = "wall_clock" if objective_id == "set_wall_clock" else None
         try:
             metadata = get_map_metadata(target_map)
             if objective_id == "set_wall_clock":
                 # The map's script identity is the semantic affordance
                 # identity. It is independent of the physical clock tile.
-                interaction_id = next(
-                    (
-                        event.script_symbol
-                        for event in metadata.bg_events
-                        if event.kind == "Script" and event.script_symbol.endswith("_EventScript_WallClock")
-                    ),
-                    None,
-                ) or interaction_id
+                interaction_id = (
+                    next(
+                        (
+                            event.script_symbol
+                            for event in metadata.bg_events
+                            if event.kind == "Script" and event.script_symbol.endswith("_EventScript_WallClock")
+                        ),
+                        None,
+                    )
+                    or interaction_id
+                )
             else:
                 # Meeting the rival is the ROM's rival Poké Ball interaction,
                 # not an instruction to visit an arbitrary upstairs map.
@@ -1171,7 +1181,8 @@ def _semantic_target_for_objective(objective_id: str | None) -> SemanticTarget |
                         (
                             event.script_symbol
                             for event in arrival_metadata.coord_events
-                            if event.script_symbol is not None and event.script_symbol.endswith("_EventScript_GoSeeRoom")
+                            if event.script_symbol is not None
+                            and event.script_symbol.endswith("_EventScript_GoSeeRoom")
                         ),
                         None,
                     )
@@ -1273,7 +1284,9 @@ def _main_menu_target_index(menu: EmeraldMenuObservation, target: EmeraldMainMen
     return None
 
 
-def _menu_button(observation: EmeraldCampaignObservation | EmeraldObservation, action: EmeraldCampaignAction) -> str | None:
+def _menu_button(
+    observation: EmeraldCampaignObservation | EmeraldObservation, action: EmeraldCampaignAction
+) -> str | None:
     """Choose one input from the current normalized menu observation."""
     menu = getattr(observation, "menu", None) or getattr(observation, "menu_observation", None)
     if menu is None or not menu.input_ready or menu.cursor_index is None:
@@ -1305,6 +1318,7 @@ def _menu_button(observation: EmeraldCampaignObservation | EmeraldObservation, a
 def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iterator[object]:
     """Execute at most one bounded action, then yield for fresh perception."""
     field_message_lifecycle_active = False
+
     def higher_priority_actionable() -> bool:
         # Re-observe through the same normalized pipeline.  Avoid recursion by
         # checking only actions that outrank overworld movement.
@@ -1346,7 +1360,11 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
             # to overworld campaign navigation.
             action = EmeraldCampaignAction.WAIT
         starter = observation.starter_selection
-        if starter is not None and resolved_starter is not None and starter.phase is EmeraldStarterSelectionPhase.CHOOSING:
+        if (
+            starter is not None
+            and resolved_starter is not None
+            and starter.phase is EmeraldStarterSelectionPhase.CHOOSING
+        ):
             target_index = starter.choices.index(resolved_starter)
             if starter.selected_index < target_index:
                 action = EmeraldCampaignAction.MOVE_STARTER_RIGHT
@@ -1354,14 +1372,13 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
                 action = EmeraldCampaignAction.MOVE_STARTER_LEFT
             else:
                 action = EmeraldCampaignAction.CHOOSE_STARTER
-        starter_signature = None if starter is None else (
-            starter.phase, starter.selected_index, starter.input_ready
-        )
+        starter_signature = None if starter is None else (starter.phase, starter.selected_index, starter.input_ready)
         if starter_signature != pending_starter_signature:
             pending_starter_signature = None
             pending_starter_quiet_frames = 0
         if (
-            action in {
+            action
+            in {
                 EmeraldCampaignAction.MOVE_STARTER_LEFT,
                 EmeraldCampaignAction.MOVE_STARTER_RIGHT,
                 EmeraldCampaignAction.CHOOSE_STARTER,
@@ -1393,7 +1410,8 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
             pending_nickname_quiet_frames = 0
         if (
             nickname_confirmation_signature is not None
-            and action in {
+            and action
+            in {
                 EmeraldCampaignAction.MOVE_CONFIRMATION_TO_YES,
                 EmeraldCampaignAction.CHOOSE_POKEMON_NICKNAME,
             }
@@ -1424,7 +1442,8 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
             pending_go_see_rival_quiet_frames = 0
         if (
             go_see_rival_signature is not None
-            and action in {
+            and action
+            in {
                 EmeraldCampaignAction.MOVE_CONFIRMATION_TO_YES,
                 EmeraldCampaignAction.CONFIRM_GO_SEE_RIVAL,
             }
@@ -1465,10 +1484,7 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
             yield from _advance_scripted_input(field_message_lifecycle_active)
             issued = True
         elif action is EmeraldCampaignAction.ENTER_NAME:
-            if (
-                observation.naming is None
-                or observation.naming.target is not EmeraldNamingTarget.PLAYER_NAME
-            ):
+            if observation.naming is None or observation.naming.target is not EmeraldNamingTarget.PLAYER_NAME:
                 yield
                 continue
             if resolved_player_initialization is None:
@@ -1566,9 +1582,7 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
                 yield
                 continue
             loop = AgentControlLoop(
-                lambda: observe_agent(
-                    goal=ReachLocation((observation.map_id, target[0]))
-                ),
+                lambda: observe_agent(goal=ReachLocation((observation.map_id, target[0]))),
                 goal=ReachLocation((observation.map_id, target[0])),
             ).run()
             try:
@@ -1635,12 +1649,14 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
             # re-evaluated by CampaignController on the next frame.
             # The target is read again from the same current observation that
             # selected this action; no route is retained across frames.
-            next(observation_driven_overworld_progression(
-                higher_priority_actionable,
-                observation.semantic_target,
-                tactical_execution_cache,
-                objective_id,
-            ))
+            next(
+                observation_driven_overworld_progression(
+                    higher_priority_actionable,
+                    observation.semantic_target,
+                    tactical_execution_cache,
+                    objective_id,
+                )
+            )
             yield
             continue
         else:

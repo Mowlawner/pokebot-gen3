@@ -6,9 +6,7 @@ from modules.nuzlocke.campaign_status import CampaignStatus, format_campaign_sta
 
 class CampaignStatusTests(unittest.TestCase):
     def test_meaningful_target_is_visible(self):
-        text = format_campaign_status(
-            CampaignStatus("Meet Rival", SemanticTarget.map((0, 16)), "Navigate")
-        )
+        text = format_campaign_status(CampaignStatus("Meet Rival", SemanticTarget.map((0, 16)), "Navigate"))
         self.assertIn("Objective: Meet Rival", text)
         self.assertIn("Target: map (0, 16)", text)
         self.assertIn("Intent: Navigate", text)

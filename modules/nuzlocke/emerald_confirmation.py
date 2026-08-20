@@ -73,10 +73,14 @@ def _active_confirmation_task() -> str | None:
             # This deliberately recognizes task-owned menu handlers, not
             # text or pixels.  New prompt implementations remain observable
             # as UNKNOWN until their handler is classified here.
-            if name in _PLAYER_NAME_TASKS or name in _CLOCK_CONFIRM_TASKS or (
-                name.startswith("Task_")
-                and "YesNo" in name
-                and ("Process" in name or "Handle" in name or "Create" in name)
+            if (
+                name in _PLAYER_NAME_TASKS
+                or name in _CLOCK_CONFIRM_TASKS
+                or (
+                    name.startswith("Task_")
+                    and "YesNo" in name
+                    and ("Process" in name or "Handle" in name or "Create" in name)
+                )
             ):
                 return name
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
@@ -89,7 +93,6 @@ def observe_emerald_confirmation() -> EmeraldConfirmationObservation | None:
     task_name = _active_confirmation_task()
     if task_name is None:
         return None
-
 
     selected = None
     try:
@@ -127,13 +130,17 @@ def observe_emerald_confirmation() -> EmeraldConfirmationObservation | None:
         question_text = "Is this the correct time?"
         consequences = (
             ChoiceConsequence(
-                "YES", ConsequenceKnowledge.KNOWN,
-                {"wall_clock_set": True}, True,
+                "YES",
+                ConsequenceKnowledge.KNOWN,
+                {"wall_clock_set": True},
+                True,
                 "accept displayed time and finish clock initialization",
             ),
             ChoiceConsequence(
-                "NO", ConsequenceKnowledge.KNOWN,
-                {"wall_clock_set": False}, False,
+                "NO",
+                ConsequenceKnowledge.KNOWN,
+                {"wall_clock_set": False},
+                False,
                 "return to clock configuration",
             ),
         )

@@ -11,7 +11,15 @@ from modules.agent_control import (
     evaluate_goal,
     select_action,
 )
-from modules.goals import ActivateTrigger, NavigationGoal, ReachInteractionPosition, ReachLocation, ReachWarp, EncounterMode, SemanticTarget
+from modules.goals import (
+    ActivateTrigger,
+    NavigationGoal,
+    ReachInteractionPosition,
+    ReachLocation,
+    ReachWarp,
+    EncounterMode,
+    SemanticTarget,
+)
 from modules.interaction_state import InteractionObservation
 from modules.map_path import Direction
 from modules.memory import GameState
@@ -61,11 +69,13 @@ class TestWorldMapGraph(unittest.TestCase):
 
     def test_mixed_and_sequential_transition_route_uses_total_cost(self):
         source, middle, next_map, target = (1, 0), (1, 1), (1, 2), (1, 3)
-        graph = WorldMapGraph((
-            WorldEdge(source, middle, "warp", ((0, 0),), ((0, 0),), estimated_cost=4),
-            WorldEdge(middle, next_map, "connection", ((1, 0),), ((1, 2),), estimated_cost=2),
-            WorldEdge(next_map, target, "warp", ((0, 2),), ((0, 0),), estimated_cost=3),
-        ))
+        graph = WorldMapGraph(
+            (
+                WorldEdge(source, middle, "warp", ((0, 0),), ((0, 0),), estimated_cost=4),
+                WorldEdge(middle, next_map, "connection", ((1, 0),), ((1, 2),), estimated_cost=2),
+                WorldEdge(next_map, target, "warp", ((0, 2),), ((0, 0),), estimated_cost=3),
+            )
+        )
 
         route = graph.route(source, target)
 
@@ -80,6 +90,7 @@ class TestWorldMapGraph(unittest.TestCase):
             classify_transition_relevance(transition, SemanticTarget.map((2, 1))),
             TransitionRelevance.UNKNOWN,
         )
+
     def test_simple_two_map_route(self):
         graph = WorldMapGraph((edge((0, 0), (0, 1)),))
 
@@ -142,9 +153,11 @@ class TestWorldMapGraph(unittest.TestCase):
 
     def test_emerald_littleroot_to_route101_connection_topology(self):
         littleroot = SimpleNamespace(
-            map_size=(6, 4), warps=[], connections=[SimpleNamespace(
-                destination_map_group=0, destination_map_number=16, direction="South", offset=0
-            )]
+            map_size=(6, 4),
+            warps=[],
+            connections=[
+                SimpleNamespace(destination_map_group=0, destination_map_number=16, direction="South", offset=0)
+            ],
         )
         route101 = SimpleNamespace(map_size=(6, 5), warps=[], connections=[])
 
@@ -158,12 +171,14 @@ class TestWorldMapGraph(unittest.TestCase):
         source, target = (7, 0), (7, 3)
         direct = edge(source, target)
         direct = WorldEdge(**{**direct.__dict__, "estimated_cost": 50})
-        graph = WorldMapGraph((
-            direct,
-            WorldEdge(source, (7, 1), "warp", ((0, 0),), ((0, 0),), estimated_cost=5),
-            WorldEdge((7, 1), (7, 2), "warp", ((0, 0),), ((0, 0),), estimated_cost=5),
-            WorldEdge((7, 2), target, "warp", ((0, 0),), ((0, 0),), estimated_cost=5),
-        ))
+        graph = WorldMapGraph(
+            (
+                direct,
+                WorldEdge(source, (7, 1), "warp", ((0, 0),), ((0, 0),), estimated_cost=5),
+                WorldEdge((7, 1), (7, 2), "warp", ((0, 0),), ((0, 0),), estimated_cost=5),
+                WorldEdge((7, 2), target, "warp", ((0, 0),), ((0, 0),), estimated_cost=5),
+            )
+        )
 
         route = graph.route(source, target)
 
@@ -172,11 +187,13 @@ class TestWorldMapGraph(unittest.TestCase):
 
     def test_cyclic_detour_is_worse_than_direct_transition(self):
         current, target, detour = (8, 0), (8, 2), (8, 1)
-        graph = WorldMapGraph((
-            edge(current, target),
-            edge(detour, current),
-            edge(current, target),
-        ))
+        graph = WorldMapGraph(
+            (
+                edge(current, target),
+                edge(detour, current),
+                edge(current, target),
+            )
+        )
         semantic_target = SemanticTarget.map(target)
         direct = WarpObservation((current, (1, 0)), (target, (0, 0)))
         cyclic = WarpObservation((current, (2, 0)), (detour, (0, 0)))
@@ -605,12 +622,16 @@ class TestWeightedNavigation(unittest.TestCase):
         )
         connection = MapConnectionObservation(boundary, (target_map, (1, 2)), required_facing=Direction.North)
         world = NavigationWorld(
-            tiles={tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles},
+            tiles={
+                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles
+            },
             transitions=(connection,),
         )
         graph = WorldMapGraph((edge(source_map, target_map, boundary[1], (1, 2), kind="connection"),))
 
-        plan, _ = plan_with_world_navigation(world, (source_map, (0, 0)), ReachLocation((target_map, (1, 2))), graph=graph)
+        plan, _ = plan_with_world_navigation(
+            world, (source_map, (0, 0)), ReachLocation((target_map, (1, 2))), graph=graph
+        )
 
         self.assertEqual(plan.actions[-1].action_type, NavigationActionType.WARP)
         self.assertEqual(plan.actions[-1].transition_kind, "map_connection")
@@ -639,9 +660,7 @@ class TestWeightedNavigation(unittest.TestCase):
             (Direction.West, (0, 2), (1, 2), (4, 2)),
         )
         tiles = tuple(
-            TileObservation((source_map, (x, y)), False, frozenset(Direction))
-            for y in range(5)
-            for x in range(5)
+            TileObservation((source_map, (x, y)), False, frozenset(Direction)) for y in range(5) for x in range(5)
         )
         for direction, boundary, approach, destination in cases:
             with self.subTest(direction=direction):
@@ -683,12 +702,12 @@ class TestWeightedNavigation(unittest.TestCase):
             required_facing=Direction.North,
         )
         tiles = tuple(
-            TileObservation((source_map, (x, y)), False, frozenset(Direction))
-            for y in range(5)
-            for x in range(6)
+            TileObservation((source_map, (x, y)), False, frozenset(Direction)) for y in range(5) for x in range(6)
         )
         world = NavigationWorld(
-            tiles={tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles},
+            tiles={
+                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles
+            },
             transitions=(connection,),
         )
         graph = WorldMapGraph((edge(source_map, target_map, boundary, destination, kind="connection"),))
@@ -720,7 +739,9 @@ class TestWeightedNavigation(unittest.TestCase):
             for x in range(20)
         )
         world = NavigationWorld(
-            tiles={tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles},
+            tiles={
+                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles
+            },
             transitions=(connection,),
         )
         graph = WorldMapGraph((edge(source_map, target_map, boundary, destination, kind="connection"),))
@@ -757,7 +778,9 @@ class TestWeightedNavigation(unittest.TestCase):
             for x in range(5)
         )
         world = NavigationWorld(
-            tiles={tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles},
+            tiles={
+                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles
+            },
             warps=(house,),
             transitions=(house, connection),
             facing=Direction.South,
@@ -801,7 +824,9 @@ class TestWeightedNavigation(unittest.TestCase):
             required_facing=Direction.North,
         )
         world = NavigationWorld(
-            tiles={tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles},
+            tiles={
+                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles
+            },
             transitions=(connection,),
         )
         graph = WorldMapGraph((edge(source_map, target_map, boundary[1], (2, 4), kind="connection"),))
@@ -879,12 +904,12 @@ class TestWeightedNavigation(unittest.TestCase):
         entry = (source_map, (2, 2))
         warp = WarpObservation(entry, (target_map, (1, 3)), activation=WarpActivation.STEP_ON)
         tiles = tuple(
-            TileObservation((source_map, (x, y)), False, frozenset(Direction))
-            for y in range(5)
-            for x in range(5)
+            TileObservation((source_map, (x, y)), False, frozenset(Direction)) for y in range(5) for x in range(5)
         )
         world = NavigationWorld(
-            tiles={tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles},
+            tiles={
+                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles
+            },
             warps=(warp,),
             facing=Direction.North,
         )

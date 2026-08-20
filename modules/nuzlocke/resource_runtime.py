@@ -43,7 +43,9 @@ def observe_resource_snapshot() -> ResourceSnapshot:
 
 def party_is_restored() -> bool:
     party = get_party()
-    return bool(party) and all(p.current_hp == p.total_hp and p.status_condition.value == "none" for p in party if not p.is_egg)
+    return bool(party) and all(
+        p.current_hp == p.total_hp and p.status_condition.value == "none" for p in party if not p.is_egg
+    )
 
 
 def observe_route_recovery() -> RouteRecovery:

@@ -139,7 +139,11 @@ def assess_campaign_resources(
 
     item = _useful_item(snapshot, route)
     pc_item = next(
-        (item for item in snapshot.pc_healing_items if item.quantity > 0 and item.heal_amount >= snapshot.total_missing_hp),
+        (
+            item
+            for item in snapshot.pc_healing_items
+            if item.quantity > 0 and item.heal_amount >= snapshot.total_missing_hp
+        ),
         None,
     )
     if item is None and pc_item is not None and route.pc_accessible and (route.pc_acquisition_cost or 0) <= 2:
@@ -155,5 +159,7 @@ def assess_campaign_resources(
     return ResourceDecision.PRESERVE_RESOURCES
 
 
-def assess_wild_encounter(objective: ResourceObjective, snapshot: ResourceSnapshot, route: RouteRecovery) -> ResourceDecision:
+def assess_wild_encounter(
+    objective: ResourceObjective, snapshot: ResourceSnapshot, route: RouteRecovery
+) -> ResourceDecision:
     return assess_campaign_resources(objective, snapshot, route, wild_encounter=True)

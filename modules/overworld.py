@@ -37,6 +37,7 @@ class WorldTransition:
     crossing, while a warp is an entry-tile transition.  ``destination=None``
     is an unresolved dynamic transition, never an inferred destination.
     """
+
     entry: Location
     destination: Location | None
     required_facing: Direction | None = None
@@ -53,12 +54,14 @@ class WorldTransition:
 @dataclass(frozen=True)
 class WarpObservation(WorldTransition):
     """Compatibility name for ordinary ROM warp observations."""
+
     kind: str = "warp"
 
 
 @dataclass(frozen=True)
 class MapConnectionObservation(WorldTransition):
     """A boundary crossing derived from a ROM MapConnection."""
+
     kind: str = "map_connection"
 
 
@@ -475,18 +478,17 @@ def perceive_overworld() -> OverworldObservation:
                 movement_type=getattr(object_event.object_event_template, "movement_type", None),
                 movement_action=object_event.movement_action,
                 script_controlled=any(
-                    flag in object_event.flags
-                    for flag in ("heldMovementActive", "singleMovementActive", "frozen")
+                    flag in object_event.flags for flag in ("heldMovementActive", "singleMovementActive", "frozen")
                 ),
                 visibility_flag_id=getattr(object_event.object_event_template, "flag_id", 0) or None,
                 trainer_type=object_event.trainer_type,
                 trainer_range=(
-                    object_event.object_event_template.trainer_range
-                    if object_event.trainer_type != "None" else None
+                    object_event.object_event_template.trainer_range if object_event.trainer_type != "None" else None
                 ),
                 trainer_defeated=(
                     object_event.object_event_template.is_trainer_defeated
-                    if object_event.trainer_type != "None" else None
+                    if object_event.trainer_type != "None"
+                    else None
                 ),
             )
             for object_event in get_map_objects()
@@ -517,12 +519,14 @@ def perceive_overworld() -> OverworldObservation:
             and player_tile is not None
             and not player_tile.blocked
         )
-        live_triggers.append(replace(
-            trigger,
-            condition_current_value=current_value,
-            condition_active=active,
-            currently_actionable=actionable,
-        ))
+        live_triggers.append(
+            replace(
+                trigger,
+                condition_current_value=current_value,
+                condition_active=active,
+                currently_actionable=actionable,
+            )
+        )
     triggers = live_triggers
 
     # Object templates/scripts are the reliable data available for NPC

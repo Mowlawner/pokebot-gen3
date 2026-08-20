@@ -225,9 +225,11 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
         cache = {}
         with patch.object(capabilities, "perceive_overworld", return_value=world), patch.object(
             capabilities, "AgentControlLoop", side_effect=fake_constructor
-        ), patch.object(capabilities, "_observed_exit_goal", return_value=ReachWarp(
-            destination_map=(1, 0), destination=((1, 0), (8, 2)), warp=world.warps[0]
-        )):
+        ), patch.object(
+            capabilities,
+            "_observed_exit_goal",
+            return_value=ReachWarp(destination_map=(1, 0), destination=((1, 0), (8, 2)), warp=world.warps[0]),
+        ):
             progression = capabilities.observation_driven_overworld_progression(
                 semantic_target=target, execution_cache=cache
             )

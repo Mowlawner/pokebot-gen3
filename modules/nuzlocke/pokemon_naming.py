@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Literal
 
-
 POKEMON_NICKNAME_MAX_LENGTH = 10
 PokemonGender = Literal["male", "female", None]
 

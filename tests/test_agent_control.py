@@ -91,7 +91,9 @@ class AgentActionSelectionTests(TestCase):
             facing=Direction.East,
             controllable=True,
             tiles=tuple(
-                TileObservation((MAP, coordinate), False, frozenset(Direction), warp=warp if coordinate == (1, 0) else None)
+                TileObservation(
+                    (MAP, coordinate), False, frozenset(Direction), warp=warp if coordinate == (1, 0) else None
+                )
                 for coordinate in ((0, 0), (1, 0))
             ),
             warps=(warp,),
@@ -106,18 +108,27 @@ class AgentActionSelectionTests(TestCase):
         self.assertEqual(decision.action.action_type, AgentActionType.NAVIGATE_TOWARD_GOAL)
         self.assertEqual(decision.action.navigation.action_type, NavigationActionType.MOVE)
         self.assertEqual(decision.action.direction, Direction.East)
-        self.assertIn("global route unavailable; using observed local transition", decision.goal_evaluation.world_diagnostics)
+        self.assertIn(
+            "global route unavailable; using observed local transition", decision.goal_evaluation.world_diagnostics
+        )
 
     def test_arrival_at_directional_observed_warp_emits_activation_input(self):
         destination = (("destination", 0), (10, 19))
         warp = WarpObservation(
-            (MAP, (1, 0)), destination, required_facing=Direction.East,
+            (MAP, (1, 0)),
+            destination,
+            required_facing=Direction.East,
             activation=WarpActivation.DIRECTIONAL_STEP,
         )
         world = OverworldObservation(
-            MAP, (1, 0), Direction.East, True,
+            MAP,
+            (1, 0),
+            Direction.East,
+            True,
             (TileObservation((MAP, (1, 0)), False, frozenset(Direction), warp=warp),),
-            (warp,), (), (),
+            (warp,),
+            (),
+            (),
         )
         goal = ReachWarp(destination_map=destination[0], destination=destination, warp=warp)
         with patch("modules.navigation.get_world_map_graph", return_value=WorldMapGraph(())):
@@ -131,21 +142,38 @@ class AgentActionSelectionTests(TestCase):
     def test_local_directional_warp_requires_reobserved_activation_and_destination(self):
         destination = (("destination", 0), (10, 19))
         warp = WarpObservation(
-            (MAP, (1, 0)), destination, required_facing=Direction.East,
+            (MAP, (1, 0)),
+            destination,
+            required_facing=Direction.East,
             activation=WarpActivation.DIRECTIONAL_STEP,
         )
 
         def source_world(coordinates):
             return OverworldObservation(
-                MAP, coordinates, Direction.East, True,
-                tuple(TileObservation((MAP, coordinate), False, frozenset(Direction), warp=warp if coordinate == (1, 0) else None)
-                      for coordinate in ((0, 0), (1, 0))),
-                (warp,), (), (),
+                MAP,
+                coordinates,
+                Direction.East,
+                True,
+                tuple(
+                    TileObservation(
+                        (MAP, coordinate), False, frozenset(Direction), warp=warp if coordinate == (1, 0) else None
+                    )
+                    for coordinate in ((0, 0), (1, 0))
+                ),
+                (warp,),
+                (),
+                (),
             )
 
         target_world = OverworldObservation(
-            destination[0], destination[1], Direction.South, True,
-            (TileObservation(destination, False, frozenset(Direction)),), (), (), (),
+            destination[0],
+            destination[1],
+            Direction.South,
+            True,
+            (TileObservation(destination, False, frozenset(Direction)),),
+            (),
+            (),
+            (),
         )
         observations = iter((source_world((0, 0)), source_world((1, 0)), target_world))
         goal = ReachWarp(destination_map=destination[0], destination=destination, warp=warp)
@@ -174,13 +202,20 @@ class AgentActionSelectionTests(TestCase):
     def test_failed_local_directional_activation_is_not_repeated_forever(self):
         destination = (("destination", 0), (10, 19))
         warp = WarpObservation(
-            (MAP, (1, 0)), destination, required_facing=Direction.East,
+            (MAP, (1, 0)),
+            destination,
+            required_facing=Direction.East,
             activation=WarpActivation.DIRECTIONAL_STEP,
         )
         world = OverworldObservation(
-            MAP, (1, 0), Direction.East, True,
+            MAP,
+            (1, 0),
+            Direction.East,
+            True,
             (TileObservation((MAP, (1, 0)), False, frozenset(Direction), warp=warp),),
-            (warp,), (), (),
+            (warp,),
+            (),
+            (),
         )
         goal = ReachWarp(destination_map=destination[0], destination=destination, warp=warp)
         observations = iter((world,) * 12)

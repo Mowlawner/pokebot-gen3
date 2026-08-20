@@ -49,9 +49,9 @@ class CampaignObservationMigrationTests(unittest.TestCase):
         ):
             with self.subTest(objective_id=objective_id):
                 with (
-                patch("modules.nuzlocke.emerald_capabilities.context", fake_context),
-                patch("modules.nuzlocke.emerald_capabilities._emerald_observation", return_value=wait),
-                patch("modules.modes.opening.EmeraldOpeningCapability") as legacy,
+                    patch("modules.nuzlocke.emerald_capabilities.context", fake_context),
+                    patch("modules.nuzlocke.emerald_capabilities._emerald_observation", return_value=wait),
+                    patch("modules.modes.opening.EmeraldOpeningCapability") as legacy,
                 ):
                     execution = emerald_campaign_capability(objective_id)
                     next(execution)

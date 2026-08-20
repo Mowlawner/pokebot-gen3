@@ -1251,8 +1251,10 @@ class AgentControlLoop:
                     self._warp_wait_observations = 0
                     self._invalidate_plan(reason)
                     wait_action = AgentAction(AgentActionType.WAIT_REOBSERVE, reason=reason)
-                    return observation, ActionDecision(wait_action), ActionResult(
-                        ActionResultType.UNREACHABLE, wait_action, reason
+                    return (
+                        observation,
+                        ActionDecision(wait_action),
+                        ActionResult(ActionResultType.UNREACHABLE, wait_action, reason),
                     )
                 trace = getattr(context, "stutter_trace", None)
                 if trace is not None:
@@ -1301,8 +1303,10 @@ class AgentControlLoop:
                     GoalStatus.UNREACHABLE,
                     reason=blocked_action.reason,
                 )
-                return observation, ActionDecision(blocked_action, blocked_evaluation), ActionResult(
-                    ActionResultType.UNREACHABLE, blocked_action, blocked_action.reason
+                return (
+                    observation,
+                    ActionDecision(blocked_action, blocked_evaluation),
+                    ActionResult(ActionResultType.UNREACHABLE, blocked_action, blocked_action.reason),
                 )
 
         # Diagnostic-only snapshotting happens after transition handling and
@@ -1528,8 +1532,7 @@ class AgentControlLoop:
             transition_kind = decision.action.navigation.transition_kind or "warp"
             transition_label = transition_kind.upper()
             self._report(
-                f"WORLD: transition_ready={transition_label} "
-                f"source_position={decision.action.navigation.source!r}"
+                f"WORLD: transition_ready={transition_label} " f"source_position={decision.action.navigation.source!r}"
             )
             self._report(f"WORLD: required_facing={decision.action.direction.name!r}")
             self._report(

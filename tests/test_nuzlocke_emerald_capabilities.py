@@ -80,9 +80,7 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             patch("modules.nuzlocke.emerald_capabilities.player_avatar_is_controllable", return_value=False),
             patch("modules.nuzlocke.emerald_capabilities.get_tasks", return_value=(SimpleNamespace(),)),
         ):
-            action = choose_emerald_campaign_action(
-                self.observation(OpeningSequenceState.MAIN_MENU, fast=False)
-            )
+            action = choose_emerald_campaign_action(self.observation(OpeningSequenceState.MAIN_MENU, fast=False))
         self.assertIs(action, EmeraldCampaignAction.ENTER_OPTIONS)
 
     def test_immediate_states_take_priority_over_campaign_menu_action(self):
@@ -143,9 +141,7 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
     def test_observed_ui_interrupt_abandons_overworld_transaction(self):
         from modules.nuzlocke.emerald_capabilities import observation_driven_overworld_progression
 
-        with patch(
-            "modules.nuzlocke.emerald_capabilities.perceive_overworld"
-        ) as perceive_overworld:
+        with patch("modules.nuzlocke.emerald_capabilities.perceive_overworld") as perceive_overworld:
             progression = observation_driven_overworld_progression(lambda: True)
             next(progression)
 
@@ -206,10 +202,16 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         second = WarpObservation(((25, 40), (4, 2)), destination, required_facing=Direction.East)
         third = WarpObservation(((25, 40), (4, 3)), destination, required_facing=Direction.East)
         world = OverworldObservation(
-            source[0], source[1], Direction.East, True,
-            tuple(TileObservation(((25, 40), (x, y)), False, frozenset(Direction))
-                  for x, y in ((4, 1), (4, 2), (4, 3))),
-            (first, second, third), (), (),
+            source[0],
+            source[1],
+            Direction.East,
+            True,
+            tuple(
+                TileObservation(((25, 40), (x, y)), False, frozenset(Direction)) for x, y in ((4, 1), (4, 2), (4, 3))
+            ),
+            (first, second, third),
+            (),
+            (),
         )
         navigator = GoalAwareNavigator(NavigationWorld.from_overworld(world))
         goal = _observed_exit_goal(world, navigator)
@@ -233,10 +235,17 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         cheap_unrelated = WarpObservation((source_map, (2, 8)), ((1, 1), (0, 0)))
         expensive_relevant = WarpObservation((source_map, (8, 1)), ((9, 9), (0, 0)))
         world = OverworldObservation(
-            source_map, (2, 7), Direction.South, True,
-            tuple(TileObservation((source_map, coordinate), False, frozenset(Direction))
-                  for coordinate in ((2, 7), (2, 8), (8, 1))),
-            (cheap_unrelated, expensive_relevant), (), (),
+            source_map,
+            (2, 7),
+            Direction.South,
+            True,
+            tuple(
+                TileObservation((source_map, coordinate), False, frozenset(Direction))
+                for coordinate in ((2, 7), (2, 8), (8, 1))
+            ),
+            (cheap_unrelated, expensive_relevant),
+            (),
+            (),
         )
         navigator = Mock()
         navigator.plan.side_effect = lambda start, goal, algorithm: SimpleNamespace(
@@ -267,18 +276,25 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         staircase = WarpObservation((house_1f, (2, 2)), (house_2f, (2, 7)))
         door = WarpObservation((house_1f, (2, 8)), (outside, (10, 5)))
         world = OverworldObservation(
-            house_1f, (2, 7), Direction.South, True,
+            house_1f,
+            (2, 7),
+            Direction.South,
+            True,
             tuple(
                 TileObservation((house_1f, coordinate), False, frozenset(Direction))
                 for coordinate in ((2, 7), (2, 8), (2, 2))
             ),
-            (staircase, door), (), (),
+            (staircase, door),
+            (),
+            (),
         )
-        graph = WorldMapGraph((
-            WorldEdge(house_1f, house_2f, "warp", ((2, 2),), ((2, 7),)),
-            WorldEdge(house_1f, outside, "warp", ((2, 8),), ((10, 5),)),
-            WorldEdge(outside, house_1f, "warp", ((10, 5),), ((2, 8),)),
-        ))
+        graph = WorldMapGraph(
+            (
+                WorldEdge(house_1f, house_2f, "warp", ((2, 2),), ((2, 7),)),
+                WorldEdge(house_1f, outside, "warp", ((2, 8),), ((10, 5),)),
+                WorldEdge(outside, house_1f, "warp", ((10, 5),), ((2, 8),)),
+            )
+        )
         navigator = Mock()
         navigator.plan.side_effect = lambda start, goal, algorithm: SimpleNamespace(
             metrics=SimpleNamespace(
@@ -303,25 +319,39 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         locally_blocked = WarpObservation((source, (2, 8)), ((1, 1), (0, 0)))
         locally_reachable = WarpObservation((source, (8, 1)), ((9, 9), (0, 0)))
         world = OverworldObservation(
-            source, (2, 7), Direction.South, True,
-            tuple(TileObservation((source, coordinate), False, frozenset(Direction))
-                  for coordinate in ((2, 7), (2, 8), (8, 1))),
-            (locally_blocked, locally_reachable), (), (),
+            source,
+            (2, 7),
+            Direction.South,
+            True,
+            tuple(
+                TileObservation((source, coordinate), False, frozenset(Direction))
+                for coordinate in ((2, 7), (2, 8), (8, 1))
+            ),
+            (locally_blocked, locally_reachable),
+            (),
+            (),
         )
         navigator = Mock()
+
         def plan(_start, goal, algorithm):
             if goal.warp is locally_blocked:
                 raise NavigationError("local route unavailable")
-            return SimpleNamespace(metrics=SimpleNamespace(
-                encounter_opportunities=0, total_route_cost=5, movement_actions=5
-            ))
+            return SimpleNamespace(
+                metrics=SimpleNamespace(encounter_opportunities=0, total_route_cost=5, movement_actions=5)
+            )
+
         navigator.plan.side_effect = plan
         target = SemanticTarget.map((9, 9))
         with (
-            patch("modules.nuzlocke.emerald_capabilities.classify_transition_relevance", return_value=TransitionRelevance.RELEVANT),
+            patch(
+                "modules.nuzlocke.emerald_capabilities.classify_transition_relevance",
+                return_value=TransitionRelevance.RELEVANT,
+            ),
             patch(
                 "modules.nuzlocke.emerald_capabilities.transition_world_route",
-                side_effect=lambda warp, _target, _graph: WorldRoute((source,), (), 1 if warp is locally_blocked else 20),
+                side_effect=lambda warp, _target, _graph: WorldRoute(
+                    (source,), (), 1 if warp is locally_blocked else 20
+                ),
             ),
         ):
             selected = _observed_exit_goal(world, navigator, target)
@@ -334,10 +364,17 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         source_map = (25, 40)
         warp = WarpObservation((source_map, (2, 8)), ((1, 1), (0, 0)))
         world = OverworldObservation(
-            source_map, (2, 7), Direction.South, True,
-            (TileObservation((source_map, (2, 7)), False, frozenset(Direction)),
-             TileObservation((source_map, (2, 8)), False, frozenset(Direction))),
-            (warp,), (), (),
+            source_map,
+            (2, 7),
+            Direction.South,
+            True,
+            (
+                TileObservation((source_map, (2, 7)), False, frozenset(Direction)),
+                TileObservation((source_map, (2, 8)), False, frozenset(Direction)),
+            ),
+            (warp,),
+            (),
+            (),
         )
         navigator = Mock()
         with patch(
@@ -352,25 +389,25 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         from modules.world_navigation import WorldEdge, WorldMapGraph
 
         source_map, route101 = (0, 9), (0, 16)
-        connection = MapConnectionObservation(
-            (source_map, (3, 3)), (route101, (3, 0)), required_facing=Direction.South
-        )
+        connection = MapConnectionObservation((source_map, (3, 3)), (route101, (3, 0)), required_facing=Direction.South)
         world = OverworldObservation(
-            source_map, (3, 2), Direction.South, True,
+            source_map,
+            (3, 2),
+            Direction.South,
+            True,
             tuple(
                 TileObservation((source_map, coordinate), False, frozenset(Direction))
                 for coordinate in ((3, 2), (3, 3))
             ),
-            (), (), (), transitions=(connection,),
+            (),
+            (),
+            (),
+            transitions=(connection,),
         )
-        graph = WorldMapGraph((
-            WorldEdge(source_map, route101, "connection", ((3, 3),), ((3, 0),)),
-        ))
+        graph = WorldMapGraph((WorldEdge(source_map, route101, "connection", ((3, 3),), ((3, 0),)),))
         navigator = Mock()
         navigator.plan.return_value = SimpleNamespace(
-            metrics=SimpleNamespace(
-                encounter_opportunities=0, total_route_cost=1, movement_actions=1
-            )
+            metrics=SimpleNamespace(encounter_opportunities=0, total_route_cost=1, movement_actions=1)
         )
 
         with patch("modules.navigation.get_world_map_graph", return_value=graph):
@@ -400,10 +437,7 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             (7, 2),
             Direction.North,
             True,
-            tuple(
-                TileObservation((source_map, (x, y)), False, frozenset(Direction))
-                for x, y in ((7, 1), (7, 2))
-            ),
+            tuple(TileObservation((source_map, (x, y)), False, frozenset(Direction)) for x, y in ((7, 1), (7, 2))),
             (ordinary_warp,),
             (),
             (),
@@ -418,18 +452,20 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             return original_plan(start, goal, algorithm=algorithm)
 
         navigator.plan = counted_plan
-        graph = WorldMapGraph((
-            WorldEdge(
-                source_map,
-                target_map,
-                "connection",
-                tuple(connection.entry[1] for connection in connections),
-                tuple(connection.destination[1] for connection in connections),
-                estimated_cost=1,
-            ),
-            WorldEdge(source_map, detour_map, "warp", ((0, 3),), ((0, 0),), estimated_cost=50),
-            WorldEdge(detour_map, target_map, "warp", ((0, 0),), ((0, 0),), estimated_cost=50),
-        ))
+        graph = WorldMapGraph(
+            (
+                WorldEdge(
+                    source_map,
+                    target_map,
+                    "connection",
+                    tuple(connection.entry[1] for connection in connections),
+                    tuple(connection.destination[1] for connection in connections),
+                    estimated_cost=1,
+                ),
+                WorldEdge(source_map, detour_map, "warp", ((0, 3),), ((0, 0),), estimated_cost=50),
+                WorldEdge(detour_map, target_map, "warp", ((0, 0),), ((0, 0),), estimated_cost=50),
+            )
+        )
         with patch("modules.navigation.get_world_map_graph", return_value=graph):
             selected = _observed_exit_goal(world, navigator, SemanticTarget.map(target_map))
 
@@ -443,6 +479,7 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
 
     def test_meet_rival_print_tiles(self):
         from modules.navigation import NavigationWorld
+
         # This test is just for debugging
         # In a real environment, we would use the emulator context
         # But here we can mock the world or inspect the environment
@@ -457,8 +494,14 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             bg_events=(),
         )
         with (
-            patch("modules.nuzlocke.emerald_capabilities._player_house_map", return_value=MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F),
-            patch("modules.nuzlocke.emerald_capabilities._rival_house_map", return_value=MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F),
+            patch(
+                "modules.nuzlocke.emerald_capabilities._player_house_map",
+                return_value=MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F,
+            ),
+            patch(
+                "modules.nuzlocke.emerald_capabilities._rival_house_map",
+                return_value=MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F,
+            ),
             patch("modules.nuzlocke.emerald_capabilities._opening_gender", return_value="female"),
             patch("modules.nuzlocke.emerald_capabilities.get_map_metadata", return_value=metadata),
         ):
@@ -490,12 +533,14 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         route101 = MapRSE.ROUTE101.value
         littleroot = MapRSE.LITTLEROOT_TOWN.value
         lab = MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value
-        graph = WorldMapGraph((
-            WorldEdge(route103, oldale, "connection", ((9, 21),), ((9, 0),), estimated_cost=22),
-            WorldEdge(oldale, route101, "connection", ((9, 19),), ((9, 0),), estimated_cost=20),
-            WorldEdge(route101, littleroot, "connection", ((9, 28),), ((9, 0),), estimated_cost=30),
-            WorldEdge(littleroot, lab, "warp", ((10, 8),), ((6, 7),), estimated_cost=10),
-        ))
+        graph = WorldMapGraph(
+            (
+                WorldEdge(route103, oldale, "connection", ((9, 21),), ((9, 0),), estimated_cost=22),
+                WorldEdge(oldale, route101, "connection", ((9, 19),), ((9, 0),), estimated_cost=20),
+                WorldEdge(route101, littleroot, "connection", ((9, 28),), ((9, 0),), estimated_cost=30),
+                WorldEdge(littleroot, lab, "warp", ((10, 8),), ((6, 7),), estimated_cost=10),
+            )
+        )
 
         self.assertEqual(
             graph.route(route103, lab).maps,
@@ -509,9 +554,7 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         route101_exit = MapConnectionObservation(
             (littleroot, (10, 1)), (route101, (10, 28)), required_facing=Direction.North
         )
-        lab_entry = WarpObservation(
-            (littleroot, (10, 8)), (lab, (6, 7))
-        )
+        lab_entry = WarpObservation((littleroot, (10, 8)), (lab, (6, 7)))
         world = OverworldObservation(
             littleroot,
             (10, 4),
@@ -557,9 +600,7 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         )
 
         self.assertIsNone(
-            _observed_local_destination_goal(
-                world, Mock(), MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value
-            )
+            _observed_local_destination_goal(world, Mock(), MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value)
         )
 
     def test_receive_pokedex_waits_for_rom_owned_lab_event_after_entry(self):
@@ -600,24 +641,28 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         route101 = MapRSE.ROUTE101.value
         littleroot = MapRSE.LITTLEROOT_TOWN.value
         lab = MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value
-        north = MapConnectionObservation(
-            (oldale, (9, 0)), (route103, (9, 21)), required_facing=Direction.North
-        )
-        south = MapConnectionObservation(
-            (oldale, (9, 19)), (route101, (9, 0)), required_facing=Direction.South
-        )
+        north = MapConnectionObservation((oldale, (9, 0)), (route103, (9, 21)), required_facing=Direction.North)
+        south = MapConnectionObservation((oldale, (9, 19)), (route101, (9, 0)), required_facing=Direction.South)
         world = OverworldObservation(
-            oldale, (9, 0), Direction.South, True,
+            oldale,
+            (9, 0),
+            Direction.South,
+            True,
             (TileObservation((oldale, (9, 0)), False, frozenset(Direction)),),
-            (), (), (), transitions=(north, south),
+            (),
+            (),
+            (),
+            transitions=(north, south),
         )
-        graph = WorldMapGraph((
-            WorldEdge(oldale, route103, "connection", ((9, 0),), ((9, 21),), estimated_cost=22),
-            WorldEdge(route103, oldale, "connection", ((9, 21),), ((9, 0),), estimated_cost=22),
-            WorldEdge(oldale, route101, "connection", ((9, 19),), ((9, 0),), estimated_cost=20),
-            WorldEdge(route101, littleroot, "connection", ((9, 28),), ((9, 0),), estimated_cost=30),
-            WorldEdge(littleroot, lab, "warp", ((10, 8),), ((6, 7),), estimated_cost=10),
-        ))
+        graph = WorldMapGraph(
+            (
+                WorldEdge(oldale, route103, "connection", ((9, 0),), ((9, 21),), estimated_cost=22),
+                WorldEdge(route103, oldale, "connection", ((9, 21),), ((9, 0),), estimated_cost=22),
+                WorldEdge(oldale, route101, "connection", ((9, 19),), ((9, 0),), estimated_cost=20),
+                WorldEdge(route101, littleroot, "connection", ((9, 28),), ((9, 0),), estimated_cost=30),
+                WorldEdge(littleroot, lab, "warp", ((10, 8),), ((6, 7),), estimated_cost=10),
+            )
+        )
         navigator = Mock()
         navigator.plan.side_effect = lambda _start, goal, algorithm: SimpleNamespace(
             destination=goal.warp.entry,
@@ -636,13 +681,17 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
     def test_lab_target_selects_oldale_from_route103(self):
         route103 = MapRSE.ROUTE103.value
         oldale = MapRSE.OLDALE_TOWN.value
-        connection = MapConnectionObservation(
-            (route103, (9, 21)), (oldale, (9, 0)), required_facing=Direction.South
-        )
+        connection = MapConnectionObservation((route103, (9, 21)), (oldale, (9, 0)), required_facing=Direction.South)
         world = OverworldObservation(
-            route103, (9, 20), Direction.South, True,
+            route103,
+            (9, 20),
+            Direction.South,
+            True,
             (TileObservation((route103, (9, 20)), False, frozenset(Direction)),),
-            (), (), (), transitions=(connection,),
+            (),
+            (),
+            (),
+            transitions=(connection,),
         )
         navigator = Mock()
         navigator.plan.return_value = SimpleNamespace(
@@ -743,7 +792,9 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             (2, 3),
             Direction.North,
             True,
-            tuple(TileObservation((map_id, coordinate), False, frozenset(Direction)) for coordinate in ((2, 2), (2, 3))),
+            tuple(
+                TileObservation((map_id, coordinate), False, frozenset(Direction)) for coordinate in ((2, 2), (2, 3))
+            ),
             (),
             (),
             (trigger,),
@@ -788,6 +839,7 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             classify_transition_relevance(relevant, None, graph),
             TransitionRelevance.UNKNOWN,
         )
+
 
 class EmeraldCampaignLifecycleTests(unittest.TestCase):
     def observation(
@@ -948,9 +1000,7 @@ class EmeraldCampaignLifecycleTests(unittest.TestCase):
                 "modules.nuzlocke.emerald_capabilities.player_avatar_is_controllable",
                 return_value=True,
             ),
-            patch(
-                "modules.nuzlocke.emerald_capabilities.perceive_overworld"
-            ) as perceive_overworld,
+            patch("modules.nuzlocke.emerald_capabilities.perceive_overworld") as perceive_overworld,
             patch(
                 "modules.nuzlocke.emerald_capabilities._advance_scripted_input",
                 side_effect=lambda: advance_dialogue(),

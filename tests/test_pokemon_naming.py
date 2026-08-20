@@ -41,9 +41,10 @@ class PokemonNamingTests(unittest.TestCase):
 
     def test_gender_aware_names_and_genderless_request(self):
         for gender in ("male", "female", None):
-            with self.subTest(gender=gender), patch(
-                "modules.nuzlocke.pokemon_naming._human_name", return_value="Alex"
-            ) as source:
+            with (
+                self.subTest(gender=gender),
+                patch("modules.nuzlocke.pokemon_naming._human_name", return_value="Alex") as source,
+            ):
                 self.assertEqual(generate_pokemon_nickname("Treecko", gender), "Alex")
                 source.assert_called_once_with(gender)
 
@@ -57,28 +58,40 @@ class PokemonNamingTests(unittest.TestCase):
         prompt = EmeraldConfirmationObservation(
             True, EmeraldConfirmationChoice.YES, True, EmeraldConfirmationContext.POKEMON_NICKNAME
         )
-        action = choose_emerald_observation_action(self.observation(
-            confirmation=prompt, dialogue_actionable=True
-        ))
+        action = choose_emerald_observation_action(self.observation(confirmation=prompt, dialogue_actionable=True))
         self.assertIs(action, EmeraldCampaignAction.CHOOSE_POKEMON_NICKNAME)
 
     def test_nickname_screen_owns_campaign_and_prevents_navigation(self):
         naming = EmeraldNamingObservation(
-            EmeraldNamingTarget.POKEMON_NICKNAME, 3, 0x02010000, True,
-            277, "Treecko", "female", 1234,
+            EmeraldNamingTarget.POKEMON_NICKNAME,
+            3,
+            0x02010000,
+            True,
+            277,
+            "Treecko",
+            "female",
+            1234,
         )
-        action = choose_emerald_observation_action(self.observation(
-            game_state=GameState.NAMING_SCREEN,
-            naming=naming,
-            controllable=True,
-            overworld=SimpleNamespace(),
-        ))
+        action = choose_emerald_observation_action(
+            self.observation(
+                game_state=GameState.NAMING_SCREEN,
+                naming=naming,
+                controllable=True,
+                overworld=SimpleNamespace(),
+            )
+        )
         self.assertIs(action, EmeraldCampaignAction.ENTER_POKEMON_NICKNAME)
 
     def test_nonready_naming_screen_waits(self):
         naming = EmeraldNamingObservation(
-            EmeraldNamingTarget.POKEMON_NICKNAME, 3, 0x02010000, False,
-            277, "Treecko", "male", 1234,
+            EmeraldNamingTarget.POKEMON_NICKNAME,
+            3,
+            0x02010000,
+            False,
+            277,
+            "Treecko",
+            "male",
+            1234,
         )
         self.assertIs(
             choose_emerald_observation_action(self.observation(naming=naming)),
@@ -93,8 +106,11 @@ class PokemonNamingTests(unittest.TestCase):
             nuzlocke_runtime=SimpleNamespace(session_id="nickname"),
         )
         prompt = EmeraldConfirmationObservation(
-            True, EmeraldConfirmationChoice.YES, True,
-            EmeraldConfirmationContext.POKEMON_NICKNAME, "Task_HandleYesNoInput",
+            True,
+            EmeraldConfirmationChoice.YES,
+            True,
+            EmeraldConfirmationContext.POKEMON_NICKNAME,
+            "Task_HandleYesNoInput",
         )
         observed = self.observation(confirmation=prompt)
         with (
@@ -115,8 +131,11 @@ class PokemonNamingTests(unittest.TestCase):
             nuzlocke_runtime=SimpleNamespace(session_id="nickname-retry"),
         )
         prompt = EmeraldConfirmationObservation(
-            True, EmeraldConfirmationChoice.YES, True,
-            EmeraldConfirmationContext.POKEMON_NICKNAME, "Task_HandleYesNoInput",
+            True,
+            EmeraldConfirmationChoice.YES,
+            True,
+            EmeraldConfirmationContext.POKEMON_NICKNAME,
+            "Task_HandleYesNoInput",
         )
         with (
             patch("modules.nuzlocke.emerald_capabilities.context", context),
@@ -142,8 +161,11 @@ class PokemonNamingTests(unittest.TestCase):
             nuzlocke_runtime=SimpleNamespace(session_id="nickname-transition"),
         )
         prompt = EmeraldConfirmationObservation(
-            True, EmeraldConfirmationChoice.YES, True,
-            EmeraldConfirmationContext.POKEMON_NICKNAME, "Task_HandleYesNoInput",
+            True,
+            EmeraldConfirmationChoice.YES,
+            True,
+            EmeraldConfirmationContext.POKEMON_NICKNAME,
+            "Task_HandleYesNoInput",
         )
         transition = self.observation(controllable=True, overworld=SimpleNamespace())
         with (
@@ -163,8 +185,11 @@ class PokemonNamingTests(unittest.TestCase):
 
     def test_unrelated_yes_no_prompt_is_not_claimed(self):
         prompt = EmeraldConfirmationObservation(
-            True, EmeraldConfirmationChoice.YES, True,
-            EmeraldConfirmationContext.UNKNOWN, "Task_HandleYesNoInput",
+            True,
+            EmeraldConfirmationChoice.YES,
+            True,
+            EmeraldConfirmationContext.UNKNOWN,
+            "Task_HandleYesNoInput",
         )
         self.assertIs(
             choose_emerald_observation_action(self.observation(confirmation=prompt)),
@@ -173,7 +198,9 @@ class PokemonNamingTests(unittest.TestCase):
 
     def test_go_see_rival_prompt_chooses_yes(self):
         prompt = EmeraldConfirmationObservation(
-            True, EmeraldConfirmationChoice.YES, True,
+            True,
+            EmeraldConfirmationChoice.YES,
+            True,
             EmeraldConfirmationContext.GO_SEE_RIVAL,
             "Task_HandleYesNoInput",
             script_identity="LittlerootTown_ProfessorBirchsLab_EventScript_GoSeeRival",
@@ -191,7 +218,9 @@ class PokemonNamingTests(unittest.TestCase):
             nuzlocke_runtime=SimpleNamespace(session_id="go-see-rival"),
         )
         prompt = EmeraldConfirmationObservation(
-            True, EmeraldConfirmationChoice.YES, True,
+            True,
+            EmeraldConfirmationChoice.YES,
+            True,
             EmeraldConfirmationContext.GO_SEE_RIVAL,
             "Task_HandleYesNoInput",
             script_identity="LittlerootTown_ProfessorBirchsLab_EventScript_GoSeeRival",
@@ -225,18 +254,13 @@ class PokemonNamingTests(unittest.TestCase):
     def test_go_see_rival_script_allows_dialogue_then_releases(self):
         script = "LittlerootTown_ProfessorBirchsLab_EventScript_GoSeeRival"
         self.assertIs(
-            choose_emerald_observation_action(self.observation(
-                script_stack=(script,), dialogue_actionable=True
-            )),
+            choose_emerald_observation_action(self.observation(script_stack=(script,), dialogue_actionable=True)),
             EmeraldCampaignAction.ADVANCE_DIALOGUE,
         )
         self.assertIs(
-            choose_emerald_observation_action(self.observation(
-                controllable=True, overworld=SimpleNamespace()
-            )),
+            choose_emerald_observation_action(self.observation(controllable=True, overworld=SimpleNamespace())),
             EmeraldCampaignAction.ADVANCE_OBSERVED_OVERWORLD,
         )
-
 
     def test_nickname_debounce_does_not_claim_wall_clock_confirmation(self):
         emulator = SimpleNamespace(press_button=Mock())
@@ -265,8 +289,14 @@ class PokemonNamingTests(unittest.TestCase):
             nuzlocke_runtime=SimpleNamespace(session_id="nickname"),
         )
         naming = EmeraldNamingObservation(
-            EmeraldNamingTarget.POKEMON_NICKNAME, 3, 0x02010000, True,
-            277, "Treecko", "female", 1234,
+            EmeraldNamingTarget.POKEMON_NICKNAME,
+            3,
+            0x02010000,
+            True,
+            277,
+            "Treecko",
+            "female",
+            1234,
         )
         observed = self.observation(game_state=GameState.NAMING_SCREEN, naming=naming)
         keyboard_steps = Mock()

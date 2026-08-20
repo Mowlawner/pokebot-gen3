@@ -1528,9 +1528,7 @@ class EmeraldOpeningCapability(BotMode):
             if current is not origin:
                 return
             state = self._dialogue_state_snapshot()
-            if self._dialogue_detection(
-                current, state
-            )[0]:
+            if self._dialogue_detection(current, state)[0]:
                 return
             try:
                 next(transaction)
@@ -2129,12 +2127,14 @@ class EmeraldOpeningCapability(BotMode):
             elif self._truck_can_use_exit(diagnostics):
                 self._last_truck_navigation_target = (MapRSE.INSIDE_OF_TRUCK.value, (4, 1))
                 self._last_truck_decision = "navigate: ROM truck exit tile (4,1); await game warp"
-                yield from self._run_navigation_transaction(navigate_to(
-                    MapRSE.INSIDE_OF_TRUCK.value,
-                    (4, 1),
-                    avoid_scripted_events=False,
-                    expecting_script=True,
-                ))
+                yield from self._run_navigation_transaction(
+                    navigate_to(
+                        MapRSE.INSIDE_OF_TRUCK.value,
+                        (4, 1),
+                        avoid_scripted_events=False,
+                        expecting_script=True,
+                    )
+                )
             else:
                 self._last_truck_decision = "wait: truck script/task or transitional state"
                 yield
@@ -2341,11 +2341,13 @@ class EmeraldOpeningCapability(BotMode):
                 navigation_target=interaction_coordinates,
                 decision=self._last_truck_decision,
             )
-            yield from self._run_navigation_transaction(navigate_to(
-                rival_2f,
-                interaction_coordinates,
-                avoid_scripted_events=False,
-            ))
+            yield from self._run_navigation_transaction(
+                navigate_to(
+                    rival_2f,
+                    interaction_coordinates,
+                    avoid_scripted_events=False,
+                )
+            )
             yield from self._run_preemptible_transaction(ensure_facing_direction(interaction_facing))
             _report_opening_a_decision(
                 source="EmeraldOpeningMode._advance_phase:May Poké Ball interaction",
@@ -2384,10 +2386,12 @@ class EmeraldOpeningCapability(BotMode):
                         reason="Rival event complete; descend from 2F",
                         navigation_target=rival_1f.value,
                     )
-                    yield from self._run_navigation_transaction(_warp_to(
-                        rival_1f,
-                        expecting_script=True,
-                    ))
+                    yield from self._run_navigation_transaction(
+                        _warp_to(
+                            rival_1f,
+                            expecting_script=True,
+                        )
+                    )
                 else:
                     self._report_may_sequence_state(
                         observed,
@@ -2432,13 +2436,15 @@ class EmeraldOpeningCapability(BotMode):
                     navigation_target=(10, 6),
                     decision="navigate: Route 101 entrance",
                 )
-                yield from self._run_navigation_transaction(navigate_to(
-                    MapRSE.ROUTE101,
-                    (10, 6),
-                    avoid_encounters=False,
-                    avoid_scripted_events=False,
-                    expecting_script=True,
-                ))
+                yield from self._run_navigation_transaction(
+                    navigate_to(
+                        MapRSE.ROUTE101,
+                        (10, 6),
+                        avoid_encounters=False,
+                        avoid_scripted_events=False,
+                        expecting_script=True,
+                    )
+                )
                 return
             # Only apply the Route 101 arrival-event gate after the player is
             # actually on Route 101.  Script/message state must never decide
@@ -2476,13 +2482,15 @@ class EmeraldOpeningCapability(BotMode):
                 navigation_target=starter_target,
                 decision="navigate: canonical starter bag handoff position",
             )
-            yield from self._run_navigation_transaction(navigate_to(
-                MapRSE.ROUTE101,
-                starter_target,
-                avoid_encounters=False,
-                avoid_scripted_events=False,
-                expecting_script=True,
-            ))
+            yield from self._run_navigation_transaction(
+                navigate_to(
+                    MapRSE.ROUTE101,
+                    starter_target,
+                    avoid_encounters=False,
+                    avoid_scripted_events=False,
+                    expecting_script=True,
+                )
+            )
             try:
                 reached_target = get_player_avatar().local_coordinates == starter_target
             except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
@@ -2528,11 +2536,13 @@ class EmeraldOpeningCapability(BotMode):
             return
         coordinates, facing = target
         self._last_truck_decision = f"navigate: Emerald wall clock interaction at {coordinates}"
-        yield from self._run_navigation_transaction(navigate_to(
-            house_map,
-            coordinates,
-            avoid_scripted_events=False,
-        ))
+        yield from self._run_navigation_transaction(
+            navigate_to(
+                house_map,
+                coordinates,
+                avoid_scripted_events=False,
+            )
+        )
         yield from self._run_preemptible_transaction(ensure_facing_direction(facing))
         _report_opening_a_decision(
             source="EmeraldOpeningMode._start_clock_interaction",

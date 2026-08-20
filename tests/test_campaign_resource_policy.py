@@ -13,7 +13,6 @@ from modules.nuzlocke.resource_policy import (
 from modules.nuzlocke.resource_runtime import CampaignCapability
 from unittest.mock import patch
 
-
 IMPORTANT = ResourceObjective(
     "dangerous_trainer",
     readiness=ReadinessImportance.IMPORTANT,
@@ -33,11 +32,17 @@ def test_healthy_party_can_continue_without_immediate_danger():
 
 
 def test_center_on_route_is_preferred_before_important_battle():
-    assert assess_campaign_resources(IMPORTANT, party(18), RouteRecovery(center_available=True, center_on_route=True)) is ResourceDecision.RECOVER_AT_CENTER
+    assert (
+        assess_campaign_resources(IMPORTANT, party(18), RouteRecovery(center_available=True, center_on_route=True))
+        is ResourceDecision.RECOVER_AT_CENTER
+    )
 
 
 def test_damaged_party_uses_center_when_safe_and_available():
-    assert assess_campaign_resources(IMPORTANT, party(6), RouteRecovery(center_available=True, safe_to_reach_center=True)) is ResourceDecision.RECOVER_AT_CENTER
+    assert (
+        assess_campaign_resources(IMPORTANT, party(6), RouteRecovery(center_available=True, safe_to_reach_center=True))
+        is ResourceDecision.RECOVER_AT_CENTER
+    )
 
 
 def test_damaged_party_uses_bag_item_when_center_is_unsafe():
@@ -90,7 +95,10 @@ def test_normal_encounter_policy_does_not_preserve_optional_wild_battle():
 
 
 def test_non_wild_battle_never_becomes_run_decision():
-    assert assess_campaign_resources(IMPORTANT, party(4), RouteRecovery(), wild_encounter=False) is ResourceDecision.PRESERVE_RESOURCES
+    assert (
+        assess_campaign_resources(IMPORTANT, party(4), RouteRecovery(), wild_encounter=False)
+        is ResourceDecision.PRESERVE_RESOURCES
+    )
 
 
 def test_healthy_capability_does_not_resolve_recovery_context():

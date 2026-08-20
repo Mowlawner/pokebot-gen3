@@ -10,7 +10,10 @@ class TestPlayerControllability(unittest.TestCase):
 
         with (
             patch("modules.player.get_game_state", return_value=GameState.OVERWORLD),
-            patch("modules.player.get_player_map_object", return_value=types.SimpleNamespace(flags={"heldMovementFinished"})),
+            patch(
+                "modules.player.get_player_map_object",
+                return_value=types.SimpleNamespace(flags={"heldMovementFinished"}),
+            ),
             patch(
                 "modules.player.get_global_script_context",
                 return_value=types.SimpleNamespace(is_active=True, native_function_name="WaitForObjectEvent"),
@@ -24,7 +27,10 @@ class TestPlayerControllability(unittest.TestCase):
 
         with (
             patch("modules.player.get_game_state", return_value=GameState.OVERWORLD),
-            patch("modules.player.get_player_map_object", return_value=types.SimpleNamespace(flags={"heldMovementFinished"})),
+            patch(
+                "modules.player.get_player_map_object",
+                return_value=types.SimpleNamespace(flags={"heldMovementFinished"}),
+            ),
             patch(
                 "modules.player.get_global_script_context",
                 return_value=types.SimpleNamespace(is_active=False, native_function_name="WaitForObjectEvent"),
@@ -38,7 +44,10 @@ class TestPlayerControllability(unittest.TestCase):
 
         with (
             patch("modules.player.get_game_state", return_value=GameState.OVERWORLD),
-            patch("modules.player.get_player_map_object", return_value=types.SimpleNamespace(flags={"heldMovementFinished"})),
+            patch(
+                "modules.player.get_player_map_object",
+                return_value=types.SimpleNamespace(flags={"heldMovementFinished"}),
+            ),
             patch(
                 "modules.player.get_global_script_context",
                 return_value=types.SimpleNamespace(is_active=True, native_function_name="WaitForAorBPress"),
@@ -52,10 +61,14 @@ class TestPlayerControllability(unittest.TestCase):
 
         with (
             patch("modules.player.get_game_state", return_value=GameState.OVERWORLD),
-            patch("modules.player.get_player_map_object", return_value=types.SimpleNamespace(flags={"heldMovementActive"})),
+            patch(
+                "modules.player.get_player_map_object", return_value=types.SimpleNamespace(flags={"heldMovementActive"})
+            ),
             patch(
                 "modules.player.get_global_script_context",
-                return_value=types.SimpleNamespace(is_active=True, native_function_name="IsFreezeSelectedObjectAndPlayerFinished"),
+                return_value=types.SimpleNamespace(
+                    is_active=True, native_function_name="IsFreezeSelectedObjectAndPlayerFinished"
+                ),
             ),
         ):
             self.assertFalse(player_avatar_is_rom_owned_movement())

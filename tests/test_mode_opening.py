@@ -21,7 +21,9 @@ class TestEmeraldOpeningState(unittest.TestCase):
         mode.phase = OpeningSequenceState.BIRCH_HOUSE_2F
         with (
             patch("modules.modes.opening.context", opening_context),
-            patch("modules.modes.opening.get_opening_sequence_state", return_value=OpeningSequenceState.PLAYER_HOUSE_1F),
+            patch(
+                "modules.modes.opening.get_opening_sequence_state", return_value=OpeningSequenceState.PLAYER_HOUSE_1F
+            ),
             patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
             patch.object(
                 mode,
@@ -48,11 +50,21 @@ class TestEmeraldOpeningState(unittest.TestCase):
             inputs.append("Up")
             yield
 
-        with patch(
-            "modules.modes.opening.get_opening_sequence_state",
-            side_effect=[OpeningSequenceState.PLAYER_HOUSE_1F, OpeningSequenceState.PLAYER_HOUSE_1F, OpeningSequenceState.BIRCH_HOUSE_1F],
-        ), patch.object(mode, "_dialogue_state_snapshot", return_value=(False, None, False, None, None, False, True, False, None, (), None, None)), patch.object(
-            mode, "_dialogue_detection", return_value=(False, "no dialogue")
+        with (
+            patch(
+                "modules.modes.opening.get_opening_sequence_state",
+                side_effect=[
+                    OpeningSequenceState.PLAYER_HOUSE_1F,
+                    OpeningSequenceState.PLAYER_HOUSE_1F,
+                    OpeningSequenceState.BIRCH_HOUSE_1F,
+                ],
+            ),
+            patch.object(
+                mode,
+                "_dialogue_state_snapshot",
+                return_value=(False, None, False, None, None, False, True, False, None, (), None, None),
+            ),
+            patch.object(mode, "_dialogue_detection", return_value=(False, "no dialogue")),
         ):
             transaction = mode._run_navigation_transaction(navigation())
             next(transaction)
@@ -363,9 +375,15 @@ class TestEmeraldOpeningState(unittest.TestCase):
             yield
 
         with (
-            patch.object(mode, "_dialogue_state_snapshot", return_value=(False, None, True, "WaitForAorBPress", "Std_MsgboxDefault", True, False, False)),
+            patch.object(
+                mode,
+                "_dialogue_state_snapshot",
+                return_value=(False, None, True, "WaitForAorBPress", "Std_MsgboxDefault", True, False, False),
+            ),
             patch.object(mode, "_dialogue_detection", return_value=(True, "dialogue is actionable")),
-            patch("modules.modes.opening.get_opening_sequence_state", return_value=OpeningSequenceState.PLAYER_HOUSE_1F),
+            patch(
+                "modules.modes.opening.get_opening_sequence_state", return_value=OpeningSequenceState.PLAYER_HOUSE_1F
+            ),
         ):
             list(mode._run_preemptible_transaction(facing()))
 
@@ -1311,7 +1329,20 @@ class TestEmeraldOpeningState(unittest.TestCase):
             patch.object(
                 EmeraldOpeningCapability,
                 "_dialogue_state_snapshot",
-                return_value=(False, None, True, "WaitForAorBPress", "Std_MsgboxDefault", True, True, True, None, (), None, None),
+                return_value=(
+                    False,
+                    None,
+                    True,
+                    "WaitForAorBPress",
+                    "Std_MsgboxDefault",
+                    True,
+                    True,
+                    True,
+                    None,
+                    (),
+                    None,
+                    None,
+                ),
             ),
             patch("modules.modes.opening.is_emerald_field_dialogue_advanceable", return_value=True) as advanceable,
         ):
