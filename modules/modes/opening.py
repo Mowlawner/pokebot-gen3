@@ -914,7 +914,7 @@ def _report_opening_a_decision(
     )
 
 
-def _advance_scripted_input() -> Generator:
+def _advance_scripted_input(field_message_lifecycle_active: bool = False) -> Generator:
     """Advance only when the game reports that an input is currently wanted."""
     global _last_scripted_input_trace
     state = EmeraldOpeningCapability._dialogue_state_snapshot()
@@ -935,7 +935,7 @@ def _advance_scripted_input() -> Generator:
             native_function_name=state[3],
             script_function_name=state[4],
             input_waiting=state[5],
-            field_message_lifecycle_active=state[0],
+            field_message_lifecycle_active=field_message_lifecycle_active or state[0],
         )
         if waiting_for_input:
             waiting_reason = "Emerald field-message lifecycle is advanceable"
@@ -1218,6 +1218,10 @@ class EmeraldOpeningCapability(BotMode):
 
         while context.bot_mode != "Manual":
             observed = get_opening_sequence_state(self._resolved_player_gender)
+            # Compatibility only: execution is rebased from the ROM
+            # observation on every frame.  A prior route phase must never
+            # survive a map/script transition and continue to own input.
+            self.phase = observed
             global _birch_gender_diagnostic_phase, _birch_gender_diagnostic_target
             _birch_gender_diagnostic_phase = observed.name
             _birch_gender_diagnostic_target = self._resolved_player_gender
@@ -1508,6 +1512,35 @@ class EmeraldOpeningCapability(BotMode):
         else:
             self._report_dialogue_handler(observed, "return: no dialogue", state)
         return False
+
+    def _run_preemptible_transaction(self, transaction: Generator) -> Generator:
+        """Run lower-priority work only while its observation remains valid.
+
+        A field message can be in Emerald's script-owned ``WaitForAorBPress``
+        state after the draw task and printer have gone away.  Therefore the
+        transaction must ask the authoritative dialogue predicate every
+        iteration; a separate task/printer heuristic cannot decide whether
+        the predicate is worth consulting.
+        """
+        origin = get_opening_sequence_state(self._resolved_player_gender)
+        while True:
+            current = get_opening_sequence_state(self._resolved_player_gender)
+            if current is not origin:
+                return
+            state = self._dialogue_state_snapshot()
+            if self._dialogue_detection(
+                current, state
+            )[0]:
+                return
+            try:
+                next(transaction)
+            except StopIteration:
+                return
+            yield
+
+    def _run_navigation_transaction(self, transaction: Generator) -> Generator:
+        """Drive navigation until it completes or dialogue preempts it."""
+        yield from self._run_preemptible_transaction(transaction)
 
     def _report_route101_lifecycle(self, observed: OpeningSequenceState) -> None:
         """Report meaningful Route 101 message/control boundaries only."""
@@ -2096,12 +2129,12 @@ class EmeraldOpeningCapability(BotMode):
             elif self._truck_can_use_exit(diagnostics):
                 self._last_truck_navigation_target = (MapRSE.INSIDE_OF_TRUCK.value, (4, 1))
                 self._last_truck_decision = "navigate: ROM truck exit tile (4,1); await game warp"
-                yield from navigate_to(
+                yield from self._run_navigation_transaction(navigate_to(
                     MapRSE.INSIDE_OF_TRUCK.value,
                     (4, 1),
                     avoid_scripted_events=False,
                     expecting_script=True,
-                )
+                ))
             else:
                 self._last_truck_decision = "wait: truck script/task or transitional state"
                 yield
@@ -2121,7 +2154,7 @@ class EmeraldOpeningCapability(BotMode):
                 yield from _advance_scripted_input()
                 return
             else:
-                yield from _warp_to(player_1f)
+                yield from self._run_navigation_transaction(_warp_to(player_1f))
                 self.phase = OpeningSequenceState.PLAYER_HOUSE_1F
                 return
 
@@ -2146,7 +2179,7 @@ class EmeraldOpeningCapability(BotMode):
                             yield
                             return
                         self._last_truck_decision = "navigate: ROM-defined staircase warp back to player's house 1F"
-                        yield from _warp_to(destination)
+                        yield from self._run_navigation_transaction(_warp_to(destination))
                         return
                     self._last_truck_decision = f"wait: house warp to {destination.name}; observed map={observed_map}"
                     yield
@@ -2167,7 +2200,7 @@ class EmeraldOpeningCapability(BotMode):
                     return
                 self._pending_house_warp_destination = player_2f
                 self._last_truck_decision = "navigate: ROM-defined staircase warp to player's house 2F"
-                yield from _warp_to(player_2f)
+                yield from self._run_navigation_transaction(_warp_to(player_2f))
                 return
             if observed == OpeningSequenceState.PLAYER_HOUSE_2F:
                 if get_event_flag("SET_WALL_CLOCK"):
@@ -2175,18 +2208,30 @@ class EmeraldOpeningCapability(BotMode):
                     # walking to it lets the map/path system handle the warp.
                     self._pending_house_warp_destination = player_1f
                     self._last_truck_decision = "navigate: ROM-defined staircase warp back to player's house 1F"
-                    yield from _warp_to(player_1f)
+                    yield from self._run_navigation_transaction(_warp_to(player_1f))
                 else:
                     self.phase = OpeningSequenceState.PLAYER_HOUSE_2F
             elif get_event_flag("SET_WALL_CLOCK") and observed == OpeningSequenceState.PLAYER_HOUSE_1F:
                 self._pending_house_warp_destination = MapRSE.LITTLEROOT_TOWN
                 self._last_truck_decision = "navigate: leave player's house after setting clock"
-                yield from _warp_to(MapRSE.LITTLEROOT_TOWN)
+                yield from self._run_navigation_transaction(_warp_to(MapRSE.LITTLEROOT_TOWN))
             else:
                 yield from _advance_scripted_input()
             return
 
         if self.phase is OpeningSequenceState.PLAYER_HOUSE_2F:
+            # A capability can be mounted after CampaignProgression advances
+            # the objective, while the player is still visibly on the same
+            # second-floor map.  The map alone is not evidence that the ROM's
+            # wall-clock objective is still pending: SET_WALL_CLOCK is the
+            # authoritative campaign fact.  Re-entering CLOCK_SETTING here
+            # would claim ownership before the controller-wide dialogue
+            # handler can service the post-clock message.
+            if get_event_flag("SET_WALL_CLOCK"):
+                self.phase = OpeningSequenceState.PLAYER_HOUSE_1F
+                self._last_truck_decision = "complete: wall clock already set; resume post-clock house progression"
+                yield
+                return
             self.phase = OpeningSequenceState.CLOCK_SETTING
             self._clock_interaction_started = False
             yield from self._start_clock_interaction()
@@ -2216,7 +2261,7 @@ class EmeraldOpeningCapability(BotMode):
                 # The rival's house starts a ROM-owned arrival event as the
                 # warp completes.  Accept that expected interruption so the
                 # generic dialogue handler can service it on the next frame.
-                yield from _warp_to(rival_1f, expecting_script=True)
+                yield from self._run_navigation_transaction(_warp_to(rival_1f, expecting_script=True))
                 self.phase = OpeningSequenceState.BIRCH_HOUSE_1F
             return
 
@@ -2244,7 +2289,7 @@ class EmeraldOpeningCapability(BotMode):
                 self._last_truck_decision = "wait: Birch's house arrival event"
                 yield
                 return
-            yield from _warp_to(rival_2f)
+            yield from self._run_navigation_transaction(_warp_to(rival_2f))
             self.phase = OpeningSequenceState.BIRCH_HOUSE_2F
             return
 
@@ -2296,12 +2341,12 @@ class EmeraldOpeningCapability(BotMode):
                 navigation_target=interaction_coordinates,
                 decision=self._last_truck_decision,
             )
-            yield from navigate_to(
+            yield from self._run_navigation_transaction(navigate_to(
                 rival_2f,
                 interaction_coordinates,
                 avoid_scripted_events=False,
-            )
-            yield from ensure_facing_direction(interaction_facing)
+            ))
+            yield from self._run_preemptible_transaction(ensure_facing_direction(interaction_facing))
             _report_opening_a_decision(
                 source="EmeraldOpeningMode._advance_phase:May Poké Ball interaction",
                 reason="navigation and facing completed at the interaction target",
@@ -2339,10 +2384,10 @@ class EmeraldOpeningCapability(BotMode):
                         reason="Rival event complete; descend from 2F",
                         navigation_target=rival_1f.value,
                     )
-                    yield from _warp_to(
+                    yield from self._run_navigation_transaction(_warp_to(
                         rival_1f,
                         expecting_script=True,
-                    )
+                    ))
                 else:
                     self._report_may_sequence_state(
                         observed,
@@ -2350,7 +2395,7 @@ class EmeraldOpeningCapability(BotMode):
                         reason="Rival event complete; leave May's house",
                         navigation_target=MapRSE.LITTLEROOT_TOWN.value,
                     )
-                    yield from _warp_to(MapRSE.LITTLEROOT_TOWN, expecting_script=True)
+                    yield from self._run_navigation_transaction(_warp_to(MapRSE.LITTLEROOT_TOWN, expecting_script=True))
                     self.phase = OpeningSequenceState.ROUTE_101
             else:
                 self._report_may_sequence_state(
@@ -2387,13 +2432,13 @@ class EmeraldOpeningCapability(BotMode):
                     navigation_target=(10, 6),
                     decision="navigate: Route 101 entrance",
                 )
-                yield from navigate_to(
+                yield from self._run_navigation_transaction(navigate_to(
                     MapRSE.ROUTE101,
                     (10, 6),
                     avoid_encounters=False,
                     avoid_scripted_events=False,
                     expecting_script=True,
-                )
+                ))
                 return
             # Only apply the Route 101 arrival-event gate after the player is
             # actually on Route 101.  Script/message state must never decide
@@ -2431,13 +2476,13 @@ class EmeraldOpeningCapability(BotMode):
                 navigation_target=starter_target,
                 decision="navigate: canonical starter bag handoff position",
             )
-            yield from navigate_to(
+            yield from self._run_navigation_transaction(navigate_to(
                 MapRSE.ROUTE101,
                 starter_target,
                 avoid_encounters=False,
                 avoid_scripted_events=False,
                 expecting_script=True,
-            )
+            ))
             try:
                 reached_target = get_player_avatar().local_coordinates == starter_target
             except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
@@ -2454,7 +2499,7 @@ class EmeraldOpeningCapability(BotMode):
                 )
                 yield
                 return
-            yield from ensure_facing_direction(starter_bag)
+            yield from self._run_preemptible_transaction(ensure_facing_direction(starter_bag))
             global _starter_handoff_pending
             _starter_handoff_pending = True
             self._report_phase_dispatch(
@@ -2483,12 +2528,12 @@ class EmeraldOpeningCapability(BotMode):
             return
         coordinates, facing = target
         self._last_truck_decision = f"navigate: Emerald wall clock interaction at {coordinates}"
-        yield from navigate_to(
+        yield from self._run_navigation_transaction(navigate_to(
             house_map,
             coordinates,
             avoid_scripted_events=False,
-        )
-        yield from ensure_facing_direction(facing)
+        ))
+        yield from self._run_preemptible_transaction(ensure_facing_direction(facing))
         _report_opening_a_decision(
             source="EmeraldOpeningMode._start_clock_interaction",
             reason="navigation and facing completed at the wall clock",

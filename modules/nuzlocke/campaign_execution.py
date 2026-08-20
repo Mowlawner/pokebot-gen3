@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Iterator
 
-from modules.goals import ActivateTrigger, Goal, ReachLocation, ReachWarp, EARLY_POKEBALL_TRIGGER_ID
+from modules.goals import ActivateTrigger, Goal, ReachWarp, EARLY_POKEBALL_TRIGGER_ID
 from modules.map_data import MapRSE
 
 from .campaign_objectives import CampaignObjective, ObjectiveSelection, ObjectiveStatus
@@ -100,12 +100,15 @@ class CampaignExecutionAdapter:
                     "complete_intro_rival has no valid introductory rival goal",
                     objective.execution_id,
                 )
+            from .resource_runtime import CampaignCapability
+
             return CampaignExecutionResult(
                 objective,
                 CampaignExecutionStatus.READY,
                 "translated to the existing introductory rival tactical goal",
                 objective.execution_id,
                 goal,
+                capability=CampaignCapability(objective.objective_id, objective.resource_policy, goal),
             )
 
         if objective.objective_id in {
@@ -121,18 +124,11 @@ class CampaignExecutionAdapter:
             # a live Emerald objective is actually mounted.
             from .emerald_capabilities import emerald_campaign_capability
 
-            tactical_goal = None
-            if objective.objective_id == "receive_pokedex":
-                # Preserve the proven Birch-lab navigation request as a
-                # diagnostic/tactical hint while the capability owns the
-                # complete interaction and authoritative completion.
-                tactical_goal = ReachLocation(((1, 4), (6, 4)))
             return CampaignExecutionResult(
                 objective,
                 CampaignExecutionStatus.READY,
-                f"mounted Emerald capability for {objective.objective_id}",
+                f"mounted observation-driven Emerald executor for {objective.objective_id}",
                 objective.execution_id,
-                tactical_goal=tactical_goal,
                 capability=lambda: emerald_campaign_capability(objective.objective_id),
             )
 

@@ -730,6 +730,14 @@ class LibmgbaEmulator:
         """
         Runs the emulation for a single frame, and then waits if necessary to hit the target FPS rate.
         """
+        try:
+            from modules.player import player_avatar_is_controllable
+
+            if not player_avatar_is_controllable():
+                for direction in ("Up", "Down", "Left", "Right"):
+                    self.release_button(direction)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
         fresh_inputs = self._fresh_input_pending
         applied_inputs = (self._pressed_inputs | self._held_inputs) & ~fresh_inputs
         if fresh_inputs:

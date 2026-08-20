@@ -83,6 +83,7 @@ class CampaignFacts:
     intro_rival_battle_complete: Fact[bool]
     pokedex_received: Fact[bool]
     pokeballs_available: Fact[bool]
+    pokeballs_ready: Fact[bool]
     nuzlocke_started: Fact[bool]
 
     def __getitem__(self, name: str) -> Fact[bool]:
@@ -118,7 +119,9 @@ def derive_campaign_facts(
     setup = Fact.known(intro.value >= 3) if intro.is_known else Fact(None, intro.status)
     rival_met = Fact.known(rival.value >= 3) if rival.is_known else Fact(None, rival.status)
     starter = (
-        Fact.known(lab.value >= 2 and pokemon_get.value)
+        # State 2 is the ROM-owned lab nickname/rival prompt sequence. Keep
+        # obtain_starter active until that script sets state 3 and releases.
+        Fact.known(lab.value >= 3 and pokemon_get.value)
         if lab.is_known and pokemon_get.is_known
         else Fact(None, lab.status if lab.status is not FactStatus.KNOWN else pokemon_get.status)
     )
@@ -131,6 +134,11 @@ def derive_campaign_facts(
         if inventory.is_known
         else Fact(None, inventory.status)
     )
+    ready = (
+        Fact.known(balls.value and lab.value >= 5)
+        if balls.is_known and lab.is_known
+        else Fact(None, balls.status if balls.status is not FactStatus.KNOWN else lab.status)
+    )
     return CampaignFacts(
         text_speed,
         setup,
@@ -141,6 +149,7 @@ def derive_campaign_facts(
         _flag(observation.flags, "DEFEATED_RIVAL_ROUTE103", available),
         pokedex,
         balls,
+        ready,
         nuzlocke_started,
     )
 

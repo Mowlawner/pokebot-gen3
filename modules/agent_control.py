@@ -115,7 +115,10 @@ def prewarm_warp_destination(
         or navigation.action_type is not NavigationActionType.WARP
         or observation.overworld is None
         or navigation.source[0] != observation.overworld.map_id
-        or not any(warp.destination == navigation.destination for warp in observation.overworld.warps)
+        or not any(
+            transition.destination == navigation.destination
+            for transition in (observation.overworld.transitions or observation.overworld.warps)
+        )
     ):
         return False
     trace = getattr(context, "stutter_trace", None)
@@ -500,6 +503,27 @@ class ActionResult:
 
 
 @dataclass
+class _PendingTransition:
+    """Execution state for a selected cross-map action.
+
+    This is deliberately controller-local.  Planning still chooses the
+    action, but while the ROM is resolving it that choice remains
+    authoritative and is not fed back through the planner each frame.
+    """
+
+    action: NavigationAction
+    source: tuple[tuple[int, int], tuple[int, int]]
+    activation_position: tuple[tuple[int, int], tuple[int, int]]
+    direction: Direction
+    destination: tuple[tuple[int, int], tuple[int, int]] | None
+    transition_kind: str
+    observations: int = 0
+    moved: bool = False
+    input_issued: bool = False
+    last_position: tuple[tuple[int, int], tuple[int, int]] | None = None
+
+
+@dataclass
 class _MovementBatch:
     """A bounded suffix of a cached plan being driven frame-by-frame.
 
@@ -611,6 +635,7 @@ class AgentControlLoop:
             ]
             | None
         ) = None
+        self._pending_transition: _PendingTransition | None = None
         self._warp_settling = False
         self._warp_wait_observations = 0
         self._blocked_warp: WarpObservation | None = None
@@ -784,6 +809,24 @@ class AgentControlLoop:
 
     def _report(self, message: str) -> None:
         self._logger(f"AGENT_{message}")
+
+    @staticmethod
+    def _release_transition_input(pending: _PendingTransition) -> None:
+        """Release only the direction sustained by a terminal transition."""
+        release_button = getattr(context.emulator, "release_button", None)
+        if callable(release_button):
+            release_button(pending.direction.button_name)
+
+    def dispose(self) -> None:
+        """Release controller-owned transition input at a lifecycle boundary."""
+        pending = self._pending_transition
+        if pending is None:
+            return
+        # Clear ownership before calling the adapter so disposal is
+        # idempotent even if adapter cleanup re-enters controller teardown.
+        self._pending_transition = None
+        self._expected_world_transition = None
+        self._release_transition_input(pending)
 
     def _diagnostics_enabled(self) -> bool:
         return self._custom_logger or (context.debug and getattr(context, "debug_trace", False))
@@ -1128,6 +1171,13 @@ class AgentControlLoop:
             observation = replace(observation, goal=self._goal)
 
         interaction_type = observation.interaction_type
+        if observation.overworld is not None and not observation.overworld.controllable:
+            # ROM/script movement owns the avatar now.  Do not let a bot-held
+            # direction bleed into the first frames after control returns.
+            release_button = getattr(context.emulator, "release_button", None)
+            if callable(release_button):
+                for direction in Direction:
+                    release_button(direction.button_name)
         if self._dialogue_input_in_flight:
             if not observation.interaction.field_message_lifecycle_active:
                 self._dialogue_input_in_flight = False
@@ -1150,74 +1200,80 @@ class AgentControlLoop:
             self._last_interaction_type = interaction_type
         self._battle_was_active = interaction_type is InteractionType.BATTLE
 
-        if observation.overworld is not None and self._expected_world_transition is not None:
-            expected_source, expected_destination = self._expected_world_transition
-            observed_map = observation.overworld.map_id
-            if observed_map == expected_destination[0]:
-                self._report(
-                    f"WARP_TRANSITION: map_changed=True map={observed_map!r}"
-                    f" position={observation.overworld.player_coordinates!r}"
-                )
-                self._report(f"WORLD: warp_destination_confirmed={observed_map!r}")
+        pending = self._pending_transition
+        if observation.overworld is not None and pending is not None:
+            observed = (observation.overworld.map_id, observation.overworld.player_coordinates)
+            destination_map = pending.destination[0] if pending.destination is not None else None
+            if destination_map is not None and observation.overworld.map_id == destination_map:
+                self._report("TRANSITION: destination_observed")
+                self._release_transition_input(pending)
                 self._expected_world_transition = None
-                self._last_world_transition_source = expected_source
+                self._pending_transition = None
+                self._last_world_transition_source = pending.source
                 trace = getattr(context, "stutter_trace", None)
                 if trace is not None:
                     trace.mark("map_changed_event", True)
+                    trace.mark("transition_state", "destination_observed")
                 self._warp_wait_observations = 0
                 self._invalidate_plan("warp_destination_confirmed")
                 self._warp_settling = True
-            elif observed_map != expected_source[0]:
-                # A map transition happened, but not the one predicted by the
-                # static route.  Clear the expectation so the next decision
-                # recomputes from the observed map.
-                self._report(
-                    f"WORLD: destination_mismatch=True"
-                    f" expected={expected_destination[0]!r} observed={observed_map!r}"
-                )
+            elif observed[0] != pending.source[0] and destination_map is None:
+                self._report("TRANSITION: destination_observed destination_unknown=True")
+                self._release_transition_input(pending)
+                self._pending_transition = None
                 self._expected_world_transition = None
-                self._warp_settling = False
+                self._invalidate_plan("transition_destination_observed")
+                self._warp_settling = True
+            elif observed[0] != pending.source[0]:
+                self._report(
+                    f"TRANSITION: blocked destination_mismatch expected={destination_map!r}"
+                    f" observed={observed[0]!r}"
+                )
+                self._release_transition_input(pending)
+                self._pending_transition = None
+                self._expected_world_transition = None
                 self._invalidate_plan("warp_destination_mismatch")
             elif interaction_type is InteractionType.OVERWORLD:
-                self._warp_wait_observations += 1
-                if self._warp_wait_observations > 8:
-                    failed_warp = self._goal.warp if isinstance(self._goal, ReachWarp) else None
-                    self._blocked_warp = failed_warp
+                if pending.last_position is not None and observed != pending.last_position:
+                    pending.moved = True
+                    pending.observations = 0
+                    self._report("TRANSITION: player_moved_while_pending")
+                else:
+                    pending.observations += 1
+                pending.last_position = observed
+                if pending.observations > 8:
+                    reason = "transition_blocked" if pending.moved is False else "transition_timeout"
+                    self._report(f"TRANSITION: {reason}")
+                    self._blocked_warp = self._goal.warp if isinstance(self._goal, ReachWarp) else None
+                    self._release_transition_input(pending)
+                    self._pending_transition = None
                     self._expected_world_transition = None
                     self._warp_wait_observations = 0
-                    self._invalidate_plan("warp_activation_not_observed")
-                    wait_action = AgentAction(
-                        AgentActionType.WAIT_REOBSERVE,
-                        reason="observed warp activation failed; waiting for a changed affordance",
+                    self._invalidate_plan(reason)
+                    wait_action = AgentAction(AgentActionType.WAIT_REOBSERVE, reason=reason)
+                    return observation, ActionDecision(wait_action), ActionResult(
+                        ActionResultType.UNREACHABLE, wait_action, reason
                     )
-                    wait_decision = ActionDecision(wait_action)
-                    wait_result = ActionResult(
-                        ActionResultType.UNREACHABLE,
-                        wait_action,
-                        wait_action.reason,
-                    )
-                    return observation, wait_decision, wait_result
-                if self._warp_wait_observations <= 3 or self._warp_wait_observations % 10 == 0:
-                    try:
-                        emulator_frame = context.emulator.get_frame_count()
-                    except (AttributeError, RuntimeError, TypeError):
-                        emulator_frame = None
-                    self._report(
-                        f"WARP_WAIT: observation={self._warp_wait_observations}"
-                        f" frame={emulator_frame!r} map={observation.overworld.map_id!r}"
-                        f" position={observation.overworld.player_coordinates!r}"
-                        f" facing={getattr(observation.overworld.facing, 'name', None)!r}"
-                        f" movement_state={getattr(observation.overworld.movement_state, 'name', None)!r}"
-                        f" controllable={observation.overworld.controllable!r}"
-                        f" expected_map={expected_destination[0]!r}"
-                    )
+                trace = getattr(context, "stutter_trace", None)
+                if trace is not None:
+                    trace.mark("transition_state", "player_moved" if pending.moved else "pending")
+                # A fresh pulse is used only for dispatch.  Holding/ordinary
+                # presses here lets directional activations remain sustained.
+                hold_button = getattr(context.emulator, "hold_button", None)
+                if callable(hold_button):
+                    hold_button(pending.direction.button_name)
+                else:
+                    # Adapters without a held-button API can still provide a
+                    # non-fresh directional event; importantly, never emit a
+                    # fresh pulse for this unchanged pending transition.
+                    context.emulator.press_button(pending.direction.button_name)
+                self._report("TRANSITION: input_continuing")
                 wait_action = AgentAction(
                     AgentActionType.WAIT_REOBSERVE,
-                    reason=f"awaiting warp destination {expected_destination[0]!r}",
+                    reason="transition pending; destination not yet observed",
                 )
                 wait_decision = ActionDecision(wait_action)
-                wait_result = self._executor.execute(wait_action, observation)
-                return observation, wait_decision, wait_result
+                return observation, wait_decision, self._executor.execute(wait_action, observation)
 
         if self._warp_settling and interaction_type is InteractionType.OVERWORLD and observation.overworld is not None:
             if not observation.overworld.controllable:
@@ -1469,16 +1525,37 @@ class AgentControlLoop:
             and decision.action.navigation is not None
             and decision.action.navigation.action_type is NavigationActionType.WARP
         ):
-            self._report(f"WORLD: warp_ready=True source_position={decision.action.navigation.source!r}")
+            transition_kind = decision.action.navigation.transition_kind or "warp"
+            transition_label = transition_kind.upper()
+            self._report(
+                f"WORLD: transition_ready={transition_label} "
+                f"source_position={decision.action.navigation.source!r}"
+            )
             self._report(f"WORLD: required_facing={decision.action.direction.name!r}")
-            self._report(f"ACTION: warp_activation direction={decision.action.direction.name!r}")
+            self._report(
+                f"ACTION: transition_activation kind={transition_label} "
+                f"direction={decision.action.direction.name!r}"
+            )
             self._expected_world_transition = (
                 decision.action.navigation.source,
                 decision.action.navigation.destination,
             )
+            self._pending_transition = _PendingTransition(
+                action=decision.action.navigation,
+                source=decision.action.navigation.source,
+                activation_position=decision.action.navigation.source,
+                direction=decision.action.direction,
+                destination=decision.action.navigation.destination,
+                transition_kind=transition_kind,
+                input_issued=True,
+                last_position=(observation.overworld.map_id, observation.overworld.player_coordinates),
+            )
             self._warp_wait_observations = 0
+            trace = getattr(context, "stutter_trace", None)
+            if trace is not None:
+                trace.mark("transition_state", "input_issued")
             self._report(
-                f"WARP_DISPATCH: direction={decision.action.direction.name!r}"
+                f"TRANSITION_DISPATCH: kind={transition_label} direction={decision.action.direction.name!r}"
                 f" source={decision.action.navigation.source!r}"
                 f" expected_destination={decision.action.navigation.destination!r}"
                 f" movement_state={getattr(observation.overworld.movement_state, 'name', None)!r}"
@@ -1493,13 +1570,22 @@ class AgentControlLoop:
         return observation, decision, result
 
     def run(self) -> Generator:
-        while True:
-            if self._movement_batch is not None:
-                # The batch owns only the current emulator frame.  If it ends
-                # or is interrupted, immediately return to the normal loop on
-                # the next iteration so existing handlers process the cause.
-                if self._advance_movement_batch():
-                    yield
-                    continue
-            self.step()
-            yield
+        try:
+            while True:
+                if self._movement_batch is not None:
+                    # The batch owns only the current emulator frame.  If it ends
+                    # or is interrupted, immediately return to the normal loop on
+                    # the next iteration so existing handlers process the cause.
+                    if self._advance_movement_batch():
+                        yield
+                        continue
+                _, _, result = self.step()
+                if result.result_type in (
+                    ActionResultType.GOAL_COMPLETE,
+                    ActionResultType.UNREACHABLE,
+                    ActionResultType.UNSUPPORTED,
+                ):
+                    return
+                yield
+        finally:
+            self.dispose()

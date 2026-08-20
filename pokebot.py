@@ -53,6 +53,7 @@ class StartupSettings:
     stutter_trace: bool = False
     stutter_threshold_ms: float = 50.0
     no_save_state: bool = False
+    profile_source: str = "unknown"
 
 
 def directory_arg(value: str) -> pathlib.Path:
@@ -158,8 +159,10 @@ def parse_arguments(bot_mode_names: list[str]) -> StartupSettings:
     args = parser.parse_args()
 
     preselected_profile: Profile | None = None
+    profile_source = "unknown"
     if args.profile and profile_directory_exists(args.profile):
         preselected_profile = load_profile_by_name(args.profile)
+        profile_source = "CLI"
 
     return StartupSettings(
         profile=preselected_profile,
@@ -178,6 +181,7 @@ def parse_arguments(bot_mode_names: list[str]) -> StartupSettings:
         stutter_trace=bool(args.stutter_trace),
         stutter_threshold_ms=float(args.stutter_threshold_ms),
         no_save_state=bool(args.no_save_state),
+        profile_source=profile_source,
     )
 
 

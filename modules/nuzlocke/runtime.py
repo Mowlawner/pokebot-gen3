@@ -13,6 +13,7 @@ from uuid import uuid4
 from typing import TYPE_CHECKING
 
 from .events import Event, NuzlockeEventObserver, NuzlockeStarted
+from .policy import EventSink, EventStatistics, PersistenceClass, classify_event
 from .snapshots import NuzlockeSnapshot, get_nuzlocke_snapshot
 from .projection import CampaignProjection
 from .rules import NuzlockeRulesProjection
@@ -27,11 +28,13 @@ class NuzlockeRuntime:
     def __init__(
         self,
         snapshot_provider: Callable[[], NuzlockeSnapshot] = get_nuzlocke_snapshot,
-        event_sink: Callable[[Event, str], None] | None = None,
+        event_sink: EventSink | None = None,
+        diagnostic_sink: EventSink | None = None,
         session_id: str | None = None,
     ) -> None:
         self._snapshot_provider = snapshot_provider
         self._event_sink = event_sink
+        self._diagnostic_sink = diagnostic_sink
         self._session_id = session_id or str(uuid4())
         self._event_sequence = 0
         self._observer = NuzlockeEventObserver()
@@ -40,6 +43,7 @@ class NuzlockeRuntime:
         self._last_frame: int | None = None
         self._campaign_projection = CampaignProjection()
         self._rules_projection = NuzlockeRulesProjection(encounters_active=False)
+        self._event_statistics = EventStatistics()
 
     @property
     def observed_projection(self) -> CampaignProjection:
@@ -82,12 +86,20 @@ class NuzlockeRuntime:
             self._event_sequence += 1
             self._campaign_projection.apply(event, session_id=self._session_id, sequence=self._event_sequence)
             self._rules_projection.apply(event, sequence=self._event_sequence)
-            if self._event_sink is not None:
+            persistence_class = classify_event(event)
+            self._event_statistics.record(event, persistence_class)
+            if persistence_class is PersistenceClass.DURABLE and self._event_sink is not None:
                 self._event_sink(event, self._session_id)
+            elif persistence_class is PersistenceClass.DIAGNOSTIC and self._diagnostic_sink is not None:
+                self._diagnostic_sink(event, self._session_id)
             for subscriber in tuple(self._subscribers):
                 subscriber(event)
         self._events.extend(events)
         return events
+
+    def event_statistics(self) -> dict[str, dict[str, int]]:
+        """Return generated-event counts grouped by persistence class/type."""
+        return self._event_statistics.snapshot()
 
     @property
     def session_id(self) -> str:
@@ -120,6 +132,7 @@ class NuzlockeRuntime:
         self._rules_projection.apply(event, sequence=self._event_sequence)
         if self._event_sink is not None:
             self._event_sink(event, self._session_id)
+        self._event_statistics.record(event, PersistenceClass.DURABLE)
         for subscriber in tuple(self._subscribers):
             subscriber(event)
         self._events.append(event)

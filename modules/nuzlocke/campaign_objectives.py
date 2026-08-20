@@ -15,6 +15,7 @@ from modules.goals import Goal, ReachWarp, early_pokeball_goal, introductory_riv
 from modules.map_data import MapRSE
 
 from .campaign_state import CampaignState, Fact, FactStatus, RunStatus
+from .resource_policy import EncounterPolicy, ReadinessImportance, ResourceObjective
 
 
 class ObjectiveStatus(Enum):
@@ -46,6 +47,7 @@ class CampaignObjective:
     failure: CampaignPredicate | None = None
     execution_id: str | None = None
     tactical_target: Goal | None = None
+    resource_policy: ResourceObjective | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +185,13 @@ def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
             completion=campaign_fact("intro_rival_battle_complete"),
             execution_id="intro_rival",
             tactical_target=introductory_rival_goal(),
+            resource_policy=ResourceObjective(
+                "complete_intro_rival",
+                readiness=ReadinessImportance.IMPORTANT,
+                encounters=EncounterPolicy.PRESERVE,
+                mandatory_battle=True,
+                recover_before_completion=True,
+            ),
         ),
         CampaignObjective(
             objective_id="receive_pokedex",
@@ -195,7 +204,7 @@ def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
             objective_id="receive_pokeballs",
             description="Receive Poké Balls",
             prerequisites=(campaign_fact("pokedex_received"),),
-            completion=campaign_fact("pokeballs_available"),
+            completion=campaign_fact("pokeballs_ready"),
             execution_id="receive_pokeballs",
             tactical_target=early_pokeball_goal(),
         ),

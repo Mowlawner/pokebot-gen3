@@ -39,7 +39,7 @@ class CampaignFactsTests(unittest.TestCase):
         variables = (
             NamedVariable("LITTLEROOT_INTRO_STATE", 3),
             NamedVariable("LITTLEROOT_RIVAL_STATE", 3),
-            NamedVariable("BIRCH_LAB_STATE", 2),
+            NamedVariable("BIRCH_LAB_STATE", 3),
         )
         facts = self.state(flags=flags, variables=variables, balls=5).campaign_facts
         self.assertTrue(
@@ -59,11 +59,33 @@ class CampaignFactsTests(unittest.TestCase):
             )
         )
         self.assertFalse(facts.nuzlocke_started.value)
+        self.assertFalse(facts.pokeballs_ready.value)
+
+    def test_starter_remains_incomplete_during_lab_nickname_sequence(self):
+        facts = self.state(
+            flags=(NamedFlag("SYS_POKEMON_GET", True),),
+            variables=(NamedVariable("BIRCH_LAB_STATE", 2),),
+        ).campaign_facts
+        self.assertFalse(facts.starter_obtained.value)
+
+    def test_pokedex_completion_accepts_either_authoritative_rom_flag(self):
+        for flag_name in ("RECEIVED_POKEDEX_FROM_BIRCH", "SYS_POKEDEX_GET"):
+            flags = tuple(
+                NamedFlag(name, name == flag_name)
+                for name in ("RECEIVED_POKEDEX_FROM_BIRCH", "SYS_POKEDEX_GET")
+            )
+            facts = self.state(flags=flags).campaign_facts
+            self.assertTrue(facts.pokedex_received.value, flag_name)
 
     def test_unknown_observation_is_not_false(self):
         facts = self.state(available=False).campaign_facts
         self.assertEqual(facts.wall_clock_set.status, FactStatus.UNAVAILABLE)
         self.assertEqual(facts.rival_met.status, FactStatus.UNAVAILABLE)
+
+    def test_fresh_initialized_save_observes_clock_as_not_set(self):
+        facts = self.state(flags=(NamedFlag("SET_WALL_CLOCK", False),)).campaign_facts
+        self.assertEqual(facts.wall_clock_set.status, FactStatus.KNOWN)
+        self.assertFalse(facts.wall_clock_set.value)
 
     def test_selector_is_ordered_and_does_not_recurse(self):
         state = self.state(

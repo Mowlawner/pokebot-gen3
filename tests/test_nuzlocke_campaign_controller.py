@@ -156,6 +156,32 @@ class CampaignControllerTests(unittest.TestCase):
         self.assertEqual(state.status, CampaignControllerStatus.READY)
         self.assertIn("capability boundary", state.reason)
 
+    def test_failed_capability_is_cleared_and_can_be_rebuilt(self):
+        objective = self.fixture.objective("recoverable", self.fixture.predicate("complete", False))
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "ready")
+        attempts = []
+
+        def capability():
+            attempts.append(len(attempts))
+            if len(attempts) == 1:
+                raise RuntimeError("temporary recovery lookup failure")
+            yield
+
+        execution = CampaignExecutionResult(
+            objective, CampaignExecutionStatus.READY, "capability", capability=capability
+        )
+        controller = CampaignController(
+            lambda: self.current,
+            selector=lambda _: selection,
+            adapter=lambda _: execution,
+        )
+        first = controller.step()
+        self.assertEqual(first.status, CampaignControllerStatus.UNKNOWN)
+        self.assertIsNone(controller._tactical_loop)
+        second = controller.step()
+        self.assertEqual(second.status, CampaignControllerStatus.READY)
+        self.assertEqual(attempts, [0, 1])
+
     def test_completion_clears_goal_before_unsupported_next_objective(self):
         controller = self.controller()
         controller.refresh()

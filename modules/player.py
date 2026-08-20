@@ -24,7 +24,7 @@ from modules.memory import (
 from modules.pokemon import Item, get_item_by_index
 from modules.state_cache import state_cache
 from modules.profiler import count as profile_count, now as profile_now, timing as profile_timing
-from modules.tasks import task_is_active
+from modules.tasks import get_global_script_context, task_is_active
 
 
 # https://github.com/pret/pokeemerald/blob/104e81b359d287668cee613f6604020a6e7228a3/include/global.fieldmap.h
@@ -320,6 +320,39 @@ def player_avatar_is_controllable() -> bool:
         return False
 
     return True
+
+
+def player_avatar_is_rom_owned_movement() -> bool:
+    """Whether Emerald is currently driving the avatar through a script.
+
+    ``Controllable`` is intentionally not used here.  Emerald can expose that
+    bit while a script is between movement commands, even though the script's
+    movement sequence still owns the frame.  The object-event held-movement
+    flags identify the movement machinery, and the active script context
+    distinguishes it from an ordinary player input transaction.
+    """
+    try:
+        if get_game_state() != GameState.OVERWORLD:
+            return False
+        player_map_object = get_player_map_object()
+        if player_map_object is None:
+            return False
+        flags = player_map_object.flags
+        if "heldMovementActive" not in flags and "heldMovementFinished" not in flags:
+            return False
+        script_context = get_global_script_context()
+        if script_context is None or not script_context.is_active:
+            return False
+        # Object-event movement bits can survive the final movement frame.
+        # The script native is the authoritative ownership signal: ordinary
+        # object movement waits use one of these natives, while message
+        # cleanup and player-controlled frames use different natives.
+        return script_context.native_function_name in {
+            "WaitForObjectEvent",
+            "WaitForMovementFinish",
+        }
+    except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+        return False
 
 
 def player_avatar_is_standing_still() -> bool:

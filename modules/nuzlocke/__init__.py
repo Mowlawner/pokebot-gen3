@@ -21,6 +21,8 @@ from .snapshots import (
 from .identity import PokemonIdentity
 from .events import NuzlockeStarted, PokemonCaptured, PokemonStorageLocation, StorageChanged
 from .runtime import NuzlockeRuntime
+from .policy import EventStatistics, PersistenceClass, classify_event
+from .diagnostics import BoundedEventTrace
 from .persistence import (
     EventStoreCorruptionError,
     EventStoreError,
@@ -61,6 +63,18 @@ from .campaign_execution import (
     adapt_campaign_execution,
 )
 from .campaign_controller import CampaignController, CampaignControllerState, CampaignControllerStatus
+from .resource_policy import (
+    EncounterPolicy,
+    HealingResource,
+    PartyResource,
+    ReadinessImportance,
+    ResourceDecision,
+    ResourceObjective,
+    ResourceSnapshot,
+    RouteRecovery,
+    assess_campaign_resources,
+    assess_wild_encounter,
+)
 
 __all__ = [
     "BattleSnapshot",
@@ -85,6 +99,10 @@ __all__ = [
     "NuzlockeStarted",
     "get_nuzlocke_snapshot",
     "NuzlockeRuntime",
+    "PersistenceClass",
+    "EventStatistics",
+    "classify_event",
+    "BoundedEventTrace",
     "EventStoreError",
     "EventStoreCorruptionError",
     "JsonEventStore",

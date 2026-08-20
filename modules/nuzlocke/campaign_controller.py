@@ -181,6 +181,13 @@ class CampaignController:
                 ),
                 CampaignControllerStatus.FAILED,
             )
+        except Exception as error:
+            # A failed generator cannot be resumed safely. Clear it and leave
+            # the controller recoverable so a later Campaign-mode entry can
+            # select the current objective and rebuild fresh execution state.
+            self._tactical_loop = None
+            self.status = CampaignControllerStatus.UNKNOWN
+            self.transition_reason = f"tactical execution failed; will re-evaluate: {error}"
         return self.state
 
     def run(self) -> Generator:
