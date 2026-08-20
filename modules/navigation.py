@@ -14,6 +14,7 @@ from modules.goals import (
     ReachInteractionPosition,
     ReachLocation,
     ReachWarp,
+    SemanticTarget,
     EncounterMode,
 )
 from modules.map_path import Direction
@@ -22,6 +23,7 @@ from modules.overworld import (
     Location,
     OverworldObservation,
     TriggerObservation,
+    WorldTransition,
     WarpObservation,
     WarpActivation,
 )
@@ -44,12 +46,65 @@ class NavigationActionType(Enum):
     WARP = auto()
 
 
+class TransitionRelevance(Enum):
+    RELEVANT = auto()
+    IRRELEVANT = auto()
+    UNKNOWN = auto()
+    BLOCKED = auto()
+
+
+def classify_transition_relevance(
+    transition: WorldTransition,
+    target: SemanticTarget | None,
+    graph: WorldMapGraph | None = None,
+    *,
+    currently_reachable: bool | None = None,
+) -> TransitionRelevance:
+    """Classify a world transition before local movement cost is considered."""
+    if currently_reachable is False:
+        return TransitionRelevance.BLOCKED
+    if target is None or target.target_map is None or transition.destination is None:
+        return TransitionRelevance.UNKNOWN
+    destination_map = transition.destination[0]
+    if destination_map == target.target_map:
+        return TransitionRelevance.RELEVANT
+    try:
+        (graph or get_world_map_graph()).route(destination_map, target.target_map)
+    except WorldNavigationError:
+        return TransitionRelevance.IRRELEVANT
+    return TransitionRelevance.RELEVANT
+
+
+def transition_world_route(
+    transition: WorldTransition,
+    target: SemanticTarget | None,
+    graph: WorldMapGraph | None = None,
+) -> WorldRoute | None:
+    """Return the cheapest known route after an observed transition.
+
+    ``None`` is deliberately ambiguous between no semantic target and an
+    unresolved/unreachable transition; callers must retain UNKNOWN for the
+    latter rather than inventing a destination.
+    """
+    if target is None or target.target_map is None or transition.destination is None:
+        return None
+    graph = graph or get_world_map_graph()
+    try:
+        return graph.route(transition.destination[0], target.target_map)
+    except WorldNavigationError:
+        return None
+
+
 @dataclass(frozen=True)
 class NavigationAction:
     action_type: NavigationActionType
     direction: Direction
     source: Location
-    destination: Location
+    # Unknown destinations are valid for runtime transition execution.  The
+    # world planner only emits known destinations today, but the controller
+    # can still retain an observed transition until a map change confirms it.
+    destination: Location | None
+    transition_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +163,7 @@ class NavigationWorld:
     triggers: tuple[TriggerObservation, ...] = ()
     bindings: tuple[BindingResolution, ...] = ()
     facing: Direction | None = None
+    transitions: tuple[WorldTransition, ...] = ()
 
     @classmethod
     @traced("NavigationWorld_construction")
@@ -128,6 +184,7 @@ class NavigationWorld:
             triggers=observation.triggers,
             bindings=observation.bindings,
             facing=observation.facing,
+            transitions=getattr(observation, "transitions", ()) or observation.warps,
         )
 
     def neighbors(self, location: Location) -> tuple[tuple[Direction, Location, bool], ...]:
@@ -142,26 +199,32 @@ class NavigationWorld:
             (Direction.West, (x - 1, y)),
         )
         result: list[tuple[Direction, Location, bool]] = []
+        transitions = self.transitions or self.warps
+        transition_entries = {transition.entry for transition in transitions}
         for direction, coordinate in candidates:
             destination = (location[0], coordinate)
             neighbour = self.tiles.get(destination)
             if (
                 neighbour is not None
                 and not neighbour.blocked
-                and (neighbour.allowed_directions is None or direction in neighbour.allowed_directions)
+                and (
+                    destination in transition_entries
+                    or neighbour.allowed_directions is None
+                    or direction in neighbour.allowed_directions
+                )
             ):
                 result.append((direction, destination, False))
-        for warp in self.warps:
-            if warp.entry == location:
-                result.append((self._warp_direction(location, warp), warp.destination, True))
+        for transition in transitions:
+            if transition.entry == location and transition.destination is not None:
+                result.append((self._warp_direction(location, transition), transition.destination, True))
         return tuple(result)
 
     @staticmethod
-    def _warp_direction(location: Location, warp: WarpObservation) -> Direction:
+    def _warp_direction(location: Location, warp: WorldTransition) -> Direction:
         # Entering a warp is an input in the direction of the destination tile
         # only when the map data supplies one; otherwise any adjacent route can
         # reach the entry and the direction is a stable default.
-        return warp.required_facing or Direction.South
+        return warp.required_facing if warp.required_facing is not None else Direction.South
 
 
 @dataclass(frozen=True)
@@ -235,6 +298,8 @@ def navigation_candidate_key(metrics: NavigationMetrics, encounter_mode: Encount
 
 
 def goal_target_map(world: NavigationWorld, goal: Goal) -> MapId | None:
+    if isinstance(goal, SemanticTarget):
+        return goal.target_map or (goal.location[0] if goal.location else None)
     target = goal.target if isinstance(goal, NavigationGoal) else goal
     if isinstance(target, ReachLocation):
         return target.location[0]
@@ -259,6 +324,50 @@ def _world_edge_direction(edge, fallback: Direction = Direction.South) -> Direct
         except RuntimeError:
             pass
     return fallback
+
+
+def _direction_between(source: tuple[int, int], destination: tuple[int, int]) -> Direction | None:
+    """Return the cardinal input which moves ``source`` onto ``destination``."""
+    dx = destination[0] - source[0]
+    dy = destination[1] - source[1]
+    if (dx, dy) == (0, -1):
+        return Direction.North
+    if (dx, dy) == (1, 0):
+        return Direction.East
+    if (dx, dy) == (0, 1):
+        return Direction.South
+    if (dx, dy) == (-1, 0):
+        return Direction.West
+    return None
+
+
+def map_connection_approach_position(boundary: tuple[int, int], direction: Direction | None) -> tuple[int, int]:
+    """Return the ordinary predecessor of a connection boundary tile.
+
+    A ROM MapConnection describes the edge coordinate at which the field
+    engine accepts the off-map crossing input.  Local A* reaches this adjacent
+    walkable tile; the planner then appends the terminal boundary step and
+    crossing input without making the blocked edge an ordinary search node.
+    """
+    if direction is Direction.North:
+        return boundary[0], boundary[1] + 1
+    if direction is Direction.South:
+        return boundary[0], boundary[1] - 1
+    if direction is Direction.East:
+        return boundary[0] - 1, boundary[1]
+    if direction is Direction.West:
+        return boundary[0] + 1, boundary[1]
+    raise NavigationError("map connection has no crossing direction")
+
+
+def transition_approach_position(transition: WorldTransition) -> Location | None:
+    """Return the walkable predecessor of a map connection boundary."""
+    if transition.kind != "map_connection":
+        return None
+    return (
+        transition.entry[0],
+        map_connection_approach_position(transition.entry[1], transition.required_facing),
+    )
 
 
 @traced("world_map_and_candidate_planning")
@@ -291,6 +400,9 @@ def plan_with_world_navigation(
         for coordinates, source_map in zip(edge.source_coordinates, (edge.source_map,) * len(edge.source_coordinates))
         if source_map == start[0]
     )
+    selected_warp = navigation_goal.target.warp if isinstance(navigation_goal.target, ReachWarp) else None
+    if selected_warp is not None:
+        candidates = tuple(candidate for candidate in candidates if candidate == selected_warp.entry)
     # Map warp records name the tile containing the warp, while the input
     # which activates a normal door warp is the step *onto* that tile.  Find
     # the adjacent activation positions instead of treating the warp tile as
@@ -302,10 +414,13 @@ def plan_with_world_navigation(
     candidate_attempt_count = 0
     best_encounters: int | None = None
     best_route_cost: int | None = None
-    runtime_warps = {
-        warp.entry[1]: warp
-        for warp in world.warps
-        if warp.entry[0] == edge.source_map and warp.destination[0] == edge.destination_map
+    runtime_transitions = {
+        transition.entry[1]: transition
+        for transition in (world.transitions or world.warps)
+        if transition.entry[0] == edge.source_map
+        and transition.destination is not None
+        and transition.destination[0] == edge.destination_map
+        and (transition.kind == edge.kind or (edge.kind == "connection" and transition.kind == "map_connection"))
     }
     candidate_choices: list[tuple[str, tuple[int, int], tuple[tuple[int, int, Direction | None], ...]]] = []
     for candidate_index, (_, coordinates) in enumerate(candidates):
@@ -315,10 +430,39 @@ def plan_with_world_navigation(
             (coordinates[0], coordinates[1] + 1, Direction.North),
             (coordinates[0] - 1, coordinates[1], Direction.East),
         )
-        warp = runtime_warps.get(coordinates)
-        if warp is not None and warp.activation_locations:
+        warp = runtime_transitions.get(coordinates)
+        # A selected observed warp is stronger evidence than the static edge
+        # metadata.  Keep it available even when the ROM edge has a different
+        # destination coordinate or an unresolved/dynamic representation.
+        if warp is None and selected_warp is not None and selected_warp.entry == (edge.source_map, coordinates):
+            if selected_warp.destination is not None and selected_warp.destination[0] == edge.destination_map:
+                warp = selected_warp
+        if edge.kind == "connection":
+            connection_direction = (
+                warp.required_facing
+                if warp is not None and warp.required_facing is not None
+                else _world_edge_direction(edge)
+            )
+            approach = map_connection_approach_position(coordinates, connection_direction)
+            choices = (
+                (
+                    approach[0],
+                    approach[1],
+                    connection_direction,
+                ),
+            )
+        elif warp is not None and warp.activation_locations:
             choices = tuple(
-                (source[1][0], source[1][1], warp.activation_direction) for source in warp.activation_locations
+                (
+                    source[1][0],
+                    source[1][1],
+                    (
+                        warp.activation_direction
+                        if warp.activation_direction is not None
+                        else _direction_between(source[1], coordinates)
+                    ),
+                )
+                for source in warp.activation_locations
             )
         else:
             choices = activation_candidates if warp is not None else ((coordinates[0], coordinates[1], None),)
@@ -441,7 +585,7 @@ def plan_with_world_navigation(
             and local_plan.metrics is not None
             and local_plan.metrics.final_facing is not activation_direction
         ):
-            runtime_warp = runtime_warps.get(source_coordinates)
+            runtime_warp = runtime_transitions.get(source_coordinates)
             activation_position = (
                 source_coordinates[0]
                 - (activation_direction is Direction.East)
@@ -450,7 +594,11 @@ def plan_with_world_navigation(
                 - (activation_direction is Direction.South)
                 + (activation_direction is Direction.North),
             )
-            turn_location = (start[0], source_coordinates if runtime_warp is not None else activation_position)
+            turn_location = (
+                (start[0], activation_position)
+                if edge.kind == "connection"
+                else (start[0], source_coordinates if runtime_warp is not None else activation_position)
+            )
             actions = local_plan.actions + (
                 NavigationAction(NavigationActionType.TURN, activation_direction, turn_location, turn_location),
             )
@@ -504,8 +652,15 @@ def plan_with_world_navigation(
         )
     destination_index = edge.source_coordinates.index(source_coordinates)
     destination_coordinates = edge.destination_coordinates[destination_index]
-    transition_direction = activation_direction or _world_edge_direction(edge)
-    runtime_warp = runtime_warps.get(source_coordinates)
+    transition_direction = activation_direction if activation_direction is not None else _world_edge_direction(edge)
+    runtime_warp = runtime_transitions.get(source_coordinates)
+    if (
+        runtime_warp is None
+        and selected_warp is not None
+        and selected_warp.entry == (edge.source_map, source_coordinates)
+    ):
+        if selected_warp.destination is not None and selected_warp.destination[0] == edge.destination_map:
+            runtime_warp = selected_warp
     activation_position = None
     if activation_direction is not None:
         activation_position = (
@@ -514,10 +669,28 @@ def plan_with_world_navigation(
             - (activation_direction is Direction.South)
             + (activation_direction is Direction.North),
         )
-    if runtime_warp is not None and (
-        runtime_warp.activation is WarpActivation.DIRECTIONAL_STEP
-        or (runtime_warp.required_facing is not None and not runtime_warp.activation_locations)
-    ):
+    directional_activation = runtime_warp is not None and runtime_warp.activation is WarpActivation.DIRECTIONAL_STEP
+    connection_activation = edge.kind == "connection"
+    if connection_activation and runtime_warp is not None and runtime_warp.required_facing is not None:
+        transition_direction = runtime_warp.required_facing
+    if connection_activation:
+        if activation_position is None or activation_direction is None:
+            raise NavigationError("map connection has no reachable boundary predecessor")
+        # The edge coordinate is the final in-map tile, not the crossing
+        # input's source predecessor.  Keep it outside ordinary A* expansion
+        # (it may be marked blocked), but represent the observed step onto it
+        # explicitly before dispatching the fresh off-map input.
+        boundary_move = NavigationAction(
+            NavigationActionType.MOVE,
+            activation_direction,
+            (start[0], activation_position),
+            (start[0], source_coordinates),
+        )
+        local_plan = NavigationPlan(
+            local_plan.actions + (boundary_move,),
+            (start[0], source_coordinates),
+        )
+    if directional_activation:
         # ROM arrow warps first step onto the warp and then accept the
         # ROM-defined direction as their activation input. Step-on warps,
         # including escalators, activate from the adjacent tile's MOVE.
@@ -534,20 +707,31 @@ def plan_with_world_navigation(
                 ),
                 local_plan.destination,
             )
-        transition_direction = runtime_warp.required_facing
+        transition_direction = (
+            runtime_warp.required_facing
+            if runtime_warp.required_facing is not None
+            else runtime_warp.activation_direction
+        )
+        if transition_direction is None:
+            raise NavigationError("directional warp has no activation direction")
+    elif runtime_warp is not None and runtime_warp.activation is WarpActivation.STEP_ON and not connection_activation:
+        # STEP_ON is the movement onto the entry tile.  The synthetic WARP
+        # action is retained so the executor can verify the map transition,
+        # but its input must be the approach movement, never a graph-edge
+        # facing hint or an arbitrary default direction.
+        if activation_position is None or activation_direction is None:
+            raise NavigationError("step-on warp has no reachable activation side")
+        transition_direction = activation_direction
     transition = NavigationAction(
         NavigationActionType.WARP,
         transition_direction,
         (
             (start[0], source_coordinates)
-            if runtime_warp is not None
-            and (
-                runtime_warp.activation is WarpActivation.DIRECTIONAL_STEP
-                or (runtime_warp.required_facing is not None and not runtime_warp.activation_locations)
-            )
+            if directional_activation or connection_activation
             else (start[0], activation_position or source_coordinates)
         ),
         (edge.destination_map, destination_coordinates),
+        transition_kind="map_connection" if edge.kind == "connection" else edge.kind,
     )
     actions = local_plan.actions + (transition,)
     return (
@@ -556,6 +740,80 @@ def plan_with_world_navigation(
         ),
         route,
     )
+
+
+def plan_observed_warp_locally(
+    world: NavigationWorld,
+    start: Location,
+    goal: ReachWarp,
+) -> NavigationPlan:
+    """Plan to an exact observed warp without consulting the map graph."""
+    selected = goal.warp
+    if selected is None or selected not in (world.transitions or world.warps):
+        raise NavigationError("observed transition is not present in the current perception")
+    if selected.destination is None:
+        raise NavigationError("observed warp destination is unresolved")
+    if goal.destination is not None and selected.destination != goal.destination:
+        raise NavigationError("observed warp destination no longer matches the goal")
+    if goal.destination_map is not None and selected.destination[0] != goal.destination_map:
+        raise NavigationError("observed warp map no longer matches the goal")
+    # ReachWarp's local terminal condition is deliberately the entry/source
+    # state.  For directional-step warps that is not the transition itself:
+    # the ROM consumes one additional directional input while standing on the
+    # entry tile.  The cross-map planner normally appends this action after
+    # its local plan; preserve that contract for the graph-independent path.
+    if selected.kind == "map_connection":
+        direction = selected.required_facing
+        if direction is None:
+            raise NavigationError("map connection has no crossing direction")
+        approach = transition_approach_position(selected)
+        if approach is None:
+            raise NavigationError("map connection has no approach position")
+        if start == selected.entry:
+            local_actions = ()
+        else:
+            local_plan = GoalAwareNavigator(world).plan(start, goal)
+            boundary_move = NavigationAction(
+                NavigationActionType.MOVE,
+                direction,
+                approach,
+                selected.entry,
+            )
+            local_actions = local_plan.actions + (boundary_move,)
+        crossing = NavigationAction(
+            NavigationActionType.WARP,
+            direction,
+            selected.entry,
+            selected.destination,
+            transition_kind="map_connection",
+        )
+        actions = local_actions + (crossing,)
+        return NavigationPlan(
+            actions,
+            selected.entry,
+            GoalAwareNavigator(world)._metrics(actions),
+        )
+    local_plan = GoalAwareNavigator(world).plan(start, goal)
+    if selected.activation is WarpActivation.DIRECTIONAL_STEP:
+        direction = (
+            selected.activation_direction if selected.activation_direction is not None else selected.required_facing
+        )
+        if direction is None:
+            raise NavigationError("directional observed warp has no activation direction")
+        activation_source = selected.entry
+        activation = NavigationAction(
+            NavigationActionType.WARP,
+            direction,
+            activation_source,
+            selected.destination,
+        )
+        actions = local_plan.actions + (activation,)
+        return NavigationPlan(
+            actions,
+            local_plan.destination,
+            GoalAwareNavigator(world)._metrics(actions),
+        )
+    return local_plan
 
 
 def navigation_diagnostics(world: NavigationWorld, start: Location, goal: Goal) -> tuple[str, ...]:
@@ -609,28 +867,31 @@ def navigation_diagnostics(world: NavigationWorld, start: Location, goal: Goal) 
         target_positions = (target.location,)
         target_maps = (target.location[0],)
     elif isinstance(target, ReachWarp):
+        transitions = world.transitions or world.warps
         target_maps = tuple(
             sorted(
                 {
-                    warp.destination[0]
-                    for warp in world.warps
-                    if target.destination_map is None or warp.destination[0] == target.destination_map
+                    transition.destination[0]
+                    for transition in transitions
+                    if transition.destination is not None
+                    if target.destination_map is None or transition.destination[0] == target.destination_map
                 },
                 key=repr,
             )
         )
 
     current_map_goal = bool(target_maps) and set(target_maps) == {start[0]}
-    available_warps = tuple(
+    available_transitions = tuple(
         (
-            warp.entry,
-            warp.destination,
-            warp.required_facing.name if warp.required_facing else None,
-            warp.activation.name,
-            tuple(sorted(warp.activation_locations, key=repr)),
-            warp.activation_direction.name if warp.activation_direction else None,
+            transition.kind,
+            transition.entry,
+            transition.destination,
+            transition.required_facing.name if transition.required_facing else None,
+            transition.activation.name,
+            tuple(sorted(transition.activation_locations, key=repr)),
+            transition.activation_direction.name if transition.activation_direction else None,
         )
-        for warp in world.warps
+        for transition in (world.transitions or world.warps)
     )
     matching_bindings = tuple(
         binding for binding in world.bindings if binding.binding.trigger_id == getattr(target, "trigger_id", None)
@@ -657,7 +918,7 @@ def navigation_diagnostics(world: NavigationWorld, start: Location, goal: Goal) 
         f"target_map={target_maps!r}",
         f"target_positions={target_positions!r}",
         f"current_map_goal={current_map_goal}",
-        f"available_warps={available_warps!r}",
+        f"available_transitions={available_transitions!r}",
         f"candidate_interaction_positions={len(target_positions)}",
         f"status=UNREACHABLE reason={reason}",
     )
@@ -1032,16 +1293,36 @@ class GoalAwareNavigator:
                 for trigger in self.world.triggers
             )
         if isinstance(target, ReachWarp):
+            transitions = self.world.transitions or self.world.warps
             return any(
-                (location in warp.activation_locations if warp.activation_locations else warp.entry == location)
+                (
+                    location == transition_approach_position(warp)
+                    if warp.kind == "map_connection"
+                    else (
+                        location in warp.activation_locations if warp.activation_locations else warp.entry == location
+                    )
+                )
                 and (
-                    (warp.activation_direction is None and warp.required_facing is None)
+                    # A normal step-on warp is activated by the movement
+                    # onto its entry tile.  Its ROM metadata may still carry
+                    # a directional hint (notably stair tiles), but requiring
+                    # that facing after arrival traps the tactical planner in
+                    # repeated TURN actions.  Facing is a terminal condition
+                    # only for warps whose activation is explicitly a second,
+                    # directional input or whose observed source specifies an
+                    # activation direction.
+                    (warp.activation is not WarpActivation.DIRECTIONAL_STEP and warp.activation_direction is None)
                     or facing is None
-                    or (warp.activation_direction or warp.required_facing) is facing
+                    or (
+                        (warp.activation_direction if warp.activation_direction is not None else warp.required_facing)
+                        is facing
+                    )
                 )
                 and (target.destination is None or warp.destination == target.destination)
                 and (target.destination_map is None or warp.destination[0] == target.destination_map)
-                for warp in self.world.warps
+                and (target.warp is None or warp == target.warp)
+                and (not target.warps or warp in target.warps)
+                for warp in transitions
             )
         raise TypeError(f"Unsupported goal type: {type(target).__name__}")
 

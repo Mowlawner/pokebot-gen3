@@ -65,6 +65,7 @@ class BotContext:
         self.battle_decision_detail: str | None = None
 
         self._current_message: str = ""
+        self._campaign_status = None
 
         self.controller_stack: list[Generator] = []
         self.debug_action_stack: list[str] = []
@@ -100,6 +101,17 @@ class BotContext:
     @property
     def message(self) -> str:
         return self._current_message
+
+    @property
+    def campaign_status(self):
+        return self._campaign_status
+
+    @campaign_status.setter
+    def campaign_status(self, status) -> None:
+        if self._campaign_status == status:
+            return
+        self._campaign_status = status
+        self._update_gui()
 
     @message.setter
     def message(self, new_message: str) -> None:

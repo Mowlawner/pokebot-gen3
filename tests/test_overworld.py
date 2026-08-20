@@ -4,7 +4,13 @@ from unittest.mock import patch
 
 from modules.map import MapMetadata, ObjectEvent
 from modules.map_path import Direction
-from modules.overworld import perceive_overworld
+from modules.overworld import (
+    ObjectObservation,
+    TriggerObservation,
+    evaluate_trigger_condition,
+    prewarm_static_map_observation,
+    perceive_overworld,
+)
 
 
 def _object_event() -> ObjectEvent:
@@ -20,6 +26,84 @@ def _object_event() -> ObjectEvent:
 
 
 class TestOverworldPerception(unittest.TestCase):
+    def test_coordinate_trigger_condition_is_observable_without_script_interpretation(self):
+        trigger = TriggerObservation(
+            "coord:1:123:4",
+            frozenset({((1, 2), (2, 8))}),
+            condition_variable_number=123,
+            condition_variable="LITTLEROOT_INTRO_STATE",
+            condition_required_value=4,
+            script_symbol="LittlerootTown_MaysHouse_1F_EventScript_GoSeeRoom",
+        )
+        self.assertTrue(evaluate_trigger_condition(trigger, 4))
+        self.assertFalse(evaluate_trigger_condition(trigger, 3))
+        self.assertIsNone(evaluate_trigger_condition(trigger, None))
+
+    def test_object_observation_preserves_dynamic_and_interaction_metadata(self):
+        object_observation = ObjectObservation(
+            2,
+            ((1, 2), (5, 5)),
+            script="TrainerScript",
+            previous_location=((1, 2), (5, 4)),
+            movement_type="Walk Around",
+            movement_action="Walk Normal Down",
+            script_controlled=True,
+            trainer_type="Normal",
+            trainer_range=3,
+            trainer_defeated=False,
+        )
+        self.assertNotEqual(object_observation.location, object_observation.previous_location)
+        self.assertTrue(object_observation.script_controlled)
+        self.assertEqual(object_observation.trainer_type, "Normal")
+        self.assertFalse(object_observation.trainer_defeated)
+
+    def test_any_facing_script_exposes_per_side_facing_requirements(self):
+        map_id = (92, 7)
+        map_data = MapMetadata(
+            map_id,
+            b"header",
+            (3).to_bytes(4, "little") + (3).to_bytes(4, "little"),
+            b"events",
+            (),
+            (),
+            (),
+            (
+                SimpleNamespace(
+                    local_coordinates=(1, 1),
+                    kind="Script",
+                    player_facing_direction="Any",
+                    script_symbol="Generic_EventScript_Interact",
+                ),
+            ),
+            (),
+        )
+        path_tiles = [
+            SimpleNamespace(
+                local_coordinates=(x, y),
+                accessible_from_direction=[True] * 4,
+                warps_to=None,
+                traversal_cost=1,
+            )
+            for y in range(3)
+            for x in range(3)
+        ]
+        with (
+            patch("modules.overworld._get_map_metadata", return_value=SimpleNamespace(tiles=path_tiles)),
+            patch("modules.overworld.get_map_metadata", return_value=map_data),
+        ):
+            prewarm_static_map_observation(map_id)
+
+        trigger = next(
+            trigger
+            for trigger in __import__("modules.overworld", fromlist=["_static_map_observations"])
+            ._static_map_observations[map_id]
+            .triggers
+            if trigger.script_symbol == "Generic_EventScript_Interact"
+        )
+        requirements = dict(trigger.activation_requirements)
+        self.assertEqual(requirements[((map_id, (1, 2)))], Direction.North)
+        self.assertEqual(requirements[((map_id, (1, 0)))], Direction.South)
+
     def test_reuses_static_tiles_when_only_avatar_state_changes(self):
         map_id = (91, 7)
         map_data = MapMetadata(

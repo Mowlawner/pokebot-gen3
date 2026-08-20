@@ -9,7 +9,7 @@ import PIL.ImageTk
 import darkdetect
 from ttkthemes import ThemedTk
 
-from modules.console import console
+from modules.console import console, diagnostic_print
 from modules.context import context
 from modules.debug import debug
 from modules.game import set_rom
@@ -137,6 +137,8 @@ class PokebotGui:
 
     def _run_profile(self, profile: "Profile") -> None:
         self._reset_screen()
+        source = "CLI" if self._startup_settings and self._startup_settings.profile is profile else "GUI"
+        diagnostic_print(lambda: f"Profile selected: {profile.path} (source: {source})")
         context.profile = profile
         context.config.load(profile.path, strict=False)
         set_rom(profile.rom)

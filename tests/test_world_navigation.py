@@ -11,7 +11,15 @@ from modules.agent_control import (
     evaluate_goal,
     select_action,
 )
-from modules.goals import ActivateTrigger, NavigationGoal, ReachInteractionPosition, ReachLocation, EncounterMode
+from modules.goals import (
+    ActivateTrigger,
+    NavigationGoal,
+    ReachInteractionPosition,
+    ReachLocation,
+    ReachWarp,
+    EncounterMode,
+    SemanticTarget,
+)
 from modules.interaction_state import InteractionObservation
 from modules.map_path import Direction
 from modules.memory import GameState
@@ -21,9 +29,21 @@ from modules.navigation import (
     NavigationActionType,
     NavigationWorld,
     NavigableTile,
+    map_connection_approach_position,
+    plan_observed_warp_locally,
     plan_with_world_navigation,
+    classify_transition_relevance,
+    transition_world_route,
+    TransitionRelevance,
 )
-from modules.overworld import OverworldObservation, TileObservation, TriggerObservation, WarpActivation
+from modules.overworld import (
+    MapConnectionObservation,
+    OverworldObservation,
+    TileObservation,
+    TriggerObservation,
+    WarpActivation,
+    WorldTransition,
+)
 from modules.overworld import WarpObservation
 from modules.trigger_bindings import BindingResolution, TriggerBinding
 from modules.world_navigation import WorldEdge, WorldMapGraph
@@ -40,6 +60,37 @@ def edge(source, destination, source_coordinate=(0, 0), destination_coordinate=(
 
 
 class TestWorldMapGraph(unittest.TestCase):
+    def test_map_connection_is_a_first_class_world_transition(self):
+        connection = edge((0, 0), (0, 1), kind="connection")
+        route = WorldMapGraph((connection,)).route((0, 0), (0, 1))
+
+        self.assertEqual(route.edges[0].kind, "connection")
+        self.assertEqual(route.edges[0].source_coordinates, ((0, 0),))
+
+    def test_mixed_and_sequential_transition_route_uses_total_cost(self):
+        source, middle, next_map, target = (1, 0), (1, 1), (1, 2), (1, 3)
+        graph = WorldMapGraph(
+            (
+                WorldEdge(source, middle, "warp", ((0, 0),), ((0, 0),), estimated_cost=4),
+                WorldEdge(middle, next_map, "connection", ((1, 0),), ((1, 2),), estimated_cost=2),
+                WorldEdge(next_map, target, "warp", ((0, 2),), ((0, 0),), estimated_cost=3),
+            )
+        )
+
+        route = graph.route(source, target)
+
+        self.assertEqual(tuple(edge.kind for edge in route.edges), ("warp", "connection", "warp"))
+        self.assertEqual(route.estimated_cost, 9)
+
+    def test_unknown_generic_transition_is_not_given_a_destination(self):
+        transition = WorldTransition(((2, 0), (0, 0)), None, kind="map_connection")
+
+        self.assertIsNone(transition.destination)
+        self.assertEqual(
+            classify_transition_relevance(transition, SemanticTarget.map((2, 1))),
+            TransitionRelevance.UNKNOWN,
+        )
+
     def test_simple_two_map_route(self):
         graph = WorldMapGraph((edge((0, 0), (0, 1)),))
 
@@ -99,6 +150,84 @@ class TestWorldMapGraph(unittest.TestCase):
         self.assertEqual(connection.kind, "connection")
         self.assertEqual(connection.source_coordinates, ((1, 0), (2, 0), (3, 0)))
         self.assertEqual(connection.destination_coordinates, ((0, 1), (1, 1), (2, 1)))
+
+    def test_emerald_littleroot_to_route101_connection_topology(self):
+        littleroot = SimpleNamespace(
+            map_size=(6, 4),
+            warps=[],
+            connections=[
+                SimpleNamespace(destination_map_group=0, destination_map_number=16, direction="South", offset=0)
+            ],
+        )
+        route101 = SimpleNamespace(map_size=(6, 5), warps=[], connections=[])
+
+        graph = WorldMapGraph.from_map_data({(0, 9): littleroot, (0, 16): route101})
+
+        route = graph.route((0, 9), (0, 16))
+        self.assertEqual(route.maps, ((0, 9), (0, 16)))
+        self.assertEqual(route.edges[0].kind, "connection")
+
+    def test_route_uses_estimated_movement_cost_not_warp_count(self):
+        source, target = (7, 0), (7, 3)
+        direct = edge(source, target)
+        direct = WorldEdge(**{**direct.__dict__, "estimated_cost": 50})
+        graph = WorldMapGraph(
+            (
+                direct,
+                WorldEdge(source, (7, 1), "warp", ((0, 0),), ((0, 0),), estimated_cost=5),
+                WorldEdge((7, 1), (7, 2), "warp", ((0, 0),), ((0, 0),), estimated_cost=5),
+                WorldEdge((7, 2), target, "warp", ((0, 0),), ((0, 0),), estimated_cost=5),
+            )
+        )
+
+        route = graph.route(source, target)
+
+        self.assertEqual(route.maps, (source, (7, 1), (7, 2), target))
+        self.assertEqual(route.estimated_cost, 15)
+
+    def test_cyclic_detour_is_worse_than_direct_transition(self):
+        current, target, detour = (8, 0), (8, 2), (8, 1)
+        graph = WorldMapGraph(
+            (
+                edge(current, target),
+                edge(detour, current),
+                edge(current, target),
+            )
+        )
+        semantic_target = SemanticTarget.map(target)
+        direct = WarpObservation((current, (1, 0)), (target, (0, 0)))
+        cyclic = WarpObservation((current, (2, 0)), (detour, (0, 0)))
+
+        self.assertEqual(transition_world_route(direct, semantic_target, graph).estimated_cost, 0)
+        self.assertGreater(transition_world_route(cyclic, semantic_target, graph).estimated_cost, 0)
+
+    def test_unknown_transition_remains_unknown(self):
+        transition = WarpObservation(((8, 0), (1, 0)), None)
+
+        self.assertIs(
+            classify_transition_relevance(transition, SemanticTarget.map((8, 2))),
+            TransitionRelevance.UNKNOWN,
+        )
+
+    def test_step_on_warp_does_not_turn_forever_for_metadata_facing_hint(self):
+        source_map = (8, 0)
+        entry = (source_map, (1, 0))
+        world = NavigationWorld(
+            tiles={
+                (source_map, (0, 0)): NavigableTile((source_map, (0, 0)), False, frozenset(Direction)),
+                entry: NavigableTile(entry, False, frozenset(Direction)),
+            },
+            warps=(WarpObservation(entry, ((8, 1), (0, 0)), required_facing=Direction.North),),
+            facing=Direction.East,
+        )
+
+        plan = GoalAwareNavigator(world).plan(
+            (source_map, (0, 0)),
+            ReachWarp(destination_map=(8, 1), warp=world.warps[0]),
+        )
+
+        self.assertEqual(plan.actions[-1].action_type, NavigationActionType.MOVE)
+        self.assertEqual(plan.actions[-1].destination, entry)
 
 
 class TestWorldGoalIntegration(unittest.TestCase):
@@ -482,6 +611,323 @@ class TestWeightedNavigation(unittest.TestCase):
         self.assertEqual(plan.actions[-1].direction, Direction.East)
         self.assertEqual(world.warps[0].activation, WarpActivation.STEP_ON)
 
+    def test_map_connection_action_crosses_boundary_with_direction_and_kind(self):
+        source_map = (40, 0)
+        target_map = (40, 1)
+        boundary = (source_map, (1, 0))
+        tiles = tuple(
+            TileObservation((source_map, (x, y)), (x, y) == (1, 0), frozenset(Direction))
+            for y in range(2)
+            for x in range(2)
+        )
+        connection = MapConnectionObservation(boundary, (target_map, (1, 2)), required_facing=Direction.North)
+        world = NavigationWorld(
+            tiles={
+                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles
+            },
+            transitions=(connection,),
+        )
+        graph = WorldMapGraph((edge(source_map, target_map, boundary[1], (1, 2), kind="connection"),))
+
+        plan, _ = plan_with_world_navigation(
+            world, (source_map, (0, 0)), ReachLocation((target_map, (1, 2))), graph=graph
+        )
+
+        self.assertEqual(plan.actions[-1].action_type, NavigationActionType.WARP)
+        self.assertEqual(plan.actions[-1].transition_kind, "map_connection")
+        self.assertEqual(plan.actions[-1].direction, Direction.North)
+        self.assertEqual(plan.actions[-2].destination, boundary)
+        self.assertEqual(plan.actions[-1].source, boundary)
+
+    def test_map_connection_approach_geometry_is_generic_and_boundary_independent(self):
+        cases = (
+            (Direction.North, (3, 0), (3, 1)),
+            (Direction.South, (3, 4), (3, 3)),
+            (Direction.East, (4, 2), (3, 2)),
+            (Direction.West, (0, 2), (1, 2)),
+        )
+        for direction, boundary, approach in cases:
+            with self.subTest(direction=direction):
+                self.assertEqual(map_connection_approach_position(boundary, direction), approach)
+
+    def test_map_connection_directions_move_to_boundary_then_cross(self):
+        source_map = (40, 2)
+        target_map = (40, 3)
+        cases = (
+            (Direction.North, (2, 0), (2, 1), (2, 4)),
+            (Direction.South, (2, 4), (2, 3), (2, 0)),
+            (Direction.East, (4, 2), (3, 2), (0, 2)),
+            (Direction.West, (0, 2), (1, 2), (4, 2)),
+        )
+        tiles = tuple(
+            TileObservation((source_map, (x, y)), False, frozenset(Direction)) for y in range(5) for x in range(5)
+        )
+        for direction, boundary, approach, destination in cases:
+            with self.subTest(direction=direction):
+                connection = MapConnectionObservation(
+                    (source_map, boundary),
+                    (target_map, destination),
+                    required_facing=direction,
+                )
+                world = NavigationWorld(
+                    tiles={
+                        tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors)
+                        for tile in tiles
+                    },
+                    transitions=(connection,),
+                )
+                graph = WorldMapGraph((edge(source_map, target_map, boundary, destination, kind="connection"),))
+                plan, _ = plan_with_world_navigation(
+                    world,
+                    (source_map, (2, 2)),
+                    ReachLocation((target_map, destination)),
+                    graph=graph,
+                )
+                self.assertEqual(plan.actions[-1].action_type, NavigationActionType.WARP)
+                self.assertEqual(plan.actions[-2].action_type, NavigationActionType.MOVE)
+                self.assertEqual(plan.actions[-2].source, (source_map, approach))
+                self.assertEqual(plan.actions[-2].destination, (source_map, boundary))
+                self.assertEqual(plan.actions[-1].source, (source_map, boundary))
+                self.assertEqual(plan.actions[-1].direction, direction)
+                self.assertEqual(plan.actions[-1].destination, (target_map, destination))
+
+    def test_map_connection_offset_keeps_source_and_destination_alignment(self):
+        source_map = (41, 2)
+        target_map = (41, 3)
+        boundary = (3, 0)
+        destination = (1, 6)
+        connection = MapConnectionObservation(
+            (source_map, boundary),
+            (target_map, destination),
+            required_facing=Direction.North,
+        )
+        tiles = tuple(
+            TileObservation((source_map, (x, y)), False, frozenset(Direction)) for y in range(5) for x in range(6)
+        )
+        world = NavigationWorld(
+            tiles={
+                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles
+            },
+            transitions=(connection,),
+        )
+        graph = WorldMapGraph((edge(source_map, target_map, boundary, destination, kind="connection"),))
+
+        plan, _ = plan_with_world_navigation(
+            world,
+            (source_map, (3, 2)),
+            ReachLocation((target_map, destination)),
+            graph=graph,
+        )
+
+        self.assertEqual(plan.actions[-2].source, (source_map, (3, 1)))
+        self.assertEqual(plan.actions[-1].source, (source_map, boundary))
+        self.assertEqual(plan.actions[-1].destination, (target_map, destination))
+
+    def test_littleroot_route101_connection_uses_reachable_north_approach(self):
+        source_map = (0, 9)
+        target_map = (0, 16)
+        boundary = (5, 0)
+        destination = (5, 19)
+        connection = MapConnectionObservation(
+            (source_map, boundary),
+            (target_map, destination),
+            required_facing=Direction.North,
+        )
+        tiles = tuple(
+            TileObservation((source_map, (x, y)), (x, y) == boundary, frozenset(Direction))
+            for y in range(20)
+            for x in range(20)
+        )
+        world = NavigationWorld(
+            tiles={
+                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles
+            },
+            transitions=(connection,),
+        )
+        graph = WorldMapGraph((edge(source_map, target_map, boundary, destination, kind="connection"),))
+
+        plan, _ = plan_with_world_navigation(
+            world,
+            (source_map, (5, 3)),
+            ReachLocation((target_map, destination)),
+            graph=graph,
+        )
+
+        self.assertEqual(plan.actions[-2].source, (source_map, (5, 1)))
+        self.assertEqual(plan.actions[-2].destination, (source_map, boundary))
+        self.assertEqual(plan.actions[-1].source, (source_map, boundary))
+        self.assertEqual(tuple(action.direction for action in plan.actions[-2:]), (Direction.North, Direction.North))
+        self.assertEqual(plan.actions[-1].direction, Direction.North)
+        self.assertEqual(plan.actions[-1].destination, (target_map, destination))
+
+    def test_reachable_map_connection_enters_existing_transition_ranking(self):
+        from modules.nuzlocke.emerald_capabilities import _observed_exit_goal
+
+        source_map = (43, 0)
+        target_map = (43, 1)
+        detour_map = (43, 2)
+        connection = MapConnectionObservation(
+            (source_map, (2, 0)),
+            (target_map, (2, 4)),
+            required_facing=Direction.North,
+        )
+        house = WarpObservation((source_map, (0, 2)), (detour_map, (0, 0)))
+        tiles = tuple(
+            TileObservation((source_map, (x, y)), (x, y) == (2, 0), frozenset(Direction))
+            for y in range(5)
+            for x in range(5)
+        )
+        world = NavigationWorld(
+            tiles={
+                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles
+            },
+            warps=(house,),
+            transitions=(house, connection),
+            facing=Direction.South,
+        )
+        graph = WorldMapGraph(
+            (
+                WorldEdge(source_map, target_map, "connection", ((2, 0),), ((2, 4),), estimated_cost=10),
+                WorldEdge(source_map, detour_map, "warp", ((0, 2),), ((0, 0),), estimated_cost=1),
+                WorldEdge(detour_map, target_map, "warp", ((0, 0),), ((0, 0),), estimated_cost=20),
+            )
+        )
+
+        with patch("modules.navigation.get_world_map_graph", return_value=graph):
+            selected = _observed_exit_goal(
+                SimpleNamespace(
+                    map_id=source_map,
+                    player_coordinates=(2, 2),
+                    controllable=True,
+                    transitions=world.transitions,
+                    warps=world.warps,
+                ),
+                GoalAwareNavigator(world),
+                SemanticTarget.map(target_map),
+            )
+
+        self.assertIsNotNone(selected)
+        self.assertIs(selected.warp, connection)
+
+    def test_map_connection_does_not_require_blocked_boundary_tile(self):
+        source_map = (41, 0)
+        target_map = (41, 1)
+        boundary = (source_map, (2, 0))
+        tiles = tuple(
+            TileObservation((source_map, (x, y)), (x, y) == boundary[1], frozenset(Direction))
+            for y in range(3)
+            for x in range(5)
+        )
+        connection = MapConnectionObservation(
+            boundary,
+            (target_map, (2, 4)),
+            required_facing=Direction.North,
+        )
+        world = NavigationWorld(
+            tiles={
+                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles
+            },
+            transitions=(connection,),
+        )
+        graph = WorldMapGraph((edge(source_map, target_map, boundary[1], (2, 4), kind="connection"),))
+
+        plan, _ = plan_with_world_navigation(
+            world,
+            (source_map, (2, 2)),
+            ReachLocation((target_map, (2, 4))),
+            graph=graph,
+        )
+
+        self.assertEqual(plan.actions[-2].source, (source_map, (2, 1)))
+        self.assertEqual(plan.actions[-2].destination, boundary)
+        self.assertEqual(plan.actions[-1].source, boundary)
+        self.assertEqual(plan.actions[-1].direction, Direction.North)
+        self.assertEqual(plan.actions[-1].transition_kind, "map_connection")
+
+    def test_reach_warp_satisfies_map_connection_from_transitions(self):
+        source_map = (42, 0)
+        target_map = (42, 1)
+        boundary = (source_map, (1, 0))
+        approach = (source_map, (1, 1))
+        connection = MapConnectionObservation(
+            boundary,
+            (target_map, (1, 4)),
+            required_facing=Direction.North,
+        )
+        world = NavigationWorld(
+            tiles={
+                (source_map, (0, 1)): NavigableTile((source_map, (0, 1)), False, frozenset(Direction)),
+                approach: NavigableTile(approach, False, frozenset(Direction)),
+                boundary: NavigableTile(boundary, True, frozenset()),
+            },
+            transitions=(connection,),
+            facing=Direction.East,
+        )
+
+        plan = GoalAwareNavigator(world).plan(
+            (source_map, (0, 1)),
+            ReachWarp(destination_map=target_map, destination=connection.destination, warp=connection),
+        )
+
+        self.assertEqual(plan.destination, approach)
+
+    def test_observed_map_connection_at_boundary_crosses_without_reverse_move(self):
+        source_map = (42, 2)
+        target_map = (42, 3)
+        boundary = (source_map, (3, 0))
+        connection = MapConnectionObservation(
+            boundary,
+            (target_map, (3, 4)),
+            required_facing=Direction.North,
+        )
+        world = NavigationWorld(
+            tiles={boundary: NavigableTile(boundary, True, frozenset())},
+            transitions=(connection,),
+            facing=Direction.North,
+        )
+
+        plan = plan_observed_warp_locally(
+            world,
+            boundary,
+            ReachWarp(destination_map=target_map, destination=connection.destination, warp=connection),
+        )
+
+        self.assertEqual(len(plan.actions), 1)
+        self.assertEqual(plan.actions[0].action_type, NavigationActionType.WARP)
+        self.assertEqual(plan.actions[0].source, boundary)
+        self.assertEqual(plan.actions[0].direction, Direction.North)
+
+    def test_world_route_step_on_from_south_emits_north_entry_input(self):
+        """The cross-map planner must preserve STEP_ON approach geometry."""
+        source_map = (0, 10)
+        target_map = (0, 11)
+        entry = (source_map, (2, 2))
+        warp = WarpObservation(entry, (target_map, (1, 3)), activation=WarpActivation.STEP_ON)
+        tiles = tuple(
+            TileObservation((source_map, (x, y)), False, frozenset(Direction)) for y in range(5) for x in range(5)
+        )
+        world = NavigationWorld(
+            tiles={
+                tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles
+            },
+            warps=(warp,),
+            facing=Direction.North,
+        )
+        graph = WorldMapGraph((edge(source_map, target_map, source_coordinate=(2, 2), destination_coordinate=(1, 3)),))
+
+        plan, _ = plan_with_world_navigation(
+            world,
+            (source_map, (2, 3)),
+            ReachWarp(destination_map=target_map, destination=warp.destination, warp=warp),
+            graph=graph,
+        )
+
+        transition = plan.actions[-1]
+        self.assertEqual(transition.action_type, NavigationActionType.WARP)
+        self.assertEqual(transition.source, (source_map, (2, 3)))
+        self.assertEqual(transition.direction, Direction.North)
+        self.assertNotEqual(transition.direction, Direction.South)
+
     def test_arrow_warp_steps_onto_tile_then_uses_required_facing(self):
         source_map = (0, 0)
         target_map = (0, 1)
@@ -490,7 +936,14 @@ class TestWeightedNavigation(unittest.TestCase):
             tiles={
                 tile.location: NavigableTile(tile.location, tile.blocked, tile.walkable_neighbors) for tile in tiles
             },
-            warps=(WarpObservation((source_map, (2, 0)), (target_map, (0, 0)), Direction.North),),
+            warps=(
+                WarpObservation(
+                    (source_map, (2, 0)),
+                    (target_map, (0, 0)),
+                    Direction.North,
+                    activation=WarpActivation.DIRECTIONAL_STEP,
+                ),
+            ),
         )
         graph = WorldMapGraph((edge(source_map, target_map, source_coordinate=(2, 0)),))
 

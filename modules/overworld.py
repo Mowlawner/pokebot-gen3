@@ -4,6 +4,8 @@ from dataclasses import dataclass, replace
 from enum import Enum, auto
 from modules.context import context
 from modules.map import get_map_metadata, get_map_objects
+from modules.game import get_event_var_name
+from modules.memory import get_event_var_by_number
 from modules.map_path import Direction, _get_map_metadata
 from modules.player import get_player_avatar, player_avatar_is_controllable
 from modules.trigger_bindings import BindingResolution, TRIGGER_BINDINGS, resolve_trigger_binding
@@ -28,9 +30,16 @@ class WarpActivation(Enum):
 
 
 @dataclass(frozen=True)
-class WarpObservation:
+class WorldTransition:
+    """A locally executable cross-map transition.
+
+    The mechanism is deliberately retained: a map connection is a boundary
+    crossing, while a warp is an entry-tile transition.  ``destination=None``
+    is an unresolved dynamic transition, never an inferred destination.
+    """
+
     entry: Location
-    destination: Location
+    destination: Location | None
     required_facing: Direction | None = None
     activation: WarpActivation = WarpActivation.STEP_ON
     # A warp entry is not necessarily the tile from which the activating
@@ -39,6 +48,21 @@ class WarpObservation:
     # than one side.
     activation_locations: frozenset[Location] = frozenset()
     activation_direction: Direction | None = None
+    kind: str = "warp"
+
+
+@dataclass(frozen=True)
+class WarpObservation(WorldTransition):
+    """Compatibility name for ordinary ROM warp observations."""
+
+    kind: str = "warp"
+
+
+@dataclass(frozen=True)
+class MapConnectionObservation(WorldTransition):
+    """A boundary crossing derived from a ROM MapConnection."""
+
+    kind: str = "map_connection"
 
 
 @dataclass(frozen=True)
@@ -53,6 +77,17 @@ class TriggerObservation:
     # rather than one direction because an object can be approached from any
     # of its four adjacent tiles, with a different required facing at each.
     activation_requirements: tuple[tuple[Location, Direction], ...] = ()
+    script_symbol: str | None = None
+    condition_variable_number: int | None = None
+    condition_variable: str | None = None
+    condition_required_value: int | None = None
+    condition_current_value: int | None = None
+    condition_active: bool | None = None
+    currently_actionable: bool | None = None
+    # Stable semantic identity used to connect a campaign interaction target
+    # to a currently observed affordance.  Navigation remains agnostic to the
+    # consequence of activating it.
+    affordance_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +98,25 @@ class ObjectObservation:
     # domain-level category can be derived without guessing from graphics IDs.
     kind: str | None = None
     script: str = ""
+    previous_location: Location | None = None
+    facing: str | None = None
+    movement_type: str | None = None
+    movement_action: str | None = None
+    script_controlled: bool | None = None
+    visibility_flag_id: int | None = None
+    trainer_type: str | None = None
+    trainer_range: int | None = None
+    trainer_defeated: bool | None = None
+    interactable: bool = True
+
+
+def evaluate_trigger_condition(trigger: TriggerObservation, current_value: int | None) -> bool | None:
+    """Evaluate a normalized trigger condition without interpreting its script."""
+    if trigger.condition_required_value is None:
+        return True
+    if current_value is None:
+        return None
+    return current_value == trigger.condition_required_value
 
 
 @dataclass(frozen=True)
@@ -78,6 +132,7 @@ class TileObservation:
     # ROM-derived encounter terrain property. This is deliberately separate
     # from traversal_cost: encounter generation is an action property.
     has_encounters: bool = False
+    transition: WorldTransition | None = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +148,7 @@ class OverworldObservation:
     bindings: tuple[BindingResolution, ...] = ()
     movement_state: MovementState | None = None
     dynamic_blocked_coordinates: frozenset[Coordinate] = frozenset()
+    transitions: tuple[WorldTransition, ...] = ()
 
     def tile_at(self, coordinates: Coordinate) -> TileObservation | None:
         tile = next((tile for tile in self.tiles if tile.location[1] == coordinates), None)
@@ -114,6 +170,7 @@ class _StaticMapObservation:
     map_data: object
     by_coordinate: dict[Coordinate, object]
     warps: tuple[WarpObservation, ...]
+    transitions: tuple[WorldTransition, ...]
     tiles: tuple[TileObservation, ...]
     triggers: tuple[TriggerObservation, ...]
 
@@ -175,7 +232,60 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
                     activation_direction=activation_direction,
                 )
             )
+        transitions: list[WorldTransition] = list(warps)
+        # A connection is a boundary crossing, not a warp.  Keep its ROM
+        # mechanism visible to tactical navigation while deriving the same
+        # boundary coordinate pairs used by the world graph.
+        for connection in map_data.connections:
+            destination_map = (connection.destination_map_group, connection.destination_map_number)
+            destination_data = get_map_metadata(destination_map)
+            source_width, source_height = map_data.map_size
+            destination_width, destination_height = destination_data.map_size
+            pairs: list[tuple[Coordinate, Coordinate]] = []
+            if connection.direction in ("North", "South"):
+                first = max(0, connection.offset)
+                last = min(source_width, connection.offset + destination_width)
+                for source_x in range(first, last):
+                    pairs.append(
+                        (
+                            (source_x, 0 if connection.direction == "North" else source_height - 1),
+                            (
+                                source_x - connection.offset,
+                                destination_height - 1 if connection.direction == "North" else 0,
+                            ),
+                        )
+                    )
+            elif connection.direction in ("East", "West"):
+                first = max(0, connection.offset)
+                last = min(source_height, connection.offset + destination_height)
+                for source_y in range(first, last):
+                    pairs.append(
+                        (
+                            (source_width - 1 if connection.direction == "East" else 0, source_y),
+                            (
+                                0 if connection.direction == "East" else destination_width - 1,
+                                source_y - connection.offset,
+                            ),
+                        )
+                    )
+            direction = {
+                "North": Direction.North,
+                "South": Direction.South,
+                "East": Direction.East,
+                "West": Direction.West,
+            }.get(connection.direction)
+            for source, destination in pairs:
+                transitions.append(
+                    MapConnectionObservation(
+                        (map_id, source),
+                        (destination_map, destination),
+                        required_facing=direction,
+                        activation=WarpActivation.STEP_ON,
+                    )
+                )
+        transitions_tuple = tuple(transitions)
         warps_by_entry = {warp.entry[1]: warp for warp in warps}
+        transitions_by_entry = {transition.entry[1]: transition for transition in transitions_tuple}
         static_trigger_ids_by_location: dict[Coordinate, set[str]] = {}
         for index, event in enumerate(map_data.coord_events):
             if event.type != "weather":
@@ -198,6 +308,7 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
                     blocked=not walkable and tile.warps_to is None,
                     walkable_neighbors=walkable,
                     warp=warps_by_entry.get(coordinate),
+                    transition=transitions_by_entry.get(coordinate),
                     trigger_ids=frozenset(static_trigger_ids_by_location.get(coordinate, set())),
                     traversal_cost=getattr(tile, "traversal_cost", 1),
                     has_encounters=getattr(tile, "has_encounters", False),
@@ -213,11 +324,17 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
                         locations=frozenset({location}),
                         activation_locations=frozenset({location}),
                         kind=event.type,
+                        script_symbol=event.script_symbol if event.type == "script" else None,
+                        condition_variable=get_event_var_name(event.trigger_var_number),
+                        condition_variable_number=event.trigger_var_number,
+                        condition_required_value=event.trigger_value,
+                        affordance_id=event.script_symbol,
                     )
                 )
         for index, event in enumerate(map_data.bg_events):
             location = (map_id, event.local_coordinates)
             activation_locations = frozenset()
+            activation_requirements: tuple[tuple[Location, Direction], ...] = ()
             direction = None
             if event.player_facing_direction == "Any":
                 activation_locations = frozenset(
@@ -229,6 +346,26 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
                         (event.local_coordinates[0] - 1, event.local_coordinates[1]),
                     )
                     if 0 <= candidate_x < map_width and 0 <= candidate_y < map_height
+                )
+                # Adjacent field-script interactions are activated while the
+                # player faces the event tile.  ROM's ``Any`` means that all
+                # adjacent approach sides are valid; it does not erase the
+                # per-side facing affordance required by the field engine.
+                activation_requirements = tuple(
+                    (
+                        source,
+                        next(
+                            direction
+                            for direction, coordinate in (
+                                (Direction.South, (event.local_coordinates[0], event.local_coordinates[1] - 1)),
+                                (Direction.West, (event.local_coordinates[0] + 1, event.local_coordinates[1])),
+                                (Direction.North, (event.local_coordinates[0], event.local_coordinates[1] + 1)),
+                                (Direction.East, (event.local_coordinates[0] - 1, event.local_coordinates[1])),
+                            )
+                            if coordinate == source[1]
+                        ),
+                    )
+                    for source in activation_locations
                 )
             else:
                 direction = _direction(event.player_facing_direction)
@@ -254,14 +391,22 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
                     activation_locations=activation_locations,
                     kind=f"bg_{event.kind.lower().replace(' ', '_')}",
                     activation_requirements=(
-                        tuple(((map_id, activation), direction) for activation in activation_locations)
-                        if event.player_facing_direction != "Any" and direction is not None
-                        else ()
+                        activation_requirements
+                        if event.player_facing_direction == "Any"
+                        else (
+                            tuple(((map_id, activation), direction) for activation in activation_locations)
+                            if direction is not None
+                            else ()
+                        )
                     ),
+                    script_symbol=script if event.kind == "Script" else None,
+                    affordance_id=script or None,
                 )
             )
         tiles = tuple(static_tiles)
-        static = _StaticMapObservation(path_tiles, map_data, by_coordinate, tuple(warps), tiles, tuple(static_triggers))
+        static = _StaticMapObservation(
+            path_tiles, map_data, by_coordinate, tuple(warps), transitions_tuple, tiles, tuple(static_triggers)
+        )
         _static_map_observations[map_id] = static
     return static.tiles
 
@@ -328,6 +473,23 @@ def perceive_overworld() -> OverworldObservation:
                 # only "normal"/"clone", not an object category, so do not expose
                 # it as one here.
                 script=object_event.object_event_template.script_symbol,
+                previous_location=(object_event.map_group_and_number, object_event.previous_coords),
+                facing=object_event.facing_direction,
+                movement_type=getattr(object_event.object_event_template, "movement_type", None),
+                movement_action=object_event.movement_action,
+                script_controlled=any(
+                    flag in object_event.flags for flag in ("heldMovementActive", "singleMovementActive", "frozen")
+                ),
+                visibility_flag_id=getattr(object_event.object_event_template, "flag_id", 0) or None,
+                trainer_type=object_event.trainer_type,
+                trainer_range=(
+                    object_event.object_event_template.trainer_range if object_event.trainer_type != "None" else None
+                ),
+                trainer_defeated=(
+                    object_event.object_event_template.is_trainer_defeated
+                    if object_event.trainer_type != "None"
+                    else None
+                ),
             )
             for object_event in get_map_objects()
             if object_event.map_group_and_number == map_id and "isPlayer" not in object_event.flags
@@ -335,6 +497,37 @@ def perceive_overworld() -> OverworldObservation:
 
     objects = trace.call("runtime_object_scan", scan_runtime_objects) if trace is not None else scan_runtime_objects()
     object_locations = {object_observation.location[1] for object_observation in objects}
+
+    # Conditions belong to the live observation, not the static cache.
+    live_triggers: list[TriggerObservation] = []
+    for trigger in triggers:
+        if trigger.condition_variable_number is None or trigger.condition_required_value is None:
+            live_triggers.append(trigger)
+            continue
+        try:
+            current_value = get_event_var_by_number(trigger.condition_variable_number)
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError, KeyError, StopIteration):
+            live_triggers.append(trigger)
+            continue
+        active = evaluate_trigger_condition(trigger, current_value)
+        player_location = (map_id, player_coordinates)
+        player_tile = next((tile for tile in tiles if tile.location == player_location), None)
+        actionable = bool(
+            active
+            and player_location in trigger.activation_locations
+            and player_coordinates not in object_locations
+            and player_tile is not None
+            and not player_tile.blocked
+        )
+        live_triggers.append(
+            replace(
+                trigger,
+                condition_current_value=current_value,
+                condition_active=active,
+                currently_actionable=actionable,
+            )
+        )
+    triggers = live_triggers
 
     # Object templates/scripts are the reliable data available for NPC
     # interactions.  The four adjacent tiles are candidate activation tiles;
@@ -366,6 +559,7 @@ def perceive_overworld() -> OverworldObservation:
                     for candidate_x, candidate_y in ((x, y - 1), (x + 1, y), (x, y + 1), (x - 1, y))
                     if 0 <= candidate_x < map_width and 0 <= candidate_y < map_height
                 ),
+                affordance_id=object_observation.script or f"object:{object_observation.local_id}",
             )
         )
 
@@ -430,6 +624,7 @@ def perceive_overworld() -> OverworldObservation:
                     {resolution.static_location} if resolution.static_location is not None else set()
                 ),
                 activation_requirements=activation_requirements,
+                affordance_id=binding.script_symbol,
             )
         )
 
@@ -465,6 +660,7 @@ def perceive_overworld() -> OverworldObservation:
         controllable=player_avatar_is_controllable(),
         tiles=static.tiles,
         warps=tuple(warps),
+        transitions=static.transitions,
         objects=objects,
         triggers=tuple(triggers),
         bindings=bindings,

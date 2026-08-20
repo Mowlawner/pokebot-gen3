@@ -250,3 +250,38 @@ def is_field_message_waiting_for_input(field_message_lifecycle_active: bool = Fa
         # Emulator state is legitimately incomplete for a frame during a map
         # transition.  Callers should retry, not switch modes or raise.
         return False
+
+
+def is_emerald_field_dialogue_advanceable(
+    *,
+    task_active: bool,
+    task_name: str | None = None,
+    script_active: bool | None,
+    native_function_name: str | None,
+    script_function_name: str | None,
+    input_waiting: bool | None,
+    field_message_lifecycle_active: bool = False,
+) -> bool:
+    """Return Emerald's authoritative ordinary-message advance predicate.
+
+    Emerald exposes the same message lifecycle through two adjacent runtime
+    states: the field-message task/printer, then the script native
+    ``WaitForAorBPress`` after the draw task has gone away.  The latter is only
+    dialogue when the script is ``Std_MsgboxDefault`` and the sampled runtime
+    state says input is ready.  This is the low-level predicate shared by the
+    legacy opening handler and observation-driven campaign capabilities.
+    """
+    if is_field_message_waiting_for_input(field_message_lifecycle_active or task_active):
+        return True
+    # New Game Birch's opening is owned by main_menu.c rather than the field
+    # script engine.  Its ``Task_NewGameBirchSpeech_*`` task drives the same
+    # text-printer pause control code (\\p), but there is no field-message task
+    # and no WaitForAorBPress native callback.
+    if task_name and task_name.startswith("Task_NewGameBirchSpeech") and input_waiting:
+        return True
+    return bool(
+        script_active
+        and native_function_name == "WaitForAorBPress"
+        and script_function_name == "Std_MsgboxDefault"
+        and input_waiting
+    )

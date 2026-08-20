@@ -88,7 +88,7 @@ def load_profile(path: Path) -> Profile:
 
 
 def profile_directory_exists(name: str) -> bool:
-    return (PROFILES_DIRECTORY / name).exists()
+    return (PROFILES_DIRECTORY / name).is_dir()
 
 
 def create_profile(name: str, rom: ROM) -> Profile:

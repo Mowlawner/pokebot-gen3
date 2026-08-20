@@ -1,6 +1,7 @@
-"""Durable storage for immutable Nuzlocke events.
+"""Durable storage for immutable Nuzlocke campaign events.
 
-This module stores observations, not campaign state. New stores use a small
+The runtime persistence policy decides which observed events reach this store.
+New stores use a small
 header followed by one JSON record per line. Each accepted event is appended,
 flushed, and synced before ``append`` returns. Legacy schema-1 JSON documents
 remain immutable and receive new records in a sibling append log, so opening a
@@ -14,6 +15,7 @@ import importlib
 import json
 import os
 import uuid
+from collections import Counter
 from dataclasses import MISSING, fields, is_dataclass
 from enum import Enum
 from pathlib import Path
@@ -31,8 +33,10 @@ from .events import (
     PokemonFainted,
     StorageChanged,
     WhiteoutOccurred,
+    NuzlockeStarted,
 )
 from .identity import PokemonIdentity
+from .policy import PersistenceClass
 
 SCHEMA_VERSION = 1
 LINE_SCHEMA_VERSION = 2
@@ -48,6 +52,7 @@ _EVENT_TYPES = {
         PokemonFainted,
         WhiteoutOccurred,
         StorageChanged,
+        NuzlockeStarted,
     )
 }
 
@@ -149,7 +154,10 @@ class JsonEventStore:
 
     def _load(self) -> None:
         try:
-            with self.path.open("r", encoding="utf-8") as handle:
+            # ``utf-8-sig`` accepts ordinary UTF-8 and consumes a leading BOM.
+            # Some editors/exporters emit the BOM even though JSON itself does
+            # not treat it as whitespace.
+            with self.path.open("r", encoding="utf-8-sig") as handle:
                 first_line = handle.readline()
         except OSError as error:
             raise EventStoreCorruptionError(f"Could not load event store: {self.path}") from error
@@ -161,16 +169,33 @@ class JsonEventStore:
             if isinstance(first, dict) and first.get("schema_version") == LINE_SCHEMA_VERSION:
                 self._load_lines(self.path)
                 return
+            if isinstance(first, dict) and {"event_id", "sequence", "type", "payload"}.issubset(first):
+                sequence = first.get("sequence")
+                raise EventStoreCorruptionError(
+                    f"Missing schema-{LINE_SCHEMA_VERSION} header in {self.path}; "
+                    f"first event record has sequence {sequence!r}"
+                )
         self._legacy = True
         try:
-            document = json.loads(self.path.read_text(encoding="utf-8"))
+            document = json.loads(self.path.read_text(encoding="utf-8-sig"))
             if document.get("schema_version") != SCHEMA_VERSION or not isinstance(document.get("events"), list):
                 raise EventStoreCorruptionError("Unsupported or missing event-store schema version")
             records = document["events"]
-            for record in records:
-                self._validate_record(record)
-            if [record["sequence"] for record in records] != list(range(1, len(records) + 1)):
-                raise EventStoreCorruptionError("Event sequence is not contiguous")
+            for index, record in enumerate(records, start=1):
+                try:
+                    self._validate_record(record)
+                except EventStoreCorruptionError as error:
+                    raise EventStoreCorruptionError(
+                        f"Malformed legacy event record {index} in {self.path}: {error}"
+                    ) from error
+            expected = list(range(1, len(records) + 1))
+            actual = [record["sequence"] for record in records]
+            if actual != expected:
+                first_bad = next((index for index, (got, want) in enumerate(zip(actual, expected)) if got != want), 0)
+                raise EventStoreCorruptionError(
+                    f"Legacy event sequence is not contiguous at record {first_bad + 1}: "
+                    f"expected {expected[first_bad]}, got {actual[first_bad]}"
+                )
             self._records = records
             self._ids = {record["event_id"] for record in records}
         except EventStoreCorruptionError:
@@ -182,7 +207,7 @@ class JsonEventStore:
             TypeError,
             ValueError,
         ) as error:
-            raise EventStoreCorruptionError(f"Could not load event store: {self.path}") from error
+            raise EventStoreCorruptionError(f"Could not load event store {self.path}: {error}") from error
 
         if self._append_path.exists():
             self._load_lines(self._append_path, allow_missing_header=True)
@@ -198,7 +223,7 @@ class JsonEventStore:
                 raise EventStoreCorruptionError("Empty event store")
             start = 0
             if not allow_missing_header:
-                header = json.loads(raw_lines[0].decode("utf-8"))
+                header = json.loads(raw_lines[0].decode("utf-8-sig"))
                 if header != {"schema_version": LINE_SCHEMA_VERSION}:
                     raise EventStoreCorruptionError("Unsupported event-line schema")
                 start = 1
@@ -214,21 +239,25 @@ class JsonEventStore:
                     if index == len(raw_lines) - 1:
                         self._truncate_partial_line(path, sum(len(line) for line in raw_lines[:index]))
                         break
-                    raise EventStoreCorruptionError("Malformed event record") from error
+                    raise EventStoreCorruptionError(
+                        f"Malformed event record at line {index + 1} in {path}: {error}"
+                    ) from error
                 try:
                     self._validate_record(record)
                 except EventStoreCorruptionError as error:
                     if index == len(raw_lines) - 1:
                         self._truncate_partial_line(path, sum(len(line) for line in raw_lines[:index]))
                         break
-                    raise error
+                    raise EventStoreCorruptionError(
+                        f"Malformed event record at line {index + 1} in {path}: {error}"
+                    ) from error
                 self._records.append(record)
                 self._ids.add(record["event_id"])
             self._validate_sequence()
         except EventStoreCorruptionError:
             raise
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise EventStoreCorruptionError(f"Could not load event store: {path}") from error
+            raise EventStoreCorruptionError(f"Could not load event store {path}: {error}") from error
 
     @staticmethod
     def _truncate_partial_line(path: Path, size: int) -> None:
@@ -241,8 +270,14 @@ class JsonEventStore:
             raise EventStoreCorruptionError(f"Could not recover event store: {path}") from error
 
     def _validate_sequence(self) -> None:
-        if [record["sequence"] for record in self._records] != list(range(1, len(self._records) + 1)):
-            raise EventStoreCorruptionError("Event sequence is not contiguous")
+        actual = [record["sequence"] for record in self._records]
+        expected = list(range(1, len(actual) + 1))
+        if actual != expected:
+            first_bad = next((index for index, (got, want) in enumerate(zip(actual, expected)) if got != want), 0)
+            raise EventStoreCorruptionError(
+                f"Event sequence is not contiguous at record {first_bad + 1}: "
+                f"expected {expected[first_bad]}, got {actual[first_bad]}"
+            )
 
     def _write_header(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,6 +336,15 @@ class JsonEventStore:
 
     def iter_records(self) -> tuple[dict[str, Any], ...]:
         return tuple(dict(record) for record in self._records)
+
+    def event_statistics(self) -> dict[str, dict[str, int]]:
+        """Return counts for events actually present in durable history."""
+        counts: Counter[str] = Counter(record["type"] for record in self._records)
+        return {
+            PersistenceClass.DURABLE.value: dict(counts),
+            PersistenceClass.EPHEMERAL.value: {},
+            PersistenceClass.DIAGNOSTIC.value: {},
+        }
 
     def last_sequence(self) -> int:
         return len(self._records)

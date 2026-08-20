@@ -933,8 +933,12 @@ class MapLocation:
     def has_encounters(self) -> bool:
         if context.rom.is_frlg:
             return bool(self._metatile_attributes[0] & 0x0700_0000)
-        else:
-            return bool(self._tile_behaviour & 1)
+
+        is_land = bool(self._tile_behaviour & 1)
+        if is_land:
+            encounters = get_wild_encounters_for_map(self.map_group, self.map_number)
+            return encounters is not None and len(encounters.land_encounters) > 0
+        return is_land
 
     @property
     def is_surfable(self) -> bool:

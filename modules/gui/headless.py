@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING
 
 from modules.context import context
+from modules.console import diagnostic_print
 from modules.game import set_rom
 from modules.libmgba import LibmgbaEmulator
 
@@ -19,6 +20,9 @@ class PokebotHeadless:
             raise RuntimeError("Headless mode cannot be started without selecting a profile.")
 
         context.profile = startup_settings.profile
+        diagnostic_print(
+            lambda: f"Profile selected: {startup_settings.profile.path} (source: {startup_settings.profile_source})"
+        )
         context.config.load(startup_settings.profile.path, strict=False)
         set_rom(startup_settings.profile.rom)
         context.emulator = LibmgbaEmulator(

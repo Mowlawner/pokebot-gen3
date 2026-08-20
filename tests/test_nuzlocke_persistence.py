@@ -42,6 +42,21 @@ def snapshot(frame, map_number=2):
 
 
 class TestNuzlockePersistence(unittest.TestCase):
+    def test_bom_prefixed_line_store_is_loaded_without_resetting_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            event = MapChanged(1, (1, 2), (1, 3))
+            store = JsonEventStore(path, session_id="session-a")
+            store.append(event)
+            original = path.read_bytes()
+            path.write_bytes(b"\xef\xbb\xbf" + original)
+
+            reloaded = JsonEventStore(path)
+
+            self.assertEqual(reloaded.iter_events(), (event,))
+            self.assertEqual(reloaded.last_sequence(), 1)
+            self.assertEqual(path.read_bytes(), b"\xef\xbb\xbf" + original)
+
     def test_reload_order_and_duplicate_delivery(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.json"
@@ -168,11 +183,11 @@ class TestNuzlockePersistence(unittest.TestCase):
             store = JsonEventStore(Path(directory) / "events.json")
             runtime = NuzlockeRuntime(event_sink=store)
             runtime.update(snapshot(1))
-            runtime.update(snapshot(2, 3))
+            runtime.mark_nuzlocke_started()
             first_session = store.iter_records()[0]["session_id"]
             store.append(MapChanged(2, (1, 2), (1, 3)), "session-b")
             records = store.iter_records()
-            self.assertEqual([record["frame"] for record in records], [2, 2])
+            self.assertEqual([record["frame"] for record in records], [1, 2])
             self.assertNotEqual(first_session, records[1]["session_id"])
 
     def test_schema_and_corruption_are_rejected(self):
@@ -180,6 +195,20 @@ class TestNuzlockePersistence(unittest.TestCase):
             path = Path(directory) / "events.json"
             path.write_text(json.dumps({"schema_version": 999, "events": []}), encoding="utf-8")
             with self.assertRaises(EventStoreCorruptionError):
+                JsonEventStore(path)
+
+    def test_sequence_gap_reports_the_first_bad_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            path.write_text(
+                '{"schema_version":1,"events":['
+                '{"event_id":"a","session_id":"s","sequence":1,"frame":1,"type":"MapChanged",'
+                '"payload":{"frame":1,"old_map":null,"new_map":[1,2]}},'
+                '{"event_id":"c","session_id":"s","sequence":3,"frame":3,"type":"MapChanged",'
+                '"payload":{"frame":3,"old_map":[1,2],"new_map":[1,3]}}]}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(EventStoreCorruptionError, "record 2.*expected 2, got 3"):
                 JsonEventStore(path)
             path.write_text('{"schema_version": 1, "events": [', encoding="utf-8")
             with self.assertRaises(EventStoreCorruptionError):

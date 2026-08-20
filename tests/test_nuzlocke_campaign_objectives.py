@@ -11,8 +11,7 @@ from modules.nuzlocke.campaign_objectives import (
     initial_emerald_campaign,
     select_campaign_objective,
 )
-from modules.nuzlocke.campaign_state import CampaignState, Fact, FactStatus, RunStatus
-from modules.nuzlocke.events import BattleEnded
+from modules.nuzlocke.campaign_state import CampaignFacts, CampaignState, Fact, FactStatus, RunStatus
 from modules.nuzlocke.identity import PokemonIdentity
 from modules.nuzlocke.snapshots import (
     InventorySnapshot,
@@ -37,6 +36,7 @@ class CampaignObjectiveTests(unittest.TestCase):
         canonical_available=True,
         inventory_available=True,
         battle=None,
+        campaign_facts=None,
     ):
         party = ()
         if party_usable:
@@ -60,6 +60,13 @@ class CampaignObjectiveTests(unittest.TestCase):
                     party_index=0,
                 ),
             )
+        if campaign_facts is None:
+            campaign_facts = CampaignFacts(
+                *(
+                    Fact.known(value)
+                    for value in (False, False, False, False, False, False, False, False, balls > 0, False, False)
+                )
+            )
         return CampaignState(
             raw_map=Fact.known(MapRSE.OLDALE_TOWN.value),
             canonical_area=Fact.known(area) if canonical_available else Fact.unknown(),
@@ -81,7 +88,25 @@ class CampaignObjectiveTests(unittest.TestCase):
             last_completed_battle=Fact.known(battle),
             session_id="test-session",
             known_session_ids=("test-session",),
+            campaign_facts=campaign_facts,
         )
+
+    @staticmethod
+    def facts(**values):
+        names = (
+            "text_speed_fast",
+            "new_game_setup_complete",
+            "wall_clock_set",
+            "rival_met",
+            "birch_rescued",
+            "starter_obtained",
+            "intro_rival_battle_complete",
+            "pokedex_received",
+            "pokeballs_available",
+            "pokeballs_ready",
+            "nuzlocke_started",
+        )
+        return CampaignFacts(*(Fact.known(values.get(name, False)) for name in names))
 
     @staticmethod
     def objective(objective_id, completion, prerequisites=(), failure=None):
@@ -104,15 +129,42 @@ class CampaignObjectiveTests(unittest.TestCase):
     def test_initial_state_selects_first_objective(self):
         selection = select_campaign_objective(self.state())
         self.assertEqual(selection.status, ObjectiveStatus.READY)
-        self.assertEqual(selection.objective.objective_id, "reach_oldale")
+        self.assertEqual(selection.objective.objective_id, "set_text_speed")
 
-    def test_completed_first_objective_selects_pokeball_objective(self):
-        selection = select_campaign_objective(self.state(area="OLDALE_TOWN"))
-        self.assertEqual(selection.objective.objective_id, "confirm_early_pokeballs")
+    def test_completed_text_speed_selects_setup_objective(self):
+        selection = select_campaign_objective(self.state(campaign_facts=self.facts(text_speed_fast=True)))
+        self.assertEqual(selection.objective.objective_id, "complete_new_game_setup")
         self.assertEqual(selection.status, ObjectiveStatus.READY)
 
-    def test_satisfied_pokeballs_selects_rival_objective(self):
-        selection = select_campaign_objective(self.state(area="OLDALE_TOWN", balls=5))
+    def test_rescue_birch_requires_authoritative_flag_and_then_advances(self):
+        before = self.facts(
+            text_speed_fast=True,
+            new_game_setup_complete=True,
+            wall_clock_set=True,
+            rival_met=True,
+        )
+        selection = select_campaign_objective(self.state(campaign_facts=before))
+        self.assertEqual(selection.status, ObjectiveStatus.READY)
+        self.assertEqual(selection.objective.objective_id, "rescue_birch")
+
+        after = replace(before, birch_rescued=Fact.known(True))
+        selection = select_campaign_objective(self.state(campaign_facts=after))
+        self.assertEqual(selection.status, ObjectiveStatus.READY)
+        self.assertEqual(selection.objective.objective_id, "obtain_starter")
+
+    def test_prerequisite_chain_selects_intro_battle(self):
+        selection = select_campaign_objective(
+            self.state(
+                campaign_facts=self.facts(
+                    text_speed_fast=True,
+                    new_game_setup_complete=True,
+                    wall_clock_set=True,
+                    rival_met=True,
+                    birch_rescued=True,
+                    starter_obtained=True,
+                )
+            )
+        )
         self.assertEqual(selection.objective.objective_id, "complete_intro_rival")
         self.assertEqual(selection.status, ObjectiveStatus.READY)
         self.assertEqual(selection.objective.execution_id, "intro_rival")
@@ -134,9 +186,11 @@ class CampaignObjectiveTests(unittest.TestCase):
         selection = select_campaign_objective(self.state(), (objective,))
         self.assertEqual(selection.status, ObjectiveStatus.UNKNOWN)
 
-    def test_unavailable_inventory_is_unknown_not_blocked(self):
-        selection = select_campaign_objective(self.state(area="OLDALE_TOWN", inventory_available=False))
-        self.assertEqual(selection.objective.objective_id, "confirm_early_pokeballs")
+    def test_unavailable_campaign_fact_is_unknown_not_blocked(self):
+        facts = self.facts()
+        facts = replace(facts, text_speed_fast=Fact.unknown())
+        selection = select_campaign_objective(self.state(campaign_facts=facts))
+        self.assertEqual(selection.objective.objective_id, "set_text_speed")
         self.assertEqual(selection.status, ObjectiveStatus.UNKNOWN)
 
     def test_completed_objective_is_skipped(self):
@@ -181,22 +235,99 @@ class CampaignObjectiveTests(unittest.TestCase):
         selection = select_campaign_objective(state)
         self.assertEqual(selection.status, ObjectiveStatus.UNKNOWN)
 
-    def test_completed_rival_advances_past_initial_campaign(self):
-        rival_battle = BattleEnded(10, "Won", ("TRAINER",), True, False, False, (), (), MapRSE.ROUTE103.value)
-        selection = select_campaign_objective(self.state(area="OLDALE_TOWN", balls=5, battle=rival_battle))
-        self.assertEqual(selection.status, ObjectiveStatus.COMPLETE)
-        self.assertIsNone(selection.objective)
+    def test_completed_intro_battle_selects_pokedex_objective(self):
+        selection = select_campaign_objective(
+            self.state(
+                campaign_facts=self.facts(
+                    text_speed_fast=True,
+                    new_game_setup_complete=True,
+                    wall_clock_set=True,
+                    rival_met=True,
+                    birch_rescued=True,
+                    starter_obtained=True,
+                    intro_rival_battle_complete=True,
+                )
+            )
+        )
+        self.assertEqual(selection.status, ObjectiveStatus.READY)
+        self.assertEqual(selection.objective.objective_id, "receive_pokedex")
 
-    def test_stable_ids_and_deterministic_definition(self):
+    def test_newly_acquired_pokeballs_select_start_nuzlocke(self):
+        state = self.state(
+            balls=5,
+            campaign_facts=self.facts(
+                text_speed_fast=True,
+                new_game_setup_complete=True,
+                wall_clock_set=True,
+                rival_met=True,
+                birch_rescued=True,
+                starter_obtained=True,
+                intro_rival_battle_complete=True,
+                pokedex_received=True,
+                pokeballs_available=True,
+                pokeballs_ready=True,
+            ),
+        )
+        selection = select_campaign_objective(state)
+        self.assertEqual(selection.status, ObjectiveStatus.READY)
+        self.assertEqual(selection.objective.objective_id, "start_nuzlocke")
+
+    def test_pokeballs_available_without_ready_blocks_nuzlocke(self):
+        # Test that pokeballs_available=True but pokeballs_ready=False blocks nuzlocke
+        # and keeps receive_pokeballs active (i.e., not complete).
+        state = self.state(
+            balls=5,
+            campaign_facts=self.facts(
+                text_speed_fast=True,
+                new_game_setup_complete=True,
+                wall_clock_set=True,
+                rival_met=True,
+                birch_rescued=True,
+                starter_obtained=True,
+                intro_rival_battle_complete=True,
+                pokedex_received=True,
+                pokeballs_available=True,
+                pokeballs_ready=False,
+            ),
+        )
+        selection = select_campaign_objective(state)
+        self.assertEqual(selection.status, ObjectiveStatus.READY)
+        self.assertEqual(selection.objective.objective_id, "receive_pokeballs")
         first = initial_emerald_campaign()
         second = initial_emerald_campaign()
         self.assertEqual(
             tuple(objective.objective_id for objective in first),
-            ("reach_oldale", "confirm_early_pokeballs", "complete_intro_rival"),
+            (
+                "set_text_speed",
+                "complete_new_game_setup",
+                "set_wall_clock",
+                "meet_rival",
+                "rescue_birch",
+                "obtain_starter",
+                "complete_intro_rival",
+                "receive_pokedex",
+                "receive_pokeballs",
+                "start_nuzlocke",
+            ),
         )
         self.assertEqual(
             [(objective.objective_id, objective.description, objective.execution_id) for objective in first],
             [(objective.objective_id, objective.description, objective.execution_id) for objective in second],
+        )
+        self.assertEqual(
+            [tuple(predicate.predicate_id for predicate in objective.prerequisites) for objective in first],
+            [
+                (),
+                ("campaign_fact:text_speed_fast",),
+                ("campaign_fact:new_game_setup_complete",),
+                ("campaign_fact:wall_clock_set",),
+                ("campaign_fact:rival_met",),
+                ("campaign_fact:birch_rescued",),
+                ("campaign_fact:starter_obtained",),
+                ("campaign_fact:intro_rival_battle_complete",),
+                ("campaign_fact:pokedex_received",),
+                ("campaign_fact:pokeballs_available",),
+            ],
         )
 
     def test_empty_definition_and_all_complete(self):

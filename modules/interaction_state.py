@@ -9,8 +9,14 @@ from enum import Enum, auto
 from typing import Any, Mapping
 
 from modules.memory import GameState, get_game_state
+from modules.context import context
 from modules.player import player_avatar_is_controllable
-from modules.tasks import get_global_script_context, is_field_message_waiting_for_input, task_is_active
+from modules.tasks import (
+    get_global_script_context,
+    is_field_message_waiting_for_input,
+    is_waiting_for_input,
+    task_is_active,
+)
 from modules.profiler import count, now, timing
 
 
@@ -49,13 +55,42 @@ def _observe_field_message_waiting(state: GameState | Any) -> bool:
     """Carry Emerald's field-message lifecycle across script native waits."""
     global _field_message_lifecycle_active, _field_message_advance_ready
     if state is not GameState.OVERWORLD:
+        # During a map/script boundary the coarse game-state reader can
+        # report UNKNOWN even though Emerald's field script is at the
+        # message input native.  Preserve the actionable dialogue signal
+        # from the script context instead of classifying it as an inert
+        # unknown state.
+        try:
+            script_context = get_global_script_context()
+            input_waiting = is_waiting_for_input()
+            if (
+                script_context is not None
+                and script_context.is_active
+                and script_context.native_function_name == "WaitForAorBPress"
+                and script_context.script_function_name == "Std_MsgboxDefault"
+                and input_waiting
+            ):
+                _field_message_lifecycle_active = True
+                _field_message_advance_ready = False
+                return True
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            pass
         _field_message_lifecycle_active = False
         _field_message_advance_ready = False
         return False
     try:
         draw_task_active = task_is_active("Task_DrawFieldMessage")
+        script_context = get_global_script_context()
+        if (
+            not draw_task_active
+            and script_context is not None
+            and script_context.native_function_name == "WaitForAorBPress"
+            and script_context.script_function_name != "Std_MsgboxDefault"
+        ):
+            _field_message_lifecycle_active = False
+            _field_message_advance_ready = False
+            return False
         waiting = is_field_message_waiting_for_input(_field_message_lifecycle_active or draw_task_active)
-        script_context = None
         native_name = None
         if not waiting:
             script_context = get_global_script_context()
@@ -129,6 +164,13 @@ def observe_interaction(
     count("interaction_dialogue_checks")
     controllable_start = now()
     controllable = player_avatar_is_controllable()
+    trace = getattr(context, "stutter_trace", None)
+    if trace is not None and callable(getattr(trace, "mark", None)):
+        trace.mark("interaction_game_state", getattr(state, "name", repr(state)))
+        trace.mark("interaction_dialogue_waiting", dialogue_waiting)
+        trace.mark("interaction_field_message_lifecycle", _field_message_lifecycle_active)
+        trace.mark("interaction_field_message_ready", _field_message_advance_ready)
+        trace.mark("interaction_controllable", controllable)
     timing("agent_interaction_controllability_check", controllable_start)
     count("interaction_controllability_checks")
     timing("agent_interaction_observation", interaction_start)

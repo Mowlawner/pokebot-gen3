@@ -7,6 +7,54 @@ from modules.memory import GameState
 
 
 class TestIsWaitingForInput(unittest.TestCase):
+    def test_emerald_dialogue_predicate_accepts_native_message_handoff(self):
+        from modules.tasks import is_emerald_field_dialogue_advanceable
+
+        with patch("modules.tasks.is_field_message_waiting_for_input", return_value=False):
+            self.assertTrue(
+                is_emerald_field_dialogue_advanceable(
+                    task_active=False,
+                    script_active=True,
+                    native_function_name="WaitForAorBPress",
+                    script_function_name="Std_MsgboxDefault",
+                    input_waiting=True,
+                )
+            )
+
+    def test_emerald_dialogue_predicate_accepts_birch_speech_printer_pause(self):
+        from modules.tasks import is_emerald_field_dialogue_advanceable
+
+        with patch("modules.tasks.is_field_message_waiting_for_input", return_value=False):
+            self.assertTrue(
+                is_emerald_field_dialogue_advanceable(
+                    task_active=True,
+                    task_name="Task_NewGameBirchSpeech_ThisIsAPokemon",
+                    script_active=False,
+                    native_function_name=None,
+                    script_function_name=None,
+                    input_waiting=True,
+                )
+            )
+
+    def test_emerald_dialogue_predicate_rejects_printing_and_other_native_waits(self):
+        from modules.tasks import is_emerald_field_dialogue_advanceable
+
+        with patch("modules.tasks.is_field_message_waiting_for_input", return_value=False):
+            for native, script, ready in (
+                ("WaitForAorBPress", "Std_MsgboxDefault", False),
+                ("WaitForMovementFinish", "Std_MsgboxDefault", True),
+                ("WaitForAorBPress", "SomeScript", True),
+            ):
+                self.assertFalse(
+                    is_emerald_field_dialogue_advanceable(
+                        task_active=True,
+                        script_active=True,
+                        native_function_name=native,
+                        script_function_name=script,
+                        input_waiting=ready,
+                    )
+                )
+
     def test_emerald_field_message_requires_task_and_input_wait(self):
         from modules.tasks import is_field_message_waiting_for_input
 

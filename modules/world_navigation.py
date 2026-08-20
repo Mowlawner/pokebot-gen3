@@ -1,6 +1,7 @@
 """Static map-level routing built from the repository's ROM map metadata."""
 
 from collections import deque
+import heapq
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -23,12 +24,20 @@ class WorldEdge:
     warp_index: int | None = None
     required_facing: object | None = None
     connection_direction: str | None = None
+    # A conservative map-level estimate.  Callers that have better movement
+    # information (for example a test graph or a cached map planner) can
+    # supply it without changing the graph topology.
+    # One transition is deliberately more expensive than a handful of local
+    # inputs.  This keeps a direct goal advance ahead of a cheap exit, while
+    # callers can provide measured estimates when they have them.
+    estimated_cost: int = 10
 
 
 @dataclass(frozen=True)
 class WorldRoute:
     maps: tuple[MapId, ...]
     edges: tuple[WorldEdge, ...]
+    estimated_cost: int = 0
 
 
 class WorldNavigationError(RuntimeError):
@@ -132,21 +141,36 @@ class WorldMapGraph:
     def route(self, source_map: MapId, target_map: MapId) -> WorldRoute:
         if source_map == target_map:
             return WorldRoute((source_map,), ())
-        queue = deque([source_map])
+        # Dijkstra retains the old insertion-order behavior for equal-cost
+        # edges, while allowing a longer warp sequence to win when its
+        # estimated movement cost is lower.
+        queue: list[tuple[int, int, MapId]] = []
+        order = 0
+        heapq.heappush(queue, (0, order, source_map))
+        distances: dict[MapId, int] = {source_map: 0}
         came_from: dict[MapId, tuple[MapId, WorldEdge] | None] = {source_map: None}
         while queue:
-            current = queue.popleft()
+            distance, _, current = heapq.heappop(queue)
+            if distance != distances[current]:
+                continue
+            if current == target_map:
+                return self._unroll(came_from, target_map, distance)
             for edge in self.outgoing(current):
-                if edge.destination_map in came_from:
+                next_distance = distance + max(1, edge.estimated_cost)
+                if next_distance >= distances.get(edge.destination_map, float("inf")):
                     continue
+                distances[edge.destination_map] = next_distance
                 came_from[edge.destination_map] = (current, edge)
-                if edge.destination_map == target_map:
-                    return self._unroll(came_from, target_map)
-                queue.append(edge.destination_map)
+                order += 1
+                heapq.heappush(queue, (next_distance, order, edge.destination_map))
         raise WorldNavigationError(f"No map route from {source_map!r} to {target_map!r}")
 
     @staticmethod
-    def _unroll(came_from: Mapping[MapId, tuple[MapId, WorldEdge] | None], destination: MapId) -> WorldRoute:
+    def _unroll(
+        came_from: Mapping[MapId, tuple[MapId, WorldEdge] | None],
+        destination: MapId,
+        estimated_cost: int = 0,
+    ) -> WorldRoute:
         maps = [destination]
         edges: list[WorldEdge] = []
         current = destination
@@ -157,7 +181,7 @@ class WorldMapGraph:
             current = previous
         maps.reverse()
         edges.reverse()
-        return WorldRoute(tuple(maps), tuple(edges))
+        return WorldRoute(tuple(maps), tuple(edges), estimated_cost)
 
 
 _world_graph_cache: dict[str, WorldMapGraph] = {}

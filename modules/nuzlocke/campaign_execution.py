@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Callable, Iterator
 
 from modules.goals import ActivateTrigger, Goal, ReachWarp, EARLY_POKEBALL_TRIGGER_ID
 from modules.map_data import MapRSE
@@ -34,6 +35,7 @@ class CampaignExecutionResult:
     reason: str
     execution_id: str | None = None
     tactical_goal: Goal | None = None
+    capability: Callable[[], Iterator[object]] | None = None
 
 
 class CampaignExecutionAdapter:
@@ -98,15 +100,39 @@ class CampaignExecutionAdapter:
                     "complete_intro_rival has no valid introductory rival goal",
                     objective.execution_id,
                 )
+            from .resource_runtime import CampaignCapability
+
             return CampaignExecutionResult(
                 objective,
                 CampaignExecutionStatus.READY,
                 "translated to the existing introductory rival tactical goal",
                 objective.execution_id,
                 goal,
+                capability=CampaignCapability(objective.objective_id, objective.resource_policy, goal),
             )
 
-        if objective.objective_id == "confirm_early_pokeballs":
+        if objective.objective_id in {
+            "set_text_speed",
+            "complete_new_game_setup",
+            "set_wall_clock",
+            "meet_rival",
+            "rescue_birch",
+            "obtain_starter",
+            "receive_pokedex",
+        }:
+            # Keep the selector ROM-neutral and import emulator code only when
+            # a live Emerald objective is actually mounted.
+            from .emerald_capabilities import emerald_campaign_capability
+
+            return CampaignExecutionResult(
+                objective,
+                CampaignExecutionStatus.READY,
+                f"mounted observation-driven Emerald executor for {objective.objective_id}",
+                objective.execution_id,
+                capability=lambda: emerald_campaign_capability(objective.objective_id),
+            )
+
+        if objective.objective_id in {"confirm_early_pokeballs", "receive_pokeballs"}:
             goal = objective.tactical_target
             if isinstance(goal, ActivateTrigger) and goal.trigger_id == EARLY_POKEBALL_TRIGGER_ID:
                 return CampaignExecutionResult(
@@ -119,7 +145,7 @@ class CampaignExecutionAdapter:
             return CampaignExecutionResult(
                 objective,
                 CampaignExecutionStatus.UNSUPPORTED,
-                "confirm_early_pokeballs has no valid Professor Birch interaction goal",
+                "Poké Ball objective has no valid Professor Birch interaction goal",
                 objective.execution_id,
             )
 

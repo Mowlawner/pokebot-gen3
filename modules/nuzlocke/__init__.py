@@ -7,6 +7,8 @@ from .snapshots import (
     InventorySnapshot,
     MoveSnapshot,
     NamedFlag,
+    NamedVariable,
+    CampaignObservationSnapshot,
     NuzlockeSnapshot,
     PartyPokemonSnapshot,
     PlayerSnapshot,
@@ -17,8 +19,10 @@ from .snapshots import (
     get_nuzlocke_snapshot,
 )
 from .identity import PokemonIdentity
-from .events import PokemonCaptured, PokemonStorageLocation, StorageChanged
+from .events import NuzlockeStarted, PokemonCaptured, PokemonStorageLocation, StorageChanged
 from .runtime import NuzlockeRuntime
+from .policy import EventStatistics, PersistenceClass, classify_event
+from .diagnostics import BoundedEventTrace
 from .persistence import (
     EventStoreCorruptionError,
     EventStoreError,
@@ -43,7 +47,7 @@ from .rules import (
     load_rules,
     reduce_rules,
 )
-from .campaign_state import CampaignState, Fact, FactStatus, RunStatus
+from .campaign_state import CampaignFacts, CampaignState, Fact, FactStatus, RunStatus, derive_campaign_facts
 from .campaign_objectives import (
     CampaignObjective,
     CampaignPredicate,
@@ -58,6 +62,19 @@ from .campaign_execution import (
     CampaignExecutionStatus,
     adapt_campaign_execution,
 )
+from .campaign_controller import CampaignController, CampaignControllerState, CampaignControllerStatus
+from .resource_policy import (
+    EncounterPolicy,
+    HealingResource,
+    PartyResource,
+    ReadinessImportance,
+    ResourceDecision,
+    ResourceObjective,
+    ResourceSnapshot,
+    RouteRecovery,
+    assess_campaign_resources,
+    assess_wild_encounter,
+)
 
 __all__ = [
     "BattleSnapshot",
@@ -66,6 +83,8 @@ __all__ = [
     "InventorySnapshot",
     "MoveSnapshot",
     "NamedFlag",
+    "NamedVariable",
+    "CampaignObservationSnapshot",
     "NuzlockeSnapshot",
     "PartyPokemonSnapshot",
     "PlayerSnapshot",
@@ -77,8 +96,13 @@ __all__ = [
     "PokemonStorageLocation",
     "StorageChanged",
     "PokemonCaptured",
+    "NuzlockeStarted",
     "get_nuzlocke_snapshot",
     "NuzlockeRuntime",
+    "PersistenceClass",
+    "EventStatistics",
+    "classify_event",
+    "BoundedEventTrace",
     "EventStoreError",
     "EventStoreCorruptionError",
     "JsonEventStore",
@@ -101,6 +125,8 @@ __all__ = [
     "Fact",
     "FactStatus",
     "RunStatus",
+    "CampaignFacts",
+    "derive_campaign_facts",
     "CampaignObjective",
     "CampaignPredicate",
     "ObjectiveSelection",
@@ -111,4 +137,7 @@ __all__ = [
     "CampaignExecutionResult",
     "CampaignExecutionStatus",
     "adapt_campaign_execution",
+    "CampaignController",
+    "CampaignControllerState",
+    "CampaignControllerStatus",
 ]

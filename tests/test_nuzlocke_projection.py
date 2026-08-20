@@ -8,6 +8,7 @@ from modules.nuzlocke.events import (
     BattleStarted,
     GameStateChanged,
     MapChanged,
+    NuzlockeStarted,
     PartyChanged,
     PokemonFainted,
     WhiteoutOccurred,
@@ -85,6 +86,18 @@ class TestCampaignProjection(unittest.TestCase):
         original = event
         CampaignProjection().apply(event)
         self.assertEqual(event, original)
+
+    def test_nuzlocke_start_is_an_explicit_replayable_campaign_boundary(self):
+        event = NuzlockeStarted(7)
+        projection = CampaignProjection()
+        projection.apply(event, session_id="run", sequence=1)
+        self.assertTrue(projection.state.nuzlocke_started)
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonEventStore(Path(directory) / "events.json", session_id="run")
+            store.append(event)
+            replayed = load_campaign_projection(JsonEventStore(store.path))
+        self.assertTrue(replayed.nuzlocke_started)
+        self.assertEqual(replayed, projection.state)
 
 
 if __name__ == "__main__":

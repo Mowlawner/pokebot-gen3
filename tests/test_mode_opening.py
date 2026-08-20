@@ -4,6 +4,75 @@ from unittest.mock import patch
 
 
 class TestEmeraldOpeningState(unittest.TestCase):
+    def test_run_rebases_legacy_phase_before_dispatch(self):
+        """A capability mounted with a stale phase follows the ROM frame."""
+        from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningCapability, OpeningSequenceState
+
+        emulator = types.SimpleNamespace(press_button=unittest.mock.Mock())
+        opening_context = types.SimpleNamespace(
+            debug=False,
+            debug_trace=False,
+            rom=types.SimpleNamespace(is_emerald=True),
+            emulator=emulator,
+            bot_mode="Start New Game",
+        )
+        mode = EmeraldOpeningCapability(campaign_owned=True)
+        mode.phase = OpeningSequenceState.BIRCH_HOUSE_2F
+        with (
+            patch("modules.modes.opening.context", opening_context),
+            patch(
+                "modules.modes.opening.get_opening_sequence_state", return_value=OpeningSequenceState.PLAYER_HOUSE_1F
+            ),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch.object(
+                mode,
+                "_dialogue_state_snapshot",
+                return_value=(True, 0, False, "WaitForAorBPress", None, True, True, True, None, (), None, None),
+            ),
+            patch("modules.modes.opening.is_field_message_waiting_for_input", return_value=True),
+        ):
+            execution = mode.run()
+            next(execution)
+
+        emulator.press_button.assert_called_once_with("B")
+        self.assertIs(mode.phase, OpeningSequenceState.PLAYER_HOUSE_1F)
+
+    def test_navigation_transaction_is_abandoned_after_map_observation_changes(self):
+        from modules.modes.opening import EmeraldOpeningCapability, OpeningSequenceState
+
+        mode = EmeraldOpeningCapability(campaign_owned=True)
+        inputs = []
+
+        def navigation():
+            inputs.append("Up")
+            yield
+            inputs.append("Up")
+            yield
+
+        with (
+            patch(
+                "modules.modes.opening.get_opening_sequence_state",
+                side_effect=[
+                    OpeningSequenceState.PLAYER_HOUSE_1F,
+                    OpeningSequenceState.PLAYER_HOUSE_1F,
+                    OpeningSequenceState.BIRCH_HOUSE_1F,
+                ],
+            ),
+            patch.object(
+                mode,
+                "_dialogue_state_snapshot",
+                return_value=(False, None, False, None, None, False, True, False, None, (), None, None),
+            ),
+            patch.object(mode, "_dialogue_detection", return_value=(False, "no dialogue")),
+        ):
+            transaction = mode._run_navigation_transaction(navigation())
+            next(transaction)
+            with self.assertRaises(StopIteration):
+                next(transaction)
+
+        self.assertEqual(inputs, ["Up"])
+
     def test_littleroot_house_maps_are_resolved_by_player_gender(self):
         from modules.map_data import MapRSE
         from modules.memory import GameState
@@ -236,6 +305,89 @@ class TestEmeraldOpeningState(unittest.TestCase):
                 avoid_scripted_events=False,
                 expecting_script=True,
             )
+
+    def test_actionable_dialogue_preempts_suspended_navigation_transaction(self):
+        """A higher-priority observation abandons movement before the next input."""
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+        from modules.nuzlocke.emerald_capabilities import (
+            EmeraldCampaignAction,
+            EmeraldCampaignObservation,
+            choose_emerald_campaign_action,
+        )
+
+        mode = EmeraldOpeningMode()
+        emulator = types.SimpleNamespace(press_button=unittest.mock.Mock())
+        navigation_inputs = []
+
+        def navigation():
+            while True:
+                emulator.press_button("Up")
+                navigation_inputs.append("Up")
+                yield
+
+        with (
+            patch("modules.modes.opening.context.emulator", emulator),
+            patch.object(
+                mode,
+                "_dialogue_state_snapshot",
+                return_value=(False, None, True, "WaitForAorBPress", "Std_MsgboxDefault", True, False, False),
+            ),
+            patch.object(
+                mode,
+                "_dialogue_detection",
+                side_effect=[(False, "navigation still owns execution"), (True, "dialogue is actionable")],
+            ),
+            patch("modules.modes.opening.get_opening_sequence_state", return_value=OpeningSequenceState.SCRIPTED_INTRO),
+        ):
+            transaction = mode._run_navigation_transaction(navigation())
+            next(transaction)
+            with self.assertRaises(StopIteration):
+                next(transaction)
+
+        observation = EmeraldCampaignObservation(
+            OpeningSequenceState.SCRIPTED_INTRO,
+            False,
+            False,
+            dialogue_waiting=True,
+        )
+        self.assertIs(choose_emerald_campaign_action(observation), EmeraldCampaignAction.ADVANCE_DIALOGUE)
+        self.assertEqual(navigation_inputs, ["Up"])
+
+        def advance_dialogue():
+            emulator.press_button("A")
+            yield
+
+        dialogue_execution = advance_dialogue()
+        next(dialogue_execution)
+        self.assertEqual(
+            [call.args[0] for call in emulator.press_button.call_args_list],
+            ["Up", "A"],
+        )
+
+    def test_actionable_dialogue_preempts_facing_transaction_before_input(self):
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        facing_inputs = []
+
+        def facing():
+            facing_inputs.append("Left")
+            yield
+
+        with (
+            patch.object(
+                mode,
+                "_dialogue_state_snapshot",
+                return_value=(False, None, True, "WaitForAorBPress", "Std_MsgboxDefault", True, False, False),
+            ),
+            patch.object(mode, "_dialogue_detection", return_value=(True, "dialogue is actionable")),
+            patch(
+                "modules.modes.opening.get_opening_sequence_state", return_value=OpeningSequenceState.PLAYER_HOUSE_1F
+            ),
+        ):
+            list(mode._run_preemptible_transaction(facing()))
+
+        self.assertEqual(facing_inputs, [])
 
     def test_observed_controllable_truck_frame_navigates_instead_of_waiting(self):
         from modules.map_data import MapRSE
@@ -650,6 +802,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         mode.phase = OpeningSequenceState.PLAYER_HOUSE_2F
         with (
             patch.object(mode, "_can_navigate", return_value=True),
+            patch("modules.modes.opening.get_event_flag", return_value=False),
             patch("modules.modes.opening._current_map_id", return_value=MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F.value),
             patch("modules.modes.opening.navigate_to", return_value=iter(())) as navigate,
             patch("modules.modes.opening.ensure_facing_direction", return_value=iter(())) as face,
@@ -669,6 +822,65 @@ class TestEmeraldOpeningState(unittest.TestCase):
         )
         face.assert_called_once_with("Up")
         emulator.press_button.assert_called_once_with("A")
+
+    def test_observed_second_floor_with_completed_clock_skips_clock_phase(self):
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.PLAYER_HOUSE_2F
+        with (
+            patch("modules.modes.opening.get_event_flag", return_value=True),
+            patch.object(mode, "_start_clock_interaction", return_value=iter(())) as start_clock,
+            patch.object(mode, "_run_navigation_transaction", return_value=iter(())) as navigation,
+        ):
+            list(mode._advance_phase(OpeningSequenceState.PLAYER_HOUSE_2F))
+
+        self.assertIs(mode.phase, OpeningSequenceState.PLAYER_HOUSE_1F)
+        self.assertEqual(
+            mode._last_truck_decision,
+            "complete: wall clock already set; resume post-clock house progression",
+        )
+        start_clock.assert_not_called()
+        navigation.assert_not_called()
+
+    def test_completed_clock_dialogue_owns_frame_before_post_clock_navigation(self):
+        from modules.memory import GameState
+        from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
+
+        emulator = types.SimpleNamespace(press_button=unittest.mock.Mock())
+        opening_context = types.SimpleNamespace(
+            debug=False,
+            rom=types.SimpleNamespace(is_emerald=True),
+            emulator=emulator,
+        )
+        actionable_message = (
+            True,
+            0,
+            False,
+            "WaitForAorBPress",
+            None,
+            True,
+            True,
+            True,
+            None,
+            (),
+            None,
+            None,
+        )
+        mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.PLAYER_HOUSE_2F
+        with (
+            patch("modules.modes.opening.context", opening_context),
+            patch("modules.modes.opening.get_game_state", return_value=GameState.OVERWORLD),
+            patch.object(mode, "_dialogue_state_snapshot", return_value=actionable_message),
+            patch("modules.modes.opening.is_field_message_waiting_for_input", return_value=True),
+            patch.object(mode, "_run_navigation_transaction", return_value=iter(())) as navigation,
+        ):
+            result = list(mode._advance_startup_dialogue(OpeningSequenceState.PLAYER_HOUSE_2F))
+
+        self.assertEqual(result, [True])
+        emulator.press_button.assert_called_once_with("B")
+        navigation.assert_not_called()
 
     def test_clock_setting_observation_starts_interaction_without_event_lookup(self):
         from modules.map_data import MapRSE
@@ -1100,6 +1312,43 @@ class TestEmeraldOpeningState(unittest.TestCase):
             opening_context.emulator = emulator
             list(_advance_scripted_input())
 
+        emulator.press_button.assert_called_once_with("A")
+
+    def test_scripted_input_preserves_field_message_lifecycle_at_native_wait(self):
+        from modules.modes.opening import EmeraldOpeningCapability, _advance_scripted_input
+
+        emulator = types.SimpleNamespace(press_button=unittest.mock.Mock())
+        opening_context = types.SimpleNamespace(
+            debug=False,
+            debug_trace=False,
+            rom=types.SimpleNamespace(is_emerald=True),
+            emulator=emulator,
+        )
+        with (
+            patch("modules.modes.opening.context", opening_context),
+            patch.object(
+                EmeraldOpeningCapability,
+                "_dialogue_state_snapshot",
+                return_value=(
+                    False,
+                    None,
+                    True,
+                    "WaitForAorBPress",
+                    "Std_MsgboxDefault",
+                    True,
+                    True,
+                    True,
+                    None,
+                    (),
+                    None,
+                    None,
+                ),
+            ),
+            patch("modules.modes.opening.is_emerald_field_dialogue_advanceable", return_value=True) as advanceable,
+        ):
+            list(_advance_scripted_input(field_message_lifecycle_active=True))
+
+        self.assertTrue(advanceable.call_args.kwargs["field_message_lifecycle_active"])
         emulator.press_button.assert_called_once_with("A")
 
     def test_truck_phase_waits_for_observed_littleroot_transition(self):

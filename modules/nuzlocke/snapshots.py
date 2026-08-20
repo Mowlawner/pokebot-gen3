@@ -129,6 +129,22 @@ class NamedFlag:
 
 
 @dataclass(frozen=True, slots=True)
+class NamedVariable:
+    name: str
+    value: int
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignObservationSnapshot:
+    """Raw, save-backed inputs used by the pure campaign-fact reducer."""
+
+    flags: tuple[NamedFlag, ...] = ()
+    variables: tuple[NamedVariable, ...] = ()
+    text_speed: int | None = None
+    available: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class ProgressionSnapshot:
     badges: tuple[NamedFlag, ...]
 
@@ -153,6 +169,7 @@ class NuzlockeSnapshot:
     inventory_available: bool = True
     pc_available: bool = True
     battle_available: bool = True
+    campaign_observation: CampaignObservationSnapshot = dataclass_field(default_factory=CampaignObservationSnapshot)
 
 
 def _moves(pokemon) -> tuple[MoveSnapshot, ...]:
@@ -366,6 +383,31 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
         trace.duration("nuzlocke_battle_duration_ms", stage)
     stage = trace.now() if trace is not None else 0
     progression = tuple(NamedFlag(f"BADGE{i:02d}_GET", get_event_flag(f"BADGE{i:02d}_GET")) for i in range(1, 9))
+    campaign_observation = CampaignObservationSnapshot()
+    try:
+        from modules.memory import get_event_var, get_save_block, unpack_uint16
+
+        campaign_flags = tuple(
+            NamedFlag(name, get_event_flag(name))
+            for name in (
+                "SET_WALL_CLOCK",
+                "RESCUED_BIRCH",
+                "DEFEATED_RIVAL_ROUTE103",
+                "SYS_POKEMON_GET",
+                "SYS_POKEDEX_GET",
+                "RECEIVED_POKEDEX_FROM_BIRCH",
+            )
+        )
+        campaign_variables = tuple(
+            NamedVariable(name, get_event_var(name))
+            for name in ("LITTLEROOT_INTRO_STATE", "LITTLEROOT_RIVAL_STATE", "BIRCH_LAB_STATE")
+        )
+        text_speed = unpack_uint16(get_save_block(2, offset=0x14, size=2)) & 0x07
+        campaign_observation = CampaignObservationSnapshot(
+            campaign_flags, campaign_variables, text_speed, game_state is not None
+        )
+    except (AttributeError, ImportError, KeyError, IndexError, RuntimeError, TypeError, ValueError):
+        pass
     if trace is not None:
         trace.duration("nuzlocke_progression_duration_ms", stage)
     return NuzlockeSnapshot(
@@ -395,4 +437,5 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
         inventory_available=bag is not None,
         pc_available=storage is not None,
         battle_available=game_state is not None,
+        campaign_observation=campaign_observation,
     )

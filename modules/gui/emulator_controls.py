@@ -14,6 +14,7 @@ from modules.libmgba import LibmgbaEmulator
 from modules.memory import GameState, get_game_state
 from modules.modes import get_bot_modes
 from modules.version import pokebot_name, pokebot_version
+from modules.nuzlocke.campaign_status import format_campaign_status
 
 
 class EmulatorControls:
@@ -31,6 +32,7 @@ class EmulatorControls:
         self.toggle_video_button: ttk.Button
         self.toggle_audio_button: ttk.Button
         self.bot_message: ttk.Label
+        self.campaign_status: ttk.Label
         self.stats_label: ttk.Label
 
         self.emulator_menu: Menu | None = None
@@ -136,6 +138,7 @@ class EmulatorControls:
         )
 
         self.bot_message.config(text=context.message)
+        self.campaign_status.config(text=format_campaign_status(context.campaign_status))
 
     def on_frame_render(self):
         self._update_stats()
@@ -301,6 +304,8 @@ class EmulatorControls:
 
         self.bot_message = ttk.Label(group, wraplength=440, justify="left")
         self.bot_message.grid(row=0, sticky="NW")
+        self.campaign_status = ttk.Label(group, wraplength=440, justify="left")
+        self.campaign_status.grid(row=1, sticky="NW", pady=(8, 0))
 
     def _add_stats_and_version_notice(self, row: int, column: int, columnspan: int = 1):
         group = ttk.Frame(self.frame)

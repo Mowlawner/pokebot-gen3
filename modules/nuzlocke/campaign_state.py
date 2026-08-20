@@ -7,7 +7,7 @@ predicates and keeps unavailable values distinct from known empty/false ones.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from enum import Enum
 from typing import Generic, TypeVar
 
@@ -18,6 +18,7 @@ from .identity import PokemonIdentity
 from .snapshots import (
     InventorySnapshot,
     NamedFlag,
+    NamedVariable,
     NuzlockeSnapshot,
     PartyPokemonSnapshot,
     StoragePokemonSnapshot,
@@ -70,6 +71,90 @@ class RunStatus(Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class CampaignFacts:
+    """Semantic, read-only facts derived from one normalized observation."""
+
+    text_speed_fast: Fact[bool]
+    new_game_setup_complete: Fact[bool]
+    wall_clock_set: Fact[bool]
+    rival_met: Fact[bool]
+    birch_rescued: Fact[bool]
+    starter_obtained: Fact[bool]
+    intro_rival_battle_complete: Fact[bool]
+    pokedex_received: Fact[bool]
+    pokeballs_available: Fact[bool]
+    pokeballs_ready: Fact[bool]
+    nuzlocke_started: Fact[bool]
+
+    def __getitem__(self, name: str) -> Fact[bool]:
+        return getattr(self, name)
+
+
+def _flag(flags: tuple[NamedFlag, ...], name: str, available: bool) -> Fact[bool]:
+    match = next((flag for flag in flags if flag.name == name), None)
+    return Fact.known(match.value) if match is not None else (Fact.unknown() if available else Fact.unavailable())
+
+
+def _var(variables: tuple[NamedVariable, ...], name: str, available: bool) -> Fact[int]:
+    match = next((variable for variable in variables if variable.name == name), None)
+    return Fact.known(match.value) if match is not None else (Fact.unknown() if available else Fact.unavailable())
+
+
+def derive_campaign_facts(
+    snapshot: NuzlockeSnapshot,
+    inventory: Fact[InventorySnapshot],
+    nuzlocke_started: Fact[bool],
+) -> CampaignFacts:
+    observation = snapshot.campaign_observation
+    available = observation.available
+    text_speed = (
+        Fact.known(observation.text_speed == 2)
+        if observation.text_speed is not None
+        else (Fact.unknown() if available else Fact.unavailable())
+    )
+    intro = _var(observation.variables, "LITTLEROOT_INTRO_STATE", available)
+    rival = _var(observation.variables, "LITTLEROOT_RIVAL_STATE", available)
+    lab = _var(observation.variables, "BIRCH_LAB_STATE", available)
+    pokemon_get = _flag(observation.flags, "SYS_POKEMON_GET", available)
+    setup = Fact.known(intro.value >= 3) if intro.is_known else Fact(None, intro.status)
+    rival_met = Fact.known(rival.value >= 3) if rival.is_known else Fact(None, rival.status)
+    starter = (
+        # State 2 is the ROM-owned lab nickname/rival prompt sequence. Keep
+        # obtain_starter active until that script sets state 3 and releases.
+        Fact.known(lab.value >= 3 and pokemon_get.value)
+        if lab.is_known and pokemon_get.is_known
+        else Fact(None, lab.status if lab.status is not FactStatus.KNOWN else pokemon_get.status)
+    )
+    pokedex = _flag(observation.flags, "RECEIVED_POKEDEX_FROM_BIRCH", available)
+    system_dex = _flag(observation.flags, "SYS_POKEDEX_GET", available)
+    if pokedex.is_known and system_dex.is_known:
+        pokedex = Fact.known(pokedex.value or system_dex.value)
+    balls = (
+        Fact.known(sum(item.quantity for item in inventory.value.poke_balls) > 0)
+        if inventory.is_known
+        else Fact(None, inventory.status)
+    )
+    ready = (
+        Fact.known(balls.value and lab.value >= 5)
+        if balls.is_known and lab.is_known
+        else Fact(None, balls.status if balls.status is not FactStatus.KNOWN else lab.status)
+    )
+    return CampaignFacts(
+        text_speed,
+        setup,
+        _flag(observation.flags, "SET_WALL_CLOCK", available),
+        rival_met,
+        _flag(observation.flags, "RESCUED_BIRCH", available),
+        starter,
+        _flag(observation.flags, "DEFEATED_RIVAL_ROUTE103", available),
+        pokedex,
+        balls,
+        ready,
+        nuzlocke_started,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class CampaignState:
     """Planner-facing view of current and replayed campaign facts.
 
@@ -95,6 +180,9 @@ class CampaignState:
     last_completed_battle: Fact[BattleEnded]
     session_id: str | None
     known_session_ids: tuple[str, ...]
+    campaign_facts: CampaignFacts = dataclass_field(
+        default_factory=lambda: CampaignFacts(*(Fact.unavailable() for _ in range(10)))
+    )
 
     @classmethod
     def from_runtime_state(
@@ -174,6 +262,11 @@ class CampaignState:
             last_battle,
             session_id,
             session_ids,
+            derive_campaign_facts(
+                snapshot,
+                inventory,
+                Fact.known(observed.nuzlocke_started) if observed is not None else Fact.unavailable(),
+            ),
         )
 
     def has_badge(self, name: str) -> Fact[bool]:

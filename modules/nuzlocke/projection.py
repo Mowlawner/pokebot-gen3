@@ -23,6 +23,7 @@ from .events import (
     PokemonFainted,
     StorageChanged,
     WhiteoutOccurred,
+    NuzlockeStarted,
 )
 from .persistence import JsonEventStore, deserialize_event, serialize_event
 from .identity import PokemonIdentity
@@ -77,6 +78,7 @@ class ObservedCampaignState:
     observed_faints: tuple[PokemonFainted, ...] = ()
     observed_whiteouts: tuple[ObservedEvent, ...] = ()
     observed_captures: tuple[PokemonCaptured, ...] = ()
+    nuzlocke_started: bool = False
 
 
 def _event_key(event: Event, session_id: str | None) -> str:
@@ -125,6 +127,7 @@ class CampaignProjection:
                 StorageChanged,
                 WhiteoutOccurred,
                 GameStateChanged,
+                NuzlockeStarted,
             ),
         ):
             raise TypeError(f"Unsupported Nuzlocke event: {type(event).__name__}")
@@ -223,6 +226,8 @@ class CampaignProjection:
             changes["pc_locations"] = tuple((identity, box, slot) for identity, (box, slot) in locations.items())
         elif isinstance(event, WhiteoutOccurred):
             changes["observed_whiteouts"] = state.observed_whiteouts + (meta,)
+        elif isinstance(event, NuzlockeStarted):
+            changes["nuzlocke_started"] = True
         self._state = replace(state, **changes)
 
     def apply_record(self, record: dict[str, Any]) -> None:
