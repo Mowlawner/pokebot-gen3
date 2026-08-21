@@ -11,6 +11,7 @@ from modules.battle_planner import (
     PlannerEvidenceKind,
     PlannerSafety,
     PlannerMove,
+    PlannerItem,
     PlannerOpponentMove,
     PlannerRisk,
     PlannerSwitch,
@@ -36,6 +37,47 @@ def context(**changes):
 
 
 class BattlePlannerTests(unittest.TestCase):
+    def test_capture_target_prefers_nonlethal_move_over_guaranteed_ko(self):
+        decision = BattlePlanner().plan(
+            context(
+                opponent_hp=10,
+                moves=(PlannerMove(0, "Strong", 10, 14), PlannerMove(1, "Weak", 3, 5)),
+                capture_target=True,
+                capture_available=True,
+                capture_appropriate_hp=2,
+            )
+        )
+        self.assertEqual(decision.action, PlannerAction.UseMove)
+        self.assertEqual(decision.target, 1)
+
+    def test_capture_target_prefers_ball_at_capture_hp(self):
+        ball = SimpleNamespace(name="Poké Ball")
+        decision = BattlePlanner().plan(
+            context(
+                opponent_hp=2,
+                capture_target=True,
+                capture_available=True,
+                capture_appropriate_hp=3,
+                items=(PlannerItem(ball, 5, 0, True),),
+            )
+        )
+        self.assertEqual(decision.action, PlannerAction.UseItem)
+        self.assertEqual(decision.target, (ball, 0))
+
+    def test_capture_target_with_only_lethal_attacks_uses_ball(self):
+        ball = SimpleNamespace(name="Poké Ball")
+        decision = BattlePlanner().plan(
+            context(
+                opponent_hp=10,
+                moves=(PlannerMove(0, "Strong", 10, 14),),
+                capture_target=True,
+                capture_available=True,
+                capture_appropriate_hp=1,
+                items=(PlannerItem(ball, 1, 0, True),),
+            )
+        )
+        self.assertEqual(decision.action, PlannerAction.UseItem)
+
     def test_best_available_diagnostic_explains_unknown_response_and_rejected_move(self):
         battle_context = context(
             opponent_hp=30,

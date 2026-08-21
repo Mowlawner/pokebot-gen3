@@ -3,6 +3,13 @@ from typing import Iterable
 
 from modules.context import context
 from modules.console import diagnostic_print
+
+
+def clear_transient_battle_message() -> None:
+    """Clear only the single current-battle GUI status slot."""
+    context.message = ""
+
+
 from modules.debug import debug
 from modules.encounter import handle_encounter, EncounterInfo, log_encounter
 from modules.map import get_map_objects, get_map_data_for_current_position
@@ -222,6 +229,10 @@ class BattleListener(BotListener):
                 self._reported_end_of_battle = True
                 clear_opponent()
                 bot_mode.on_battle_ended(outcome)
+                # context.message is the transient current-battle status slot.
+                # Clear it only after the mode callback so existing battle-end
+                # behavior and legitimate non-battle messages remain intact.
+                clear_transient_battle_message()
                 _ensure_plugin_hook_will_run(plugin_battle_ended(outcome))
                 if self._active_wild_encounter is not None:
                     context.stats.log_end_of_battle(outcome, self._active_wild_encounter)

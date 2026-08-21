@@ -15,6 +15,7 @@ from modules.nuzlocke.snapshots import (
     PlayerSnapshot,
     ProgressionSnapshot,
     StorageSnapshot,
+    ItemQuantity,
 )
 
 
@@ -38,6 +39,33 @@ def snapshot(frame: int, map_number: int = 2) -> NuzlockeSnapshot:
 
 
 class TestNuzlockeRuntime(unittest.TestCase):
+    def test_first_legal_wild_battle_designates_capture_target(self):
+        runtime = NuzlockeRuntime()
+        inventory = InventorySnapshot((), (ItemQuantity("Poké Ball", 5),), ())
+        runtime.update(replace(snapshot(1), inventory=inventory, inventory_available=True))
+        battle = NuzlockeSnapshot(
+            2,
+            "test",
+            State.BATTLE,
+            PlayerSnapshot("May", 1, 2, "MAP", (1, 1), "Down", True),
+            (),
+            inventory,
+            BattleSnapshot(("WILD",), False, True, False, (), (), "InProgress"),
+            StorageSnapshot(0, ()),
+            ProgressionSnapshot(()),
+        )
+        runtime.update(battle)
+        self.assertTrue(runtime.capture_target_for((1, 2), is_wild=True, is_trainer=False))
+        self.assertFalse(runtime.capture_target_for((1, 2), is_wild=True, is_trainer=True))
+        self.assertFalse(runtime.capture_target_for((1, 3), is_wild=True, is_trainer=False))
+
+    def test_capture_target_query_does_not_advance_encounter_state(self):
+        runtime = NuzlockeRuntime()
+        inventory = InventorySnapshot((), (ItemQuantity("Poké Ball", 1),), ())
+        runtime.update(replace(snapshot(1), inventory=inventory))
+        self.assertFalse(runtime.capture_target_for((1, 2), is_wild=True, is_trainer=False))
+        self.assertEqual(runtime.rules_projection.state.encounters, ())
+
     def test_unavailable_startup_snapshot_is_safe(self):
         runtime = NuzlockeRuntime()
         startup = replace(

@@ -239,6 +239,16 @@ class Item:
         )
 
 
+class InvalidItemIndexError(IndexError):
+    """Observed save/RAM item index is not present in the loaded item table."""
+
+    def __init__(self, index: int, *, slot: int | None = None, storage: str = "unknown"):
+        self.index = index
+        self.slot = slot
+        self.storage = storage
+        super().__init__(f"item index {index} is outside the loaded item table")
+
+
 class PokeblockColour(Enum):
     NoColour = 0
     Red = 1
@@ -352,7 +362,10 @@ class ItemBag:
             item_index = unpack_uint16(self._data[offset : offset + 2])
             quantity = decrypt16(unpack_uint16(self._data[offset + 2 : offset + 4]), self._encryption_key)
             if item_index != 0 and quantity > 0:
-                item = get_item_by_index(item_index)
+                try:
+                    item = get_item_by_index(item_index)
+                except IndexError as error:
+                    raise InvalidItemIndexError(item_index, slot=index, storage="bag") from error
                 result.append(ItemSlot(item, quantity))
         return result
 
@@ -488,7 +501,10 @@ class ItemStorage:
             item_index = unpack_uint16(self._data[offset : offset + 2])
             quantity = unpack_uint16(self._data[offset + 2 : offset + 4])
             if item_index != 0 and quantity > 0:
-                item = get_item_by_index(item_index)
+                try:
+                    item = get_item_by_index(item_index)
+                except IndexError as error:
+                    raise InvalidItemIndexError(item_index, slot=index, storage="pc") from error
                 result.append(ItemSlot(item, quantity))
         return result
 

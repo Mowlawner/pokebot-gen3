@@ -10,6 +10,7 @@ from modules.map import (
     ObjectEventTemplate,
     get_map_data,
     get_map_metadata,
+    inspect_map_connections,
 )
 
 
@@ -122,6 +123,42 @@ class TestMapMetadata(unittest.TestCase):
 
         self.assertIs(metadata.object_template(2), first)
         self.assertIs(metadata.object_template(99), None)
+
+    def test_inspect_map_connections_reports_raw_and_decoded_records(self):
+        map_id = (0, 16)
+        destination = (0, 10)
+        header = bytearray(0x1C)
+        header[0x0C:0x10] = (0x2000).to_bytes(4, "little")
+        record = bytes([2, 0, 0, 0]) + (0).to_bytes(4, "little", signed=True) + bytes([0, 10, 0, 0])
+        map_view = SimpleNamespace(map_name="ROUTE 101")
+        destination_view = SimpleNamespace(map_name="OLDALE TOWN")
+        emulator = SimpleNamespace(
+            read_bytes=lambda address, size: {
+                0x1000: (0x3000).to_bytes(4, "little"),
+                0x2000: (1).to_bytes(4, "little") + (0x4000).to_bytes(4, "little"),
+                0x4000: record,
+            }[address]
+        )
+        rom = SimpleNamespace(
+            id="rom-a",
+            game_name="Pokémon Emerald (E)",
+            game_code="BPE",
+            revision=0,
+            language=SimpleNamespace(name="English"),
+        )
+        with (
+            patch("modules.map.context", SimpleNamespace(rom=rom, emulator=emulator)),
+            patch("modules.map._map_header_cache", {"rom-a": {map_id: bytes(header)}}),
+            patch("modules.map.get_map_data", side_effect=[map_view, destination_view]),
+            patch("modules.map.read_symbol", return_value=(0x0FC0).to_bytes(4, "little")),
+        ):
+            result = inspect_map_connections(map_id)
+
+        self.assertEqual(result["connections"]["count"], 1)
+        self.assertEqual(result["connections"]["list_pointer"], 0x2000)
+        self.assertEqual(result["connections"]["records"][0]["raw_direction"], 2)
+        self.assertEqual(result["connections"]["records"][0]["direction"], "North")
+        self.assertEqual(result["connections"]["records"][0]["destination_name"], "OLDALE TOWN")
 
     def test_object_template_script_symbol_is_resolved_once(self):
         data = bytearray(24)

@@ -1984,6 +1984,80 @@ def get_map_metadata(map_group_and_number: "tuple[int, int] | MapFRLG | MapRSE")
     return rom_cache[map_group_and_number]
 
 
+def inspect_map_connections(map_group_and_number: "tuple[int, int] | MapFRLG | MapRSE") -> dict:
+    """Return raw and decoded connection metadata for a ROM map.
+
+    This is intentionally diagnostic-only.  It reads the active ROM's map
+    group/header and connection-list bytes, then compares them with the
+    existing ``MapConnection`` decoder.  It does not populate or alter any
+    navigation representation.
+    """
+    if not isinstance(map_group_and_number, tuple):
+        map_group_and_number = map_group_and_number.value
+
+    map_group, map_number = map_group_and_number
+    map_data = get_map_data(map_group_and_number, (0, 0))
+    map_header = _map_header_cache[context.rom.id][map_group_and_number]
+    map_group_pointers = read_symbol("gMapGroups", size=4 * (map_group + 1))
+    group_pointer = unpack_uint32(map_group_pointers[map_group * 4 : (map_group + 1) * 4])
+    map_header_pointer = unpack_uint32(context.emulator.read_bytes(group_pointer + 4 * map_number, 4))
+
+    list_pointer = unpack_uint32(map_header[0x0C:0x10])
+    count = 0
+    connection_pointer = 0
+    records: list[dict] = []
+    if list_pointer:
+        connection_list_header = context.emulator.read_bytes(list_pointer, 8)
+        count = unpack_uint32(connection_list_header[:4])
+        connection_pointer = unpack_uint32(connection_list_header[4:8])
+        if connection_pointer:
+            raw = context.emulator.read_bytes(connection_pointer, 12 * count)
+            for index in range(count):
+                record = raw[index * 12 : (index + 1) * 12]
+                connection = MapConnection(record)
+                destination = (connection.destination_map_group, connection.destination_map_number)
+                try:
+                    destination_name = get_map_data(destination, (0, 0)).map_name
+                except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+                    destination_name = None
+                records.append(
+                    {
+                        "index": index,
+                        "raw_hex": record.hex(),
+                        "raw_direction": record[0],
+                        "direction": connection.direction,
+                        "offset": connection.offset,
+                        "destination_group": destination[0],
+                        "destination_number": destination[1],
+                        "destination_name": destination_name,
+                    }
+                )
+
+    return {
+        "rom": {
+            "id": context.rom.id,
+            "game_name": context.rom.game_name,
+            "game_code": context.rom.game_code,
+            "revision": context.rom.revision,
+            "language": context.rom.language.name,
+        },
+        "map": {
+            "group": map_group,
+            "number": map_number,
+            "name": map_data.map_name,
+            "header_pointer": map_header_pointer,
+            "header_hex": map_header.hex(),
+        },
+        "connections": {
+            "header_offset": 0x0C,
+            "list_pointer": list_pointer,
+            "count": count,
+            "connection_pointer": connection_pointer,
+            "records": records,
+        },
+    }
+
+
 def get_map_data(
     map_group_and_number: "tuple[int, int] | MapFRLG | MapRSE",
     local_position: tuple[int, int],
@@ -2191,6 +2265,29 @@ def get_wild_encounters_for_map(map_group: int, map_number: int) -> WildEncounte
             _wild_encounters_cache[context.rom.id][(group, number)] = WildEncounterList(**data)
 
     return _wild_encounters_cache[context.rom.id].get((map_group, map_number))
+
+
+def get_maps_with_wild_encounters() -> tuple[tuple[int, int], ...]:
+    """Return map IDs whose authoritative ROM encounter tables are non-empty."""
+    if not context.rom.is_rse:
+        return ()
+    result = []
+    for map_address in MapRSE:
+        if context.rom.is_rs and not map_address.exists_on_rs:
+            continue
+        encounters = get_wild_encounters_for_map(*map_address.value)
+        if encounters is not None and any(
+            (
+                encounters.land_encounters,
+                encounters.surf_encounters,
+                encounters.rock_smash_encounters,
+                encounters.old_rod_encounters,
+                encounters.good_rod_encounters,
+                encounters.super_rod_encounters,
+            )
+        ):
+            result.append(map_address.value)
+    return tuple(result)
 
 
 @dataclass

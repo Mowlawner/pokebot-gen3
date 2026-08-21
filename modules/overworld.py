@@ -29,6 +29,19 @@ class WarpActivation(Enum):
     DIRECTIONAL_STEP = auto()
 
 
+class OverworldObservationStatus(Enum):
+    VALID = "valid"
+    UNAVAILABLE = "unavailable"
+    MALFORMED = "malformed"
+
+
+@dataclass(frozen=True, slots=True)
+class OverworldObservationResult:
+    status: OverworldObservationStatus
+    observation: "OverworldObservation | None" = None
+    reason: str | None = None
+
+
 @dataclass(frozen=True)
 class WorldTransition:
     """A locally executable cross-map transition.
@@ -412,7 +425,7 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
 
 
 @traced("overworld_perception")
-def perceive_overworld() -> OverworldObservation:
+def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
     """Read the current map and avatar without changing emulator state.
 
     Collision and directional access come from the existing PathMap metadata;
@@ -425,8 +438,30 @@ def perceive_overworld() -> OverworldObservation:
     profile_start = now()
     stage_start = now()
     avatar = get_player_avatar()
-    map_id = avatar.map_group_and_number
-    player_coordinates = avatar.local_coordinates
+    if avatar is None:
+        reason = "player_avatar_unavailable"
+        if trace is not None:
+            trace.mark("overworld_observation_status", OverworldObservationStatus.UNAVAILABLE.value)
+            trace.mark("overworld_observation_reason", reason)
+        return OverworldObservationResult(OverworldObservationStatus.UNAVAILABLE, reason=reason)
+    try:
+        map_id = avatar.map_group_and_number
+        player_coordinates = avatar.local_coordinates
+        if (
+            not isinstance(map_id, tuple)
+            or len(map_id) != 2
+            or any(value is None for value in map_id)
+            or not isinstance(player_coordinates, tuple)
+            or len(player_coordinates) != 2
+            or any(value is None for value in player_coordinates)
+        ):
+            raise ValueError("player_map_or_coordinates_malformed")
+    except ValueError as error:
+        reason = str(error)
+        if trace is not None:
+            trace.mark("overworld_observation_status", OverworldObservationStatus.MALFORMED.value)
+            trace.mark("overworld_observation_reason", reason)
+        return OverworldObservationResult(OverworldObservationStatus.MALFORMED, reason=reason)
     timing("perception_player_avatar", stage_start)
     count("player_avatar_observations")
     stage_start = now()

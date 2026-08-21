@@ -268,6 +268,24 @@ class BattleState:
             return NotImplemented
 
     @property
+    def nuzlocke_capture_target(self) -> bool:
+        """Opt-in capture intent supplied by the observed Nuzlocke runtime."""
+        runtime = getattr(context, "nuzlocke_runtime", None)
+        if runtime is None or not self.is_wild or self.is_trainer_battle:
+            return False
+        try:
+            from modules.player import get_player_avatar
+
+            location = get_player_avatar().map_group_and_number
+            return runtime.capture_target_for(
+                location,
+                is_wild=self.is_wild,
+                is_trainer=self.is_trainer_battle,
+            )
+        except (AttributeError, RuntimeError, TypeError):
+            return False
+
+    @property
     def battling_pokemon(self) -> list["BattlePokemon"]:
         if self._battler_count > 4:
             return []

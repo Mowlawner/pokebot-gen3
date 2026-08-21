@@ -119,6 +119,7 @@ class CampaignExecutionAdapter:
             "rescue_birch",
             "obtain_starter",
             "receive_pokedex",
+            "reach_petalburg",
         }:
             # Keep the selector ROM-neutral and import emulator code only when
             # a live Emerald objective is actually mounted.

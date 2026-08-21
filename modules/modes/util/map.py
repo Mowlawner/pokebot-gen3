@@ -3,6 +3,9 @@ from modules.map_data import MapFRLG, PokemonCenter, MapRSE, get_map_enum
 from modules.map_path import calculate_path, PathFindingError
 from modules.modes import BotModeError
 from modules.player import get_player_location
+from modules.console import diagnostic_print
+import json
+from time import perf_counter_ns
 
 _closest_pokemon_centers: dict[MapFRLG | MapRSE, list[PokemonCenter]] = {
     # Hoenn
@@ -103,16 +106,125 @@ def find_closest_pokemon_center(
     pokemon_center = None
     path_length_to_pokemon_center = None
 
+    candidates = _closest_pokemon_centers.get(training_spot_map, ())
+    diagnostic_print(
+        lambda: "recovery_center_candidate_discovery: "
+        + json.dumps(
+            {"source": location, "candidate_count": len(candidates), "candidates": candidates},
+            default=str,
+            sort_keys=True,
+        ),
+        trace=True,
+    )
     if training_spot_map in _closest_pokemon_centers:
         for pokemon_center_candidate in _closest_pokemon_centers[training_spot_map]:
+            operation_started = perf_counter_ns()
+            path_to = path_from = None
             try:
+                diagnostic_print(
+                    lambda: "recovery_path_start: "
+                    + json.dumps(
+                        {
+                            "operation": "path_to",
+                            "source": location,
+                            "destination_center": pokemon_center_candidate,
+                            "candidate": pokemon_center_candidate,
+                        },
+                        default=str,
+                        sort_keys=True,
+                    ),
+                    trace=True,
+                )
                 path_to = calculate_path(location, pokemon_center_candidate.value)
+                diagnostic_print(
+                    lambda: "recovery_path_complete: "
+                    + json.dumps(
+                        {
+                            "operation": "path_to",
+                            "candidate": pokemon_center_candidate,
+                            "path_length": len(path_to),
+                            "duration_ms": round((perf_counter_ns() - operation_started) / 1_000_000, 3),
+                            "success": True,
+                        },
+                        default=str,
+                        sort_keys=True,
+                    ),
+                    trace=True,
+                )
+                operation_started = perf_counter_ns()
+                diagnostic_print(
+                    lambda: "recovery_path_start: "
+                    + json.dumps(
+                        {
+                            "operation": "path_from",
+                            "source": pokemon_center_candidate.value,
+                            "destination": location,
+                            "candidate": pokemon_center_candidate,
+                        },
+                        default=str,
+                        sort_keys=True,
+                    ),
+                    trace=True,
+                )
                 path_from = calculate_path(pokemon_center_candidate.value, location)
+                diagnostic_print(
+                    lambda: "recovery_path_complete: "
+                    + json.dumps(
+                        {
+                            "operation": "path_from",
+                            "candidate": pokemon_center_candidate,
+                            "path_length": len(path_from),
+                            "duration_ms": round((perf_counter_ns() - operation_started) / 1_000_000, 3),
+                            "success": True,
+                        },
+                        default=str,
+                        sort_keys=True,
+                    ),
+                    trace=True,
+                )
                 path_length = len(path_to) + len(path_from)
+                diagnostic_print(
+                    lambda: "recovery_path_complete: "
+                    + json.dumps(
+                        {
+                            "candidate": pokemon_center_candidate,
+                            "path_length": path_length,
+                            "duration_ms": round((perf_counter_ns() - operation_started) / 1_000_000, 3),
+                            "success": True,
+                        },
+                        default=str,
+                        sort_keys=True,
+                    ),
+                    trace=True,
+                )
                 if path_length_to_pokemon_center is None or path_length < path_length_to_pokemon_center:
                     pokemon_center = pokemon_center_candidate
                     path_length_to_pokemon_center = path_length
-            except PathFindingError:
+                    diagnostic_print(
+                        lambda: "recovery_center_selected: "
+                        + json.dumps(
+                            {"candidate": pokemon_center_candidate, "path_length": path_length},
+                            default=str,
+                            sort_keys=True,
+                        ),
+                        trace=True,
+                    )
+            except PathFindingError as error:
+                diagnostic_print(
+                    lambda: "recovery_path_failure: "
+                    + json.dumps(
+                        {
+                            "candidate": pokemon_center_candidate,
+                            "duration_ms": round((perf_counter_ns() - operation_started) / 1_000_000, 3),
+                            "success": False,
+                            "exception_type": type(error).__name__,
+                            "error": str(error),
+                        },
+                        default=str,
+                        sort_keys=True,
+                    ),
+                    trace=True,
+                )
                 pass
 
     if pokemon_center is None:
