@@ -140,19 +140,12 @@ class NuzlockeRuntime:
             self._event_sequence = 0
 
         self._last_frame = current.frame
-        inventory_fact = (
-            Fact.known(current.inventory)
-            if current.inventory_available
-            else Fact.unavailable()
-        )
+        inventory_fact = Fact.known(current.inventory) if current.inventory_available else Fact.unavailable()
         campaign_facts = derive_campaign_facts(current, inventory_fact, Fact.unavailable())
         # Pokédex receipt is the Emerald campaign fact that activates the
         # Nuzlocke encounter rule.  Inventory remains a capture/readiness
         # concern and must not affect whether a location is consumed.
-        encounter_eligible = (
-            campaign_facts.pokedex_received.is_known
-            and campaign_facts.pokedex_received.value is True
-        )
+        encounter_eligible = campaign_facts.pokedex_received.is_known and campaign_facts.pokedex_received.value is True
         observer_started = trace.now() if trace is not None else 0
         events = self._observer.observe(current)
         if trace is not None:

@@ -95,9 +95,16 @@ class TestNuzlockeEvents(unittest.TestCase):
         battle = battle.__class__(battle.battle_type, False, True, False, (), (opponent,), battle.outcome, True)
         observer = NuzlockeEventObserver()
         observer.observe(self.snapshot())
-        self.assertTrue(any(isinstance(e, BattleStarted) for e in observer.observe(self.snapshot(frame=2, state=State.BATTLE, battle=battle))))
+        self.assertTrue(
+            any(
+                isinstance(e, BattleStarted)
+                for e in observer.observe(self.snapshot(frame=2, state=State.BATTLE, battle=battle))
+            )
+        )
         ended = observer.observe(self.snapshot(frame=3, battle=None))
-        self.assertEqual([type(e) for e in ended if isinstance(e, (PokemonCaptured, BattleEnded))], [PokemonCaptured, BattleEnded])
+        self.assertEqual(
+            [type(e) for e in ended if isinstance(e, (PokemonCaptured, BattleEnded))], [PokemonCaptured, BattleEnded]
+        )
 
     def test_failed_capture_does_not_emit_capture_event(self):
         from modules.nuzlocke.events import NuzlockeEventObserver, PokemonCaptured

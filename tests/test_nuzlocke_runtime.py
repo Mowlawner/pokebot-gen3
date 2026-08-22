@@ -89,7 +89,9 @@ class TestNuzlockeRuntime(unittest.TestCase):
     def test_pokedex_receipt_not_ball_quantity_makes_wild_battle_eligible(self):
         runtime = NuzlockeRuntime()
         runtime.update(snapshot(1, map_number=3, pokedex_received=True))
-        runtime.update(self.wild_battle(2, map_number=3, inventory=InventorySnapshot((), (), ()), pokedex_received=True))
+        runtime.update(
+            self.wild_battle(2, map_number=3, inventory=InventorySnapshot((), (), ()), pokedex_received=True)
+        )
         self.assertEqual(len(runtime.rules_projection.state.encounters), 1)
 
     def test_first_legal_wild_battle_designates_capture_target(self):
