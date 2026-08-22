@@ -16,6 +16,8 @@ from modules.nuzlocke.snapshots import (
     ProgressionSnapshot,
     StorageSnapshot,
     ItemQuantity,
+    CampaignObservationSnapshot,
+    NamedFlag,
 )
 
 
@@ -24,7 +26,13 @@ class State(Enum):
     BATTLE = 2
 
 
-def snapshot(frame: int, map_number: int = 2) -> NuzlockeSnapshot:
+def snapshot(frame: int, map_number: int = 2, *, pokedex_received: bool | None = None) -> NuzlockeSnapshot:
+    observation = CampaignObservationSnapshot()
+    if pokedex_received is not None:
+        observation = CampaignObservationSnapshot(
+            flags=(NamedFlag("RECEIVED_POKEDEX_FROM_BIRCH", pokedex_received),),
+            available=True,
+        )
     return NuzlockeSnapshot(
         frame,
         "test",
@@ -35,14 +43,59 @@ def snapshot(frame: int, map_number: int = 2) -> NuzlockeSnapshot:
         None,
         StorageSnapshot(0, ()),
         ProgressionSnapshot(()),
+        campaign_observation=observation,
     )
 
 
 class TestNuzlockeRuntime(unittest.TestCase):
+    @staticmethod
+    def wild_battle(frame, map_number=2, inventory=None, inventory_available=True, pokedex_received=None):
+        inventory = inventory or InventorySnapshot((), (), ())
+        observation = CampaignObservationSnapshot()
+        if pokedex_received is not None:
+            observation = CampaignObservationSnapshot(
+                flags=(NamedFlag("RECEIVED_POKEDEX_FROM_BIRCH", pokedex_received),),
+                available=True,
+            )
+        return NuzlockeSnapshot(
+            frame,
+            "test",
+            State.BATTLE,
+            PlayerSnapshot("May", 1, map_number, "MAP", (1, 1), "Down", True),
+            (),
+            inventory,
+            BattleSnapshot(("WILD",), False, True, False, (), (), "InProgress"),
+            StorageSnapshot(0, ()),
+            ProgressionSnapshot(()),
+            inventory_available=inventory_available,
+            campaign_observation=observation,
+        )
+
+    def test_pre_pokeball_wild_battle_does_not_consume_location(self):
+        runtime = NuzlockeRuntime()
+        runtime.update(snapshot(1, pokedex_received=False))
+        runtime.update(self.wild_battle(2))
+        self.assertEqual(runtime.rules_projection.state.encounters, ())
+        self.assertFalse(runtime.capture_target_for((1, 2), is_wild=True, is_trainer=False))
+
+        balls = InventorySnapshot((), (ItemQuantity("Poké Ball", 1),), ())
+        runtime.update(replace(snapshot(3, pokedex_received=True), inventory=balls))
+        runtime.update(self.wild_battle(4, inventory=balls, pokedex_received=True))
+        encounters = runtime.rules_projection.state.encounters
+        self.assertEqual(len(encounters), 1)
+        self.assertEqual(encounters[0].location, (1, 2))
+        self.assertTrue(runtime.capture_target_for((1, 2), is_wild=True, is_trainer=False))
+
+    def test_pokedex_receipt_not_ball_quantity_makes_wild_battle_eligible(self):
+        runtime = NuzlockeRuntime()
+        runtime.update(snapshot(1, map_number=3, pokedex_received=True))
+        runtime.update(self.wild_battle(2, map_number=3, inventory=InventorySnapshot((), (), ()), pokedex_received=True))
+        self.assertEqual(len(runtime.rules_projection.state.encounters), 1)
+
     def test_first_legal_wild_battle_designates_capture_target(self):
         runtime = NuzlockeRuntime()
         inventory = InventorySnapshot((), (ItemQuantity("Poké Ball", 5),), ())
-        runtime.update(replace(snapshot(1), inventory=inventory, inventory_available=True))
+        runtime.update(replace(snapshot(1, pokedex_received=True), inventory=inventory, inventory_available=True))
         battle = NuzlockeSnapshot(
             2,
             "test",
@@ -53,6 +106,9 @@ class TestNuzlockeRuntime(unittest.TestCase):
             BattleSnapshot(("WILD",), False, True, False, (), (), "InProgress"),
             StorageSnapshot(0, ()),
             ProgressionSnapshot(()),
+            campaign_observation=CampaignObservationSnapshot(
+                flags=(NamedFlag("RECEIVED_POKEDEX_FROM_BIRCH", True),), available=True
+            ),
         )
         runtime.update(battle)
         self.assertTrue(runtime.capture_target_for((1, 2), is_wild=True, is_trainer=False))
@@ -62,7 +118,7 @@ class TestNuzlockeRuntime(unittest.TestCase):
     def test_capture_target_query_does_not_advance_encounter_state(self):
         runtime = NuzlockeRuntime()
         inventory = InventorySnapshot((), (ItemQuantity("Poké Ball", 1),), ())
-        runtime.update(replace(snapshot(1), inventory=inventory))
+        runtime.update(replace(snapshot(1, pokedex_received=True), inventory=inventory))
         self.assertFalse(runtime.capture_target_for((1, 2), is_wild=True, is_trainer=False))
         self.assertEqual(runtime.rules_projection.state.encounters, ())
 

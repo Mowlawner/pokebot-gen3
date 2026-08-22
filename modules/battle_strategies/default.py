@@ -5,6 +5,7 @@ from modules.context import context
 from modules.modes._interface import BotModeError
 from modules.pokemon import Pokemon, Move, LearnedMove
 from modules.pokemon_party import get_party
+from modules.items import get_item_bag
 from modules.battle_observation import default_battle_recorder
 from modules.battle_planner import PlannerAction, PlannerConfidence, PlannerDecisionClass, plan_battle_state
 from modules.console import diagnostic_print
@@ -152,6 +153,55 @@ class DefaultBattleStrategy(BattleStrategy):
         """
         Decides the action to take for the current turn based on the battle state.
         """
+        # The early BattleListener callback runs before the normalized
+        # Nuzlocke observer can register a pending encounter.  Re-evaluate at
+        # this ready-turn boundary, where BattleState and the rules projection
+        # are both authoritative.  Delegate all ball/status-selection logic to
+        # the existing capture strategy.
+        nuzlocke_capture_target = getattr(battle_state, "nuzlocke_capture_target", False)
+        diagnostic_print(
+            lambda: f"READY_TURN_CAPTURE_CHECK: ready_turn_reached=True nuzlocke_capture_target={nuzlocke_capture_target}",
+            trace=True,
+        )
+        if nuzlocke_capture_target:
+            from modules.battle_strategies.catch import CatchStrategy
+
+            # Let the existing planner establish a safe weakening turn before
+            # falling back to the capture strategy.  The planner receives the
+            # legal-target facts from its normal battle-state adapter, so its
+            # capture HP threshold and damage/safety model remain authoritative.
+            planner_decision = plan_battle_state(battle_state, default_battle_recorder.knowledge)
+            if (
+                planner_decision.action is PlannerAction.UseMove
+                and planner_decision.classification is PlannerDecisionClass.SAFE
+                and planner_decision.is_safe_to_execute
+            ):
+                return self._turn_action_from_planner_decision(planner_decision)
+
+            try:
+                usable_balls = tuple(ball for ball in get_item_bag().poke_balls if ball.quantity > 0)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                usable_balls = ()
+            diagnostic_print(
+                lambda: (
+                    "READY_TURN_CAPTURE: CatchStrategy invoked "
+                    f"usable_pokeball_found={bool(usable_balls)} "
+                    f"available_balls={[getattr(ball.item, 'name', None) for ball in usable_balls]!r}"
+                ),
+                trace=True,
+            )
+            capture_action = CatchStrategy().decide_turn(battle_state)
+            diagnostic_print(
+                lambda: (
+                    "READY_TURN_CAPTURE_RESULT: "
+                    f"action={getattr(capture_action[0], 'name', capture_action[0])!r} "
+                    f"item={getattr(capture_action[1], 'name', capture_action[1])!r}"
+                ),
+                trace=True,
+            )
+            if capture_action[0] is not TurnAction.SwitchToManual:
+                return capture_action
+
         util = BattleStrategyUtil(battle_state)
 
         # Strategic ownership starts with the planner on every single-battle

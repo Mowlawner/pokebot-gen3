@@ -118,10 +118,11 @@ class CampaignProgressionMode(BotMode):
         )
 
     def on_battle_started(self, encounter) -> BattleAction:
-        """Hand campaign battles to the existing default battle controller."""
+        """Choose campaign battle policy, leaving execution to the listener."""
         scheduler = getattr(self, "_readiness_scheduler", None)
         if scheduler is not None:
             scheduler.invalidate("battle_started")
+
         controller = getattr(self, "controller", None)
         if encounter is not None and controller is not None and controller.last_selection is not None:
             objective = controller.last_selection.objective

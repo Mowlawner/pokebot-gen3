@@ -217,6 +217,21 @@ class NuzlockeEventObserver:
             )
         elif snapshot.battle_available and snapshot.battle is None and self._previous_ready_battle is not None:
             battle = self._previous_ready_battle.battle
+            if (
+                battle is not None
+                and battle.is_wild
+                and not battle.is_trainer
+                and battle.outcome.lower() in {"caught", "captured"}
+                and len(battle.opponent_active) == 1
+                and battle.opponent_active[0].identity is not None
+            ):
+                events.append(
+                    PokemonCaptured(
+                        snapshot.frame,
+                        battle.opponent_active[0].identity,
+                        _map(self._previous_ready_battle),
+                    )
+                )
             events.append(
                 BattleEnded(
                     snapshot.frame,

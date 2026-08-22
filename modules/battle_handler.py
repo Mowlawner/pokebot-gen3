@@ -26,6 +26,7 @@ from modules.plugins import plugin_should_nickname_pokemon
 from modules.pokemon import StatusCondition
 from modules.pokemon_party import get_party, get_party_size, PartyPokemon
 from modules.tasks import task_is_active
+from modules.nuzlocke.pokemon_naming import generate_pokemon_nickname
 
 if TYPE_CHECKING:
     from modules.encounter import EncounterInfo
@@ -263,6 +264,14 @@ def handle_fainted_pokemon(strategy: BattleStrategy):
 @debug.track
 def handle_nickname_caught_pokemon(encounter: "EncounterInfo"):
     nickname_choice = plugin_should_nickname_pokemon(encounter)
+    if nickname_choice is None and context.nuzlocke_runtime is not None:
+        try:
+            nickname_choice = generate_pokemon_nickname(
+                encounter.pokemon.species.name,
+                encounter.pokemon.gender,
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            nickname_choice = None
     if nickname_choice:
         yield from handle_naming_screen(nickname_choice)
 

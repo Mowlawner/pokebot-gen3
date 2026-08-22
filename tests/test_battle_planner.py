@@ -123,6 +123,71 @@ class BattlePlannerTests(unittest.TestCase):
 
         self.assertEqual(planner.call_count, 2)
 
+    def test_ready_legal_nuzlocke_battle_delegates_to_existing_capture_strategy(self):
+        party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
+        battle_state = SimpleNamespace(
+            nuzlocke_capture_target=True,
+            own_side=SimpleNamespace(active_battler=SimpleNamespace()),
+        )
+        expected = (TurnAction.UseItem, SimpleNamespace(name="Poké Ball"))
+        with patch("modules.battle_strategies.default.get_party", return_value=party), patch(
+            "modules.battle_strategies.catch.CatchStrategy.decide_turn", return_value=expected
+        ) as capture_turn, patch(
+            "modules.battle_strategies.default.plan_battle_state",
+            return_value=SimpleNamespace(action=PlannerAction.UseItem, classification=PlannerDecisionClass.SAFE,
+                                          is_safe_to_execute=True),
+        ):
+            result = DefaultBattleStrategy().decide_turn(battle_state)
+        self.assertIs(result[0], TurnAction.UseItem)
+        self.assertEqual(result[1].name, "Poké Ball")
+        capture_turn.assert_called_once_with(battle_state)
+
+    def test_legal_target_uses_safe_planner_move_before_capture(self):
+        party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
+        battle_state = SimpleNamespace(nuzlocke_capture_target=True,
+            own_side=SimpleNamespace(active_battler=SimpleNamespace()))
+        decision = SimpleNamespace(action=PlannerAction.UseMove, target=1,
+            classification=PlannerDecisionClass.SAFE, is_safe_to_execute=True)
+        with patch("modules.battle_strategies.default.get_party", return_value=party), \
+             patch("modules.battle_strategies.default.plan_battle_state", return_value=decision), \
+             patch("modules.battle_strategies.catch.CatchStrategy.decide_turn") as catch:
+            self.assertEqual(DefaultBattleStrategy().decide_turn(battle_state), (TurnAction.UseMove, 1))
+        catch.assert_not_called()
+
+    def test_legal_target_falls_back_to_capture_when_planner_is_not_safe(self):
+        party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
+        battle_state = SimpleNamespace(nuzlocke_capture_target=True,
+            own_side=SimpleNamespace(active_battler=SimpleNamespace()))
+        decision = SimpleNamespace(action=PlannerAction.UseMove, target=1,
+            classification=PlannerDecisionClass.BEST_AVAILABLE, is_safe_to_execute=False)
+        expected = (TurnAction.UseItem, SimpleNamespace(name="Poké Ball"))
+        with patch("modules.battle_strategies.default.get_party", return_value=party), \
+             patch("modules.battle_strategies.default.plan_battle_state", return_value=decision), \
+             patch("modules.battle_strategies.catch.CatchStrategy.decide_turn", return_value=expected):
+            result = DefaultBattleStrategy().decide_turn(battle_state)
+        self.assertIs(result[0], TurnAction.UseItem)
+
+    def test_ready_non_target_does_not_delegate_to_capture_strategy(self):
+        party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
+        active = SimpleNamespace(current_hp_percentage=80)
+        battle_state = SimpleNamespace(
+            nuzlocke_capture_target=False,
+            own_side=SimpleNamespace(active_battler=active),
+        )
+        decision = SimpleNamespace(
+            action=PlannerAction.UseMove,
+            target=0,
+            confidence=PlannerConfidence.HIGH,
+            rationale="safe",
+            is_safe_to_execute=True,
+        )
+        with patch("modules.battle_strategies.default.get_party", return_value=party), patch(
+            "modules.battle_strategies.default.plan_battle_state", return_value=decision
+        ), patch("modules.battle_strategies.catch.CatchStrategy.decide_turn") as capture_turn:
+            result = DefaultBattleStrategy().decide_turn(battle_state)
+        self.assertEqual(result, (TurnAction.UseMove, 0))
+        capture_turn.assert_not_called()
+
     def test_safe_planner_actions_keep_existing_turn_action_shapes(self):
         item = SimpleNamespace(name="Potion")
         cases = (
