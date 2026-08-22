@@ -618,6 +618,37 @@ def plan_with_world_navigation(
     local_plan, source_coordinates, activation_direction, selected_candidate_id = min(
         candidate_plans, key=candidate_key
     )
+    from modules.route102_diagnostics import emit as route102_emit
+
+    ranked_candidates = []
+    for item in candidate_plans:
+        plan = completed_local_plan(item)
+        metrics = plan.metrics
+        ranked_candidates.append(
+            {
+                "candidate_id": item[3],
+                "source_coordinates": item[1],
+                "destination": getattr(runtime_transitions.get(item[1]), "destination", None),
+                "transition_direction": getattr(item[2], "name", None),
+                "activation_state": "active",
+                "local_reachability": metrics is not None,
+                "local_route_cost": metrics.total_route_cost if metrics else None,
+                "downstream_route_cost": None,
+                "total_route_cost": metrics.total_route_cost if metrics else None,
+                "ranking_tuple": candidate_key(item),
+                "selected": item[3] == selected_candidate_id,
+            }
+        )
+    route102_emit(
+        "candidate_selection",
+        current_map=start[0],
+        current_coordinates=start[1],
+        navigation_goal=repr(navigation_goal),
+        candidates=tuple(candidate_records),
+        ranked_candidates=ranked_candidates,
+        selected_candidate=selected_candidate_id,
+        anti_oscillation=None,
+    )
     local_plan = completed_local_plan((local_plan, source_coordinates, activation_direction, selected_candidate_id))
     for candidate_record in candidate_records:
         if candidate_record["candidate_id"] == selected_candidate_id:
@@ -625,6 +656,18 @@ def plan_with_world_navigation(
             candidate_record["reason"] = "canonical_navigation_objective"
         elif candidate_record["status"] == "pathfound":
             candidate_record["reason"] = "pathfound_but_not_selected"
+    trace = getattr(context, "stutter_trace", None)
+    if trace is not None:
+        trace.mark(
+            "navigation_candidate_selection",
+            {
+                "map": start[0],
+                "position": start[1],
+                "candidates": tuple(candidate_records),
+                "selected_candidate": selected_candidate_id,
+                "selection_reason": "canonical_navigation_objective",
+            },
+        )
     if profiling_enabled():
         record_cross_map_goal_evaluation(
             algorithm=algorithm,

@@ -106,7 +106,14 @@ class NuzlockeRulesProjection:
     def state(self) -> NuzlockeCampaignState:
         return self._state
 
-    def apply(self, event: Event, *, sequence: int | None = None, event_id: str | None = None) -> None:
+    def apply(
+        self,
+        event: Event,
+        *,
+        sequence: int | None = None,
+        event_id: str | None = None,
+        encounter_eligible: bool | None = None,
+    ) -> None:
         if not isinstance(
             event,
             (
@@ -142,10 +149,11 @@ class NuzlockeRulesProjection:
         elif isinstance(event, NuzlockeStarted):
             # The campaign marker is reduced here only to keep the shared
             # event sequence replayable; encounter activation remains driven
-            # by the observed Poké Ball boundary in NuzlockeRuntime.
+            # by the campaign's observed Pokédex-received fact in runtime.
             pass
         elif isinstance(event, BattleStarted):
-            if self._encounters_active and event.is_wild and not event.is_trainer and event.location is not None:
+            eligible_now = self._encounters_active if encounter_eligible is None else encounter_eligible
+            if eligible_now and event.is_wild and not event.is_trainer and event.location is not None:
                 location = event.location
                 existing = next((e for e in state.encounters if e.location == location), None)
                 if existing is None:

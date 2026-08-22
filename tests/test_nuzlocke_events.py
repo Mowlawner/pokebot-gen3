@@ -84,6 +84,37 @@ class TestNuzlockeEvents(unittest.TestCase):
             0,
         )
 
+    def test_authoritative_caught_outcome_emits_capture_before_battle_end(self):
+        from modules.nuzlocke.events import BattleEnded, BattleStarted, NuzlockeEventObserver, PokemonCaptured
+        from modules.nuzlocke.snapshots import BattlePokemonSnapshot
+        from modules.nuzlocke.identity import PokemonIdentity
+
+        identity = PokemonIdentity(7, 2, 3)
+        opponent = BattlePokemonSnapshot(0, "Poochyena", 5, 10, "none", False, False, (), identity)
+        battle = self.battle(outcome="Caught")
+        battle = battle.__class__(battle.battle_type, False, True, False, (), (opponent,), battle.outcome, True)
+        observer = NuzlockeEventObserver()
+        observer.observe(self.snapshot())
+        self.assertTrue(
+            any(
+                isinstance(e, BattleStarted)
+                for e in observer.observe(self.snapshot(frame=2, state=State.BATTLE, battle=battle))
+            )
+        )
+        ended = observer.observe(self.snapshot(frame=3, battle=None))
+        self.assertEqual(
+            [type(e) for e in ended if isinstance(e, (PokemonCaptured, BattleEnded))], [PokemonCaptured, BattleEnded]
+        )
+
+    def test_failed_capture_does_not_emit_capture_event(self):
+        from modules.nuzlocke.events import NuzlockeEventObserver, PokemonCaptured
+
+        observer = NuzlockeEventObserver()
+        observer.observe(self.snapshot())
+        observer.observe(self.snapshot(frame=2, state=State.BATTLE, battle=self.battle(outcome="InProgress")))
+        ended = observer.observe(self.snapshot(frame=3, battle=None))
+        self.assertFalse(any(isinstance(e, PokemonCaptured) for e in ended))
+
     def test_map_party_faint_and_whiteout_transitions(self):
         from modules.nuzlocke.events import (
             MapChanged,

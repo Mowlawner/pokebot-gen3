@@ -107,6 +107,10 @@ class CampaignFactsTests(unittest.TestCase):
                 "receive_pokedex",
                 "receive_pokeballs",
                 "start_nuzlocke",
+                "reach_petalburg",
+                "recover_devon_goods",
+                "reach_rustboro",
+                "defeat_roxanne",
             ),
         )
 

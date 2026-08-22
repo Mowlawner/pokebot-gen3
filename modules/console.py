@@ -249,6 +249,10 @@ def diagnostic_print(message: str | Callable[[], str], *, trace: bool = False) -
     if not context.debug or (trace and not getattr(context, "debug_trace", False)):
         return
     console.print(message() if callable(message) else message)
+    # Lifecycle/path-boundary records must reach the pipe before a synchronous
+    # operation (or KeyboardInterrupt) can prevent the normal frame flush.
+    if trace:
+        console.file.flush()
 
 
 def profile_print(message: str | Callable[[], str], *, every: int = 1) -> None:

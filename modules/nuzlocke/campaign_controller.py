@@ -4,14 +4,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Generator, Iterator
+from typing import Callable, Generator, Iterator, Any
+import json
 
 from modules.agent_control import AgentControlLoop, observe_agent
 from modules.goals import Goal
 
 from .campaign_execution import CampaignExecutionResult, CampaignExecutionStatus, adapt_campaign_execution
-from .campaign_objectives import ObjectiveSelection, select_campaign_objective
+from .campaign_objectives import ObjectiveSelection, campaign_task_diagnostics, select_campaign_objective
+from modules.console import diagnostic_print
 from .campaign_state import CampaignState
+from .readiness_diagnostics import (
+    CampaignReadinessPolicy,
+    ProgressionReadinessDiagnostic,
+    ReadinessDecision,
+    evaluate_progression_readiness,
+)
 
 
 class CampaignControllerStatus(Enum):
@@ -30,10 +38,14 @@ class CampaignControllerState:
     selection: ObjectiveSelection | None
     execution: CampaignExecutionResult | None
     reason: str
+    execution_phase: str = "CAMPAIGN"
+    recovery_status: str | None = None
 
 
 TacticalLoopFactory = Callable[[Goal], Iterator[object]]
 CampaignBoundaryHandler = Callable[[str], bool]
+ReadinessProvider = Callable[[Any, Goal | None], ProgressionReadinessDiagnostic]
+RecoveryFactory = Callable[[ProgressionReadinessDiagnostic], Iterator[object]]
 
 
 class CampaignController:
@@ -47,6 +59,9 @@ class CampaignController:
         selector: Callable[[CampaignState], ObjectiveSelection] = select_campaign_objective,
         adapter: Callable[[ObjectiveSelection], CampaignExecutionResult] = adapt_campaign_execution,
         campaign_boundary_handler: CampaignBoundaryHandler | None = None,
+        readiness_provider: ReadinessProvider | None = None,
+        recovery_factory: RecoveryFactory | None = None,
+        readiness_policy: CampaignReadinessPolicy | None = None,
     ) -> None:
         self._state_provider = state_provider
         self._selector = selector
@@ -60,6 +75,11 @@ class CampaignController:
         self.status = CampaignControllerStatus.UNKNOWN
         self.transition_reason = "not started"
         self._tactical_loop: Iterator[object] | None = None
+        self._readiness_provider = readiness_provider
+        self._recovery_factory = recovery_factory
+        self._readiness_policy = readiness_policy or CampaignReadinessPolicy()
+        self._execution_phase = "CAMPAIGN"
+        self._recovery_status: str | None = None
 
     @staticmethod
     def _default_tactical_loop(goal: Goal) -> Iterator[object]:
@@ -74,6 +94,8 @@ class CampaignController:
             self.last_selection,
             self.last_execution,
             self.transition_reason,
+            self._execution_phase,
+            self._recovery_status,
         )
 
     def _terminal(self, execution: CampaignExecutionResult, status: CampaignControllerStatus) -> None:
@@ -86,7 +108,22 @@ class CampaignController:
 
     def refresh(self) -> CampaignControllerState:
         """Rebuild state, select, adapt, and mount work if needed."""
-        selection = self._selector(self._state_provider())
+        observed_state = self._state_provider()
+        selection = self._selector(observed_state)
+        diagnostic_print(
+            lambda: "CAMPAIGN_TASK_DISCOVERY: "
+            + json.dumps(
+                {
+                    "tasks": campaign_task_diagnostics(observed_state),
+                    "selected": selection.objective.objective_id if selection.objective else None,
+                    "selection_status": selection.status.value,
+                    "selection_reason": selection.reason,
+                },
+                sort_keys=True,
+                default=str,
+            ),
+            trace=True,
+        )
         if (
             selection.status.value == "ready"
             and selection.objective is not None
@@ -141,6 +178,120 @@ class CampaignController:
             )
             return self.state
         objective_id = execution.objective.objective_id
+        # Readiness is tactical/resource gating. Startup Emerald capabilities
+        # intentionally have no tactical Goal: they must be allowed to observe
+        # title/menu/naming/clock state before overworld readiness exists.
+        if (
+            self._readiness_provider is not None
+            and self._execution_phase == "CAMPAIGN"
+            and execution.tactical_goal is not None
+        ):
+            evaluated = evaluate_progression_readiness(
+                self._readiness_provider(execution.objective, execution.tactical_goal),
+                self._readiness_policy,
+            )
+            schedule = getattr(getattr(self._readiness_provider, "__self__", None), "state", None)
+            diagnostic_print(
+                lambda: "CAMPAIGN_READINESS_LIFECYCLE: "
+                + json.dumps(
+                    {
+                        "controller_tick": schedule.tick_count if schedule is not None else None,
+                        "objective_id": objective_id,
+                        "current_map": evaluated.current_map,
+                        "coordinates": evaluated.current_coordinates,
+                        "lowest_hp_ratio": evaluated.lowest_hp_ratio,
+                        "usable_pokemon_count": evaluated.usable_count,
+                        "trainer_hazard_state": evaluated.trainers,
+                        "recovery_availability": evaluated.recovery_availability.value,
+                        "readiness_decision": evaluated.readiness_decision.value,
+                        "readiness_reason": evaluated.readiness_reason.value,
+                        "execution_phase": self._execution_phase,
+                        "recovery_status": self._recovery_status,
+                        "schedule": (
+                            {
+                                "status": schedule.status,
+                                "age_ticks": schedule.age_ticks,
+                                "refresh_count": schedule.refresh_count,
+                                "tick_count": schedule.tick_count,
+                                "invalidation_reason": schedule.invalidation_reason,
+                            }
+                            if schedule is not None
+                            else None
+                        ),
+                    },
+                    sort_keys=True,
+                ),
+                trace=True,
+            )
+            from modules.route102_diagnostics import emit as route102_emit
+
+            route102_emit(
+                "readiness",
+                controller_tick=schedule.tick_count if schedule is not None else None,
+                execution_phase=self._execution_phase,
+                objective_id=objective_id,
+                objective_status=getattr(execution.objective, "status", None),
+                tactical_goal=repr(execution.tactical_goal),
+                readiness_decision=evaluated.readiness_decision.value,
+                readiness_reason=evaluated.readiness_reason.value,
+                scheduler=(
+                    schedule.__dict__ if schedule is not None and hasattr(schedule, "__dict__") else repr(schedule)
+                ),
+                current_map=evaluated.current_map,
+                coordinates=evaluated.current_coordinates,
+                lowest_hp_ratio=evaluated.lowest_hp_ratio,
+                usable_pokemon_count=evaluated.usable_count,
+                trainer_availability=evaluated.trainer_availability.value,
+                trainers=evaluated.trainers,
+                recovery_availability=evaluated.recovery_availability.value,
+                recovery_status=self._recovery_status,
+            )
+            if evaluated.readiness_decision is ReadinessDecision.UNKNOWN:
+                self._tactical_loop = None
+                self.status = CampaignControllerStatus.BLOCKED
+                self._execution_phase = "BLOCKED"
+                self.transition_reason = f"readiness deferred: {evaluated.readiness_reason.value}"
+                return self.state
+            if evaluated.readiness_decision is ReadinessDecision.RECOVER:
+                if self._recovery_factory is None:
+                    self._tactical_loop = None
+                    self.status = CampaignControllerStatus.BLOCKED
+                    self._execution_phase = "BLOCKED"
+                    self.transition_reason = "readiness requested recovery but no recovery capability is available"
+                    return self.state
+                self.current_objective_id = objective_id
+                self.current_tactical_goal = execution.tactical_goal
+                # This is intentionally before invoking the recovery factory:
+                # recovery pathfinding is synchronous and may outlive the
+                # frame/trace lifecycle (including on KeyboardInterrupt).
+                diagnostic_print(
+                    lambda: "recovery_start: "
+                    + json.dumps(
+                        {
+                            "objective_id": objective_id,
+                            "execution_phase": "RECOVERY",
+                            "readiness_decision": evaluated.readiness_decision.value,
+                            "readiness_reason": evaluated.readiness_reason.value,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    ),
+                    trace=True,
+                )
+                try:
+                    self._tactical_loop = self._recovery_factory(evaluated)
+                except Exception as error:
+                    self._tactical_loop = None
+                    self.status = CampaignControllerStatus.BLOCKED
+                    self._execution_phase = "BLOCKED"
+                    self._recovery_status = "UNAVAILABLE"
+                    self.transition_reason = f"recovery unavailable: {error}"
+                    return self.state
+                self._execution_phase = "RECOVERY"
+                self._recovery_status = "ACTIVE"
+                self.status = CampaignControllerStatus.READY
+                self.transition_reason = f"recover before {objective_id}"
+                return self.state
         if (
             self.current_objective_id != objective_id
             or self.current_tactical_goal != execution.tactical_goal
@@ -158,6 +309,30 @@ class CampaignController:
         return self.state
 
     def step(self) -> CampaignControllerState:
+        if self._execution_phase == "BLOCKED":
+            return self.state
+        if self._execution_phase == "RECOVERY":
+            try:
+                if self._tactical_loop is None:
+                    raise RuntimeError("recovery has no executable capability")
+                next(self._tactical_loop)
+            except StopIteration:
+                self._tactical_loop = None
+                self._execution_phase = "CAMPAIGN"
+                self._recovery_status = "COMPLETED"
+                scheduler = getattr(self._readiness_provider, "__self__", None)
+                invalidate = getattr(scheduler, "invalidate", None)
+                if callable(invalidate):
+                    invalidate("recovery_completed")
+                self.status = CampaignControllerStatus.READY
+                self.transition_reason = "recovery verified; reevaluating campaign readiness"
+            except Exception as error:
+                self._tactical_loop = None
+                self._execution_phase = "BLOCKED"
+                self._recovery_status = "FAILED"
+                self.status = CampaignControllerStatus.BLOCKED
+                self.transition_reason = f"recovery failed: {error}"
+            return self.state
         current = self.refresh()
         if current.status is not CampaignControllerStatus.READY or self._tactical_loop is None:
             return current

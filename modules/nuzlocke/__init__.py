@@ -48,6 +48,14 @@ from .rules import (
     reduce_rules,
 )
 from .campaign_state import CampaignFacts, CampaignState, Fact, FactStatus, RunStatus, derive_campaign_facts
+from .encounter_catalog import EncounterOpportunity, encounter_opportunities
+from .campaign_simulation import CampaignCheckpoint, CampaignSimulation, simulate_checkpoint, simulate_checkpoints
+from .fixture_state import (
+    FixtureStateUnavailable,
+    audit_fixture,
+    load_campaign_state_from_fixture,
+    load_offline_normalized_snapshot,
+)
 from .campaign_objectives import (
     CampaignObjective,
     CampaignPredicate,
@@ -55,6 +63,19 @@ from .campaign_objectives import (
     ObjectiveStatus,
     initial_emerald_campaign,
     select_campaign_objective,
+    available_campaign_tasks,
+    select_available_campaign_task,
+    encounter_task,
+    RouteContext,
+    RouteRelation,
+    measure_route_context,
+    campaign_task_diagnostics,
+    EncounterClassification,
+    EncounterRecommendation,
+    EncounterEvaluationPolicy,
+    EncounterEvaluation,
+    evaluate_encounter_opportunity,
+    progression_destination,
 )
 from .campaign_execution import (
     CampaignExecutionAdapter,
@@ -127,6 +148,22 @@ __all__ = [
     "RunStatus",
     "CampaignFacts",
     "derive_campaign_facts",
+    "EncounterOpportunity",
+    "encounter_opportunities",
+    "CampaignCheckpoint",
+    "CampaignSimulation",
+    "simulate_checkpoint",
+    "simulate_checkpoints",
+    "FixtureStateUnavailable",
+    "load_campaign_state_from_fixture",
+    "load_offline_normalized_snapshot",
+    "audit_fixture",
+    "EncounterClassification",
+    "EncounterRecommendation",
+    "EncounterEvaluationPolicy",
+    "EncounterEvaluation",
+    "evaluate_encounter_opportunity",
+    "progression_destination",
     "CampaignObjective",
     "CampaignPredicate",
     "ObjectiveSelection",

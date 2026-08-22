@@ -396,6 +396,10 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
                 "SYS_POKEMON_GET",
                 "SYS_POKEDEX_GET",
                 "RECEIVED_POKEDEX_FROM_BIRCH",
+                "VISITED_PETALBURG_CITY",
+                "RECOVERED_DEVON_GOODS",
+                "VISITED_RUSTBORO_CITY",
+                "DEFEATED_RUSTBORO_GYM",
             )
         )
         campaign_variables = tuple(

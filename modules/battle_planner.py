@@ -131,6 +131,7 @@ class PlannerItem:
     item: Any
     quantity: int
     heal_amount: int
+    is_capture_ball: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +154,13 @@ class PlannerContext:
     can_run: bool = False
     escape_confidence: PlannerConfidence = PlannerConfidence.INSUFFICIENT
     opponent_max_hp: int | None = None
+    # Set only by the Nuzlocke/capture controller for the legal wild target.
+    # These fields are deliberately opt-in so trainer and ordinary wild
+    # battles retain their existing policy.
+    capture_target: bool = False
+    capture_available: bool = False
+    capture_appropriate_hp: int | None = None
+    capture_attempted: bool = False
 
 
 class BattlePlanner:
@@ -189,6 +197,29 @@ class BattlePlanner:
             return self._abort("Active or opponent HP is unavailable.")
 
         usable = [move for move in context.moves if self._is_candidate(move)]
+        if context.capture_target and not context.is_trainer:
+            # A ball is an observation/action boundary, never proof of a
+            # capture. The observer will later emit PokemonCaptured.
+            if context.capture_available and (
+                context.capture_attempted
+                or context.capture_appropriate_hp is None
+                or context.opponent_hp <= context.capture_appropriate_hp
+            ):
+                return PlannerDecision(
+                    PlannerAction.UseItem,
+                    self._capture_item(context),
+                    PlannerConfidence.HIGH,
+                    "Legal Nuzlocke capture target is in capture state; attempt capture before dealing more damage.",
+                    PlannerSafety.SAFE,
+                    classification=PlannerDecisionClass.SAFE,
+                    risk=PlannerRisk.LOW,
+                )
+
+            # Filter lethal moves before the ordinary battle policy sees them.
+            # Minimum damage is enough to prove a guaranteed KO; maximum damage
+            # is used for meaningful KO risk.
+            nonlethal = [move for move in usable if move.damage_max < context.opponent_hp]
+            usable = nonlethal
         # A guaranteed KO is safe even when the opponent's unrevealed move is
         # unknown: the opponent gets no response after the KO.
         guaranteed = [
@@ -399,6 +430,17 @@ class BattlePlanner:
                 risk=self._risk_for_unknown_attack(context, move),
             )
 
+        if context.capture_target and context.capture_available:
+            return PlannerDecision(
+                PlannerAction.UseItem,
+                self._capture_item(context),
+                PlannerConfidence.MEDIUM,
+                "No nonlethal damaging action is available; preserve the legal capture target and attempt a ball.",
+                PlannerSafety.SAFE,
+                classification=PlannerDecisionClass.SAFE,
+                risk=PlannerRisk.MODERATE,
+            )
+
         healing = [item for item in context.items if item.quantity > 0 and item.heal_amount > 0]
         if healing and context.opponent_damage_max is not None:
             item = max(healing, key=lambda candidate: candidate.heal_amount)
@@ -442,6 +484,11 @@ class BattlePlanner:
         if failed_attacks:
             reason += " " + " ".join(failed_attacks[:2])
         return self._abort(reason, tuple(failed_attacks))
+
+    @staticmethod
+    def _capture_item(context: PlannerContext):
+        balls = [item for item in context.items if item.quantity > 0 and item.is_capture_ball]
+        return (max(balls, key=lambda item: item.quantity).item, 0) if balls else None
 
     @classmethod
     def _is_candidate(cls, move: PlannerMove) -> bool:
@@ -955,6 +1002,8 @@ def plan_battle_state(battle_state: Any, knowledge: BattleKnowledge | None = Non
         for slot in get_item_bag().items:
             if slot.item.battle_use is ItemBattleUse.Healing:
                 items.append(PlannerItem(slot.item, slot.quantity, slot.item.parameter))
+        for slot in get_item_bag().poke_balls:
+            items.append(PlannerItem(slot.item, slot.quantity, 0, True))
     except (AttributeError, RuntimeError, TypeError, ValueError):
         pass
 
@@ -988,6 +1037,10 @@ def plan_battle_state(battle_state: Any, knowledge: BattleKnowledge | None = Non
         escape > 0,
         escape_confidence,
         getattr(opponent, "total_hp", None),
+        bool(getattr(battle_state, "nuzlocke_capture_target", False)),
+        any(item.is_capture_ball and item.quantity > 0 for item in items),
+        int(getattr(battle_state, "capture_appropriate_hp", 1) or 1),
+        bool(getattr(battle_state, "capture_attempted", False)),
     )
     diagnostic_print(
         lambda: (
@@ -997,7 +1050,9 @@ def plan_battle_state(battle_state: Any, knowledge: BattleKnowledge | None = Non
             f"opponent_damage_max={planner_context.opponent_damage_max!r} "
             f"candidate_moves={[move.name for move in planner_context.moves]!r} "
             f"active_hp={planner_context.active_hp}/{planner_context.active_max_hp} "
-            f"opponent_hp={planner_context.opponent_hp}"
+            f"opponent_hp={planner_context.opponent_hp} "
+            f"nuzlocke_capture_target={planner_context.capture_target} "
+            f"capture_available={planner_context.capture_available}"
         ),
         trace=True,
     )

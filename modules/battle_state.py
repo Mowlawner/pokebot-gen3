@@ -34,6 +34,7 @@ from modules.pokemon import (
 )
 from modules.state_cache import state_cache
 from modules.tasks import get_global_script_context
+from modules.console import diagnostic_print
 
 
 class Weather(Enum):
@@ -266,6 +267,44 @@ class BattleState:
             )
         else:
             return NotImplemented
+
+    @property
+    def nuzlocke_capture_target(self) -> bool:
+        """Opt-in capture intent supplied by the observed Nuzlocke runtime."""
+        runtime = getattr(context, "nuzlocke_runtime", None)
+        diagnostic_print(
+            lambda: (
+                "BATTLESTATE_CAPTURE_TARGET_TRACE: "
+                f"runtime_id={id(runtime) if runtime is not None else None} "
+                f"battle_location={getattr(get_player_avatar(), 'map_group_and_number', None)!r} "
+                f"is_wild={not self.is_trainer_battle} is_trainer={self.is_trainer_battle} "
+                f"filter_runtime_none={runtime is None} "
+                f"filter_not_wild={self.is_trainer_battle} "
+                f"filter_trainer={self.is_trainer_battle}"
+            ),
+            trace=True,
+        )
+        if runtime is None or self.is_trainer_battle:
+            return False
+        try:
+            location = get_player_avatar().map_group_and_number
+            result = runtime.capture_target_for(
+                location,
+                is_wild=not self.is_trainer_battle,
+                is_trainer=self.is_trainer_battle,
+            )
+            diagnostic_print(
+                lambda: (
+                    "BATTLESTATE_CAPTURE_TARGET: "
+                    f"runtime_id={id(runtime)} "
+                    f"location={location!r} is_wild={not self.is_trainer_battle} "
+                    f"is_trainer={self.is_trainer_battle} capture_target_for={result} final={result}"
+                ),
+                trace=True,
+            )
+            return result
+        except (AttributeError, RuntimeError, TypeError):
+            return False
 
     @property
     def battling_pokemon(self) -> list["BattlePokemon"]:

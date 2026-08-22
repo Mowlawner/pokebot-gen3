@@ -85,6 +85,10 @@ class CampaignFacts:
     pokeballs_available: Fact[bool]
     pokeballs_ready: Fact[bool]
     nuzlocke_started: Fact[bool]
+    visited_petalburg: Fact[bool]
+    devon_goods_recovered: Fact[bool]
+    visited_rustboro: Fact[bool]
+    first_badge_obtained: Fact[bool]
 
     def __getitem__(self, name: str) -> Fact[bool]:
         return getattr(self, name)
@@ -151,6 +155,10 @@ def derive_campaign_facts(
         balls,
         ready,
         nuzlocke_started,
+        _flag(observation.flags, "VISITED_PETALBURG_CITY", available),
+        _flag(observation.flags, "RECOVERED_DEVON_GOODS", available),
+        _flag(observation.flags, "VISITED_RUSTBORO_CITY", available),
+        _flag(observation.flags, "DEFEATED_RUSTBORO_GYM", available),
     )
 
 
@@ -181,7 +189,7 @@ class CampaignState:
     session_id: str | None
     known_session_ids: tuple[str, ...]
     campaign_facts: CampaignFacts = dataclass_field(
-        default_factory=lambda: CampaignFacts(*(Fact.unavailable() for _ in range(10)))
+        default_factory=lambda: CampaignFacts(*(Fact.unavailable() for _ in range(15)))
     )
 
     @classmethod

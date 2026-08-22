@@ -266,6 +266,189 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
 
         self.assertIs(selected.warp, expensive_relevant)
 
+    def test_semantic_map_target_prefers_progression_connection_over_interior_warp(self):
+        """A globally relevant house warp must not beat the next boundary edge."""
+        from modules.world_navigation import WorldRoute
+
+        oldale, route102, house, petalburg = (1, 1), (1, 2), (2, 0), (1, 3)
+        progression = MapConnectionObservation((oldale, (8, 0)), (route102, (0, 20)), required_facing=Direction.North)
+        interior = WarpObservation((oldale, (1, 1)), (house, (3, 3)))
+        world = SimpleNamespace(
+            map_id=oldale,
+            player_coordinates=(1, 0),
+            controllable=True,
+            transitions=(progression, interior),
+            warps=(),
+        )
+        navigator = Mock()
+        navigator.plan.side_effect = lambda start, goal, algorithm: SimpleNamespace(
+            destination=goal.warp.entry,
+            metrics=SimpleNamespace(
+                encounter_opportunities=0,
+                total_route_cost=20 if goal.warp is progression else 1,
+                movement_actions=20 if goal.warp is progression else 1,
+            ),
+        )
+
+        def downstream(transition, target, graph=None):
+            destination = transition.destination[0]
+            return WorldRoute((destination, petalburg), (), 100 if destination == route102 else 1)
+
+        with (
+            patch(
+                "modules.nuzlocke.emerald_capabilities.classify_transition_relevance",
+                return_value=TransitionRelevance.RELEVANT,
+            ),
+            patch("modules.nuzlocke.emerald_capabilities.transition_world_route", side_effect=downstream),
+        ):
+            selected = _observed_exit_goal(world, navigator, SemanticTarget.map(petalburg))
+
+        self.assertIs(selected.warp, progression)
+        self.assertEqual(selected.destination_map, route102)
+
+    def test_semantic_map_target_allows_interior_warp_when_no_connection_exists(self):
+        house, petalburg = (2, 0), (1, 3)
+        interior = WarpObservation(((1, 1), (1, 1)), (house, (3, 3)))
+        world = SimpleNamespace(
+            map_id=(1, 1),
+            player_coordinates=(1, 0),
+            controllable=True,
+            transitions=(interior,),
+            warps=(),
+        )
+        navigator = Mock()
+        navigator.plan.return_value = SimpleNamespace(
+            destination=interior.entry,
+            metrics=SimpleNamespace(encounter_opportunities=0, total_route_cost=1, movement_actions=1),
+        )
+        with (
+            patch(
+                "modules.nuzlocke.emerald_capabilities.classify_transition_relevance",
+                return_value=TransitionRelevance.RELEVANT,
+            ),
+            patch(
+                "modules.nuzlocke.emerald_capabilities.transition_world_route",
+                return_value=SimpleNamespace(estimated_cost=1),
+            ),
+        ):
+            selected = _observed_exit_goal(world, navigator, SemanticTarget.map(petalburg))
+        self.assertIs(selected.warp, interior)
+
+    def test_explicit_interaction_target_allows_interior_warp_with_connection(self):
+        from modules.world_navigation import WorldRoute
+
+        oldale, route102, house, target_map = (1, 1), (1, 2), (2, 0), (1, 3)
+        progression = MapConnectionObservation((oldale, (8, 0)), (route102, (0, 20)), required_facing=Direction.North)
+        interior = WarpObservation((oldale, (1, 1)), (house, (3, 3)))
+        world = SimpleNamespace(
+            map_id=oldale,
+            player_coordinates=(1, 0),
+            controllable=True,
+            transitions=(progression, interior),
+            warps=(),
+        )
+        navigator = Mock()
+        navigator.plan.side_effect = lambda start, goal, algorithm: SimpleNamespace(
+            destination=goal.warp.entry,
+            metrics=SimpleNamespace(
+                encounter_opportunities=0, total_route_cost=1 if goal.warp is interior else 20, movement_actions=1
+            ),
+        )
+        with (
+            patch(
+                "modules.nuzlocke.emerald_capabilities.classify_transition_relevance",
+                return_value=TransitionRelevance.RELEVANT,
+            ),
+            patch(
+                "modules.nuzlocke.emerald_capabilities.transition_world_route",
+                return_value=WorldRoute((house, target_map), (), 1),
+            ),
+        ):
+            selected = _observed_exit_goal(world, navigator, SemanticTarget.interaction(house, "enter_house"))
+        self.assertIs(selected.warp, interior)
+
+    def test_recent_transition_prevents_immediate_cheap_reversal(self):
+        from modules.world_navigation import WorldRoute
+
+        current_map, previous_map, forward_map = (50, 1), (50, 0), (50, 2)
+        reverse = MapConnectionObservation(
+            (current_map, (1, 0)), (previous_map, (1, 4)), required_facing=Direction.North
+        )
+        forward = MapConnectionObservation(
+            (current_map, (3, 0)), (forward_map, (3, 4)), required_facing=Direction.North
+        )
+        world = SimpleNamespace(
+            map_id=current_map,
+            player_coordinates=(2, 2),
+            controllable=True,
+            transitions=(reverse, forward),
+            warps=(),
+        )
+        navigator = Mock()
+        navigator.plan.side_effect = lambda start, goal, algorithm: SimpleNamespace(
+            metrics=SimpleNamespace(
+                encounter_opportunities=0,
+                total_route_cost=1 if goal.warp is reverse else 44,
+                movement_actions=1,
+            )
+        )
+
+        def downstream(transition, target, graph=None):
+            return WorldRoute((transition.destination[0], (0, 99)), (), 40 if transition is reverse else 20)
+
+        with (
+            patch(
+                "modules.nuzlocke.emerald_capabilities.classify_transition_relevance",
+                return_value=TransitionRelevance.RELEVANT,
+            ),
+            patch("modules.nuzlocke.emerald_capabilities.transition_world_route", side_effect=downstream),
+        ):
+            selected = _observed_exit_goal(
+                world,
+                navigator,
+                SemanticTarget.map(forward_map),
+                {"previous_transition": (previous_map, current_map)},
+            )
+
+        self.assertIs(selected.warp, forward)
+
+    def test_recent_transition_does_not_permanently_forbid_required_backtracking(self):
+        from modules.world_navigation import WorldRoute
+
+        current_map, previous_map = (51, 1), (51, 0)
+        reverse = MapConnectionObservation(
+            (current_map, (1, 0)), (previous_map, (1, 4)), required_facing=Direction.North
+        )
+        world = SimpleNamespace(
+            map_id=current_map,
+            player_coordinates=(1, 2),
+            controllable=True,
+            transitions=(reverse,),
+            warps=(),
+        )
+        navigator = Mock()
+        navigator.plan.return_value = SimpleNamespace(
+            metrics=SimpleNamespace(encounter_opportunities=0, total_route_cost=1, movement_actions=1)
+        )
+        with (
+            patch(
+                "modules.nuzlocke.emerald_capabilities.classify_transition_relevance",
+                return_value=TransitionRelevance.RELEVANT,
+            ),
+            patch(
+                "modules.nuzlocke.emerald_capabilities.transition_world_route",
+                return_value=WorldRoute((previous_map,), (), 0),
+            ),
+        ):
+            selected = _observed_exit_goal(
+                world,
+                navigator,
+                SemanticTarget.map(previous_map),
+                {"previous_transition": (previous_map, current_map)},
+            )
+
+        self.assertIs(selected.warp, reverse)
+
     def test_goal_route_quality_prefers_staircase_over_cheap_cyclic_exit(self):
         """The autonomous 1F boundary must choose forward world progress."""
         from modules.map_path import Direction

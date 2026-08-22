@@ -2,7 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from modules.goals import ActivateTrigger, EARLY_POKEBALL_TRIGGER_ID
+from modules.goals import ActivateTrigger, EARLY_POKEBALL_TRIGGER_ID, SemanticTargetKind
+from modules.map_data import MapRSE
 from modules.nuzlocke.campaign_execution import (
     CampaignExecutionStatus,
     adapt_campaign_execution,
@@ -48,6 +49,7 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
             "rescue_birch",
             "obtain_starter",
             "receive_pokedex",
+            "reach_petalburg",
             "complete_intro_rival",
             "receive_pokeballs",
         }
@@ -67,6 +69,21 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
         self.assertEqual(result.status, CampaignExecutionStatus.READY)
         self.assertIsNone(result.tactical_goal)
         self.assertIsNotNone(result.capability)
+
+    def test_reach_petalburg_mounts_shared_emerald_navigation_capability(self):
+        result = adapt_campaign_execution(self.ready(self.objectives["reach_petalburg"]))
+        self.assertEqual(result.status, CampaignExecutionStatus.READY)
+        self.assertEqual(result.execution_id, "reach_petalburg")
+        self.assertIsNone(result.tactical_goal)
+        self.assertIsNotNone(result.capability)
+
+    def test_reach_petalburg_resolves_to_map_semantic_target(self):
+        from modules.nuzlocke.emerald_capabilities import _semantic_target_for_objective
+
+        target = _semantic_target_for_objective("reach_petalburg")
+        self.assertIsNotNone(target)
+        self.assertEqual(target.kind, SemanticTargetKind.MAP)
+        self.assertEqual(target.target_map, MapRSE.PETALBURG_CITY.value)
 
     def test_selection_statuses_are_preserved_without_translation(self):
         objective = self.objectives["set_text_speed"]

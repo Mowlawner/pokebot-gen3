@@ -30,6 +30,12 @@ class ResourceDecision(Enum):
     WITHDRAW_HEALING_ITEM = "withdraw_healing_item"
 
 
+class ResourceObservationStatus(Enum):
+    VALID = "valid"
+    UNAVAILABLE = "unavailable"
+    MALFORMED = "malformed"
+
+
 @dataclass(frozen=True, slots=True)
 class PartyResource:
     current_hp: int
@@ -57,6 +63,12 @@ class ResourceSnapshot:
     bag_healing_items: tuple[HealingResource, ...] = ()
     pc_healing_items: tuple[HealingResource, ...] = ()
     current_map: object | None = None
+    observation_status: ResourceObservationStatus = ResourceObservationStatus.VALID
+    invalid_item_index: int | None = None
+    invalid_item_slot: int | None = None
+    invalid_item_storage: str | None = None
+    observation_error: str | None = None
+    unavailable_components: tuple[str, ...] = ()
 
     @property
     def usable_party(self) -> tuple[PartyResource, ...]:
@@ -81,6 +93,10 @@ class RouteRecovery:
     distance_to_objective: int | None = None
     pc_accessible: bool = False
     pc_acquisition_cost: int | None = None
+    # False means the route observation itself was unavailable (for example
+    # during a map transition), distinct from a known route with no center.
+    observation_available: bool = True
+    observation_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

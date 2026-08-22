@@ -55,6 +55,11 @@ from modules.overworld import (
 from modules.player import get_player_avatar
 from modules.profiler import count, invalidation, now, profiled, timing, format_snapshot
 from modules.tasks import is_field_message_waiting_for_input
+from modules.nuzlocke.readiness_diagnostics import (
+    build_progression_readiness_diagnostic,
+    evaluate_progression_readiness,
+)
+import json
 
 
 class AgentActionType(Enum):
@@ -279,6 +284,35 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
         return GoalEvaluation(GoalStatus.NOT_APPLICABLE, reason="no goal supplied")
     if observation.overworld is None or observation.interaction_type is not InteractionType.OVERWORLD:
         return GoalEvaluation(GoalStatus.NOT_APPLICABLE, reason="goal requires an overworld observation")
+
+    # Diagnostics only: this deliberately does not gate, score, or alter the
+    # navigation decision.  Keep the snapshot at the same overworld decision
+    # boundary as the active goal evaluation so later telemetry can explain
+    # exactly what was available before a trainer approach.
+    try:
+        from modules.nuzlocke.snapshots import get_nuzlocke_snapshot
+
+        snapshot = get_nuzlocke_snapshot()
+        controller = getattr(getattr(context, "bot_mode_instance", None), "controller", None)
+        selection = getattr(controller, "last_selection", None)
+        objective = getattr(selection, "objective", None)
+        status = getattr(selection, "status", None)
+        diagnostic = build_progression_readiness_diagnostic(
+            snapshot,
+            objective_id=getattr(objective, "objective_id", None),
+            objective_status=getattr(status, "value", None),
+            destination=getattr(objective, "destination", None),
+            navigation_goal=observation.goal,
+            campaign_mode=str(context.bot_mode),
+            overworld=observation.overworld,
+        )
+        diagnostic = evaluate_progression_readiness(diagnostic)
+        diagnostic_print(
+            lambda: "CAMPAIGN_READINESS: " + json.dumps(diagnostic.as_dict(), sort_keys=True, default=str), trace=True
+        )
+    except (AttributeError, ImportError, KeyError, RuntimeError, TypeError, ValueError):
+        # Diagnostics must never make navigation unavailable.
+        pass
 
     world_start = now()
     trace_world_start = getattr(context, "stutter_trace", None)
@@ -1417,6 +1451,24 @@ class AgentControlLoop:
         timing("navigation_total_decision", navigation_start)
         decision_elapsed = perf_counter_ns() - profile_start - observe_elapsed if profiling else 0
         if decision.goal_evaluation is not None and self._diagnostics_enabled():
+            diagnostic_print(
+                lambda: "CAMPAIGN_INTERACTION_DECISION: "
+                + json.dumps(
+                    {
+                        "map": observation.overworld.map_id if observation.overworld else None,
+                        "coordinates": observation.overworld.player_coordinates if observation.overworld else None,
+                        "interaction_type": observation.interaction_type.name,
+                        "goal": repr(observation.goal),
+                        "goal_status": decision.goal_evaluation.status.name,
+                        "action": decision.action.action_type.name,
+                        "action_reason": decision.action.reason,
+                        "option": decision.action.option,
+                    },
+                    sort_keys=True,
+                    default=str,
+                ),
+                trace=True,
+            )
             self._report(f"GOAL: {observation.goal!r} status={decision.goal_evaluation.status.name}")
             diagnostics = decision.goal_evaluation.diagnostics
             if diagnostics and diagnostics != self._last_navigation_diagnostics:

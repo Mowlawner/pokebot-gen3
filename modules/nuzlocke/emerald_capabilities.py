@@ -16,7 +16,7 @@ from typing import Callable, Iterator
 
 from modules.context import context
 from modules.agent_control import AgentControlLoop, observe_agent
-from modules.goals import ActivateTrigger, ReachLocation, ReachWarp, SemanticTarget
+from modules.goals import ActivateTrigger, ReachLocation, ReachWarp, SemanticTarget, SemanticTargetKind
 from modules.navigation import (
     GoalAwareNavigator,
     NavigationError,
@@ -341,6 +341,7 @@ def _observed_exit_goal(
     world: OverworldObservation,
     navigator: GoalAwareNavigator,
     semantic_target: SemanticTarget | None = None,
+    navigation_progress: dict | None = None,
 ) -> ReachWarp | None:
     """Choose a tactical exit from the currently observed map.
 
@@ -431,6 +432,19 @@ def _observed_exit_goal(
         )
     if semantic_target is not None:
         relevant = tuple(transition for transition in exits if relevance[transition] is TransitionRelevance.RELEVANT)
+        # A semantic map destination normally advances through a boundary
+        # connection.  Interior ROM warps can also be globally relevant (for
+        # example, a house can return to its town and then reach the target),
+        # but must not outrank an available progression connection merely
+        # because their local activation tile is closer.  Retain warp
+        # candidates as a fallback when no connection can advance the route;
+        # this preserves necessary backtracking and maps whose only observed
+        # exit is an interior transition.  Explicit interaction targets are
+        # intentionally unaffected.
+        if semantic_target.kind is SemanticTargetKind.MAP:
+            progression = tuple(transition for transition in relevant if transition.kind == "map_connection")
+            if progression:
+                relevant = progression
         if relevant:
             exits = relevant
         else:
@@ -495,6 +509,7 @@ def _observed_exit_goal(
         # observation.  Local feasibility must be established before the
         # combined route score is compared.
     ranked: list[tuple[tuple, object]] = []
+    previous_transition = None if navigation_progress is None else navigation_progress.get("previous_transition")
     # Evaluate every observed candidate that could advance the semantic goal.
     # The world route is a quality discriminator; local path cost remains the
     # tie-breaker among equally good downstream routes.
@@ -532,6 +547,11 @@ def _observed_exit_goal(
         downstream_cost = downstream.estimated_cost if downstream not in (None, False) else 0
         local_cost = metrics.total_route_cost if metrics else float("inf")
         total_route_cost = downstream_cost + local_cost
+        immediate_reverse = (
+            previous_transition is not None
+            and warp.entry[0] == previous_transition[1]
+            and warp.destination[0] == previous_transition[0]
+        )
         ranked.append(
             (
                 (
@@ -543,6 +563,7 @@ def _observed_exit_goal(
                     warp.entry[1],
                 ),
                 warp,
+                immediate_reverse,
             )
         )
     if trace is not None:
@@ -576,7 +597,13 @@ def _observed_exit_goal(
             return None
         selected = candidates[0]
     else:
-        selected = min(ranked, key=lambda item: item[0])[1]
+        # Prefer continuing through a relevant, locally reachable exit over
+        # immediately reversing the transition just completed.  If every
+        # viable exit is a reversal, retain the ordinary cost ordering so
+        # legitimate backtracking remains possible.
+        forward = tuple(item for item in ranked if not item[2])
+        pool = forward or tuple(ranked)
+        selected = min(pool, key=lambda item: item[0])[1]
     if trace is not None:
         trace.mark(
             "navigation_selected_transition",
@@ -625,6 +652,12 @@ def observation_driven_overworld_progression(
         if interrupt is not None and interrupt():
             yield
             continue
+        progress = execution_cache.setdefault("navigation_progress", {})
+        pending_transition = progress.get("pending_transition")
+        if pending_transition is not None and current is not None:
+            if current.map_id == pending_transition[1] and current.map_id != pending_transition[0]:
+                progress["previous_transition"] = pending_transition
+                progress.pop("pending_transition", None)
         # A tactical plan is deliberately local to this observation.  The
         # next frame gets a new navigator and cannot inherit route ownership.
         if current is None or not current.controllable:
@@ -688,7 +721,7 @@ def observation_driven_overworld_progression(
             # map escape route.
             yield
             continue
-        goal = _observed_exit_goal(current, navigator, semantic_target)
+        goal = _observed_exit_goal(current, navigator, semantic_target, progress)
         if goal is None:
             _publish_navigation_intent(semantic_target, "no viable local transition")
             yield
@@ -698,6 +731,9 @@ def observation_driven_overworld_progression(
             f"{getattr(goal.warp, 'kind', 'warp').upper()} → "
             f"{goal.destination[0] if goal.destination is not None else 'UNKNOWN'}",
         )
+        progress = execution_cache.setdefault("navigation_progress", {})
+        if goal.warp is not None and goal.destination is not None:
+            progress["pending_transition"] = (goal.warp.entry[0], goal.destination[0])
         loop = AgentControlLoop(lambda: observe_agent(goal=goal), goal=goal).run()
         execution_cache["overworld"] = (cache_key, loop)
         try:
@@ -1140,6 +1176,8 @@ def _semantic_target_for_objective(objective_id: str | None) -> SemanticTarget |
         # sequence.  The campaign supplies only the destination map and keeps
         # completion authoritative through the existing Pokédex flags.
         return SemanticTarget.map(MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value)
+    if objective_id == "reach_petalburg":
+        return SemanticTarget.map(MapRSE.PETALBURG_CITY.value)
     if objective_id not in {"set_wall_clock", "meet_rival"}:
         return None
 

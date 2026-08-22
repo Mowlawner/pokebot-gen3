@@ -10,6 +10,8 @@ from modules.overworld import (
     evaluate_trigger_condition,
     prewarm_static_map_observation,
     perceive_overworld,
+    OverworldObservationResult,
+    OverworldObservationStatus,
 )
 
 
@@ -26,6 +28,24 @@ def _object_event() -> ObjectEvent:
 
 
 class TestOverworldPerception(unittest.TestCase):
+    def test_missing_avatar_is_explicitly_unavailable(self):
+        with patch("modules.overworld.get_player_avatar", return_value=None):
+            result = perceive_overworld()
+        self.assertIsInstance(result, OverworldObservationResult)
+        self.assertEqual(result.status, OverworldObservationStatus.UNAVAILABLE)
+        self.assertEqual(result.reason, "player_avatar_unavailable")
+
+    def test_malformed_avatar_coordinates_are_explicitly_malformed(self):
+        avatar = SimpleNamespace(map_group_and_number=(1, 2), local_coordinates=None)
+        with patch("modules.overworld.get_player_avatar", return_value=avatar):
+            result = perceive_overworld()
+        self.assertEqual(result.status, OverworldObservationStatus.MALFORMED)
+
+    def test_unexpected_avatar_error_propagates(self):
+        with patch("modules.overworld.get_player_avatar", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                perceive_overworld()
+
     def test_coordinate_trigger_condition_is_observable_without_script_interpretation(self):
         trigger = TriggerObservation(
             "coord:1:123:4",
