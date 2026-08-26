@@ -862,7 +862,13 @@ class MapLocation:
 
     @cached_property
     def _tile_behaviour(self) -> int:
-        return read_symbol("sTileBitAttributes", self._metatile_attributes[0] & 0x3FF, 1)[0]
+        # Emerald stores the metatile behavior directly in the low byte of
+        # the tileset attribute word.  ``sTileBitAttributes`` is not indexed
+        # by the map metatile ID; using that table here turns behaviors such
+        # as MB_COUNTER into unrelated values (or zero).
+        if context.rom.is_frlg:
+            return read_symbol("sTileBitAttributes", self._metatile_attributes[0] & 0x3FF, 1)[0]
+        return self._metatile_attributes[0] & 0xFF
 
     @cached_property
     def _event_list(self) -> bytes | None:
@@ -920,6 +926,11 @@ class MapLocation:
     @property
     def tile_type(self) -> str:
         return _get_tile_type_name(self._metatile_attributes[0] & 0xFF)
+
+    @property
+    def metatile_behavior(self) -> int:
+        """Raw ROM metatile behavior used by field interaction semantics."""
+        return self._tile_behaviour
 
     @property
     def collision(self) -> int:

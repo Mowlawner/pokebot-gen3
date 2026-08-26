@@ -43,6 +43,10 @@ class GlfwGui:
             self._on_frame,
             save_state_on_shutdown=not startup_settings.no_save_state,
         )
+        # A newly created emulator begins a fresh runtime-transition session.
+        from modules.navigation import clear_runtime_transition_observations
+
+        clear_runtime_transition_observations()
         context.audio = not startup_settings.no_audio
         context.video = not startup_settings.no_video
         context.emulation_speed = startup_settings.emulation_speed

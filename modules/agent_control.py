@@ -23,6 +23,7 @@ from modules.goals import (
 )
 from modules.interaction_state import (
     InteractionObservation,
+    InteractionPhase,
     InteractionType,
     classify_interaction,
     observe_interaction,
@@ -38,6 +39,9 @@ from modules.navigation import (
     NavigationActionType,
     NavigationError,
     NavigationPlan,
+    RoutePlan,
+    RouteCheckpoint,
+    record_runtime_transition_observation,
     NavigationWorld,
     WorldNavigationError,
     goal_target_map,
@@ -156,12 +160,33 @@ def observe_agent(
     trace = getattr(context, "stutter_trace", None)
     span = trace.span("observation") if trace is not None else nullcontext()
     with span:
-        return _observe_agent_instrumented(
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_PLAN_TRACE: phase=observe_agent_begin "
+                f"frame={getattr(context, 'frame', None)!r} goal={goal!r}"
+            ),
+            trace=True,
+        )
+        result = _observe_agent_instrumented(
             goal=goal,
             choice_options=choice_options,
             menu_options=menu_options,
             special_interaction=special_interaction,
         )
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_PLAN_TRACE: phase=observe_agent_end "
+                f"frame={getattr(context, 'frame', None)!r} "
+                f"map={result.overworld.map_id if result.overworld else None!r} "
+                f"coordinates={result.overworld.player_coordinates if result.overworld else None!r} "
+                f"facing={result.overworld.facing if result.overworld else None!r} goal={result.goal!r}"
+                f" movement={getattr(getattr(result, 'overworld', None).movement_state, 'name', None) if result.overworld else None!r}"
+                f" blocked={getattr(result.overworld, 'dynamic_blocked_coordinates', None) if result.overworld else None!r}"
+                f" objects={getattr(result.overworld, 'objects', None) if result.overworld else None!r}"
+            ),
+            trace=True,
+        )
+        return result
 
 
 def _observe_agent_instrumented(
@@ -210,7 +235,7 @@ class ActionDecision:
 
 
 def _dialogue_actions(observation: AgentObservation) -> tuple[AgentAction, ...]:
-    if observation.interaction.dialogue_waiting:
+    if observation.interaction.interaction_phase is InteractionPhase.FIELD_MESSAGE_INPUT_WAIT:
         return (AgentAction(AgentActionType.ADVANCE_DIALOGUE, reason="dialogue is waiting for input"),)
     return (AgentAction(AgentActionType.WAIT_REOBSERVE, reason="dialogue is not ready"),)
 
@@ -348,9 +373,26 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
                 f"target_positions={resolution.interaction_positions!r}",
             )
     planning_start = now()
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_PLAN_TRACE: phase=evaluate_goal_begin "
+            f"frame={getattr(context, 'frame', None)!r} start={start!r} goal={observation.goal!r}"
+        ),
+        trace=True,
+    )
     trace_planning_start = trace_world_start.now() if trace_world_start is not None else 0
     try:
+        diagnostic_print(lambda: "CAMPAIGN_PLAN_TRACE: phase=world_plan_begin", trace=True)
         plan, world_route = plan_with_world_navigation(world, start, observation.goal)
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_PLAN_TRACE: phase=world_plan_end "
+                f"actions={len(plan.actions)} destination={plan.destination!r} "
+                f"first={plan.actions[0] if plan.actions else None!r} "
+                f"last={plan.actions[-1] if plan.actions else None!r}"
+            ),
+            trace=True,
+        )
         target_map = goal_target_map(world, observation.goal)
         if diagnostics_enabled and world_route is not None and target_map is not None:
             world_diagnostics = (
@@ -457,7 +499,7 @@ def _select_action_instrumented(observation: AgentObservation) -> ActionDecision
     # owns the avatar.  Do not send the goal's interaction input again until
     # the script has returned control to the player.
     if not observation.interaction.controllable:
-        if observation.interaction.field_message_advance_ready:
+        if observation.interaction.interaction_phase is InteractionPhase.FIELD_MESSAGE_INPUT_WAIT:
             return ActionDecision(
                 AgentAction(
                     AgentActionType.ADVANCE_DIALOGUE,
@@ -555,6 +597,7 @@ class _PendingTransition:
     moved: bool = False
     input_issued: bool = False
     last_position: tuple[tuple[int, int], tuple[int, int]] | None = None
+    settling_observations: int = 0
 
 
 @dataclass
@@ -592,6 +635,19 @@ class AgentActionExecutor:
             return self._execute_instrumented(action, observation)
 
     def _execute_instrumented(self, action: AgentAction, observation: AgentObservation) -> ActionResult:
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_INTERACTION_TRACE: "
+                f"phase=execute frame={getattr(context, 'frame', None)!r} "
+                f"map={observation.overworld.map_id if observation.overworld else None!r} "
+                f"coordinates={observation.overworld.player_coordinates if observation.overworld else None!r} "
+                f"facing={observation.overworld.facing if observation.overworld else None!r} "
+                f"action={action.action_type.name!r} option={action.option!r} "
+                f"direction={getattr(action.direction, 'name', None)!r} navigation={action.navigation!r} "
+                f"goal={observation.goal!r} interaction={observation.interaction!r}"
+            ),
+            trace=True,
+        )
         if action.action_type is AgentActionType.WAIT_REOBSERVE:
             return ActionResult(ActionResultType.WAITING, action, action.reason)
         if action.action_type is AgentActionType.DELEGATE_BATTLE:
@@ -609,15 +665,38 @@ class AgentActionExecutor:
             return ActionResult(ActionResultType.UNSUPPORTED, action, "no emulator is attached")
 
         if action.action_type is AgentActionType.ADVANCE_DIALOGUE:
-            if not (observation.interaction.dialogue_waiting or observation.interaction.field_message_advance_ready):
+            if observation.interaction.interaction_phase is not InteractionPhase.FIELD_MESSAGE_INPUT_WAIT:
                 return ActionResult(ActionResultType.WAITING, action, "dialogue is not ready")
-            context.emulator.press_button("A")
+            diagnostic_print(
+                lambda: (
+                    "AGENT_DIALOGUE_INPUT: action=ADVANCE_DIALOGUE "
+                    f"dialogue_waiting={observation.interaction.dialogue_waiting!r} "
+                    f"field_message_advance_ready={observation.interaction.field_message_advance_ready!r} "
+                    "operation=press_button(A)"
+                ),
+                trace=True,
+            )
+            # Dialogue dismissal must be a fresh input.  Otherwise the A
+            # edge can survive the script-to-overworld handoff and be
+            # consumed as a new object interaction on the first controllable
+            # frame.
+            press_button_fresh = getattr(type(context.emulator), "press_button_fresh", None)
+            if callable(press_button_fresh):
+                context.emulator.press_button_fresh("A")
+            else:
+                context.emulator.press_button("A")
         elif action.action_type is AgentActionType.CHOOSE_DIALOGUE_OPTION:
             if action.option not in observation.interaction.choice_options:
                 return ActionResult(ActionResultType.UNSUPPORTED, action, "choice is not available")
-            if self._choose_option is None:
+            if self._choose_option is not None:
+                self._choose_option(action.option)
+            elif observation.interaction.choice_menu_active and observation.interaction.choice_menu_input_ready:
+                if action.option == "YES" and observation.interaction.choice_selected == "NO":
+                    context.emulator.press_button_fresh("UP")
+                else:
+                    context.emulator.press_button_fresh("A")
+            else:
                 return ActionResult(ActionResultType.UNSUPPORTED, action, "no choice controller is attached")
-            self._choose_option(action.option)
         elif action.action_type is AgentActionType.NAVIGATE_MENU:
             if action.option not in observation.interaction.menu_options:
                 return ActionResult(ActionResultType.UNSUPPORTED, action, "menu option is not available")
@@ -637,6 +716,14 @@ class AgentActionExecutor:
             else:
                 context.emulator.press_button(action.direction.button_name)
         elif action.action_type is AgentActionType.INTERACT:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_INTERACTION_TRACE: "
+                    f"phase=press_input frame={getattr(context, 'frame', None)!r} "
+                    f"button='A' trigger={action.option!r}"
+                ),
+                trace=True,
+            )
             context.emulator.press_button("A")
         return ActionResult(ActionResultType.EXECUTED, action)
 
@@ -674,6 +761,7 @@ class AgentControlLoop:
         self._warp_wait_observations = 0
         self._blocked_warp: WarpObservation | None = None
         self._cached_evaluation: GoalEvaluation | None = None
+        self._route_plan: RoutePlan | None = None
         self._cached_actions: tuple[NavigationAction, ...] = ()
         self._cached_action_index = 0
         self._in_flight_move: NavigationAction | None = None
@@ -685,7 +773,28 @@ class AgentControlLoop:
         self._last_world_transition_source: tuple[tuple[int, int], tuple[int, int]] | None = None
         self._movement_batch: _MovementBatch | None = None
         self._movement_blocked_retries = 0
+        # Counts failed movement attempts for this mounted goal.  Unlike the
+        # one-shot transient retry above, this survives route invalidation so
+        # an unchanged plan cannot reset the failure budget.
+        self._movement_failure_count = 0
+        self._movement_failure_limit = 4
         self._dialogue_input_in_flight = False
+        self._started_interaction_id: str | None = None
+        self._last_observed_location: Location | None = None
+        self._previous_observed_location: Location | None = None
+
+    def _implicit_transition_boundary(self, observation: AgentObservation) -> bool:
+        """Recognize a transition exposed between controller observations."""
+        world = observation.overworld
+        if world is None or self._previous_observed_location is None:
+            return False
+        current = (world.map_id, world.player_coordinates)
+        previous = self._previous_observed_location
+        if current == previous or current[0] != previous[0]:
+            return False
+        if abs(current[1][0] - previous[1][0]) + abs(current[1][1] - previous[1][1]) <= 1:
+            return False
+        return any(warp.destination == current for warp in world.warps if warp.destination is not None)
 
     def _safe_movement_batch(self, observation: AgentObservation) -> tuple[NavigationAction, ...]:
         """Return a short, same-map movement segment from the cached plan.
@@ -816,7 +925,12 @@ class AgentControlLoop:
             batch.frames_waiting += 1
             if batch.frames_waiting > 24:
                 count("cached_route_fast_path_fallback_frames")
+                self._movement_failure_count += 1
                 self._cancel_movement_batch("movement_blocked")
+                if self._movement_failure_count >= self._movement_failure_limit:
+                    raise NavigationError(
+                        "recovery/navigation movement made no progress " f"for {self._movement_failure_count} attempts"
+                    )
                 return False
             if avatar.facing_direction != action.direction.button_name:
                 context.emulator.press_button(action.direction.button_name)
@@ -1043,6 +1157,9 @@ class AgentControlLoop:
                 trace.mark("map_warp_transition", True)
         invalidation(reason)
         self._cached_evaluation = None
+        if self._route_plan is not None:
+            self._report(f"ROUTE_PLAN_INVALIDATED route_id={self._route_plan.route_id} invalidation_reason={reason!r}")
+        self._route_plan = None
         self._cached_actions = ()
         self._cached_action_index = 0
         self._in_flight_move = None
@@ -1160,10 +1277,21 @@ class AgentControlLoop:
                         ),
                         self._cached_evaluation,
                     )
+                # ReachLocation completion belongs to the semantic goal
+                # evaluator.  Drop the exhausted fast-path plan so the next
+                # decision can produce GOAL_COMPLETE authoritatively.
+                self._invalidate_plan("cached goal position reached")
+                return None
+            if self._implicit_transition_boundary(observation):
+                trace = getattr(context, "stutter_trace", None)
+                if trace is not None:
+                    trace.mark("transition_state", "implicit_boundary_observed")
+                    trace.mark("route_invalidation_detail", "cached route ended at known transition destination")
+                self._warp_settling = True
                 return ActionDecision(
                     AgentAction(
                         AgentActionType.WAIT_REOBSERVE,
-                        reason="cached goal position reached",
+                        reason="waiting for implicit transition destination to settle",
                     ),
                     self._cached_evaluation,
                 )
@@ -1197,7 +1325,14 @@ class AgentControlLoop:
         if trace is not None and self._cached_action_index < len(self._cached_actions):
             trace.mark("cached_route_active", True)
             trace.mark("cached_route_actions_remaining", len(self._cached_actions) - self._cached_action_index)
+        previous_location = self._last_observed_location
         observation = self._observe()
+        self._previous_observed_location = previous_location
+        if observation.overworld is not None:
+            self._last_observed_location = (
+                observation.overworld.map_id,
+                observation.overworld.player_coordinates,
+            )
         observe_elapsed = perf_counter_ns() - profile_start if profiling else 0
         if observation.goal is not None:
             self._goal = observation.goal
@@ -1205,6 +1340,26 @@ class AgentControlLoop:
             observation = replace(observation, goal=self._goal)
 
         interaction_type = observation.interaction_type
+        tactical_trace = isinstance(self._goal, (ReachLocation, ReachWarp))
+        if tactical_trace:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_TACTICAL_STEP: "
+                    f"phase=observed frame={getattr(context, 'frame', None)!r} "
+                    f"loop_id={id(self)!r} "
+                    f"game_state={getattr(observation.interaction.game_state, 'name', repr(observation.interaction.game_state))!r} "
+                    f"map={getattr(observation.overworld, 'map_id', None)!r} "
+                    f"coordinates={getattr(observation.overworld, 'player_coordinates', None)!r} "
+                    f"controllable={getattr(observation.overworld, 'controllable', None)!r} "
+                    f"interaction_type={interaction_type.name!r} goal={self._goal!r} "
+                    f"cached_action_index={self._cached_action_index!r} "
+                    f"cached_actions_remaining={len(self._cached_actions) - self._cached_action_index!r} "
+                    f"in_flight_move={self._in_flight_move!r} pending_transition={self._pending_transition!r} "
+                    f"warp_settling={self._warp_settling!r} "
+                    f"dynamic_blocked_here={getattr(observation.overworld, 'player_coordinates', None) in getattr(observation.overworld, 'dynamic_blocked_coordinates', ()) if observation.overworld is not None else None!r}"
+                ),
+                trace=True,
+            )
         if observation.overworld is not None and not observation.overworld.controllable:
             # ROM/script movement owns the avatar now.  Do not let a bot-held
             # direction bleed into the first frames after control returns.
@@ -1234,11 +1389,72 @@ class AgentControlLoop:
             self._last_interaction_type = interaction_type
         self._battle_was_active = interaction_type is InteractionType.BATTLE
 
+        # Once this loop has emitted an interaction input, an active script is
+        # the generic handoff from positioning to the interaction owner.  Do
+        # not run the reached-position decision again and emit another input.
+        if (
+            self._started_interaction_id is not None
+            and isinstance(self._goal, (ActivateTrigger, ReachInteractionPosition))
+            and self._goal.trigger_id == self._started_interaction_id
+            and observation.interaction.script_active
+        ):
+            wait_action = AgentAction(
+                AgentActionType.WAIT_REOBSERVE,
+                reason="started interaction script is executing",
+            )
+            return (
+                observation,
+                ActionDecision(wait_action),
+                ActionResult(
+                    ActionResultType.GOAL_COMPLETE,
+                    wait_action,
+                    "started interaction script owns the interaction",
+                ),
+            )
+
         pending = self._pending_transition
         if observation.overworld is not None and pending is not None:
             observed = (observation.overworld.map_id, observation.overworld.player_coordinates)
             destination_map = pending.destination[0] if pending.destination is not None else None
             if destination_map is not None and observation.overworld.map_id == destination_map:
+                if pending.destination is not None and observed != pending.destination:
+                    if observation.overworld.movement_state is MovementState.MOVING:
+                        pending.settling_observations += 1
+                        if pending.settling_observations <= 8:
+                            self._report(
+                                f"TRANSITION: settling observation={pending.settling_observations} "
+                                f"observed={observed!r} expected={pending.destination!r}"
+                            )
+                            wait_action = AgentAction(
+                                AgentActionType.WAIT_REOBSERVE,
+                                reason="transition destination settling",
+                            )
+                            wait_decision = ActionDecision(wait_action)
+                            wait_result = self._executor.execute(wait_action, observation)
+                            return observation, wait_decision, wait_result
+                    record_runtime_transition_observation(
+                        pending.source, pending.transition_kind, pending.destination, observed
+                    )
+                    self._report(
+                        f"TRANSITION_PREDICTION_MISMATCH source={pending.source!r} "
+                        f"kind={pending.transition_kind!r} predicted={pending.destination!r} observed={observed!r}"
+                    )
+                    self._report(
+                        f"TRANSITION: destination_coordinate_mismatch expected={pending.destination!r}"
+                        f" observed={observed!r}"
+                    )
+                    self._release_transition_input(pending)
+                    self._expected_world_transition = None
+                    self._pending_transition = None
+                    self._invalidate_plan("warp_destination_coordinate_mismatch")
+                    self._warp_settling = True
+                    return (
+                        observation,
+                        ActionDecision(
+                            AgentAction(AgentActionType.WAIT_REOBSERVE, reason="transition destination mismatch")
+                        ),
+                        ActionResult(ActionResultType.UNREACHABLE, None, "transition destination mismatch"),
+                    )
                 self._report("TRANSITION: destination_observed")
                 self._release_transition_input(pending)
                 self._expected_world_transition = None
@@ -1249,7 +1465,19 @@ class AgentControlLoop:
                     trace.mark("map_changed_event", True)
                     trace.mark("transition_state", "destination_observed")
                 self._warp_wait_observations = 0
-                self._invalidate_plan("warp_destination_confirmed")
+                # A confirmed destination is a successful hard checkpoint;
+                # retain the complete route and continue with its suffix.
+                if self._route_plan is not None:
+                    self._report(
+                        f"ROUTE_CHECKPOINT_REACHED route_id={self._route_plan.route_id} "
+                        "checkpoint_kind='transition_postcondition'"
+                    )
+                    self._report(
+                        f"ROUTE_CHECKPOINT_VALID route_id={self._route_plan.route_id} "
+                        f"actual_map={observed[0]!r} actual_coordinate={observed[1]!r}"
+                    )
+                    self._route_plan.current_checkpoint += 1
+                self._cached_world_signature = self._world_signature(observation)
                 self._warp_settling = True
             elif observed[0] != pending.source[0] and destination_map is None:
                 self._report("TRANSITION: destination_observed destination_unknown=True")
@@ -1259,6 +1487,13 @@ class AgentControlLoop:
                 self._invalidate_plan("transition_destination_observed")
                 self._warp_settling = True
             elif observed[0] != pending.source[0]:
+                record_runtime_transition_observation(
+                    pending.source, pending.transition_kind, pending.destination, observed
+                )
+                self._report(
+                    f"TRANSITION_PREDICTION_MISMATCH source={pending.source!r} "
+                    f"kind={pending.transition_kind!r} predicted={pending.destination!r} observed={observed!r}"
+                )
                 self._report(
                     f"TRANSITION: blocked destination_mismatch expected={destination_map!r}"
                     f" observed={observed[0]!r}"
@@ -1312,6 +1547,19 @@ class AgentControlLoop:
                 return observation, wait_decision, self._executor.execute(wait_action, observation)
 
         if self._warp_settling and interaction_type is InteractionType.OVERWORLD and observation.overworld is not None:
+            observed_location = (observation.overworld.map_id, observation.overworld.player_coordinates)
+            # A map connection can expose the avatar on the destination map
+            # before its coordinates belong to that map's static navigation
+            # model.  Do not evaluate a local goal or replan from that
+            # transient location; wait for a coherent destination observation.
+            if observation.overworld.tile_at(observation.overworld.player_coordinates) is None:
+                wait_action = AgentAction(
+                    AgentActionType.WAIT_REOBSERVE,
+                    reason="waiting for a valid post-transition location",
+                )
+                wait_decision = ActionDecision(wait_action)
+                wait_result = self._executor.execute(wait_action, observation)
+                return observation, wait_decision, wait_result
             if not observation.overworld.controllable:
                 wait_action = AgentAction(
                     AgentActionType.WAIT_REOBSERVE,
@@ -1386,10 +1634,15 @@ class AgentControlLoop:
                         self._in_flight_move = None
                         self._in_flight_move_initial_facing = None
                     else:
+                        self._movement_failure_count += 1
                         self._report(
                             "REPLAN: reason='movement blocked'" f" requested={self._in_flight_move.direction.name!r}"
                         )
                         self._invalidate_plan("movement_blocked")
+                        if self._movement_failure_count >= self._movement_failure_limit:
+                            raise NavigationError(
+                                "movement made no progress after " f"{self._movement_failure_count} attempts"
+                            )
                 else:
                     wait_action = AgentAction(
                         AgentActionType.WAIT_REOBSERVE,
@@ -1401,6 +1654,7 @@ class AgentControlLoop:
             if self._in_flight_move is not None and location == self._in_flight_move.destination:
                 self._cached_action_index += 1
                 self._movement_blocked_retries = 0
+                self._movement_failure_count = 0
                 self._in_flight_move = None
                 self._in_flight_move_initial_facing = None
             elif self._in_flight_move is not None:
@@ -1438,6 +1692,11 @@ class AgentControlLoop:
                 self._cached_evaluation = decision.goal_evaluation
                 self._cached_actions = decision.goal_evaluation.plan.actions
                 self._cached_action_index = 0
+                self._route_plan = RoutePlan.from_navigation_plan(decision.goal_evaluation.plan, target=self._goal)
+                self._report(
+                    f"ROUTE_PLAN_CREATED route_id={self._route_plan.route_id} "
+                    f"actions={len(self._route_plan.actions)} checkpoints={len(self._route_plan.checkpoints)}"
+                )
                 self._cached_goal = self._goal
                 self._cached_world_signature = self._world_signature(observation)
                 count("navigation_replans")
@@ -1447,7 +1706,25 @@ class AgentControlLoop:
                 if self._diagnostics_enabled():
                     self._report("PLAN: replanned")
         elif self._diagnostics_enabled():
+            if self._route_plan is not None:
+                self._report(
+                    f"ROUTE_PLAN_REUSED route_id={self._route_plan.route_id} "
+                    f"action_index={self._cached_action_index}"
+                )
             self._report("PLAN: continuing_cached")
+        if tactical_trace:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_TACTICAL_STEP: "
+                    f"phase=selected frame={getattr(context, 'frame', None)!r} "
+                    f"loop_id={id(self)!r} "
+                    f"action={decision.action.action_type.name!r} "
+                    f"direction={getattr(decision.action.direction, 'name', None)!r} "
+                    f"navigation={decision.action.navigation!r} "
+                    f"evaluation_status={getattr(getattr(decision, 'goal_evaluation', None), 'status', None)!r}"
+                ),
+                trace=True,
+            )
         timing("navigation_total_decision", navigation_start)
         decision_elapsed = perf_counter_ns() - profile_start - observe_elapsed if profiling else 0
         if decision.goal_evaluation is not None and self._diagnostics_enabled():
@@ -1541,6 +1818,19 @@ class AgentControlLoop:
         if decision.action.navigation is not None:
             prewarm_warp_destination(observation, decision.action.navigation)
         result = self._executor.execute(decision.action, observation)
+        if result.result_type is ActionResultType.EXECUTED and decision.action.action_type is AgentActionType.INTERACT:
+            self._started_interaction_id = decision.action.option
+        if tactical_trace:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_TACTICAL_STEP: "
+                    f"phase=executed frame={getattr(context, 'frame', None)!r} "
+                    f"loop_id={id(self)!r} "
+                    f"action={decision.action.action_type.name!r} "
+                    f"result={result.result_type.name!r} message={result.message!r} yielded=True"
+                ),
+                trace=True,
+            )
         if (
             result.result_type is ActionResultType.EXECUTED
             and decision.action.action_type is AgentActionType.ADVANCE_DIALOGUE
@@ -1635,12 +1925,15 @@ class AgentControlLoop:
                         yield
                         continue
                 _, _, result = self.step()
-                if result.result_type in (
-                    ActionResultType.GOAL_COMPLETE,
-                    ActionResultType.UNREACHABLE,
-                    ActionResultType.UNSUPPORTED,
-                ):
+                if result.result_type is ActionResultType.GOAL_COMPLETE:
                     return
+                if result.result_type in (ActionResultType.UNREACHABLE, ActionResultType.UNSUPPORTED):
+                    # A generator returning here is indistinguishable from a
+                    # successful recovery to CampaignController.  Propagate
+                    # terminal navigation failure explicitly so recovery is
+                    # marked failed and the interrupted objective remains
+                    # available for safe policy-level handling.
+                    raise NavigationError(result.message or result.result_type.name.lower())
                 yield
         finally:
             self.dispose()

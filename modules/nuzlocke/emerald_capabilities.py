@@ -15,7 +15,8 @@ import random
 from typing import Callable, Iterator
 
 from modules.context import context
-from modules.agent_control import AgentControlLoop, observe_agent
+from modules.console import diagnostic_print
+from modules.agent_control import AgentControlLoop, ActionResultType, observe_agent
 from modules.goals import ActivateTrigger, ReachLocation, ReachWarp, SemanticTarget, SemanticTargetKind
 from modules.navigation import (
     GoalAwareNavigator,
@@ -358,7 +359,13 @@ def _observed_exit_goal(
     exits = tuple(
         transition
         for transition in (getattr(world, "transitions", ()) or world.warps)
-        if transition.destination is not None and transition.destination[0] != world.map_id
+        if transition.destination is not None
+        and transition.destination[0] != world.map_id
+        and not (
+            transition.kind == "map_connection"
+            and transition_approach_position(transition)
+            in {(world.map_id, coordinate) for coordinate in getattr(world, "dynamic_blocked_coordinates", ())}
+        )
     )
     if not exits:
         return None
@@ -441,10 +448,19 @@ def _observed_exit_goal(
         # this preserves necessary backtracking and maps whose only observed
         # exit is an interior transition.  Explicit interaction targets are
         # intentionally unaffected.
-        if semantic_target.kind is SemanticTargetKind.MAP:
-            progression = tuple(transition for transition in relevant if transition.kind == "map_connection")
-            if progression:
-                relevant = progression
+        # A direct boundary connection to the semantic target map is the
+        # correct progression edge even when the target is an interaction.
+        # Otherwise interior warps can win on local cost and send the player
+        # through the house cycle while still being graph-reachable.
+        progression = tuple(
+            transition
+            for transition in relevant
+            if transition.kind == "map_connection"
+            and transition.destination is not None
+            and semantic_target.target_map == transition.destination[0]
+        )
+        if progression:
+            relevant = progression
         if relevant:
             exits = relevant
         else:
@@ -525,8 +541,17 @@ def _observed_exit_goal(
             )
         )
         try:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_PLAN_TRACE: phase=exit_candidate_begin "
+                    f"frame={getattr(context, 'frame', None)!r} current={world.map_id, world.player_coordinates!r} "
+                    f"goal={target!r}"
+                ),
+                trace=True,
+            )
             # Use A* for faster heuristic-guided search.
             plan = navigator.plan((world.map_id, world.player_coordinates), target, algorithm="astar")
+            diagnostic_print(lambda: ("CAMPAIGN_PLAN_TRACE: phase=exit_candidate_end " f"plan={plan!r}"), trace=True)
         except NavigationError:
             continue
         # Navigation providers are allowed to decline a candidate without a
@@ -537,7 +562,11 @@ def _observed_exit_goal(
         warp = representative
         if len(group) > 1:
             matching = tuple(
-                transition for transition in group if transition_approach_position(transition) == plan.destination
+                transition
+                for transition in group
+                if plan.actions
+                and plan.actions[-1].action_type.name == "WARP"
+                and plan.actions[-1].destination == transition.destination
             )
             if not matching:
                 continue
@@ -551,6 +580,7 @@ def _observed_exit_goal(
             previous_transition is not None
             and warp.entry[0] == previous_transition[1]
             and warp.destination[0] == previous_transition[0]
+            and not (semantic_target is not None and semantic_target.target_map == previous_transition[0])
         )
         ranked.append(
             (
@@ -671,13 +701,28 @@ def observation_driven_overworld_progression(
             close = getattr(evicted[1], "close", None) if evicted is not None else None
             if callable(close):
                 close()
-            cached = None
+                cached = None
         if cached is not None:
             loop = cached[1]
             try:
-                next(loop)
+                result = next(loop)
             except StopIteration:
                 execution_cache.pop("overworld", None)
+            else:
+                # A tactical loop owns a concrete observed transition.  If
+                # that transition becomes unreachable (dynamic NPCs and
+                # scripts can change the local affordance), discard the loop
+                # so this observation-driven layer can resolve a fresh exit
+                # rather than replaying a stale ReachWarp forever.
+                if (
+                    isinstance(result, tuple)
+                    and len(result) >= 3
+                    and getattr(result[2], "result_type", None) is ActionResultType.UNREACHABLE
+                ):
+                    close = getattr(loop, "close", None)
+                    if callable(close):
+                        close()
+                    execution_cache.pop("overworld", None)
             yield
             continue
         interaction_goal = _observed_interaction_goal(current, semantic_target)
@@ -800,6 +845,56 @@ def _observed_interaction_goal(
     for trigger in world.triggers:
         identities = (trigger.trigger_id, trigger.affordance_id, trigger.script_symbol)
         if interaction_id in identities and trigger.condition_active is not False and trigger.activation_locations:
+            return ActivateTrigger(trigger.trigger_id)
+    return None
+
+
+def _observed_boundary_interaction_goal(
+    world: OverworldObservation,
+    semantic_target: SemanticTarget | None,
+) -> ActivateTrigger | None:
+    """Resolve an observed NPC occupying the approach to a target connection.
+
+    Some Emerald opening boundaries are script gates: the player must talk to
+    the NPC standing on the connection approach tile before the connection can
+    be traversed.  Keep this observation-driven and generic; the campaign
+    target remains the eventual semantic interaction on the destination map.
+    """
+    if semantic_target is None or semantic_target.target_map is None:
+        return None
+    target_connections = tuple(
+        transition
+        for transition in (getattr(world, "transitions", ()) or world.warps)
+        if transition.kind == "map_connection"
+        and transition.destination is not None
+        and transition.destination[0] == semantic_target.target_map
+    )
+    approach_tiles = {
+        transition_approach_position(transition)
+        for transition in target_connections
+        if transition_approach_position(transition) is not None
+    }
+    blocked = set(getattr(world, "dynamic_blocked_coordinates", ()))
+    blocked_locations = {(world.map_id, coordinate) for coordinate in blocked}
+    occupied_approaches = approach_tiles & blocked_locations
+    if not occupied_approaches:
+        return None
+    for trigger in world.triggers:
+        if trigger.condition_active is False:
+            continue
+        if (
+            trigger.locations & blocked_locations
+            and (world.map_id, world.player_coordinates) in trigger.activation_locations
+        ):
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_NAVIGATION_TRACE: boundary_interaction_required "
+                    f"frame={getattr(context, 'frame', None)!r} map={world.map_id!r} "
+                    f"player={world.player_coordinates!r} target_map={semantic_target.target_map!r} "
+                    f"trigger={trigger.trigger_id!r} occupied_approaches={occupied_approaches!r}"
+                ),
+                trace=True,
+            )
             return ActivateTrigger(trigger.trigger_id)
     return None
 
@@ -1118,6 +1213,14 @@ def _emerald_observation(
         except (AttributeError, RuntimeError, ValueError, TypeError, IndexError, KeyError):
             clock_target = None
     semantic_target = _semantic_target_for_objective(objective_id)
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_CAPABILITY_HANDOFF: "
+            f"capability_id={id(legacy)!r} objective_id={objective_id!r} "
+            f"semantic_target={semantic_target!r}"
+        ),
+        trace=True,
+    )
     _publish_campaign_status(objective_id, semantic_target, legacy, overworld)
     trace = getattr(context, "stutter_trace", None)
     if trace is not None and callable(getattr(trace, "mark", None)):
@@ -1169,15 +1272,31 @@ def _emerald_observation(
 
 def _semantic_target_for_objective(objective_id: str | None) -> SemanticTarget | None:
     """Translate the current campaign objective into a ROM affordance."""
+    diagnostic_print(
+        lambda: ("CAMPAIGN_SEMANTIC_TARGET_CALL: " f"capability_id={id(objective_id)!r} objective_id={objective_id!r}"),
+        trace=True,
+    )
     if objective_id == "rescue_birch":
-        return SemanticTarget.interaction(MapRSE.ROUTE101.value, interaction_id=_BIRCH_BAG_INTERACTION_ID)
+        result = SemanticTarget.interaction(MapRSE.ROUTE101.value, interaction_id=_BIRCH_BAG_INTERACTION_ID)
+        diagnostic_print(
+            lambda: f"CAMPAIGN_SEMANTIC_TARGET_RESULT: objective_id={objective_id!r} target={result!r}", trace=True
+        )
+        return result
     if objective_id == "receive_pokedex":
         # Returning to Birch's lab activates Emerald's ROM-owned Pokédex
         # sequence.  The campaign supplies only the destination map and keeps
         # completion authoritative through the existing Pokédex flags.
-        return SemanticTarget.map(MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value)
+        result = SemanticTarget.map(MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value)
+        diagnostic_print(
+            lambda: f"CAMPAIGN_SEMANTIC_TARGET_RESULT: objective_id={objective_id!r} target={result!r}", trace=True
+        )
+        return result
     if objective_id == "reach_petalburg":
-        return SemanticTarget.map(MapRSE.PETALBURG_CITY.value)
+        result = SemanticTarget.map(MapRSE.PETALBURG_CITY.value)
+        diagnostic_print(
+            lambda: f"CAMPAIGN_SEMANTIC_TARGET_RESULT: objective_id={objective_id!r} target={result!r}", trace=True
+        )
+        return result
     if objective_id not in {"set_wall_clock", "meet_rival"}:
         return None
 
@@ -1225,7 +1344,12 @@ def _semantic_target_for_objective(objective_id: str | None) -> SemanticTarget |
                         None,
                     )
                     if arrival_script is not None:
-                        return SemanticTarget.interaction(arrival_map, interaction_id=arrival_script)
+                        result = SemanticTarget.interaction(arrival_map, interaction_id=arrival_script)
+                        diagnostic_print(
+                            lambda: f"CAMPAIGN_SEMANTIC_TARGET_RESULT: objective_id={objective_id!r} target={result!r}",
+                            trace=True,
+                        )
+                        return result
                 rival_metadata = get_map_metadata(target_map)
                 interaction_id = next(
                     (
@@ -1239,7 +1363,11 @@ def _semantic_target_for_objective(objective_id: str | None) -> SemanticTarget |
             pass
         if interaction_id is None:
             return None
-        return SemanticTarget.interaction(target_map, interaction_id=interaction_id)
+        result = SemanticTarget.interaction(target_map, interaction_id=interaction_id)
+        diagnostic_print(
+            lambda: f"CAMPAIGN_SEMANTIC_TARGET_RESULT: objective_id={objective_id!r} target={result!r}", trace=True
+        )
+        return result
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
         return None
 

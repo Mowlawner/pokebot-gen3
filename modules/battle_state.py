@@ -3,6 +3,7 @@ from enum import Enum, Flag, KEEP, auto
 from typing import Literal
 
 from modules.context import context
+from modules.console import diagnostic_print
 from modules.fishing import FishingRod
 from modules.game import get_symbol_name_before
 from modules.memory import (
@@ -887,8 +888,19 @@ def get_battle_state() -> BattleState:
 
 
 def battle_is_active() -> bool:
+    global _last_battle_main_state
     callback1 = get_symbol_name_before(unpack_uint32(read_symbol("gMain", 0, 4))).lower()
-    return callback1 == "battlemaincb1"
+    active = callback1 == "battlemaincb1"
+    if active != _last_battle_main_state:
+        diagnostic_print(
+            lambda: f"BATTLE_MAIN_STATE_CHANGE: frame={getattr(context, 'frame', None)!r} active={active!r} gmain_callback={callback1!r}",
+            trace=True,
+        )
+        _last_battle_main_state = active
+    return active
+
+
+_last_battle_main_state: bool | None = None
 
 
 def get_main_battle_callback() -> str:

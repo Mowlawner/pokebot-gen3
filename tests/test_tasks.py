@@ -231,3 +231,29 @@ class TestIsWaitingForInput(unittest.TestCase):
         self.assertFalse(observation.dialogue_waiting)
         self.assertTrue(observation.field_message_lifecycle_active)
         self.assertTrue(observation.field_message_advance_ready)
+
+    def test_active_hidden_box_is_dialogue_lifecycle_but_not_actionable(self):
+        import modules.interaction_state as interaction_state
+
+        interaction_state._field_message_lifecycle_active = True
+        interaction_state._field_message_advance_ready = False
+        with (
+            patch("modules.interaction_state.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.interaction_state.player_avatar_is_controllable", return_value=True),
+            patch("modules.interaction_state.task_is_active", return_value=False),
+            patch("modules.interaction_state.is_field_message_waiting_for_input", return_value=True),
+            patch(
+                "modules.interaction_state.get_global_script_context",
+                return_value=types.SimpleNamespace(
+                    is_active=True,
+                    script_function_name="Std_MsgboxYesNo",
+                    native_function_name="IsFieldMessageBoxHidden",
+                ),
+            ),
+        ):
+            observation = observe_interaction()
+
+        self.assertFalse(observation.dialogue_waiting)
+        self.assertTrue(observation.field_message_lifecycle_active)
+        self.assertFalse(observation.field_message_advance_ready)
+        interaction_state._field_message_lifecycle_active = False

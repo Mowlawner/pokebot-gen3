@@ -94,6 +94,19 @@ _closest_pokemon_centers: dict[MapFRLG | MapRSE, list[PokemonCenter]] = {
 }
 
 
+def pokemon_center_candidates(
+    location: MapLocation | tuple[MapFRLG | MapRSE, tuple[int, int]] | None = None,
+) -> tuple[PokemonCenter, ...]:
+    """Return all registered recovery sources for the current map."""
+    if isinstance(location, MapLocation):
+        map_id = location.map_group_and_number
+    elif location is not None:
+        map_id = location[0]
+    else:
+        map_id = get_player_location()[0]
+    return tuple(dict.fromkeys(_closest_pokemon_centers.get(map_id, ())))
+
+
 def find_closest_pokemon_center(
     location: MapLocation | tuple[MapFRLG | MapRSE, tuple[int, int]] | None = None,
 ) -> PokemonCenter:

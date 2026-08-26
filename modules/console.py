@@ -236,6 +236,24 @@ def print_stats(stats: "GlobalStats", encounter: "EncounterInfo") -> None:
 
 console = Console(theme=theme)
 
+_DIAGNOSTIC_LOG_WHITELIST = (
+    "CAMPAIGN_SELECTION_HANDOFF",
+    "CAMPAIGN_EXECUTION_HANDOFF",
+    "CAMPAIGN_TACTICAL_LOOP_BOUNDARY",
+    "CAMPAIGN_TACTICAL_LOOP_INVALIDATED",
+    "CAMPAIGN_TACTICAL_STEP_HANDOFF",
+    "CAMPAIGN_CAPABILITY_HANDOFF",
+    "CAMPAIGN_SEMANTIC_TARGET_CALL",
+    "CAMPAIGN_SEMANTIC_TARGET_RESULT",
+    "CAMPAIGN_INTERACTION_TRACE",
+    "CAMPAIGN_NAVIGATION_TRACE",
+    "CAMPAIGN_PLAN_TRACE",
+    "CAMPAIGN:",
+    "EMULATOR_INPUT_OWNERSHIP",
+    "WARP_INPUT:",
+    "",
+)
+
 
 def diagnostic_print(message: str | Callable[[], str], *, trace: bool = False) -> None:
     """Print a diagnostic message only when its configured level is enabled.
@@ -248,7 +266,10 @@ def diagnostic_print(message: str | Callable[[], str], *, trace: bool = False) -
 
     if not context.debug or (trace and not getattr(context, "debug_trace", False)):
         return
-    console.print(message() if callable(message) else message)
+    rendered = message() if callable(message) else message
+    if trace and not rendered.startswith(_DIAGNOSTIC_LOG_WHITELIST):
+        return
+    console.print(rendered)
     # Lifecycle/path-boundary records must reach the pipe before a synchronous
     # operation (or KeyboardInterrupt) can prevent the normal frame flush.
     if trace:

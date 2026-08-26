@@ -124,6 +124,50 @@ class TestOverworldPerception(unittest.TestCase):
         self.assertEqual(requirements[((map_id, (1, 2)))], Direction.North)
         self.assertEqual(requirements[((map_id, (1, 0)))], Direction.South)
 
+    def test_map_connection_observation_uses_full_endpoint_coordinates(self):
+        source_id, destination_id = (93, 1), (93, 2)
+        tile = lambda coordinate: SimpleNamespace(
+            local_coordinates=coordinate,
+            accessible_from_direction=[True] * 4,
+            warps_to=None,
+            traversal_cost=1,
+        )
+        source = SimpleNamespace(
+            map_size=(3, 2),
+            warps=(),
+            connections=(
+                SimpleNamespace(
+                    destination_map_group=destination_id[0],
+                    destination_map_number=destination_id[1],
+                    direction="North",
+                    offset=0,
+                ),
+            ),
+            objects=(),
+            bg_events=(),
+            coord_events=(),
+        )
+        destination = SimpleNamespace(
+            map_size=(3, 2),
+            warps=(),
+            connections=(),
+            objects=(),
+            bg_events=(),
+            coord_events=(),
+        )
+        with patch(
+            "modules.overworld._get_map_metadata",
+            side_effect=lambda map_id: SimpleNamespace(tiles=tuple(tile((x, y)) for y in range(2) for x in range(3))),
+        ), patch(
+            "modules.overworld.get_map_metadata",
+            side_effect=lambda map_id: source if map_id == source_id else destination,
+        ):
+            prewarm_static_map_observation(source_id)
+        static = __import__("modules.overworld", fromlist=["_static_map_observations"])._static_map_observations[
+            source_id
+        ]
+        self.assertTrue(any(t.kind == "map_connection" for t in static.transitions))
+
     def test_reuses_static_tiles_when_only_avatar_state_changes(self):
         map_id = (91, 7)
         map_data = MapMetadata(

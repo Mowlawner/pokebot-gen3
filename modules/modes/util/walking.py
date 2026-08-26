@@ -28,6 +28,7 @@ from modules.player import (
     AvatarFlags,
 )
 from modules.roms import ROMLanguage
+from modules.console import diagnostic_print
 from modules.tasks import get_global_script_context, task_is_active
 from .sleep import wait_for_n_frames
 from .._interface import BotModeError
@@ -583,6 +584,15 @@ def wait_for_player_avatar_to_be_controllable(
     button_to_press: str | None = None,
 ) -> Generator:
     while not player_avatar_is_controllable():
+        diagnostic_print(
+            lambda: (
+                "RECOVERY_CONTROLLABILITY_WAIT: "
+                f"frame={getattr(context, 'frame', None)!r} "
+                f"game_state={getattr(get_game_state(), 'name', repr(get_game_state()))!r} "
+                "yielding=True"
+            ),
+            trace=True,
+        )
         if button_to_press is not None:
             context.emulator.press_button(button_to_press)
         yield
@@ -592,7 +602,37 @@ def wait_for_player_avatar_to_be_controllable(
 def wait_for_player_avatar_to_be_standing_still(
     button_to_press: str | None = None,
 ) -> Generator:
+    diagnostic_print(
+        lambda: (
+            "RECOVERY_WAIT_STANDING_STILL: phase=entry "
+            f"frame={getattr(context, 'frame', None)!r} emulator_frame={context.emulator.get_frame_count()!r} "
+            f"button={button_to_press!r} map={get_player_avatar().map_group_and_number!r} "
+            f"coordinates={get_player_avatar().local_coordinates!r} "
+            f"controllable={player_avatar_is_controllable()!r} standing_still={player_avatar_is_standing_still()!r}"
+        ),
+        trace=True,
+    )
     while not player_avatar_is_standing_still():
+        diagnostic_print(
+            lambda: (
+                "RECOVERY_WAIT_STANDING_STILL: phase=iteration "
+                f"frame={getattr(context, 'frame', None)!r} emulator_frame={context.emulator.get_frame_count()!r} "
+                f"button={button_to_press!r} map={get_player_avatar().map_group_and_number!r} "
+                f"coordinates={get_player_avatar().local_coordinates!r} "
+                f"controllable={player_avatar_is_controllable()!r} standing_still={player_avatar_is_standing_still()!r} "
+                f"input_issued={button_to_press is not None!r}"
+            ),
+            trace=True,
+        )
         if button_to_press is not None:
             context.emulator.press_button(button_to_press)
         yield
+    diagnostic_print(
+        lambda: (
+            "RECOVERY_WAIT_STANDING_STILL: phase=return "
+            f"frame={getattr(context, 'frame', None)!r} emulator_frame={context.emulator.get_frame_count()!r} "
+            f"map={get_player_avatar().map_group_and_number!r} coordinates={get_player_avatar().local_coordinates!r} "
+            f"controllable={player_avatar_is_controllable()!r} standing_still={player_avatar_is_standing_still()!r}"
+        ),
+        trace=True,
+    )

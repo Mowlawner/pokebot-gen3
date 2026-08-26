@@ -10,6 +10,11 @@ from typing import Any
 
 from .resource_policy import PartyResource, ResourceSnapshot, RouteRecovery
 from .snapshots import NuzlockeSnapshot
+from modules.console import diagnostic_print
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from modules.navigation import RouteAnalysis
 
 
 class Availability(Enum):
@@ -28,7 +33,8 @@ class ReadinessDecision(Enum):
 class ReadinessReason(Enum):
     PARTY_INFORMATION_UNKNOWN = "PARTY_INFORMATION_UNKNOWN"
     NO_USABLE_POKEMON = "NO_USABLE_POKEMON"
-    CRITICAL_PARTY_HP_BEFORE_TRAINER = "CRITICAL_PARTY_HP_BEFORE_TRAINER"
+    CRITICAL_PARTY_HP = "CRITICAL_PARTY_HP"
+    OPPORTUNISTIC_RECOVERY = "OPPORTUNISTIC_RECOVERY"
     TRAINER_HAZARD_UNKNOWN = "TRAINER_HAZARD_UNKNOWN"
     RECOVERY_UNAVAILABLE = "RECOVERY_UNAVAILABLE"
     RECOVERY_CAPABILITY_UNKNOWN = "RECOVERY_CAPABILITY_UNKNOWN"
@@ -36,6 +42,8 @@ class ReadinessReason(Enum):
     PARTY_HEALTHY = "PARTY_HEALTHY"
     OVERWORLD_UNAVAILABLE = "OVERWORLD_UNAVAILABLE"
     RESOURCE_INFORMATION_UNKNOWN = "RESOURCE_INFORMATION_UNKNOWN"
+    OPPORTUNISTIC_ROUTE_UNAVAILABLE = "OPPORTUNISTIC_ROUTE_UNAVAILABLE"
+    OPPORTUNISTIC_ROUTE_NOT_WITHIN_THRESHOLD = "OPPORTUNISTIC_ROUTE_NOT_WITHIN_THRESHOLD"
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +97,7 @@ class ProgressionReadinessDiagnostic:
     resource_reason: str | None = None
     readiness_decision: ReadinessDecision | None = None
     readiness_reason: ReadinessReason | None = None
+    route_analysis: "RouteAnalysis | None" = None
 
     @property
     def party_count(self) -> int | None:
@@ -185,7 +194,15 @@ class ReadinessObservationScheduler:
         if can_reuse:
             self._age += 1
             self._invalidation_reason = None
+            diagnostic_print(
+                lambda: f"READINESS_SCHEDULER: cache=hit tick={self._tick_count} objective={getattr(objective, 'objective_id', None)!r}",
+                trace=True,
+            )
             return self._cached
+        diagnostic_print(
+            lambda: f"READINESS_SCHEDULER: cache=miss tick={self._tick_count} objective={getattr(objective, 'objective_id', None)!r}",
+            trace=True,
+        )
         result = self._provider(objective, goal)
         self._cached = result
         self._cached_key = key
@@ -221,10 +238,43 @@ class ReadinessObservationScheduler:
 class CampaignReadinessPolicy:
     """Pure first-stage progression policy; it performs no recovery action."""
 
-    critical_hp_ratio: float = 0.20
+    critical_hp_ratio: float = 0.25
+    # Reuse the existing important-objective minimum-health concept for
+    # opportunistic recovery, but only when a nearby Center makes recovery a
+    # small tactical detour rather than a general healing mandate.
+    opportunistic_hp_ratio: float = 0.75
+    opportunistic_detour_threshold: int = 50
 
     def evaluate(self, readiness: ProgressionReadinessDiagnostic) -> ReadinessResult:
+        evaluation_id = id(readiness)
+        recovery = readiness.recovery
+        lowest_hp_ratio = readiness.lowest_hp_ratio
+        critical = lowest_hp_ratio is not None and lowest_hp_ratio <= self.critical_hp_ratio
+        opportunistic_threshold = lowest_hp_ratio is not None and lowest_hp_ratio <= self.opportunistic_hp_ratio
+        recovery_known = readiness.recovery_availability is Availability.KNOWN
+        center_available = bool(recovery and recovery.center_available)
+        center_safe = bool(recovery and recovery.safe_to_reach_center)
+        imminent = _has_imminent_trainer(readiness)
+        diagnostic_print(
+            lambda: (
+                "READINESS_POLICY_BEFORE: "
+                f"evaluation_id={evaluation_id} frame={getattr(readiness, 'frame', None)!r} "
+                f"map={readiness.current_map!r} location={readiness.current_coordinates!r} "
+                f"lowest_hp_ratio={lowest_hp_ratio!r} critical_threshold={self.critical_hp_ratio!r} "
+                f"opportunistic_threshold={self.opportunistic_hp_ratio!r} critical={critical} "
+                f"imminent_trainer={imminent} recovery_availability_known={recovery_known} "
+                f"center_available={center_available} center_safe={center_safe} "
+                f"route_analysis_available={readiness.route_analysis is not None} "
+                f"opportunistic_detour_threshold={self.opportunistic_detour_threshold!r}"
+            ),
+            trace=True,
+        )
         if readiness.overworld_availability is not Availability.KNOWN:
+            return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.OVERWORLD_UNAVAILABLE)
+        # Coordinates can remain readable briefly while the emulator crosses
+        # a battle or script boundary. Recovery requires authoritative stable
+        # overworld state before it may take ownership.
+        if readiness.game_state != "OVERWORLD":
             return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.OVERWORLD_UNAVAILABLE)
         if readiness.resource_availability is not Availability.KNOWN:
             return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.RESOURCE_INFORMATION_UNKNOWN)
@@ -232,14 +282,54 @@ class CampaignReadinessPolicy:
             return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.PARTY_INFORMATION_UNKNOWN)
         if readiness.usable_count == 0:
             return self._recovery_result(readiness, ReadinessReason.NO_USABLE_POKEMON)
-        if readiness.lowest_hp_ratio is None or readiness.lowest_hp_ratio > self.critical_hp_ratio:
+        if readiness.lowest_hp_ratio is None:
+            return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.PARTY_INFORMATION_UNKNOWN)
+
+        critical = readiness.lowest_hp_ratio <= self.critical_hp_ratio
+        if critical:
+            return self._recovery_result(readiness, ReadinessReason.CRITICAL_PARTY_HP)
+        # An imminent trainer interaction is part of the active campaign
+        # objective.  Do not divert for optional healing immediately before
+        # it; critical HP recovery above remains authoritative.
+        if not imminent:
+            if readiness.route_analysis is None or readiness.route_analysis.normal_cost is None:
+                if readiness.lowest_hp_ratio <= self.opportunistic_hp_ratio:
+                    return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.OPPORTUNISTIC_ROUTE_UNAVAILABLE)
+            elif self._opportunistic_recovery_available(readiness):
+                return self._recovery_result(readiness, ReadinessReason.OPPORTUNISTIC_RECOVERY)
+        if not critical:
             return ReadinessResult(ReadinessDecision.CONTINUE, ReadinessReason.PARTY_HEALTHY)
 
-        if readiness.trainer_availability is not Availability.KNOWN:
-            return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.TRAINER_HAZARD_UNKNOWN)
-        if not _has_imminent_trainer(readiness):
-            return ReadinessResult(ReadinessDecision.CONTINUE, ReadinessReason.NO_IMMINENT_TRAINER)
-        return self._recovery_result(readiness, ReadinessReason.CRITICAL_PARTY_HP_BEFORE_TRAINER)
+    def _opportunistic_recovery_available(self, readiness: ProgressionReadinessDiagnostic) -> bool:
+        if readiness.lowest_hp_ratio is None or readiness.lowest_hp_ratio > self.opportunistic_hp_ratio:
+            return False
+        analysis = readiness.route_analysis
+        if analysis is None or analysis.normal_cost is None:
+            diagnostic_print(
+                "OPPORTUNISTIC_HEAL_ANALYSIS: route_analysis_unavailable decision=CONTINUE",
+                trace=True,
+            )
+            return False
+        candidates = tuple(
+            candidate for candidate in analysis.candidates if candidate.reachable and candidate.detour is not None
+        )
+        selected = (
+            min(candidates, key=lambda candidate: (candidate.detour, candidate.total_cost)) if candidates else None
+        )
+        decision = selected is not None and selected.detour <= self.opportunistic_detour_threshold
+        diagnostic_print(
+            lambda: (
+                "OPPORTUNISTIC_HEAL_ANALYSIS: "
+                f"hp_ratio={readiness.lowest_hp_ratio!r} goal={analysis.goal!r} "
+                f"normal_route_cost={analysis.normal_cost!r} "
+                f"candidates={[{'source': repr(c.destination), 'route_cost': c.total_cost, 'detour': c.detour, 'reachable': c.reachable} for c in analysis.candidates]!r} "
+                f"selected_source={repr(selected.destination) if selected else None!r} "
+                f"opportunistic_detour_threshold={self.opportunistic_detour_threshold!r} "
+                f"decision={'HEAL' if decision else 'CONTINUE'}"
+            ),
+            trace=True,
+        )
+        return decision
 
     @staticmethod
     def _recovery_result(readiness: ProgressionReadinessDiagnostic, reason: ReadinessReason) -> ReadinessResult:
@@ -296,6 +386,7 @@ def build_progression_readiness_diagnostic(
     overworld_reason: str | None = None,
     resource_availability: Availability | None = None,
     resource_reason: str | None = None,
+    route_analysis: "RouteAnalysis | None" = None,
 ) -> ProgressionReadinessDiagnostic:
     """Build a point-in-time diagnostic without applying a survival policy."""
     members = _party(snapshot)
@@ -367,6 +458,9 @@ def build_progression_readiness_diagnostic(
             )
         ),
         resource_reason,
+        None,
+        None,
+        route_analysis,
     )
 
 
@@ -376,4 +470,26 @@ def evaluate_progression_readiness(
 ) -> ProgressionReadinessDiagnostic:
     """Evaluate and return a diagnostic enriched with the pure policy result."""
     result = (policy or CampaignReadinessPolicy()).evaluate(readiness)
+    active_policy = policy or CampaignReadinessPolicy()
+    recovery = readiness.recovery
+    diagnostic_print(
+        lambda: (
+            "READINESS_POLICY_AFTER: "
+            f"evaluation_id={id(readiness)} map={readiness.current_map!r} "
+            f"location={readiness.current_coordinates!r} lowest_hp_ratio={readiness.lowest_hp_ratio!r} "
+            f"critical_threshold={active_policy.critical_hp_ratio!r} "
+            f"opportunistic_threshold={active_policy.opportunistic_hp_ratio!r} "
+            f"critical={readiness.lowest_hp_ratio is not None and readiness.lowest_hp_ratio <= active_policy.critical_hp_ratio} "
+            f"opportunistic_threshold_met={readiness.lowest_hp_ratio is not None and readiness.lowest_hp_ratio <= active_policy.opportunistic_hp_ratio} "
+            f"imminent_trainer={_has_imminent_trainer(readiness)} "
+            f"recovery_availability_known={readiness.recovery_availability is Availability.KNOWN} "
+            f"center_available={bool(recovery and recovery.center_available)} "
+            f"center_safe={bool(recovery and recovery.safe_to_reach_center)} "
+            f"distance_known={bool(recovery and recovery.distance_to_center is not None)} "
+            f"distance={getattr(recovery, 'distance_to_center', None)!r} "
+            f"opportunistic_detour_threshold={active_policy.opportunistic_detour_threshold!r} "
+            f"decision={result.decision.value} reason={result.reason.value}"
+        ),
+        trace=True,
+    )
     return replace(readiness, readiness_decision=result.decision, readiness_reason=result.reason)

@@ -1,6 +1,9 @@
 from typing import Generator, Literal
 
 from modules.context import context
+from modules.console import diagnostic_print
+from modules.player import get_player_avatar, player_avatar_is_controllable
+from modules.memory import get_game_state
 from modules.debug import debug
 from modules.tasks import (
     get_global_script_context,
@@ -154,10 +157,49 @@ def wait_for_script_to_start_and_finish(function_name: str, button_to_press: str
 
 @debug.track
 def wait_for_no_script_to_run(button_to_press: str | None = None) -> Generator:
+    diagnostic_print(
+        lambda: (
+            "RECOVERY_WAIT_NO_SCRIPT: phase=entry "
+            f"frame={getattr(context, 'frame', None)!r} emulator_frame={context.emulator.get_frame_count()!r} "
+            f"active={get_global_script_context().is_active!r} button={button_to_press!r} "
+            f"map={get_player_avatar().map_group_and_number!r} coordinates={get_player_avatar().local_coordinates!r} "
+            f"game_state={getattr(get_game_state(), 'name', get_game_state())!r} controllable={player_avatar_is_controllable()!r} "
+            f"module_file={__file__!r} module_name={__name__!r} "
+            f"symbol_bound={'player_avatar_is_controllable' in globals()!r} "
+            f"symbol_repr={repr(globals().get('player_avatar_is_controllable'))!r}"
+        ),
+        trace=True,
+    )
     while get_global_script_context().is_active:
+        diagnostic_print(
+            lambda: (
+                "RECOVERY_WAIT_NO_SCRIPT: phase=iteration "
+                f"frame={getattr(context, 'frame', None)!r} emulator_frame={context.emulator.get_frame_count()!r} "
+                f"active={get_global_script_context().is_active!r} button={button_to_press!r} "
+                f"map={get_player_avatar().map_group_and_number!r} coordinates={get_player_avatar().local_coordinates!r} "
+                f"controllable={player_avatar_is_controllable()!r} "
+                f"module_file={__file__!r} module_name={__name__!r} "
+                f"symbol_bound={'player_avatar_is_controllable' in globals()!r} "
+                f"symbol_repr={repr(globals().get('player_avatar_is_controllable'))!r}"
+            ),
+            trace=True,
+        )
         if button_to_press is not None:
             context.emulator.press_button(button_to_press)
         yield
+    diagnostic_print(
+        lambda: (
+            "RECOVERY_WAIT_NO_SCRIPT: phase=return "
+            f"frame={getattr(context, 'frame', None)!r} emulator_frame={context.emulator.get_frame_count()!r} "
+            f"active={get_global_script_context().is_active!r} button={button_to_press!r} "
+            f"map={get_player_avatar().map_group_and_number!r} coordinates={get_player_avatar().local_coordinates!r} "
+            f"controllable={player_avatar_is_controllable()!r} "
+            f"module_file={__file__!r} module_name={__name__!r} "
+            f"symbol_bound={'player_avatar_is_controllable' in globals()!r} "
+            f"symbol_repr={repr(globals().get('player_avatar_is_controllable'))!r}"
+        ),
+        trace=True,
+    )
 
 
 @debug.track

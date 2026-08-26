@@ -74,6 +74,17 @@ class CampaignExecutionAdapter:
         if not isinstance(objective, CampaignObjective):
             return CampaignExecutionResult(None, CampaignExecutionStatus.UNSUPPORTED, "malformed ready objective")
 
+        if objective.objective_id == "HEAL_PARTY":
+            from .resource_runtime import execute_heal_party
+
+            return CampaignExecutionResult(
+                objective,
+                CampaignExecutionStatus.READY,
+                "mounted observation-driven party healing capability",
+                objective.execution_id,
+                capability=execute_heal_party,
+            )
+
         if objective.objective_id == "reach_oldale":
             goal = objective.tactical_target
             if not isinstance(goal, ReachWarp) or goal.destination_map != MapRSE.OLDALE_TOWN.value:

@@ -43,6 +43,7 @@ from modules.overworld import (
     TriggerObservation,
     WarpActivation,
     WorldTransition,
+    _connection_endpoint_is_executable,
 )
 from modules.overworld import WarpObservation
 from modules.trigger_bindings import BindingResolution, TriggerBinding
@@ -60,6 +61,15 @@ def edge(source, destination, source_coordinate=(0, 0), destination_coordinate=(
 
 
 class TestWorldMapGraph(unittest.TestCase):
+    def test_connection_endpoint_requires_static_passability_and_no_object(self):
+        tile = SimpleNamespace(accessible_from_direction=[True, False, False, False])
+        metadata = SimpleNamespace(objects=())
+        self.assertTrue(_connection_endpoint_is_executable(metadata, {(0, 0): tile}, (0, 0)))
+        blocked = SimpleNamespace(accessible_from_direction=[False, False, False, False])
+        self.assertFalse(_connection_endpoint_is_executable(metadata, {(0, 0): blocked}, (0, 0)))
+        tree = SimpleNamespace(local_coordinates=(0, 0))
+        self.assertFalse(_connection_endpoint_is_executable(SimpleNamespace(objects=(tree,)), {(0, 0): tile}, (0, 0)))
+
     def test_map_connection_is_a_first_class_world_transition(self):
         connection = edge((0, 0), (0, 1), kind="connection")
         route = WorldMapGraph((connection,)).route((0, 0), (0, 1))
@@ -231,6 +241,41 @@ class TestWorldMapGraph(unittest.TestCase):
 
 
 class TestWorldGoalIntegration(unittest.TestCase):
+    def test_neighbors_index_matches_reference_transition_scan(self):
+        source = (1, 4)
+        tiles = {
+            (source, (x, y)): NavigableTile((source, (x, y)), False, frozenset(Direction))
+            for x, y in ((0, 0), (1, 0), (2, 0), (1, 1))
+        }
+        transitions = (
+            WorldTransition((source, (2, 0)), ((0, 18), (1, 1)), kind="warp"),
+            WorldTransition((source, (1, 0)), ((0, 19), (2, 2)), kind="map_connection"),
+            WorldTransition((source, (1, 0)), ((0, 20), (3, 3)), kind="warp"),
+        )
+        world = NavigationWorld(tiles=tiles, transitions=transitions, facing=Direction.South)
+
+        def reference(location):
+            result = []
+            for direction, coordinate in (
+                (Direction.North, (location[1][0], location[1][1] - 1)),
+                (Direction.East, (location[1][0] + 1, location[1][1])),
+                (Direction.South, (location[1][0], location[1][1] + 1)),
+                (Direction.West, (location[1][0] - 1, location[1][1])),
+            ):
+                neighbour = world.tiles.get((location[0], coordinate))
+                if neighbour is not None and not neighbour.blocked:
+                    result.append((direction, (location[0], coordinate), False))
+            for transition in transitions:
+                transition_source = transition.entry
+                if transition.kind == "map_connection":
+                    transition_source = map_connection_approach_position(transition)
+                if transition_source == location and transition.destination is not None:
+                    result.append((world._warp_direction(location, transition), transition.destination, True))
+            return tuple(result)
+
+        for location in ((source, (1, 0)), (source, (2, 0)), (source, (0, 0)), ((9, 9), (0, 0))):
+            self.assertEqual(world.neighbors(location), reference(location))
+
     def test_offscreen_static_target_is_navigable(self):
         map_id = (0, 18)
         tiles = tuple(TileObservation((map_id, (x, 0)), False, frozenset(Direction)) for x in range(3))
