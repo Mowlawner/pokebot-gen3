@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Iterator
 
-from modules.goals import ActivateTrigger, Goal, NavigationGoal, ReachWarp, EARLY_POKEBALL_TRIGGER_ID
+from modules.goals import ActivateTrigger, EngageTrainer, Goal, NavigationGoal, ReachWarp, EARLY_POKEBALL_TRIGGER_ID
 from modules.map_data import MapRSE
 
 from .campaign_objectives import CampaignObjective, ObjectiveSelection, ObjectiveStatus
@@ -137,6 +137,20 @@ class CampaignExecutionAdapter:
                 "translated encounter objective to SEEK navigation",
                 objective.execution_id,
                 goal,
+            )
+
+        # Preparation decisions supply an explicit trainer target and policy;
+        # keep the adapter generic so the live controller can mount the normal
+        # navigation loop without ROM-specific battle code here.
+        if isinstance(objective.tactical_target, NavigationGoal) and isinstance(
+            objective.tactical_target.target, EngageTrainer
+        ):
+            return CampaignExecutionResult(
+                objective,
+                CampaignExecutionStatus.READY,
+                "translated trainer preparation objective to targeted navigation",
+                objective.execution_id,
+                objective.tactical_target,
             )
 
         if objective.objective_id in {

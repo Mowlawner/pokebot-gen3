@@ -26,6 +26,7 @@ from .campaign_state import CampaignState, Fact, FactStatus, RunStatus
 from .resource_policy import EncounterPolicy, ReadinessImportance, ResourceObjective
 from modules.world_navigation import WorldMapGraph, WorldNavigationError, get_world_map_graph
 from .encounter_catalog import EncounterOpportunity, encounter_opportunities
+from .emerald_campaign_registry import evaluate_emerald_fact
 
 
 class ObjectiveStatus(Enum):
@@ -275,7 +276,11 @@ def encounter_available() -> CampaignPredicate:
 
 
 def campaign_fact(name: str) -> CampaignPredicate:
-    return CampaignPredicate(f"campaign_fact:{name}", name.replace("_", " "), lambda state: state.campaign_facts[name])
+    return CampaignPredicate(
+        f"campaign_fact:{name}",
+        name.replace("_", " "),
+        lambda state: evaluate_emerald_fact(state, name),
+    )
 
 
 def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:

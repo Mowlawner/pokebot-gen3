@@ -1400,6 +1400,7 @@ def navigation_diagnostics(world: NavigationWorld, start: Location, goal: Goal) 
             f"trainer_mode={getattr(getattr(goal, 'constraints', None), 'trainer_mode', None)!r}",
             f"selected_trainer={target.trainer_id!r}",
             f"trainer_hazards={sum(len(trigger.hazard_locations) for trigger in matching_triggers)}",
+            "policy_order=legality>trainer>encounter>movement",
         )
     if isinstance(target, ActivateTrigger):
         matching_triggers = tuple(trigger for trigger in world.triggers if trigger.trigger_id == target.trigger_id)

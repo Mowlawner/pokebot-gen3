@@ -23,6 +23,7 @@ from .events import (
     NuzlockeStarted,
 )
 from .identity import PokemonIdentity
+from .rule_config import CampaignRuleId, CampaignRulesConfig
 from .persistence import JsonEventStore, deserialize_event
 
 NO_ENCOUNTER = "none"
@@ -47,6 +48,15 @@ class RuleViolation:
     reason: str
     location: tuple[int, int] | None
     frame: int
+
+
+@dataclass(frozen=True, slots=True)
+class RuleAssessment:
+    """A pure, rule-local view of reduced campaign legality."""
+
+    rule_id: CampaignRuleId
+    legal: bool
+    reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,14 +99,141 @@ class NuzlockeCampaignState:
         return next((e for e in self.first_encounters if e.location == location), LocationEncounter(location))
 
 
+class FaintingRule:
+    """Reduce permanent fainting and whiteout events when enabled."""
+
+    rule_id = CampaignRuleId.FAINTING
+
+    def apply(
+        self,
+        state: NuzlockeCampaignState,
+        event: Event,
+        *,
+        encounter_eligible: bool,
+        active_wild: dict[tuple[int, int], tuple[PokemonIdentity, ...]],
+    ) -> NuzlockeCampaignState:
+        if isinstance(event, PokemonFainted):
+            if event.identity is None:
+                return replace(state, unknown_faints=state.unknown_faints + (event,))
+            if event.identity not in state.dead_pokemon:
+                return replace(state, dead_pokemon=state.dead_pokemon + (event.identity,))
+        elif isinstance(event, WhiteoutOccurred):
+            return replace(state, run_lost=True)
+        return state
+
+    def evaluate(self, state: NuzlockeCampaignState) -> RuleAssessment:
+        return RuleAssessment(
+            self.rule_id,
+            not state.run_lost,
+            ("whiteout occurred",) if state.run_lost else (),
+        )
+
+    def constrain(self, state: NuzlockeCampaignState, candidate):
+        return candidate
+
+
+class OneEncounterPerAreaRule:
+    """Reduce first-wild-encounter ownership without changing event history."""
+
+    rule_id = CampaignRuleId.ONE_ENCOUNTER_PER_AREA
+
+    def apply(
+        self,
+        state: NuzlockeCampaignState,
+        event: Event,
+        *,
+        encounter_eligible: bool,
+        active_wild: dict[tuple[int, int], tuple[PokemonIdentity, ...]],
+    ) -> NuzlockeCampaignState:
+        if isinstance(event, BattleStarted):
+            if not (encounter_eligible and event.is_wild and not event.is_trainer and event.location is not None):
+                return state
+            location = event.location
+            existing = next((e for e in state.encounters if e.location == location), None)
+            if existing is None:
+                identity = event.opponent_pokemon_identities[0] if len(event.opponent_pokemon_identities) == 1 else None
+                state = replace(
+                    state, encounters=state.encounters + (LocationEncounter(location, PENDING, identity, event.frame),)
+                )
+            elif existing.status not in (PENDING, UNKNOWN):
+                violation = RuleViolation(
+                    "wild encounter after location's first encounter was resolved", location, event.frame
+                )
+                identity = event.opponent_pokemon_identities[0] if len(event.opponent_pokemon_identities) == 1 else None
+                state = replace(
+                    state,
+                    encounters=state.encounters + (LocationEncounter(location, UNKNOWN, identity, event.frame, False),),
+                    violations=state.violations + (violation,),
+                )
+            active_wild[location] = event.opponent_pokemon_identities
+        elif isinstance(event, PokemonCaptured):
+            locations = ((event.location, ()),) if event.location is not None else tuple(active_wild.items())
+            for location, opponent_ids in locations:
+                if not opponent_ids or event.identity in opponent_ids:
+                    return self._resolve(state, location, CAPTURED, event.identity)
+        elif isinstance(event, BattleEnded) and event.is_wild and not event.is_trainer and event.location is not None:
+            current = next((e for e in state.encounters if e.location == event.location), None)
+            if current is not None and current.status == PENDING:
+                outcome = event.outcome.lower()
+                status = (
+                    UNKNOWN
+                    if outcome in {"unknown", "incomplete", "in progress", "inprogress", ""}
+                    else (FAINTED if outcome in {"fainted", "lost", "whiteout", "opponent fainted"} else LOST)
+                )
+                state = self._resolve(state, event.location, status, current.pokemon_identity)
+            active_wild.pop(event.location, None)
+        return state
+
+    def evaluate(self, state: NuzlockeCampaignState) -> RuleAssessment:
+        reasons = tuple(violation.reason for violation in state.violations)
+        return RuleAssessment(self.rule_id, not reasons, reasons)
+
+    def constrain(self, state: NuzlockeCampaignState, candidate):
+        return candidate
+
+    @staticmethod
+    def _resolve(
+        state: NuzlockeCampaignState, location: tuple[int, int], status: str, identity: PokemonIdentity | None
+    ) -> NuzlockeCampaignState:
+        return replace(
+            state,
+            encounters=tuple(
+                (
+                    replace(item, status=status, pokemon_identity=identity or item.pokemon_identity)
+                    if item.location == location and item.eligible
+                    else item
+                )
+                for item in state.encounters
+            ),
+        )
+
+
 class NuzlockeRulesProjection:
     """Reduce an ordered event stream into immutable Nuzlocke state."""
 
-    def __init__(self, *, encounters_active: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        encounters_active: bool = True,
+        rule_config: CampaignRulesConfig | None = None,
+    ) -> None:
         self._state = NuzlockeCampaignState()
         self._seen: set[tuple[Any, ...]] = set()
         self._active_wild: dict[tuple[int, int], tuple[PokemonIdentity, ...]] = {}
         self._encounters_active = encounters_active
+        self._rule_config = rule_config or CampaignRulesConfig()
+        self._rules = tuple(
+            rule for rule in (OneEncounterPerAreaRule(), FaintingRule()) if self._rule_config.is_enabled(rule.rule_id)
+        )
+
+    @property
+    def rule_config(self) -> CampaignRulesConfig:
+        """Return the immutable run configuration used by this reduction."""
+        return self._rule_config
+
+    @property
+    def rule_assessments(self) -> tuple[RuleAssessment, ...]:
+        return tuple(rule.evaluate(self._state) for rule in self._rules)
 
     def set_encounters_active(self, active: bool) -> None:
         """Enable the baseline rules boundary once Poké Balls exist."""
@@ -139,74 +276,15 @@ class NuzlockeRulesProjection:
             raise ValueError(f"Event sequence out of order: expected {expected}, got {actual}")
         self._seen.add(key)
         state = self._state
-        if isinstance(event, PokemonFainted):
-            if event.identity is None:
-                state = replace(state, unknown_faints=state.unknown_faints + (event,))
-            elif event.identity not in state.dead_pokemon:
-                state = replace(state, dead_pokemon=state.dead_pokemon + (event.identity,))
-        elif isinstance(event, WhiteoutOccurred):
-            state = replace(state, run_lost=True)
-        elif isinstance(event, NuzlockeStarted):
-            # The campaign marker is reduced here only to keep the shared
-            # event sequence replayable; encounter activation remains driven
-            # by the campaign's observed Pokédex-received fact in runtime.
-            pass
-        elif isinstance(event, BattleStarted):
-            eligible_now = self._encounters_active if encounter_eligible is None else encounter_eligible
-            if eligible_now and event.is_wild and not event.is_trainer and event.location is not None:
-                location = event.location
-                existing = next((e for e in state.encounters if e.location == location), None)
-                if existing is None:
-                    identity = (
-                        event.opponent_pokemon_identities[0] if len(event.opponent_pokemon_identities) == 1 else None
-                    )
-                    encounter = LocationEncounter(location, PENDING, identity, event.frame)
-                    state = replace(state, encounters=state.encounters + (encounter,))
-                elif existing.status not in (PENDING, UNKNOWN):
-                    violation = RuleViolation(
-                        "wild encounter after location's first encounter was resolved", location, event.frame
-                    )
-                    identity = (
-                        event.opponent_pokemon_identities[0] if len(event.opponent_pokemon_identities) == 1 else None
-                    )
-                    ineligible = LocationEncounter(location, UNKNOWN, identity, event.frame, False)
-                    state = replace(
-                        state, encounters=state.encounters + (ineligible,), violations=state.violations + (violation,)
-                    )
-                self._active_wild[location] = event.opponent_pokemon_identities
-        elif isinstance(event, PokemonCaptured):
-            locations = ((event.location, ()),) if event.location is not None else tuple(self._active_wild.items())
-            for location, opponent_ids in locations:
-                if not opponent_ids or event.identity in opponent_ids:
-                    state = self._resolve(state, location, CAPTURED, event.identity)
-                    break
-        elif isinstance(event, BattleEnded):
-            if event.is_wild and not event.is_trainer and event.location is not None:
-                location = event.location
-                current = next((e for e in state.encounters if e.location == location), None)
-                if current is not None and current.status == PENDING:
-                    outcome = event.outcome.lower()
-                    if outcome in {"unknown", "incomplete", "in progress", "inprogress", ""}:
-                        status = UNKNOWN
-                    else:
-                        status = FAINTED if outcome in {"fainted", "lost", "whiteout", "opponent fainted"} else LOST
-                    state = self._resolve(state, location, status, current.pokemon_identity)
-                self._active_wild.pop(location, None)
-        self._state = replace(state, last_event_sequence=actual)
-
-    @staticmethod
-    def _resolve(
-        state: NuzlockeCampaignState, location: tuple[int, int], status: str, identity: PokemonIdentity | None
-    ) -> NuzlockeCampaignState:
-        encounters = tuple(
-            (
-                replace(e, status=status, pokemon_identity=identity or e.pokemon_identity)
-                if e.location == location and e.eligible
-                else e
+        eligible_now = self._encounters_active if encounter_eligible is None else encounter_eligible
+        for rule in self._rules:
+            state = rule.apply(
+                state,
+                event,
+                encounter_eligible=eligible_now,
+                active_wild=self._active_wild,
             )
-            for e in state.encounters
-        )
-        return replace(state, encounters=encounters)
+        self._state = replace(state, last_event_sequence=actual)
 
     def apply_record(self, record: dict[str, Any]) -> None:
         required = {"event_id", "session_id", "sequence", "frame", "type", "payload"}
