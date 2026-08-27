@@ -50,9 +50,7 @@ class PreparationTests(unittest.TestCase):
         self.assertIn("no active boss", decision.reason)
 
     def test_trainer_preparation_selects_target_and_engage_policy(self):
-        decision = decide_preparation(
-            PreparationInput(self.boss, (5,), trainer_ids=("trainer-1", "trainer-2"), seed=4)
-        )
+        decision = decide_preparation(PreparationInput(self.boss, (5,), trainer_ids=("trainer-1", "trainer-2"), seed=4))
 
         self.assertEqual(decision.strategy, PreparationStrategy.TRAINERS_FIRST)
         self.assertIn(decision.trainer_id, ("trainer-1", "trainer-2"))
@@ -68,11 +66,27 @@ class PreparationTests(unittest.TestCase):
         self.assertIs(goal.encounter_mode, EncounterMode.SEEK)
 
     def test_discovery_returns_sorted_actionable_trainer_affordances(self):
-        observation = type("Observation", (), {"triggers": (
-            TriggerObservation("b", frozenset(), affordance_id="trainer-b", hazard_locations=frozenset({(0, (1, 1))})),
-            TriggerObservation("a", frozenset(), affordance_id="trainer-a", hazard_locations=frozenset({(0, (2, 2))})),
-            TriggerObservation("x", frozenset(), affordance_id="not-actionable", hazard_locations=frozenset({(0, (3, 3))}), currently_actionable=False),
-        )})()
+        observation = type(
+            "Observation",
+            (),
+            {
+                "triggers": (
+                    TriggerObservation(
+                        "b", frozenset(), affordance_id="trainer-b", hazard_locations=frozenset({(0, (1, 1))})
+                    ),
+                    TriggerObservation(
+                        "a", frozenset(), affordance_id="trainer-a", hazard_locations=frozenset({(0, (2, 2))})
+                    ),
+                    TriggerObservation(
+                        "x",
+                        frozenset(),
+                        affordance_id="not-actionable",
+                        hazard_locations=frozenset({(0, (3, 3))}),
+                        currently_actionable=False,
+                    ),
+                )
+            },
+        )()
 
         self.assertEqual(discover_trainer_ids(observation), ("trainer-a", "trainer-b"))
 

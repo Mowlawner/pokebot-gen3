@@ -142,7 +142,9 @@ class CampaignExecutionAdapter:
         # Preparation decisions supply an explicit trainer target and policy;
         # keep the adapter generic so the live controller can mount the normal
         # navigation loop without ROM-specific battle code here.
-        if isinstance(objective.tactical_target, NavigationGoal) and isinstance(objective.tactical_target.target, EngageTrainer):
+        if isinstance(objective.tactical_target, NavigationGoal) and isinstance(
+            objective.tactical_target.target, EngageTrainer
+        ):
             return CampaignExecutionResult(
                 objective,
                 CampaignExecutionStatus.READY,

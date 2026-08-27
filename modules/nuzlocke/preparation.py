@@ -124,9 +124,17 @@ def decide_preparation(request: PreparationInput) -> PreparationDecision:
     if strategy is PreparationStrategy.TRAINERS_FIRST and request.trainer_ids:
         trainer = request.trainer_ids[random.Random(request.seed).randrange(len(request.trainer_ids))]
         return PreparationDecision(
-            FactStatus.KNOWN, strategy, request.boss.boss_id, target, None, request.risk_tolerance, request.seed,
+            FactStatus.KNOWN,
+            strategy,
+            request.boss.boss_id,
+            target,
+            None,
+            request.risk_tolerance,
+            request.seed,
             f"train selected trainer {trainer!r} to bounded target {target} before {request.boss.display_name}",
-            trainer, EncounterMode.IGNORE, TrainerMode.ENGAGE,
+            trainer,
+            EncounterMode.IGNORE,
+            TrainerMode.ENGAGE,
         )
     if not request.wild_areas:
         return PreparationDecision(
@@ -138,7 +146,9 @@ def decide_preparation(request: PreparationInput) -> PreparationDecision:
             request.risk_tolerance,
             request.seed,
             "party needs training but no safe wild area is available",
-            None, EncounterMode.SEEK, TrainerMode.IGNORE,
+            None,
+            EncounterMode.SEEK,
+            TrainerMode.IGNORE,
         )
     area = request.wild_areas[random.Random(request.seed).randrange(len(request.wild_areas))]
     return PreparationDecision(
@@ -150,5 +160,7 @@ def decide_preparation(request: PreparationInput) -> PreparationDecision:
         request.risk_tolerance,
         request.seed,
         f"train wild encounters to bounded target {target} before {request.boss.display_name}",
-        None, EncounterMode.SEEK, TrainerMode.IGNORE,
+        None,
+        EncounterMode.SEEK,
+        TrainerMode.IGNORE,
     )

@@ -37,17 +37,23 @@ def assess_level_cap(
     """Assess only the active leader objective; never infer a cap from levels."""
     progression = active_emerald_boss(facts)
     if progression.status is not FactStatus.KNOWN:
-        return LevelCapAssessment(CampaignRuleId.LEVEL_CAP, progression.status, None, None, reason="boss completion is unavailable")
+        return LevelCapAssessment(
+            CampaignRuleId.LEVEL_CAP, progression.status, None, None, reason="boss completion is unavailable"
+        )
     boss = progression.active_boss
     if boss is None:
         return LevelCapAssessment(CampaignRuleId.LEVEL_CAP, FactStatus.KNOWN, boss, boss.level_cap if boss else None)
     if party is None:
-        return LevelCapAssessment(CampaignRuleId.LEVEL_CAP, FactStatus.UNKNOWN, boss, boss.level_cap, reason="party is unavailable")
+        return LevelCapAssessment(
+            CampaignRuleId.LEVEL_CAP, FactStatus.UNKNOWN, boss, boss.level_cap, reason="party is unavailable"
+        )
     illegal: list[int] = []
     for index, pokemon in enumerate(party):
         level = getattr(pokemon, "level", None)
         if not isinstance(level, int):
-            return LevelCapAssessment(CampaignRuleId.LEVEL_CAP, FactStatus.UNKNOWN, boss, boss.level_cap, reason="party level is unavailable")
+            return LevelCapAssessment(
+                CampaignRuleId.LEVEL_CAP, FactStatus.UNKNOWN, boss, boss.level_cap, reason="party level is unavailable"
+            )
         if level > boss.level_cap:
             illegal.append(getattr(pokemon, "party_index", index))
     return LevelCapAssessment(
@@ -88,7 +94,9 @@ def evaluate_battle_entry(
 ) -> BattleEntryDecision:
     """Single conservative gate used immediately before campaign battle action."""
     if rule_config is not None and not rule_config.is_enabled(CampaignRuleId.LEVEL_CAP):
-        assessment = LevelCapAssessment(CampaignRuleId.LEVEL_CAP, FactStatus.KNOWN, None, None, reason="level-cap rule disabled")
+        assessment = LevelCapAssessment(
+            CampaignRuleId.LEVEL_CAP, FactStatus.KNOWN, None, None, reason="level-cap rule disabled"
+        )
         return BattleEntryDecision(True, assessment.reason, assessment)
     assessment = assess_level_cap(facts, party, objective_id=objective_id)
     if assessment.status is not FactStatus.KNOWN:

@@ -2,7 +2,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from modules.goals import ActivateTrigger, EARLY_POKEBALL_TRIGGER_ID, EngageTrainer, GoalConstraints, NavigationGoal, SemanticTargetKind, TrainerMode
+from modules.goals import (
+    ActivateTrigger,
+    EARLY_POKEBALL_TRIGGER_ID,
+    EngageTrainer,
+    GoalConstraints,
+    NavigationGoal,
+    SemanticTargetKind,
+    TrainerMode,
+)
 from modules.map_data import MapRSE
 from modules.nuzlocke.campaign_execution import (
     CampaignExecutionStatus,

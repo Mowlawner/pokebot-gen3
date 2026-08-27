@@ -74,7 +74,12 @@ def emerald_objectives() -> tuple[EmeraldObjectiveDefinition, ...]:
 def evaluate_emerald_fact(state: CampaignState, name: str) -> Fact[bool]:
     """Resolve a registered Emerald fact without generic flag-name parsing."""
     registered = {item.completion_fact for item in EMERALD_OBJECTIVES}
-    if name not in registered and name not in {"text_speed_fast", "new_game_setup_complete", "wall_clock_set", "nuzlocke_started"}:
+    if name not in registered and name not in {
+        "text_speed_fast",
+        "new_game_setup_complete",
+        "wall_clock_set",
+        "nuzlocke_started",
+    }:
         return state.campaign_facts[name]
     return state.campaign_facts[name]
 

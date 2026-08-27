@@ -15,7 +15,9 @@ def facts(first_badge=False):
 
 class LevelCapTests(unittest.TestCase):
     def test_roxanne_cap_rejects_over_cap_party_member(self):
-        assessment = assess_level_cap(facts(), [SimpleNamespace(level=16, party_index=2)], objective_id="defeat_roxanne")
+        assessment = assess_level_cap(
+            facts(), [SimpleNamespace(level=16, party_index=2)], objective_id="defeat_roxanne"
+        )
 
         self.assertTrue(assessment.active_boss)
         self.assertEqual(assessment.level_cap, 15)
@@ -30,7 +32,9 @@ class LevelCapTests(unittest.TestCase):
 
     def test_unknown_completion_is_conservative(self):
         values = [Fact.unavailable() for _ in range(15)]
-        decision = evaluate_battle_entry(CampaignFacts(*values), [SimpleNamespace(level=1)], objective_id="defeat_roxanne")
+        decision = evaluate_battle_entry(
+            CampaignFacts(*values), [SimpleNamespace(level=1)], objective_id="defeat_roxanne"
+        )
 
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.assessment.status, FactStatus.UNAVAILABLE)
@@ -43,7 +47,10 @@ class LevelCapTests(unittest.TestCase):
 
     def test_disabled_level_cap_allows_over_cap_party(self):
         decision = evaluate_battle_entry(
-            facts(), [SimpleNamespace(level=99)], objective_id="defeat_roxanne", rule_config=CampaignRulesConfig.unrestricted()
+            facts(),
+            [SimpleNamespace(level=99)],
+            objective_id="defeat_roxanne",
+            rule_config=CampaignRulesConfig.unrestricted(),
         )
 
         self.assertTrue(decision.allowed)

@@ -152,9 +152,13 @@ class OneEncounterPerAreaRule:
             existing = next((e for e in state.encounters if e.location == location), None)
             if existing is None:
                 identity = event.opponent_pokemon_identities[0] if len(event.opponent_pokemon_identities) == 1 else None
-                state = replace(state, encounters=state.encounters + (LocationEncounter(location, PENDING, identity, event.frame),))
+                state = replace(
+                    state, encounters=state.encounters + (LocationEncounter(location, PENDING, identity, event.frame),)
+                )
             elif existing.status not in (PENDING, UNKNOWN):
-                violation = RuleViolation("wild encounter after location's first encounter was resolved", location, event.frame)
+                violation = RuleViolation(
+                    "wild encounter after location's first encounter was resolved", location, event.frame
+                )
                 identity = event.opponent_pokemon_identities[0] if len(event.opponent_pokemon_identities) == 1 else None
                 state = replace(
                     state,
@@ -171,8 +175,10 @@ class OneEncounterPerAreaRule:
             current = next((e for e in state.encounters if e.location == event.location), None)
             if current is not None and current.status == PENDING:
                 outcome = event.outcome.lower()
-                status = UNKNOWN if outcome in {"unknown", "incomplete", "in progress", "inprogress", ""} else (
-                    FAINTED if outcome in {"fainted", "lost", "whiteout", "opponent fainted"} else LOST
+                status = (
+                    UNKNOWN
+                    if outcome in {"unknown", "incomplete", "in progress", "inprogress", ""}
+                    else (FAINTED if outcome in {"fainted", "lost", "whiteout", "opponent fainted"} else LOST)
                 )
                 state = self._resolve(state, event.location, status, current.pokemon_identity)
             active_wild.pop(event.location, None)
@@ -192,9 +198,11 @@ class OneEncounterPerAreaRule:
         return replace(
             state,
             encounters=tuple(
-                replace(item, status=status, pokemon_identity=identity or item.pokemon_identity)
-                if item.location == location and item.eligible
-                else item
+                (
+                    replace(item, status=status, pokemon_identity=identity or item.pokemon_identity)
+                    if item.location == location and item.eligible
+                    else item
+                )
                 for item in state.encounters
             ),
         )
@@ -215,9 +223,7 @@ class NuzlockeRulesProjection:
         self._encounters_active = encounters_active
         self._rule_config = rule_config or CampaignRulesConfig()
         self._rules = tuple(
-            rule
-            for rule in (OneEncounterPerAreaRule(), FaintingRule())
-            if self._rule_config.is_enabled(rule.rule_id)
+            rule for rule in (OneEncounterPerAreaRule(), FaintingRule()) if self._rule_config.is_enabled(rule.rule_id)
         )
 
     @property

@@ -248,7 +248,11 @@ class CampaignProgressionMode(BotMode):
             scheduler.invalidate("battle_started")
 
         controller = getattr(self, "controller", None)
-        objective = controller.last_selection.objective if controller is not None and controller.last_selection is not None else None
+        objective = (
+            controller.last_selection.objective
+            if controller is not None and controller.last_selection is not None
+            else None
+        )
         if objective is not None:
             legality = evaluate_battle_entry(
                 runtime_campaign_state().campaign_facts,

@@ -51,9 +51,23 @@ from .rules import (
     reduce_rules,
 )
 from .rule_config import CampaignRule, CampaignRuleId, CampaignRulesConfig
-from .emerald_campaign_registry import EmeraldBossDefinition, EmeraldBossProgression, EmeraldObjectiveDefinition, active_emerald_boss, emerald_bosses, emerald_objectives
+from .emerald_campaign_registry import (
+    EmeraldBossDefinition,
+    EmeraldBossProgression,
+    EmeraldObjectiveDefinition,
+    active_emerald_boss,
+    emerald_bosses,
+    emerald_objectives,
+)
 from .level_cap import BattleEntryDecision, LevelCapAssessment, LevelCapRule, assess_level_cap, evaluate_battle_entry
-from .preparation import PreparationDecision, PreparationInput, PreparationStrategy, RiskTolerance, decide_preparation, discover_trainer_ids
+from .preparation import (
+    PreparationDecision,
+    PreparationInput,
+    PreparationStrategy,
+    RiskTolerance,
+    decide_preparation,
+    discover_trainer_ids,
+)
 from .campaign_state import CampaignFacts, CampaignState, Fact, FactStatus, RunStatus, derive_campaign_facts
 from .encounter_catalog import EncounterOpportunity, encounter_opportunities
 from .campaign_simulation import CampaignCheckpoint, CampaignSimulation, simulate_checkpoint, simulate_checkpoints
