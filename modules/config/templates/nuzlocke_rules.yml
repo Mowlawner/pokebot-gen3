@@ -1,0 +1,6 @@
+# Enabled Nuzlocke rules for campaign runs. Leave this list empty for an
+# unrestricted campaign; existing behavior is preserved by the default below.
+enabled_rules:
+  - one_encounter_per_area
+  - fainting
+  - level_cap

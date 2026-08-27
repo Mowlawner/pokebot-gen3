@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from modules.goals import ActivateTrigger, EARLY_POKEBALL_TRIGGER_ID, SemanticTargetKind
+from modules.goals import ActivateTrigger, EARLY_POKEBALL_TRIGGER_ID, EngageTrainer, GoalConstraints, NavigationGoal, SemanticTargetKind, TrainerMode
 from modules.map_data import MapRSE
 from modules.nuzlocke.campaign_execution import (
     CampaignExecutionStatus,
@@ -133,6 +133,23 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
         result = adapt_campaign_execution(self.ready(objective))
         self.assertEqual(result.status, CampaignExecutionStatus.UNSUPPORTED)
         self.assertIn("valid introductory rival goal", result.reason)
+
+    def test_trainer_preparation_mounts_targeted_navigation(self):
+        predicate = CampaignPredicate("never", "never", lambda _: Fact.known(False))
+        objective = CampaignObjective(
+            "prepare_trainer:trainer-a",
+            "Train against trainer-a",
+            (),
+            predicate,
+            execution_id="prepare_trainer:trainer-a",
+            tactical_target=NavigationGoal(
+                EngageTrainer("trainer-a"),
+                constraints=GoalConstraints(trainer_mode=TrainerMode.ENGAGE),
+            ),
+        )
+        result = adapt_campaign_execution(self.ready(objective))
+        self.assertEqual(result.status, CampaignExecutionStatus.READY)
+        self.assertEqual(result.tactical_goal, objective.tactical_target)
 
     def test_translation_is_deterministic_and_does_not_mutate_inputs(self):
         objective = self.objectives["complete_intro_rival"]

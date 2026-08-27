@@ -18,6 +18,7 @@ from .snapshots import NuzlockeSnapshot, get_nuzlocke_snapshot
 from .campaign_state import Fact, derive_campaign_facts
 from .projection import CampaignProjection
 from .rules import NuzlockeRulesProjection
+from .rule_config import CampaignRulesConfig, CampaignRuleId
 from modules.console import diagnostic_print
 
 if TYPE_CHECKING:
@@ -33,18 +34,20 @@ class NuzlockeRuntime:
         event_sink: EventSink | None = None,
         diagnostic_sink: EventSink | None = None,
         session_id: str | None = None,
+        rule_config: CampaignRulesConfig | None = None,
     ) -> None:
         self._snapshot_provider = snapshot_provider
         self._event_sink = event_sink
         self._diagnostic_sink = diagnostic_sink
         self._session_id = session_id or str(uuid4())
+        self._rule_config = rule_config or CampaignRulesConfig()
         self._event_sequence = 0
         self._observer = NuzlockeEventObserver()
         self._events: Deque[Event] = deque()
         self._subscribers: list[Callable[[Event], None]] = []
         self._last_frame: int | None = None
         self._campaign_projection = CampaignProjection()
-        self._rules_projection = NuzlockeRulesProjection(encounters_active=False)
+        self._rules_projection = NuzlockeRulesProjection(encounters_active=False, rule_config=self._rule_config)
         self._event_statistics = EventStatistics()
 
     @property
@@ -54,6 +57,10 @@ class NuzlockeRuntime:
     @property
     def rules_projection(self) -> NuzlockeRulesProjection:
         return self._rules_projection
+
+    @property
+    def rule_config(self) -> CampaignRulesConfig:
+        return self._rule_config
 
     def capture_target_for(
         self,
@@ -134,7 +141,7 @@ class NuzlockeRuntime:
         if self._last_frame is not None and current.frame < self._last_frame:
             self._observer = NuzlockeEventObserver()
             self._campaign_projection = CampaignProjection()
-            self._rules_projection = NuzlockeRulesProjection(encounters_active=False)
+            self._rules_projection = NuzlockeRulesProjection(encounters_active=False, rule_config=self._rule_config)
             self._events.clear()
             self._session_id = str(uuid4())
             self._event_sequence = 0
@@ -145,7 +152,11 @@ class NuzlockeRuntime:
         # Pokédex receipt is the Emerald campaign fact that activates the
         # Nuzlocke encounter rule.  Inventory remains a capture/readiness
         # concern and must not affect whether a location is consumed.
-        encounter_eligible = campaign_facts.pokedex_received.is_known and campaign_facts.pokedex_received.value is True
+        encounter_eligible = (
+            self._rule_config.is_enabled(CampaignRuleId.ONE_ENCOUNTER_PER_AREA)
+            and campaign_facts.pokedex_received.is_known
+            and campaign_facts.pokedex_received.value is True
+        )
         observer_started = trace.now() if trace is not None else 0
         events = self._observer.observe(current)
         if trace is not None:

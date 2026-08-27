@@ -23,6 +23,8 @@ from modules.nuzlocke.resource_runtime import (
     observe_resource_snapshot,
     observe_route_recovery,
 )
+from modules.nuzlocke.level_cap import evaluate_battle_entry
+from modules.modes._interface import BotModeError
 from modules.nuzlocke.readiness_diagnostics import (
     Availability,
     ReadinessObservationScheduler,
@@ -246,6 +248,25 @@ class CampaignProgressionMode(BotMode):
             scheduler.invalidate("battle_started")
 
         controller = getattr(self, "controller", None)
+        objective = controller.last_selection.objective if controller is not None and controller.last_selection is not None else None
+        if objective is not None:
+            legality = evaluate_battle_entry(
+                runtime_campaign_state().campaign_facts,
+                get_party(),
+                objective_id=objective.objective_id,
+                rule_config=getattr(getattr(context, "nuzlocke_runtime", None), "rule_config", None),
+            )
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_LEVEL_CAP_ENTRY: "
+                    f"objective={objective.objective_id!r} allowed={legality.allowed!r} "
+                    f"reason={legality.reason!r} boss={getattr(legality.assessment.active_boss, 'boss_id', None)!r} "
+                    f"cap={legality.assessment.level_cap!r} illegal_party_indices={legality.assessment.illegal_party_indices!r}"
+                ),
+                trace=True,
+            )
+            if not legality.allowed:
+                raise BotModeError(f"Campaign battle entry rejected: {legality.reason}")
         if encounter is not None and controller is not None and controller.last_selection is not None:
             objective = controller.last_selection.objective
             resource_policy = getattr(objective, "resource_policy", None)

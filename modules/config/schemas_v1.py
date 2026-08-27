@@ -79,6 +79,15 @@ class CatchBlock(BaseConfig):
     block_list: list[str] = ["MissingNo"]
 
 
+class NuzlockeRules(BaseConfig):
+    """Enabled campaign rules for a profile or global run configuration."""
+
+    filename: ClassVar = "nuzlocke_rules.yml"
+    enabled_rules: list[
+        Literal["one_encounter_per_area", "fainting", "species_clause", "level_cap"]
+    ] = ["one_encounter_per_area", "fainting", "level_cap"]
+
+
 class WallClockTimeMode(str, Enum):
     """Policy used for the Emerald opening wall-clock setting."""
 

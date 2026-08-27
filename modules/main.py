@@ -20,6 +20,7 @@ from modules.state_cache import state_cache
 from modules.stats import StatsDatabase
 from modules.tasks import get_global_script_context, get_tasks
 from modules.nuzlocke.runtime import NuzlockeRuntime
+from modules.nuzlocke.rule_config import CampaignRulesConfig
 from modules.nuzlocke.persistence import JsonEventStore
 from modules.profiler import count as profile_count
 from modules.profiler import (
@@ -85,7 +86,8 @@ def main_loop() -> None:
             )
 
         context.bot_listeners = get_bot_listeners(context.rom)
-        context.nuzlocke_runtime = NuzlockeRuntime(event_sink=nuzlocke_event_store)
+        campaign_rules = CampaignRulesConfig.from_names(context.config.nuzlocke_rules.enabled_rules)
+        context.nuzlocke_runtime = NuzlockeRuntime(event_sink=nuzlocke_event_store, rule_config=campaign_rules)
         trace_output = context.profile.path / "stutter_trace.jsonl" if context.debug_stutter_trace else None
         context.stutter_trace = StutterTrace(
             enabled=context.debug_stutter_trace,
@@ -260,7 +262,7 @@ def main_loop() -> None:
             if previous_frame_info is not None and previous_frame_info.frame_count > frame_info.frame_count:
                 state_cache.reset()
                 context.bot_listeners = get_bot_listeners(context.rom)
-                context.nuzlocke_runtime = NuzlockeRuntime(event_sink=nuzlocke_event_store)
+                context.nuzlocke_runtime = NuzlockeRuntime(event_sink=nuzlocke_event_store, rule_config=campaign_rules)
             if profiling_enabled():
                 profile_timing("main_frame_setup", frame_setup_start)
             frame_setup_elapsed = profile_now() - frame_setup_start if profiling_enabled() else 0

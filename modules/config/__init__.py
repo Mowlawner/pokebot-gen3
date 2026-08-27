@@ -14,6 +14,7 @@ from modules.config.schemas_v1 import (
     OBS,
     Keys,
     Logging,
+    NuzlockeRules,
     HTTP,
     ProfileMetadata,
     StartGame,
@@ -30,6 +31,7 @@ CONFIG_ATTRS = {
     "obs",
     "keys",
     "logging",
+    "nuzlocke_rules",
     "http",
     "start_game",
 }
@@ -60,6 +62,7 @@ class Config:
         self.keys: Keys = Keys()
         self.loaded = False
         self.logging: Logging = Logging()
+        self.nuzlocke_rules: NuzlockeRules = NuzlockeRules()
         self.metadata: ProfileMetadata | None = None
         self.http: HTTP = HTTP()
         self.start_game: StartGame = StartGame()
