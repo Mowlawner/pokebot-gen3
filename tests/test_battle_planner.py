@@ -125,12 +125,15 @@ class BattlePlannerTests(unittest.TestCase):
 
     def test_ready_legal_nuzlocke_battle_delegates_to_existing_capture_strategy(self):
         party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
+        bag = SimpleNamespace(poke_balls=(SimpleNamespace(quantity=1),))
         battle_state = SimpleNamespace(
             nuzlocke_capture_target=True,
             own_side=SimpleNamespace(active_battler=SimpleNamespace()),
         )
         expected = (TurnAction.UseItem, SimpleNamespace(name="Poké Ball"))
         with patch("modules.battle_strategies.default.get_party", return_value=party), patch(
+            "modules.battle_strategies.default.get_item_bag", return_value=bag
+        ), patch(
             "modules.battle_strategies.catch.CatchStrategy.decide_turn", return_value=expected
         ) as capture_turn, patch(
             "modules.battle_strategies.default.plan_battle_state",
@@ -145,6 +148,7 @@ class BattlePlannerTests(unittest.TestCase):
 
     def test_legal_target_uses_safe_planner_move_before_capture(self):
         party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
+        bag = SimpleNamespace(poke_balls=(SimpleNamespace(quantity=1),))
         battle_state = SimpleNamespace(
             nuzlocke_capture_target=True, own_side=SimpleNamespace(active_battler=SimpleNamespace())
         )
@@ -152,13 +156,16 @@ class BattlePlannerTests(unittest.TestCase):
             action=PlannerAction.UseMove, target=1, classification=PlannerDecisionClass.SAFE, is_safe_to_execute=True
         )
         with patch("modules.battle_strategies.default.get_party", return_value=party), patch(
-            "modules.battle_strategies.default.plan_battle_state", return_value=decision
-        ), patch("modules.battle_strategies.catch.CatchStrategy.decide_turn") as catch:
+            "modules.battle_strategies.default.get_item_bag", return_value=bag
+        ), patch("modules.battle_strategies.default.plan_battle_state", return_value=decision), patch(
+            "modules.battle_strategies.catch.CatchStrategy.decide_turn"
+        ) as catch:
             self.assertEqual(DefaultBattleStrategy().decide_turn(battle_state), (TurnAction.UseMove, 1))
         catch.assert_not_called()
 
     def test_legal_target_falls_back_to_capture_when_planner_is_not_safe(self):
         party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
+        bag = SimpleNamespace(poke_balls=(SimpleNamespace(quantity=1),))
         battle_state = SimpleNamespace(
             nuzlocke_capture_target=True, own_side=SimpleNamespace(active_battler=SimpleNamespace())
         )
@@ -170,10 +177,36 @@ class BattlePlannerTests(unittest.TestCase):
         )
         expected = (TurnAction.UseItem, SimpleNamespace(name="Poké Ball"))
         with patch("modules.battle_strategies.default.get_party", return_value=party), patch(
-            "modules.battle_strategies.default.plan_battle_state", return_value=decision
-        ), patch("modules.battle_strategies.catch.CatchStrategy.decide_turn", return_value=expected):
+            "modules.battle_strategies.default.get_item_bag", return_value=bag
+        ), patch("modules.battle_strategies.default.plan_battle_state", return_value=decision), patch(
+            "modules.battle_strategies.catch.CatchStrategy.decide_turn", return_value=expected
+        ):
             result = DefaultBattleStrategy().decide_turn(battle_state)
         self.assertIs(result[0], TurnAction.UseItem)
+
+    def test_legal_target_without_balls_returns_to_normal_battle_policy(self):
+        party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
+        bag = SimpleNamespace(poke_balls=())
+        active = SimpleNamespace(current_hp_percentage=80)
+        battle_state = SimpleNamespace(
+            nuzlocke_capture_target=True,
+            own_side=SimpleNamespace(active_battler=active),
+        )
+        decision = SimpleNamespace(
+            action=PlannerAction.UseMove,
+            target=1,
+            confidence=PlannerConfidence.HIGH,
+            classification=PlannerDecisionClass.SAFE,
+            is_safe_to_execute=True,
+            rationale="ordinary battle action",
+        )
+        with patch("modules.battle_strategies.default.get_party", return_value=party), patch(
+            "modules.battle_strategies.default.get_item_bag", return_value=bag
+        ), patch("modules.battle_strategies.default.plan_battle_state", return_value=decision), patch(
+            "modules.battle_strategies.catch.CatchStrategy.decide_turn"
+        ) as catch:
+            self.assertEqual(DefaultBattleStrategy().decide_turn(battle_state), (TurnAction.UseMove, 1))
+        catch.assert_not_called()
 
     def test_ready_non_target_does_not_delegate_to_capture_strategy(self):
         party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
