@@ -64,7 +64,39 @@ class CatchStrategy(DefaultBattleStrategy):
                 if status_move is not None:
                     return TurnAction.use_move(status_move)
 
+        # Preserve a legal encounter while balls remain.  Prefer the weakest
+        # reliable attack whose damage ceiling is below the target's current
+        # HP; this improves subsequent catch odds without risking a KO.
+        weakening_move = self._get_safe_weakening_move(battle_state)
+        if weakening_move is not None:
+            return TurnAction.use_move(weakening_move)
+
         return TurnAction.use_item(ball_to_throw)
+
+    def _get_safe_weakening_move(self, battle_state: BattleState) -> int | None:
+        opponent = battle_state.opponent.active_battler
+        candidates = []
+        util = BattleStrategyUtil(battle_state)
+        for index, learned_move in enumerate(battle_state.own_side.active_battler.moves):
+            if learned_move is None or learned_move.pp == 0:
+                continue
+            try:
+                if battle_state.own_side.active_battler.disabled_move is learned_move.move:
+                    continue
+                damage = util.calculate_move_damage_range(
+                    learned_move.move,
+                    battle_state.own_side.active_battler,
+                    opponent,
+                )
+                if damage.max < opponent.current_hp and damage.max > 0:
+                    candidates.append((damage.max, damage.min, learned_move.move.accuracy, index))
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                continue
+        if not candidates:
+            return None
+        # Minimize the damage ceiling first, then prefer reliable/high-floor
+        # moves.  The strict ceiling check is what makes the action nonlethal.
+        return min(candidates, key=lambda candidate: (candidate[0], -candidate[1], -candidate[2], candidate[3]))[3]
 
     def decide_turn_in_double_battle(self, battle_state: BattleState, battler_index: int) -> tuple["TurnAction", any]:
         return self.decide_turn(battle_state)

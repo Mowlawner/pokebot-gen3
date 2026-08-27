@@ -16,6 +16,9 @@ from ._util import BattleStrategyUtil
 class DefaultBattleStrategy(BattleStrategy):
     def __init__(self):
         self._first_non_fainted_party_index_before_battle = get_party().first_non_fainted.index
+        # Capture decisions are battle-local state.  Keep one strategy for the
+        # whole battle so a failed ball cannot silently reset capture policy.
+        self._capture_strategy = None
 
     def party_can_battle(self) -> bool:
         return any(self.pokemon_can_battle(pokemon) for pokemon in get_party())
@@ -163,8 +166,19 @@ class DefaultBattleStrategy(BattleStrategy):
             lambda: f"READY_TURN_CAPTURE_CHECK: ready_turn_reached=True nuzlocke_capture_target={nuzlocke_capture_target}",
             trace=True,
         )
-        if nuzlocke_capture_target:
+        try:
+            balls_available = any(ball.quantity > 0 for ball in get_item_bag().poke_balls)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            balls_available = False
+
+        if nuzlocke_capture_target and balls_available:
             from modules.battle_strategies.catch import CatchStrategy
+
+            # A legal encounter remains capture-owned while any ball exists.
+            # Once the bag is empty, intentionally fall through to ordinary
+            # battle policy; the encounter may then be defeated.
+            if self._capture_strategy is None:
+                self._capture_strategy = CatchStrategy()
 
             # Let the existing planner establish a safe weakening turn before
             # falling back to the capture strategy.  The planner receives the
@@ -190,7 +204,7 @@ class DefaultBattleStrategy(BattleStrategy):
                 ),
                 trace=True,
             )
-            capture_action = CatchStrategy().decide_turn(battle_state)
+            capture_action = self._capture_strategy.decide_turn(battle_state)
             diagnostic_print(
                 lambda: (
                     "READY_TURN_CAPTURE_RESULT: "
