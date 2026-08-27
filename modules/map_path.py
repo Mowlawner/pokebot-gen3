@@ -77,6 +77,7 @@ class PathTile:
     # Preserve the ROM tile behavior for consumers that need interaction
     # semantics (for example escalator entry direction), not only collision.
     tile_type: str = ""
+    metatile_behavior: int | None = None
 
     @property
     def global_coordinates(self) -> tuple[int, int]:
@@ -376,6 +377,7 @@ class PathMap:
                             )
                         ),
                         tile_type=tile.tile_type,
+                        metatile_behavior=tile.metatile_behavior,
                     )
                 )
             for map_object in map_data.objects:

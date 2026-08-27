@@ -21,7 +21,7 @@ from modules.goals import GoalConstraints, NavigationGoal, ReachLocation, ReachW
 from modules.interaction_state import InteractionObservation
 from modules.map_path import Direction
 from modules.memory import GameState
-from modules.navigation import NavigationAction, NavigationActionType
+from modules.navigation import NavigationAction, NavigationActionType, NavigationPlan, NavigationError
 from modules.overworld import (
     MovementState,
     OverworldObservation,
@@ -82,6 +82,23 @@ def observation(
 
 
 class AgentActionSelectionTests(TestCase):
+    def test_script_owned_controllable_overworld_waits_instead_of_reinteracting(self):
+        world = overworld({(0, 0)}, controllable=True)
+        observed = observation(
+            GameState.OVERWORLD,
+            world=world,
+            goal=ReachLocation((MAP, (0, 0))),
+        )
+        observed.interaction = InteractionObservation(
+            GameState.OVERWORLD,
+            controllable=True,
+            script_active=True,
+            script_function="SomeInteraction",
+            native_function="WaitForEffect",
+        )
+        decision = select_action(observed)
+        self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
+
     def test_observed_warp_uses_local_plan_when_global_route_is_unreachable(self):
         destination = (("destination", 0), (10, 19))
         warp = WarpObservation((MAP, (1, 0)), destination, required_facing=Direction.East)
@@ -349,7 +366,7 @@ class AgentActionSelectionTests(TestCase):
         self.assertEqual(first[2].result_type, ActionResultType.EXECUTED)
         self.assertEqual(second[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
         self.assertEqual(third[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
-        emulator.press_button.assert_called_once_with("A")
+        emulator.press_button_fresh.assert_called_once_with("A")
 
     def test_controllable_dialogue_remains_unchanged(self):
         emulator = Mock()
@@ -357,7 +374,7 @@ class AgentActionSelectionTests(TestCase):
         with patch("modules.agent_control.context.emulator", emulator):
             result = AgentActionExecutor().execute(AgentAction(AgentActionType.ADVANCE_DIALOGUE), dialogue)
         self.assertEqual(result.result_type, ActionResultType.EXECUTED)
-        emulator.press_button.assert_called_once_with("A")
+        emulator.press_button_fresh.assert_called_once_with("A")
 
     def test_safe_batch_groups_straight_and_turning_moves(self):
         world = overworld({(x, y) for x, y in ((0, 0), (1, 0), (2, 0), (2, 1))})
@@ -649,6 +666,60 @@ class AgentExecutionTests(TestCase):
         evaluate.assert_called_once()
         self.assertFalse(loop._warp_settling)
 
+    def test_post_warp_settling_defers_invalid_destination_coordinate(self):
+        source_map = (0, 0)
+        target_map = (0, 1)
+        goal = ReachLocation((target_map, (0, 0)))
+
+        def target_world(coordinates):
+            return OverworldObservation(
+                map_id=target_map,
+                player_coordinates=coordinates,
+                facing=Direction.East,
+                controllable=True,
+                tiles=(TileObservation((target_map, (0, 0)), False, frozenset(Direction)),),
+                warps=(),
+                objects=(),
+                triggers=(),
+            )
+
+        observations = iter(
+            (
+                observation(GameState.OVERWORLD, world=target_world((9, 22)), goal=goal),
+                observation(GameState.OVERWORLD, world=target_world((0, 0)), goal=goal),
+            )
+        )
+        loop = AgentControlLoop(lambda: next(observations))
+        loop._expected_world_transition = ((source_map, (1, 0)), (target_map, (0, 0)))
+        loop._cached_evaluation = GoalEvaluation(GoalStatus.REACHABLE)
+
+        with patch("modules.agent_control.evaluate_goal", return_value=GoalEvaluation(GoalStatus.COMPLETE)) as evaluate:
+            transient = loop.step()
+            arrived = loop.step()
+
+        self.assertEqual(transient[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(transient[1].action.reason, "waiting for a valid post-transition location")
+        self.assertEqual(arrived[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
+        evaluate.assert_called_once()
+
+    def test_exhausted_cached_reach_location_uses_semantic_completion(self):
+        goal = ReachLocation((MAP, (0, 0)))
+        world = overworld({(0, 0)}, start=(0, 0))
+        observed = observation(GameState.OVERWORLD, world=world, goal=goal)
+        semantic_complete = GoalEvaluation(GoalStatus.COMPLETE, reason="goal position reached")
+        loop = AgentControlLoop(lambda: observed, goal=goal)
+        loop._cached_goal = goal
+        loop._cached_evaluation = GoalEvaluation(
+            GoalStatus.REACHABLE,
+            plan=NavigationPlan((), (MAP, (0, 0))),
+        )
+        with patch("modules.agent_control.evaluate_goal", return_value=semantic_complete) as evaluate:
+            result = loop.step()
+            self.assertRaises(StopIteration, next, loop.run())
+        self.assertEqual(result[2].result_type, ActionResultType.GOAL_COMPLETE)
+        self.assertIsNone(loop._cached_evaluation)
+        self.assertGreaterEqual(evaluate.call_count, 1)
+
     def test_control_loop_retries_move_after_opposite_direction_turn(self):
         observations = iter(
             (
@@ -932,3 +1003,14 @@ class AgentExecutionTests(TestCase):
         action = available_actions(observation(GameState.UNKNOWN))[0]
         result = AgentActionExecutor().execute(action, observation(GameState.UNKNOWN))
         self.assertEqual(result.result_type, ActionResultType.WAITING)
+
+    def test_run_propagates_unreachable_instead_of_reporting_completion(self):
+        loop = AgentControlLoop(lambda: observation(GameState.UNKNOWN))
+        action = AgentAction(AgentActionType.WAIT_REOBSERVE, reason="blocked")
+        with patch.object(
+            loop,
+            "step",
+            return_value=(None, None, ActionResult(ActionResultType.UNREACHABLE, action, "no route")),
+        ):
+            with self.assertRaises(NavigationError):
+                next(loop.run())

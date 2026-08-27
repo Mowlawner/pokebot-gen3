@@ -59,6 +59,8 @@ from .fixture_state import (
 from .campaign_objectives import (
     CampaignObjective,
     CampaignPredicate,
+    party_fully_restored,
+    heal_party_objective,
     ObjectiveSelection,
     ObjectiveStatus,
     initial_emerald_campaign,
@@ -96,6 +98,7 @@ from .resource_policy import (
     assess_campaign_resources,
     assess_wild_encounter,
 )
+from .resource_runtime import HealingSource, HealingSourceType, discover_healing_source, execute_heal_party
 
 __all__ = [
     "BattleSnapshot",

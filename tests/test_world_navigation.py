@@ -18,6 +18,8 @@ from modules.goals import (
     ReachLocation,
     ReachWarp,
     EncounterMode,
+    GoalConstraints,
+    TrainerMode,
     SemanticTarget,
 )
 from modules.interaction_state import InteractionObservation
@@ -43,6 +45,7 @@ from modules.overworld import (
     TriggerObservation,
     WarpActivation,
     WorldTransition,
+    _connection_endpoint_is_executable,
 )
 from modules.overworld import WarpObservation
 from modules.trigger_bindings import BindingResolution, TriggerBinding
@@ -60,6 +63,15 @@ def edge(source, destination, source_coordinate=(0, 0), destination_coordinate=(
 
 
 class TestWorldMapGraph(unittest.TestCase):
+    def test_connection_endpoint_requires_static_passability_and_no_object(self):
+        tile = SimpleNamespace(accessible_from_direction=[True, False, False, False])
+        metadata = SimpleNamespace(objects=())
+        self.assertTrue(_connection_endpoint_is_executable(metadata, {(0, 0): tile}, (0, 0)))
+        blocked = SimpleNamespace(accessible_from_direction=[False, False, False, False])
+        self.assertFalse(_connection_endpoint_is_executable(metadata, {(0, 0): blocked}, (0, 0)))
+        tree = SimpleNamespace(local_coordinates=(0, 0))
+        self.assertFalse(_connection_endpoint_is_executable(SimpleNamespace(objects=(tree,)), {(0, 0): tile}, (0, 0)))
+
     def test_map_connection_is_a_first_class_world_transition(self):
         connection = edge((0, 0), (0, 1), kind="connection")
         route = WorldMapGraph((connection,)).route((0, 0), (0, 1))
@@ -231,6 +243,41 @@ class TestWorldMapGraph(unittest.TestCase):
 
 
 class TestWorldGoalIntegration(unittest.TestCase):
+    def test_neighbors_index_matches_reference_transition_scan(self):
+        source = (1, 4)
+        tiles = {
+            (source, (x, y)): NavigableTile((source, (x, y)), False, frozenset(Direction))
+            for x, y in ((0, 0), (1, 0), (2, 0), (1, 1))
+        }
+        transitions = (
+            WorldTransition((source, (2, 0)), ((0, 18), (1, 1)), kind="warp"),
+            WorldTransition((source, (1, 0)), ((0, 19), (2, 2)), kind="map_connection"),
+            WorldTransition((source, (1, 0)), ((0, 20), (3, 3)), kind="warp"),
+        )
+        world = NavigationWorld(tiles=tiles, transitions=transitions, facing=Direction.South)
+
+        def reference(location):
+            result = []
+            for direction, coordinate in (
+                (Direction.North, (location[1][0], location[1][1] - 1)),
+                (Direction.East, (location[1][0] + 1, location[1][1])),
+                (Direction.South, (location[1][0], location[1][1] + 1)),
+                (Direction.West, (location[1][0] - 1, location[1][1])),
+            ):
+                neighbour = world.tiles.get((location[0], coordinate))
+                if neighbour is not None and not neighbour.blocked:
+                    result.append((direction, (location[0], coordinate), False))
+            for transition in transitions:
+                transition_source = transition.entry
+                if transition.kind == "map_connection":
+                    transition_source = map_connection_approach_position(transition)
+                if transition_source == location and transition.destination is not None:
+                    result.append((world._warp_direction(location, transition), transition.destination, True))
+            return tuple(result)
+
+        for location in ((source, (1, 0)), (source, (2, 0)), (source, (0, 0)), ((9, 9), (0, 0))):
+            self.assertEqual(world.neighbors(location), reference(location))
+
     def test_offscreen_static_target_is_navigable(self):
         map_id = (0, 18)
         tiles = tuple(TileObservation((map_id, (x, 0)), False, frozenset(Direction)) for x in range(3))
@@ -431,6 +478,36 @@ class TestWeightedNavigation(unittest.TestCase):
         plan = GoalAwareNavigator(world).plan((self.MAP, (0, 0)), ReachLocation((self.MAP, (0, 1))))
         self.assertEqual(plan.metrics.encounter_opportunities, 1)
         self.assertEqual(plan.metrics.turns_on_encounter_terrain, 1)
+
+    def test_mostly_avoid_trades_encounter_opportunities_for_distance(self):
+        # Direct route crosses two grass tiles; the detour is longer but clear.
+        coordinates = ((0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1))
+        world = NavigationWorld(
+            tiles={
+                (self.MAP, coordinate): NavigableTile(
+                    (self.MAP, coordinate), False, frozenset(Direction), 1, coordinate in {(1, 0), (2, 0)}
+                )
+                for coordinate in coordinates
+            },
+            facing=Direction.East,
+        )
+        strict = GoalAwareNavigator(world).plan(
+            (self.MAP, (0, 0)), NavigationGoal(ReachLocation((self.MAP, (2, 1))), encounter_mode=EncounterMode.AVOID)
+        )
+        weighted = GoalAwareNavigator(world).plan(
+            (self.MAP, (0, 0)),
+            NavigationGoal(
+                ReachLocation((self.MAP, (2, 1))), encounter_mode=EncounterMode.MOSTLY_AVOID, encounter_penalty=0
+            ),
+        )
+        self.assertEqual(strict.metrics.encounter_opportunities, 0)
+        self.assertGreater(strict.metrics.movement_actions, weighted.metrics.movement_actions)
+
+    def test_encounter_objective_is_translated_to_seek_navigation(self):
+        from modules.nuzlocke.campaign_objectives import encounter_task
+
+        task = encounter_task(self.MAP)
+        self.assertEqual(task.tactical_target.encounter_mode, EncounterMode.SEEK)
 
     def test_interaction_route_includes_turn_before_adjacent_move(self):
         trigger = TriggerObservation(
@@ -1070,6 +1147,48 @@ class TestWeightedNavigation(unittest.TestCase):
         self.assertEqual(first[1].action.navigation.action_type, NavigationActionType.WARP)
         self.assertEqual(settling[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
         self.assertEqual(resumed[1].action.action_type, AgentActionType.INTERACT)
+
+
+class TestTrainerAvoidance(unittest.TestCase):
+    MAP = (90, 0)
+
+    @classmethod
+    def _world(cls, coordinates, hazards=()):
+        tiles = {
+            (cls.MAP, coordinate): NavigableTile((cls.MAP, coordinate), allowed_directions=frozenset(Direction))
+            for coordinate in coordinates
+        }
+        trainer = TriggerObservation(
+            "trainer:1",
+            locations=frozenset({(cls.MAP, (1, 0))}),
+            kind="trainer",
+            hazard_locations=frozenset((cls.MAP, coordinate) for coordinate in hazards),
+            hazard_kind="trainer",
+        )
+        return NavigationWorld(tiles=tiles, triggers=(trainer,))
+
+    def test_avoid_selects_longer_trainer_free_detour(self):
+        coordinates = ((0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1))
+        world = self._world(coordinates, hazards=((1, 0),))
+        goal = NavigationGoal(
+            ReachLocation((self.MAP, (2, 0))),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+        )
+        plan = GoalAwareNavigator(world).plan((self.MAP, (0, 0)), goal)
+        destinations = {action.destination for action in plan.actions if action.destination is not None}
+        self.assertNotIn((self.MAP, (1, 0)), destinations)
+        self.assertFalse(plan.forced_trainer_exposure)
+        self.assertGreater(len(plan.actions), 2)
+
+    def test_avoid_falls_back_when_trainer_exposure_is_unavoidable(self):
+        world = self._world(((0, 0), (1, 0), (2, 0)), hazards=((1, 0),))
+        goal = NavigationGoal(
+            ReachLocation((self.MAP, (2, 0))),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+        )
+        plan = GoalAwareNavigator(world).plan((self.MAP, (0, 0)), goal)
+        self.assertIn((self.MAP, (1, 0)), {action.destination for action in plan.actions})
+        self.assertTrue(plan.forced_trainer_exposure)
 
 
 if __name__ == "__main__":

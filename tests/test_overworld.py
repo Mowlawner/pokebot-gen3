@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -6,6 +7,8 @@ from modules.map import MapMetadata, ObjectEvent
 from modules.map_path import Direction
 from modules.overworld import (
     ObjectObservation,
+    TileObservation,
+    trainer_hazard_locations,
     TriggerObservation,
     evaluate_trigger_condition,
     prewarm_static_map_observation,
@@ -28,6 +31,27 @@ def _object_event() -> ObjectEvent:
 
 
 class TestOverworldPerception(unittest.TestCase):
+    def test_trainer_hazards_follow_facing_and_range(self):
+        map_id = (1, 2)
+        tiles = tuple(TileObservation((map_id, (x, 0)), False, frozenset(Direction), elevation=0) for x in range(5))
+        trainer = ObjectObservation(
+            1, (map_id, (1, 0)), facing="East", trainer_type="Normal", trainer_range=3, trainer_defeated=False
+        )
+        self.assertEqual(
+            trainer_hazard_locations(trainer, tiles),
+            frozenset({(map_id, (2, 0)), (map_id, (3, 0)), (map_id, (4, 0))}),
+        )
+
+    def test_defeated_trainer_has_no_hazards_and_objects_block_sight(self):
+        map_id = (1, 2)
+        tiles = tuple(TileObservation((map_id, (x, 0)), False, frozenset(Direction)) for x in range(5))
+        trainer = ObjectObservation(
+            1, (map_id, (1, 0)), facing="East", trainer_type="Normal", trainer_range=3, trainer_defeated=False
+        )
+        blocker = ObjectObservation(2, (map_id, (3, 0)))
+        self.assertEqual(trainer_hazard_locations(trainer, tiles, (blocker,)), frozenset({(map_id, (2, 0))}))
+        self.assertEqual(trainer_hazard_locations(replace(trainer, trainer_defeated=True), tiles), frozenset())
+
     def test_missing_avatar_is_explicitly_unavailable(self):
         with patch("modules.overworld.get_player_avatar", return_value=None):
             result = perceive_overworld()
@@ -123,6 +147,50 @@ class TestOverworldPerception(unittest.TestCase):
         requirements = dict(trigger.activation_requirements)
         self.assertEqual(requirements[((map_id, (1, 2)))], Direction.North)
         self.assertEqual(requirements[((map_id, (1, 0)))], Direction.South)
+
+    def test_map_connection_observation_uses_full_endpoint_coordinates(self):
+        source_id, destination_id = (93, 1), (93, 2)
+        tile = lambda coordinate: SimpleNamespace(
+            local_coordinates=coordinate,
+            accessible_from_direction=[True] * 4,
+            warps_to=None,
+            traversal_cost=1,
+        )
+        source = SimpleNamespace(
+            map_size=(3, 2),
+            warps=(),
+            connections=(
+                SimpleNamespace(
+                    destination_map_group=destination_id[0],
+                    destination_map_number=destination_id[1],
+                    direction="North",
+                    offset=0,
+                ),
+            ),
+            objects=(),
+            bg_events=(),
+            coord_events=(),
+        )
+        destination = SimpleNamespace(
+            map_size=(3, 2),
+            warps=(),
+            connections=(),
+            objects=(),
+            bg_events=(),
+            coord_events=(),
+        )
+        with patch(
+            "modules.overworld._get_map_metadata",
+            side_effect=lambda map_id: SimpleNamespace(tiles=tuple(tile((x, y)) for y in range(2) for x in range(3))),
+        ), patch(
+            "modules.overworld.get_map_metadata",
+            side_effect=lambda map_id: source if map_id == source_id else destination,
+        ):
+            prewarm_static_map_observation(source_id)
+        static = __import__("modules.overworld", fromlist=["_static_map_observations"])._static_map_observations[
+            source_id
+        ]
+        self.assertTrue(any(t.kind == "map_connection" for t in static.transitions))
 
     def test_reuses_static_tiles_when_only_avatar_state_changes(self):
         map_id = (91, 7)

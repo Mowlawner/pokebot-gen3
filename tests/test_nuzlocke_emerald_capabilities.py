@@ -656,8 +656,7 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         ordinary_calls = [goal for goal in calls if not goal.warps]
         self.assertEqual(len(grouped_calls), 1)
         self.assertEqual(len(grouped_calls[0].warps), 10)
-        self.assertEqual(len(ordinary_calls), 1)
-        self.assertIs(ordinary_calls[0].warp, ordinary_warp)
+        self.assertEqual(len(ordinary_calls), 0)
         self.assertIs(selected.warp, connections[7])
 
     def test_meet_rival_print_tiles(self):

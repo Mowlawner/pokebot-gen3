@@ -33,8 +33,8 @@ class PokebotHeadless:
         context.audio = not startup_settings.no_audio
         context.video = not startup_settings.no_video
         context.emulation_speed = startup_settings.emulation_speed
-        context.debug = False
-        context.debug_trace = False
+        context.debug = startup_settings.debug
+        context.debug_trace = startup_settings.debug_trace
         context.debug_profile = startup_settings.debug_profile
         context.debug_stutter_trace = startup_settings.stutter_trace
         context.stutter_trace_threshold_ms = startup_settings.stutter_threshold_ms

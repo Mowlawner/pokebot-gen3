@@ -95,13 +95,24 @@ def _battle_return_to_field_complete(frame: FrameInfo) -> bool:
     waiting for the avatar to be standing still can keep the battle controller
     above a surrounding scripted dialogue indefinitely.
     """
-    return (
-        get_game_state_symbol() not in ("CB2_RETURNTOFIELD", "CB2_RETURNTOFIELDLOCAL")
-        and "Task_ReturnToFieldNoScript" not in frame.active_tasks
-        and "Task_ReturnToFieldContinueScriptPlayMapMusic" not in frame.active_tasks
-        and "task_mpl_807E3C8" not in frame.active_tasks
-        and len(get_map_objects()) > 0
+    callback_ok = get_game_state_symbol() not in ("CB2_RETURNTOFIELD", "CB2_RETURNTOFIELDLOCAL")
+    battle_start_absent = "Task_BattleStart" not in frame.active_tasks
+    no_script_absent = "Task_ReturnToFieldNoScript" not in frame.active_tasks
+    continue_music_absent = "Task_ReturnToFieldContinueScriptPlayMapMusic" not in frame.active_tasks
+    mpl_absent = "task_mpl_807E3C8" not in frame.active_tasks
+    map_objects = len(get_map_objects())
+    complete = callback_ok and no_script_absent and continue_music_absent and mpl_absent and map_objects > 0
+    diagnostic_print(
+        lambda: (
+            "BATTLE_RETURN_GATE: "
+            f"frame={getattr(context, 'frame', None)!r} complete={complete!r} "
+            f"game_state={get_game_state().name!r} game_state_symbol={get_game_state_symbol()!r} "
+            f"task_battle_start={not battle_start_absent!r} return_no_script={not no_script_absent!r} "
+            f"return_continue_music={not continue_music_absent!r} task_mpl={not mpl_absent!r} map_objects={map_objects}"
+        ),
+        trace=True,
     )
+    return complete
 
 
 class BattleListener(BotListener):
@@ -157,6 +168,10 @@ class BattleListener(BotListener):
             frame.game_state in self.battle_states or frame.task_is_active("Task_BattleStart")
         ):
             self._in_battle = True
+            diagnostic_print(
+                lambda: f"BATTLE_OWNERSHIP_CHANGE: frame={getattr(context, 'frame', None)!r} old=False new=True game_state={frame.game_state.name!r}",
+                trace=True,
+            )
             self._reported_start_of_battle = False
             self._active_wild_encounter = None
             self._reported_wild_encounter_visible = False
@@ -238,6 +253,10 @@ class BattleListener(BotListener):
                     context.stats.log_end_of_battle(outcome, self._active_wild_encounter)
 
             if _battle_return_to_field_complete(frame):
+                diagnostic_print(
+                    lambda: f"BATTLE_OWNERSHIP_CHANGE: frame={getattr(context, 'frame', None)!r} old=True new=False game_state={get_game_state().name!r} outcome={outcome!r}",
+                    trace=True,
+                )
                 self._in_battle = False
                 diagnostic_print(
                     lambda: "BATTLE_CONTROLLER_FINISHED: " + self._controller_boundary_snapshot(),
@@ -284,6 +303,10 @@ class BattleListener(BotListener):
 
     @debug.track
     def _wait_until_battle_is_over(self):
+        diagnostic_print(
+            lambda: f"BATTLE_FIGHT_BOUNDARY: frame={getattr(context, 'frame', None)!r} event=POSTWAIT_START in_battle={self._in_battle!r}",
+            trace=True,
+        )
         while self._in_battle:
             self._post_battle_wait_frames += 1
             if self._post_battle_wait_frames == 1 or self._post_battle_wait_frames % 30 == 0:
@@ -295,6 +318,10 @@ class BattleListener(BotListener):
                     trace=True,
                 )
             if get_game_state() != GameState.OVERWORLD or get_map_data_for_current_position().map_type != "Underwater":
+                diagnostic_print(
+                    lambda: f"BATTLE_POSTWAIT_INPUT: frame={getattr(context, 'frame', None)!r} input='B' in_battle={self._in_battle!r} battle_active={__import__('modules.battle_state', fromlist=['battle_is_active']).battle_is_active()!r} game_state={get_game_state().name!r}",
+                    trace=True,
+                )
                 context.emulator.press_button("B")
             yield
 
@@ -306,14 +333,30 @@ class BattleListener(BotListener):
     @isolate_inputs
     @debug.track
     def fight(self, strategy: BattleStrategy):
+        diagnostic_print(
+            lambda: f"BATTLE_FIGHT_BOUNDARY: frame={getattr(context, 'frame', None)!r} event=FIGHT_START in_battle={self._in_battle!r}",
+            trace=True,
+        )
         first_non_fainted_lead_before_battle = get_party().first_non_fainted.index
+        diagnostic_print(
+            lambda: f"BATTLE_FIGHT_BOUNDARY: frame={getattr(context, 'frame', None)!r} event=HANDLE_BATTLE_START in_battle={self._in_battle!r}",
+            trace=True,
+        )
         yield from plugin_battle_started(self._active_wild_encounter)
         result = yield from handle_battle(strategy)
+        diagnostic_print(
+            lambda: f"BATTLE_FIGHT_BOUNDARY: frame={getattr(context, 'frame', None)!r} event=HANDLE_BATTLE_RETURNED in_battle={self._in_battle!r}",
+            trace=True,
+        )
         diagnostic_print(
             lambda: "BATTLE_FIGHT_GENERATOR: before wait_until_battle_is_over " + self._controller_boundary_snapshot(),
             trace=True,
         )
         yield from self._wait_until_battle_is_over()
+        diagnostic_print(
+            lambda: f"BATTLE_FIGHT_BOUNDARY: frame={getattr(context, 'frame', None)!r} event=POSTWAIT_RETURNED in_battle={self._in_battle!r}",
+            trace=True,
+        )
         diagnostic_print(
             lambda: "BATTLE_FIGHT_GENERATOR: wait_until_battle_is_over returned "
             + self._controller_boundary_snapshot(),
@@ -344,6 +387,10 @@ class BattleListener(BotListener):
 
         diagnostic_print(
             lambda: "BATTLE_FIGHT_GENERATOR: fight returning " + self._controller_boundary_snapshot(),
+            trace=True,
+        )
+        diagnostic_print(
+            lambda: f"BATTLE_FIGHT_BOUNDARY: frame={getattr(context, 'frame', None)!r} event=FIGHT_RETURN in_battle={self._in_battle!r}",
             trace=True,
         )
 

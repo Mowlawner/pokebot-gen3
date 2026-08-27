@@ -5,7 +5,8 @@ from enum import Enum, auto
 from modules.context import context
 from modules.map import get_map_metadata, get_map_objects
 from modules.game import get_event_var_name
-from modules.memory import get_event_var_by_number
+from modules.memory import get_event_flag, get_event_var_by_number, get_game_state_symbol
+from modules.tasks import task_is_active
 from modules.map_path import Direction, _get_map_metadata
 from modules.player import get_player_avatar, player_avatar_is_controllable
 from modules.trigger_bindings import BindingResolution, TRIGGER_BINDINGS, resolve_trigger_binding
@@ -24,9 +25,45 @@ class MovementState(Enum):
     STANDING = auto()
 
 
+# Emerald's MB_COUNTER value from include/constants/metatile_behaviors.h.
+EMERALD_MB_COUNTER = 0x80
+
+
+def _running_shoes_received() -> bool:
+    """Return the game-specific progression flag for running shoes."""
+    flag = "HIDE_PEWTER_CITY_RUNNING_SHOES_GUY" if context.rom.is_frlg else "RECEIVED_RUNNING_SHOES"
+    try:
+        return get_event_flag(flag)
+    except (KeyError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 class WarpActivation(Enum):
     STEP_ON = auto()
     DIRECTIONAL_STEP = auto()
+
+
+class TransitionMechanism(Enum):
+    ORDINARY_WARP = "ordinary_warp"
+    MAP_CONNECTION = "map_connection"
+    ARROW_WARP = "arrow_warp"
+    DOOR_WARP = "door_warp"
+    ESCALATOR_WARP = "escalator_warp"
+    SCRIPTED = "scripted"
+
+
+class TransitionActivationMode(Enum):
+    ENTRY_TILE = "stepping_on_entry_tile"
+    DIRECTIONAL_INPUT = "directional_input"
+    FIELD_EFFECT = "field_effect"
+    MAP_BOUNDARY = "map_boundary"
+    SCRIPT = "script"
+
+
+class TransitionGeometry(Enum):
+    ENTRY_TILE = "entry_tile"
+    APPROACH_TILE = "approach_tile"
+    DESTINATION = "destination"
 
 
 class OverworldObservationStatus(Enum):
@@ -62,6 +99,9 @@ class WorldTransition:
     activation_locations: frozenset[Location] = frozenset()
     activation_direction: Direction | None = None
     kind: str = "warp"
+    mechanism: TransitionMechanism = TransitionMechanism.ORDINARY_WARP
+    activation_mode: TransitionActivationMode = TransitionActivationMode.ENTRY_TILE
+    geometry: TransitionGeometry = TransitionGeometry.ENTRY_TILE
 
 
 @dataclass(frozen=True)
@@ -70,12 +110,19 @@ class WarpObservation(WorldTransition):
 
     kind: str = "warp"
 
+    @property
+    def transition_type(self) -> TransitionMechanism:
+        return self.mechanism
+
 
 @dataclass(frozen=True)
 class MapConnectionObservation(WorldTransition):
     """A boundary crossing derived from a ROM MapConnection."""
 
     kind: str = "map_connection"
+    mechanism: TransitionMechanism = TransitionMechanism.MAP_CONNECTION
+    activation_mode: TransitionActivationMode = TransitionActivationMode.MAP_BOUNDARY
+    geometry: TransitionGeometry = TransitionGeometry.APPROACH_TILE
 
 
 @dataclass(frozen=True)
@@ -101,6 +148,10 @@ class TriggerObservation:
     # to a currently observed affordance.  Navigation remains agnostic to the
     # consequence of activating it.
     affordance_id: str | None = None
+    # Dynamic trainer sight-line hazard.  These are player positions that can
+    # activate the trainer, distinct from the adjacent interaction positions.
+    hazard_locations: frozenset[Location] = frozenset()
+    hazard_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -121,6 +172,87 @@ class ObjectObservation:
     trainer_range: int | None = None
     trainer_defeated: bool | None = None
     interactable: bool = True
+    elevation: int | None = None
+
+    @property
+    def trainer_id(self) -> str | None:
+        if self.trainer_type in (None, "None"):
+            return None
+        return f"trainer:{self.location[0]}:{self.local_id}"
+
+
+def resolve_object_activation_positions(
+    object_observation: ObjectObservation,
+    objects: tuple[ObjectObservation, ...] | list[ObjectObservation],
+    tiles: tuple["TileObservation", ...] | list["TileObservation"],
+    map_size: tuple[int, int],
+) -> tuple[tuple[Location, Direction], ...]:
+    """Return player states that Emerald's object resolver can activate.
+
+    Emerald checks the tile in front of the player.  If that tile is a
+    counter and contains no object, it checks one additional tile in the same
+    direction.  Collision alone deliberately has no effect here.
+    """
+    x, y = object_observation.location[1]
+    tile_by_location = {tile.location: tile for tile in tiles}
+    object_locations = {(obj.location, obj.elevation) for obj in objects}
+    candidates = (
+        (Direction.North, (0, -1)),
+        (Direction.East, (1, 0)),
+        (Direction.South, (0, 1)),
+        (Direction.West, (-1, 0)),
+    )
+    result: list[tuple[Location, Direction]] = []
+    for facing, vector in candidates:
+        ordinary = (x - vector[0], y - vector[1])
+        counter = (x - vector[0], y - vector[1])
+        counter_location = (object_observation.location[0], counter)
+        counter_tile = tile_by_location.get(counter_location)
+        counter_has_object = (counter_location, object_observation.elevation) in object_locations
+        if counter_tile is not None and counter_tile.metatile_behavior == EMERALD_MB_COUNTER and not counter_has_object:
+            activation = (ordinary[0] - vector[0], ordinary[1] - vector[1])
+        else:
+            activation = ordinary
+        if 0 <= activation[0] < map_size[0] and 0 <= activation[1] < map_size[1]:
+            # Emerald's elevation check applies to the object lookup, not to
+            # the player's standing tile.  A counter-separated NPC can be on
+            # a different tile-elevation layer from the player.
+            result.append(((object_observation.location[0], activation), facing))
+    return tuple(result)
+
+
+def trainer_hazard_locations(
+    trainer: ObjectObservation,
+    tiles: tuple["TileObservation", ...] | list["TileObservation"],
+    objects: tuple[ObjectObservation, ...] | list[ObjectObservation] = (),
+) -> frozenset[Location]:
+    """Return player locations visible to an undefeated trainer.
+
+    This deliberately models only cardinal sight lines.  It is deterministic,
+    independent of emulator state, and conservative when collision data is
+    incomplete.
+    """
+    if trainer.trainer_type in (None, "None") or trainer.trainer_defeated is not False:
+        return frozenset()
+    tile_by_location = {tile.location: tile for tile in tiles}
+    occupied = {obj.location for obj in objects if obj.location != trainer.location}
+    directions = (
+        tuple(Direction)
+        if trainer.trainer_type == "See All Directions"
+        else (Direction.from_string(trainer.facing or "South"),)
+    )
+    vectors = {Direction.North: (0, -1), Direction.East: (1, 0), Direction.South: (0, 1), Direction.West: (-1, 0)}
+    x, y = trainer.location[1]
+    result: set[Location] = set()
+    for direction in directions:
+        dx, dy = vectors[direction]
+        for distance in range(1, (trainer.trainer_range or 0) + 1):
+            location = (trainer.location[0], (x + dx * distance, y + dy * distance))
+            tile = tile_by_location.get(location)
+            if tile is None or tile.blocked or location in occupied:
+                break
+            result.add(location)
+    return frozenset(result)
 
 
 def evaluate_trigger_condition(trigger: TriggerObservation, current_value: int | None) -> bool | None:
@@ -146,6 +278,9 @@ class TileObservation:
     # from traversal_cost: encounter generation is an action property.
     has_encounters: bool = False
     transition: WorldTransition | None = None
+    metatile_behavior: int | None = None
+    elevation: int | None = None
+    cannot_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -162,6 +297,9 @@ class OverworldObservation:
     movement_state: MovementState | None = None
     dynamic_blocked_coordinates: frozenset[Coordinate] = frozenset()
     transitions: tuple[WorldTransition, ...] = ()
+    transition_in_progress: bool = False
+    transition_signals: frozenset[str] = frozenset()
+    running_shoes: bool = False
 
     def tile_at(self, coordinates: Coordinate) -> TileObservation | None:
         tile = next((tile for tile in self.tiles if tile.location[1] == coordinates), None)
@@ -189,6 +327,16 @@ class _StaticMapObservation:
 
 
 _static_map_observations: dict[MapId, _StaticMapObservation] = {}
+
+
+def _connection_endpoint_is_executable(map_metadata, path_tiles, coordinate: Coordinate) -> bool:
+    """Return whether a geometric connection endpoint is usable on a map."""
+    tile = path_tiles.get(coordinate)
+    if tile is None or not any(tile.accessible_from_direction):
+        return False
+    return not any(
+        object_template.local_coordinates == coordinate for object_template in getattr(map_metadata, "objects", ())
+    )
 
 
 @traced("static_tile_preparation")
@@ -223,7 +371,17 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
                     activation = WarpActivation.DIRECTIONAL_STEP
             tile_type = getattr(path_tile, "tile_type", "") if path_tile is not None else ""
             x, y = warp.local_coordinates
+            mechanism = TransitionMechanism.ORDINARY_WARP
+            activation_mode = TransitionActivationMode.ENTRY_TILE
+            if "Arrow Warp" in tile_type:
+                mechanism = TransitionMechanism.ARROW_WARP
+                activation_mode = TransitionActivationMode.DIRECTIONAL_INPUT
+            elif "Door" in tile_type or "Exterior Door" in tile_type:
+                mechanism = TransitionMechanism.DOOR_WARP
+                activation_mode = TransitionActivationMode.FIELD_EFFECT
             if tile_type in ("Escalator Up", "Escalator Down"):
+                mechanism = TransitionMechanism.ESCALATOR_WARP
+                activation_mode = TransitionActivationMode.FIELD_EFFECT
                 # Up/Down describes the destination transition, not the
                 # side from which the field interaction is started.  The
                 # Gen III Pokémon Center escalator rail is activated from
@@ -243,15 +401,19 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
                     activation=activation,
                     activation_locations=activation_locations,
                     activation_direction=activation_direction,
+                    mechanism=mechanism,
+                    activation_mode=activation_mode,
                 )
             )
         transitions: list[WorldTransition] = list(warps)
         # A connection is a boundary crossing, not a warp.  Keep its ROM
         # mechanism visible to tactical navigation while deriving the same
         # boundary coordinate pairs used by the world graph.
-        for connection in map_data.connections:
+        for connection in getattr(map_data, "connections", ()):
             destination_map = (connection.destination_map_group, connection.destination_map_number)
             destination_data = get_map_metadata(destination_map)
+            destination_path_tiles = {tile.local_coordinates: tile for tile in _get_map_metadata(destination_map).tiles}
+
             source_width, source_height = map_data.map_size
             destination_width, destination_height = destination_data.map_size
             pairs: list[tuple[Coordinate, Coordinate]] = []
@@ -288,6 +450,10 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
                 "West": Direction.West,
             }.get(connection.direction)
             for source, destination in pairs:
+                if not _connection_endpoint_is_executable(map_data, by_coordinate, source):
+                    continue
+                if not _connection_endpoint_is_executable(destination_data, destination_path_tiles, destination):
+                    continue
                 transitions.append(
                     MapConnectionObservation(
                         (map_id, source),
@@ -325,6 +491,9 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
                     trigger_ids=frozenset(static_trigger_ids_by_location.get(coordinate, set())),
                     traversal_cost=getattr(tile, "traversal_cost", 1),
                     has_encounters=getattr(tile, "has_encounters", False),
+                    metatile_behavior=getattr(tile, "metatile_behavior", None),
+                    elevation=getattr(tile, "elevation", None),
+                    cannot_run=getattr(tile, "cannot_run", False),
                 )
             )
         static_triggers: list[TriggerObservation] = []
@@ -494,6 +663,36 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
     static = _static_map_observations[map_id]
     warps = static.warps
 
+    # These are deliberately independent ROM-side signals.  A map can be
+    # loading before its map id changes, and an ordinary warp can lock input
+    # without exposing a stable task name.  Consumers use this as a lifecycle
+    # hint and wait for destination confirmation instead of invalidating the
+    # route that caused the transition.
+    transition_signals: set[str] = set()
+    try:
+        callback = get_game_state_symbol().upper()
+        if "LOADMAP" in callback or callback in {"CB2_CHANGEMAP", "CB2_LOADMAP"}:
+            transition_signals.add("map_loading_callback")
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        pass
+    for task_name in (
+        "Task_Warp",
+        "Task_DoorWarp",
+        "Task_EscalatorWarp",
+        "Task_ArrowWarp",
+        "Task_MapConnection",
+        "Task_TransitionToMap",
+    ):
+        try:
+            if task_is_active(task_name):
+                transition_signals.add(f"task:{task_name}")
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            pass
+    if not player_avatar_is_controllable():
+        transition_signals.add("player_controls_locked")
+    if getattr(getattr(avatar, "tile_transition_state", None), "name", "NOT_MOVING") != "NOT_MOVING":
+        transition_signals.add("avatar_tile_transition")
+
     triggers: list[TriggerObservation] = list(static.triggers)
     runtime_start = now()
     trace_runtime_start = trace.now() if trace is not None else 0
@@ -525,6 +724,7 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
                     if object_event.trainer_type != "None"
                     else None
                 ),
+                elevation=getattr(object_event.object_event_template, "elevation", None),
             )
             for object_event in get_map_objects()
             if object_event.map_group_and_number == map_id and "isPlayer" not in object_event.flags
@@ -565,36 +765,26 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
     triggers = live_triggers
 
     # Object templates/scripts are the reliable data available for NPC
-    # interactions.  The four adjacent tiles are candidate activation tiles;
-    # the planner can refine these when a game-specific interaction reports
-    # more restrictive geometry.
+    # interactions.  Activation geometry follows Emerald's object resolver,
+    # including its generic counter continuation rule.
     for object_observation in objects:
-        x, y = object_observation.location[1]
-        activation_locations = frozenset(
-            (map_id, (candidate_x, candidate_y))
-            for candidate_x, candidate_y in ((x, y - 1), (x + 1, y), (x, y + 1), (x - 1, y))
-            if 0 <= candidate_x < map_width and 0 <= candidate_y < map_height
+        activation_requirements = resolve_object_activation_positions(
+            object_observation, objects, tiles, (map_width, map_height)
         )
+        trainer_hazards = trainer_hazard_locations(object_observation, tiles, objects)
+        activation_locations = frozenset(location for location, _ in activation_requirements)
         triggers.append(
             TriggerObservation(
                 trigger_id=f"object:{object_observation.local_id}:{object_observation.script}",
                 locations=frozenset({object_observation.location}),
                 activation_locations=activation_locations,
                 kind="object_interaction",
-                activation_requirements=tuple(
-                    (
-                        (map_id, (candidate_x, candidate_y)),
-                        {
-                            (x, y - 1): Direction.South,
-                            (x + 1, y): Direction.West,
-                            (x, y + 1): Direction.North,
-                            (x - 1, y): Direction.East,
-                        }[(candidate_x, candidate_y)],
-                    )
-                    for candidate_x, candidate_y in ((x, y - 1), (x + 1, y), (x, y + 1), (x - 1, y))
-                    if 0 <= candidate_x < map_width and 0 <= candidate_y < map_height
-                ),
-                affordance_id=object_observation.script or f"object:{object_observation.local_id}",
+                activation_requirements=activation_requirements,
+                affordance_id=object_observation.trainer_id
+                or object_observation.script
+                or f"object:{object_observation.local_id}",
+                hazard_locations=trainer_hazards,
+                hazard_kind="trainer" if trainer_hazards else None,
             )
         )
 
@@ -701,4 +891,7 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
         bindings=bindings,
         movement_state=movement_state,
         dynamic_blocked_coordinates=dynamic_blocked_coordinates,
+        transition_in_progress=bool(transition_signals),
+        transition_signals=frozenset(transition_signals),
+        running_shoes=_running_shoes_received(),
     )

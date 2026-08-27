@@ -11,7 +11,15 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable
 
-from modules.goals import Goal, ReachWarp, early_pokeball_goal, introductory_rival_goal
+from modules.goals import (
+    EncounterMode,
+    Goal,
+    NavigationGoal,
+    ReachLocation,
+    ReachWarp,
+    early_pokeball_goal,
+    introductory_rival_goal,
+)
 from modules.map_data import MapRSE
 
 from .campaign_state import CampaignState, Fact, FactStatus, RunStatus
@@ -92,6 +100,37 @@ class CampaignPredicate:
 
     def evaluate(self, state: CampaignState) -> Fact[bool]:
         return self.evaluator(state)
+
+
+def party_fully_restored() -> CampaignPredicate:
+    """Freshly observed party restoration fact used by safety objectives."""
+
+    def evaluate(state: CampaignState) -> Fact[bool]:
+        if not state.party.is_known:
+            return Fact(None, state.party.status)
+        members = tuple(p for p in (state.party.value or ()) if not getattr(p, "is_egg", getattr(p, "egg", False)))
+        return Fact.known(
+            bool(members)
+            and all(
+                p.current_hp == getattr(p, "total_hp", getattr(p, "max_hp", None))
+                and getattr(getattr(p, "status_condition", None), "value", getattr(p, "status", None)) == "none"
+                for p in members
+            )
+        )
+
+    return CampaignPredicate("party_fully_restored", "party is fully restored", evaluate)
+
+
+def heal_party_objective() -> CampaignObjective:
+    return CampaignObjective(
+        "HEAL_PARTY",
+        "Restore the party",
+        (),
+        party_fully_restored(),
+        execution_id="heal_party",
+        task_kind="safety",
+        priority=100,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,6 +430,9 @@ def encounter_task(
         task_kind="optional",
         priority=100,
         destination=location,
+        # Encounter acquisition is a reusable tactical navigation request;
+        # the selector decides whether this optional task is worth mounting.
+        tactical_target=NavigationGoal(ReachLocation(location), encounter_mode=EncounterMode.SEEK),
         observed=observed,
     )
 

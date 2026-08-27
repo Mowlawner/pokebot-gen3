@@ -24,10 +24,12 @@ from modules.player import (
     get_player,
     TileTransitionState,
     RunningState,
+    player_avatar_is_controllable,
     player_avatar_is_standing_still,
     AvatarFlags,
 )
 from modules.pokemon_party import get_party
+from modules.console import diagnostic_print
 from modules.region_map import (
     FlyDestinationFRLG,
     FlyDestinationRSE,
@@ -189,9 +191,12 @@ def spin(stop_condition: Callable[[], bool] | None = None, counter_clockwise: bo
 
 
 @debug.track
-def heal_in_pokemon_center(pokemon_center_door_location: PokemonCenter) -> Generator:
+def heal_in_pokemon_center(
+    pokemon_center_door_location: PokemonCenter, *, navigate_to_destination: bool = True
+) -> Generator:
     # Walk to and enter the Pokémon centre
-    yield from navigate_to(pokemon_center_door_location.value[0], pokemon_center_door_location.value[1])
+    if navigate_to_destination:
+        yield from navigate_to(pokemon_center_door_location.value[0], pokemon_center_door_location.value[1])
 
     if pokemon_center_door_location is PokemonCenter.PalletTown:
         # Player's house in Pallet Town, where Mum can heal us.
@@ -210,7 +215,35 @@ def heal_in_pokemon_center(pokemon_center_door_location: PokemonCenter) -> Gener
         yield from wait_for_player_avatar_to_be_standing_still("B")
 
         # Get out
+        diagnostic_print(
+            lambda: (
+                "CENTER_EXIT_BEGIN: "
+                f"frame={getattr(context, 'frame', None)!r} emulator_frame={context.emulator.get_frame_count()!r} "
+                f"map={get_player_avatar().map_group_and_number!r} coordinates={get_player_avatar().local_coordinates!r} "
+                f"game_state={getattr(get_game_state(), 'name', get_game_state())!r} "
+                f"controllable={player_avatar_is_controllable()!r} standing_still={player_avatar_is_standing_still()!r}"
+            ),
+            trace=True,
+        )
+        diagnostic_print(
+            lambda: f"CENTER_EXIT_NAVIGATION_BEGIN: frame={getattr(context, 'frame', None)!r} emulator_frame={context.emulator.get_frame_count()!r}",
+            trace=True,
+        )
         yield from navigate_to(get_player_avatar().map_group_and_number, (7, 8))
+        diagnostic_print(
+            lambda: (
+                "CENTER_EXIT_NAVIGATION_RETURN: "
+                f"frame={getattr(context, 'frame', None)!r} emulator_frame={context.emulator.get_frame_count()!r} "
+                f"map={get_player_avatar().map_group_and_number!r} coordinates={get_player_avatar().local_coordinates!r} "
+                f"game_state={getattr(get_game_state(), 'name', get_game_state())!r} "
+                f"controllable={player_avatar_is_controllable()!r} standing_still={player_avatar_is_standing_still()!r}"
+            ),
+            trace=True,
+        )
+        diagnostic_print(
+            lambda: f"CENTER_EXIT_NAVIGATION_COMPLETE: frame={getattr(context, 'frame', None)!r} emulator_frame={context.emulator.get_frame_count()!r}",
+            trace=True,
+        )
 
 
 @debug.track

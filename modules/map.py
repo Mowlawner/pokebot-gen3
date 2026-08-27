@@ -862,7 +862,13 @@ class MapLocation:
 
     @cached_property
     def _tile_behaviour(self) -> int:
-        return read_symbol("sTileBitAttributes", self._metatile_attributes[0] & 0x3FF, 1)[0]
+        # Emerald stores the metatile behavior directly in the low byte of
+        # the tileset attribute word.  ``sTileBitAttributes`` is not indexed
+        # by the map metatile ID; using that table here turns behaviors such
+        # as MB_COUNTER into unrelated values (or zero).
+        if context.rom.is_frlg:
+            return read_symbol("sTileBitAttributes", self._metatile_attributes[0] & 0x3FF, 1)[0]
+        return self._metatile_attributes[0] & 0xFF
 
     @cached_property
     def _event_list(self) -> bytes | None:
@@ -922,6 +928,11 @@ class MapLocation:
         return _get_tile_type_name(self._metatile_attributes[0] & 0xFF)
 
     @property
+    def metatile_behavior(self) -> int:
+        """Raw ROM metatile behavior used by field interaction semantics."""
+        return self._tile_behaviour
+
+    @property
     def collision(self) -> int:
         return self._metatile_attributes[1]
 
@@ -931,6 +942,12 @@ class MapLocation:
 
     @property
     def has_encounters(self) -> bool:
+        # Emerald's field encounter check is keyed to the tall-grass
+        # metatile behavior, not merely the generic land flag.  The latter is
+        # insufficient for Route 101 grass and caused navigation to classify
+        # those tiles as safe.
+        if self.tile_type in ("Tall Grass", "Long Grass", "Long Grass South Edge"):
+            return True
         if context.rom.is_frlg:
             return bool(self._metatile_attributes[0] & 0x0700_0000)
 

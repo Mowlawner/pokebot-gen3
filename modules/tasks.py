@@ -252,6 +252,33 @@ def is_field_message_waiting_for_input(field_message_lifecycle_active: bool = Fa
         return False
 
 
+def is_field_message_task_waiting_for_input() -> bool:
+    """Whether Emerald's draw task and printer are at the input boundary.
+
+    ``IsFieldMessageBoxHidden`` can remain the script native for one or more
+    frames after the printer reaches its clear/wait state.  Task state 2 plus
+    printer states Clear/ScrollStart is the ROM-level distinction from an
+    ordinary character-rendering wait.
+    """
+    try:
+        if context.rom.is_rs or not task_is_active("Task_DrawFieldMessage"):
+            return False
+        task = get_task("Task_DrawFieldMessage")
+        printer = get_text_printer()
+        return (
+            task is not None
+            and task.data_value(0) == 2
+            and printer.active
+            and printer.raw_state
+            in {
+                "Clear",
+                "ScrollStart",
+            }
+        )
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        return False
+
+
 def is_emerald_field_dialogue_advanceable(
     *,
     task_active: bool,

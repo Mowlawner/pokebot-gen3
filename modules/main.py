@@ -6,7 +6,8 @@ from typing import Generator
 
 from modules.console import console, diagnostic_print, profile_print
 from modules.context import context
-from modules.memory import get_game_state
+from modules.memory import get_game_state, read_symbol, unpack_uint32
+from modules.game import decode_string, get_symbol_name_before
 from modules.modes import (
     BotMode,
     BotModeError,
@@ -93,6 +94,11 @@ def main_loop() -> None:
         )
         previous_frame_info: FrameInfo | None = None
         last_controller_boundary: tuple | None = None
+        last_nurse_script_state = None
+        nurse_entry_count = 0
+        last_rom_execution_state = None
+        last_message_pointer = None
+        last_field_message_key = None
 
         while True:
             loop_start = profile_now()
@@ -113,6 +119,103 @@ def main_loop() -> None:
             stage_start = profile_now()
             game_state = get_game_state()
             script_context = get_global_script_context()
+            message_pointer = None
+            message_raw = b""
+            message_text = None
+            try:
+                if context.rom.is_emerald:
+                    printer = read_symbol("sTextPrinters", size=0x24)
+                    message_pointer = unpack_uint32(printer[:4])
+                    # Emerald's printer stores several pointer-sized fields;
+                    # inspect all of them because the first pointer is the
+                    # moving cursor, not necessarily the message origin.
+                    candidates = []
+                    for offset in range(0, len(printer) - 3, 4):
+                        pointer = unpack_uint32(printer[offset : offset + 4])
+                        if 0x02000000 <= pointer < 0x02400000 or 0x08000000 <= pointer < 0x09000000:
+                            try:
+                                raw = context.emulator.read_bytes(pointer, 160)
+                                text_value = decode_string(raw)
+                                if text_value and "{" not in text_value[:1]:
+                                    candidates.append((offset, pointer, text_value, raw[:32].hex()))
+                            except (RuntimeError, ValueError, TypeError, IndexError):
+                                pass
+                    if candidates:
+                        # Prefer the longest decoded candidate; cursor-derived
+                        # suffixes become shorter as the printer advances.
+                        base_offset, base_pointer, message_text, raw_hex = max(
+                            candidates, key=lambda item: len(item[2])
+                        )
+                        message_key = (base_pointer, message_text)
+                        if message_key != last_field_message_key:
+                            diagnostic_print(
+                                lambda: (
+                                    "FIELD_MESSAGE_CHANGE: "
+                                    f"frame={context.frame!r} printer_id=0 "
+                                    f"base_pointer={base_pointer:#x} base_offset={base_offset:#x} "
+                                    f"cursor_pointer={message_pointer:#x} text={message_text!r} "
+                                    f"raw={raw_hex!r}"
+                                ),
+                                trace=True,
+                            )
+                        last_field_message_key = message_key
+                        last_message_pointer = message_pointer
+            except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+                message_pointer = None
+            nurse_script_name = (
+                script_context.script_function_name if script_context is not None and script_context.is_active else None
+            )
+            nurse_state = (
+                nurse_script_name == "OldaleTown_PokemonCenter_1F_EventScript_Nurse",
+                nurse_script_name,
+                script_context.bytecode_pointer if script_context is not None else None,
+                script_context.native_pointer if script_context is not None else None,
+                tuple(script_context.stack) if script_context is not None and script_context.is_active else (),
+            )
+            rom_execution_state = (
+                bool(script_context is not None and script_context.is_active),
+                nurse_script_name,
+                script_context.bytecode_pointer if script_context is not None else None,
+                script_context.native_pointer if script_context is not None else None,
+                tuple(script_context.stack) if script_context is not None and script_context.is_active else (),
+                tuple(task.symbol for task in get_tasks()) if get_tasks() is not None else (),
+            )
+            if rom_execution_state != last_rom_execution_state:
+                diagnostic_print(
+                    lambda: (
+                        "ROM_EXECUTION_TRANSITION: "
+                        f"frame={context.frame!r} active={rom_execution_state[0]!r} "
+                        f"script={rom_execution_state[1]!r} pc={rom_execution_state[2]!r} "
+                        f"native_ptr={rom_execution_state[3]!r} stack={rom_execution_state[4]!r} "
+                        f"tasks={rom_execution_state[5]!r} previous={last_rom_execution_state!r}"
+                    ),
+                    trace=True,
+                )
+            last_rom_execution_state = rom_execution_state
+            nurse_active = nurse_state[0]
+            if nurse_active and not (last_nurse_script_state and last_nurse_script_state[0]):
+                nurse_entry_count += 1
+                diagnostic_print(
+                    lambda: (
+                        "NURSE_INTERACTION_ENTRY: "
+                        f"count={nurse_entry_count} frame={context.frame!r} "
+                        f"pc={nurse_state[2]!r} native_ptr={nurse_state[3]!r} "
+                        f"script={nurse_state[1]!r} stack={nurse_state[4]!r} "
+                        f"previous_script={last_nurse_script_state[1] if last_nurse_script_state else None!r}"
+                    ),
+                    trace=True,
+                )
+            if last_nurse_script_state and last_nurse_script_state[0] and not nurse_active:
+                diagnostic_print(
+                    lambda: (
+                        "NURSE_INTERACTION_EXIT: "
+                        f"frame={context.frame!r} previous_pc={last_nurse_script_state[2]!r} "
+                        f"previous_script={last_nurse_script_state[1]!r} "
+                        f"script={nurse_state[1]!r} pc={nurse_state[2]!r} stack={nurse_state[4]!r}"
+                    ),
+                    trace=True,
+                )
+            last_nurse_script_state = nurse_state
             script_stack = script_context.stack if script_context is not None and script_context.is_active else []
             task_list = get_tasks()
             if task_list is not None:
@@ -229,8 +332,32 @@ def main_loop() -> None:
                             trace=True,
                         )
                     try:
+                        if (
+                            "recovery" in active_controller_qualname.lower()
+                            or "CampaignController" in active_controller_qualname
+                        ):
+                            diagnostic_print(
+                                lambda: (
+                                    "CONTROLLER_LIFECYCLE: phase=before_next "
+                                    f"frame={context.frame!r} stack_depth={len(context.controller_stack)} "
+                                    f"top={active_controller_qualname!r} stack={frame_info.controller_stack!r}"
+                                ),
+                                trace=True,
+                            )
                         next(context.controller_stack[-1])
                     finally:
+                        if (
+                            "recovery" in active_controller_qualname.lower()
+                            or "CampaignController" in active_controller_qualname
+                        ):
+                            diagnostic_print(
+                                lambda: (
+                                    "CONTROLLER_LIFECYCLE: phase=after_next "
+                                    f"frame={context.frame!r} stack_depth={len(context.controller_stack)} "
+                                    f"top={active_controller_qualname!r} stack={[controller.__qualname__ for controller in context.controller_stack]!r}"
+                                ),
+                                trace=True,
+                            )
                         if is_starter_flow_controller:
                             diagnostic_print(
                                 lambda: (

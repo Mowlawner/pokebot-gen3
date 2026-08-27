@@ -213,6 +213,10 @@ class LibmgbaEmulator:
             self._audio_sample_rate = 32768
 
     def reset(self) -> None:
+        # Runtime transition observations describe one emulator session only.
+        from modules.navigation import clear_runtime_transition_observations
+
+        clear_runtime_transition_observations()
         self._core.reset()
 
     def create_save_state(self, suffix: str = "") -> None:
@@ -526,12 +530,47 @@ class LibmgbaEmulator:
             self._report_birch_gender_input("set_inputs", inputs, path="set_inputs")
         self._core._core.setKeys(self._core._core, inputs)
 
+    def _trace_input_ownership(self, button, inputs, path):
+        """Diagnostic-only input boundary trace; deliberately has no control effect."""
+        try:
+            import traceback
+
+            controller = getattr(getattr(context, "bot_mode_instance", None), "controller", None)
+            phase = getattr(controller, "_execution_phase", None)
+            loop = getattr(controller, "_tactical_loop", None)
+            producer = (
+                "recovery"
+                if phase == "RECOVERY"
+                else "campaign_tactical" if phase == "CAMPAIGN" and loop is not None else "other/unknown"
+            )
+            diagnostic_print(
+                lambda: (
+                    "EMULATOR_INPUT_OWNERSHIP: "
+                    f"frame={getattr(context, 'frame', None)!r} "
+                    f"emulator_frame={getattr(self, 'frame_count', None)!r} "
+                    f"button={button!r} inputs={inputs:#x} path={path!r} "
+                    f"producer={producer!r} controller_id={id(controller) if controller else None!r} "
+                    f"loop_id={id(loop) if loop else None!r} phase={phase!r}"
+                ),
+                trace=True,
+            )
+            if button == "A" and getattr(context, "debug_trace", False):
+                callers = " <- ".join(f"{frame.name}:{frame.lineno}" for frame in traceback.extract_stack(limit=9)[:-2])
+                diagnostic_print(
+                    lambda: f"EMULATOR_INPUT_CALLERS: frame={getattr(context, 'frame', None)!r} "
+                    f"button='A' path={path!r} callers={callers!r}",
+                    trace=True,
+                )
+        except Exception:
+            pass
+
     def press_button(self, button: str = None, inputs: int = 0):
         """
         :param button: A GBA button to be pressed, if pressed on previous frame it will be released
         :param inputs: Alternate raw input bitfield
         """
         button_inputs = inputs or input_map[button]
+        self._trace_input_ownership(button, button_inputs, "press_button")
         self._report_birch_gender_input(button, button_inputs, path="press_button")
         self._pressed_inputs |= (self._prev_pressed_inputs & button_inputs) ^ button_inputs
 
@@ -543,6 +582,7 @@ class LibmgbaEmulator:
         immediately preceding frame.
         """
         button_inputs = inputs or input_map[button]
+        self._trace_input_ownership(button, button_inputs, "press_button_fresh")
         self._report_fresh_input("press_button_fresh", button, button_inputs)
         if self._prev_pressed_inputs & button_inputs:
             self._fresh_input_pending |= button_inputs
@@ -551,6 +591,16 @@ class LibmgbaEmulator:
             return
         self.press_button(button, inputs)
         self._report_fresh_input("pulse_queued_without_neutral", button, button_inputs)
+
+    def press_direction(self, direction: str, *, run: bool = False, fresh: bool = False):
+        """Press a movement direction, optionally holding the running-shoes button."""
+        inputs = input_map[direction]
+        if run:
+            inputs |= input_map["B"]
+        if fresh:
+            self.press_button_fresh(inputs=inputs)
+        else:
+            self.press_button(inputs=inputs)
 
     def _report_fresh_input(self, event: str, button: str | None, inputs: int) -> None:
         try:
@@ -631,6 +681,7 @@ class LibmgbaEmulator:
         :param inputs: Alternate raw input bitfield
         """
         button_inputs = inputs or input_map[button]
+        self._trace_input_ownership(button, button_inputs, "hold_button")
         self._report_birch_gender_input(button, button_inputs, path="hold_button")
         self._held_inputs |= button_inputs
 
@@ -767,7 +818,9 @@ class LibmgbaEmulator:
         # so the next press_button("A") was incorrectly suppressed.
         self._prev_pressed_inputs = applied_inputs
         self._pressed_inputs = 0
-        self._pressed_inputs = fresh_inputs
+        # A fresh pulse has already been delivered after the neutral frame;
+        # do not re-arm it for another emulator frame.
+        self._pressed_inputs = 0
         self._fresh_pulse_pending = fresh_inputs
         self._fresh_input_pending = 0
 

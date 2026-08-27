@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Iterator
 
-from modules.goals import ActivateTrigger, Goal, ReachWarp, EARLY_POKEBALL_TRIGGER_ID
+from modules.goals import ActivateTrigger, Goal, NavigationGoal, ReachWarp, EARLY_POKEBALL_TRIGGER_ID
 from modules.map_data import MapRSE
 
 from .campaign_objectives import CampaignObjective, ObjectiveSelection, ObjectiveStatus
@@ -74,6 +74,17 @@ class CampaignExecutionAdapter:
         if not isinstance(objective, CampaignObjective):
             return CampaignExecutionResult(None, CampaignExecutionStatus.UNSUPPORTED, "malformed ready objective")
 
+        if objective.objective_id == "HEAL_PARTY":
+            from .resource_runtime import execute_heal_party
+
+            return CampaignExecutionResult(
+                objective,
+                CampaignExecutionStatus.READY,
+                "mounted observation-driven party healing capability",
+                objective.execution_id,
+                capability=execute_heal_party,
+            )
+
         if objective.objective_id == "reach_oldale":
             goal = objective.tactical_target
             if not isinstance(goal, ReachWarp) or goal.destination_map != MapRSE.OLDALE_TOWN.value:
@@ -109,6 +120,23 @@ class CampaignExecutionAdapter:
                 objective.execution_id,
                 goal,
                 capability=CampaignCapability(objective.objective_id, objective.resource_policy, goal),
+            )
+
+        if objective.objective_id.startswith("obtain_encounter:"):
+            goal = objective.tactical_target
+            if not isinstance(goal, NavigationGoal):
+                return CampaignExecutionResult(
+                    objective,
+                    CampaignExecutionStatus.UNSUPPORTED,
+                    "encounter objective has no valid navigation goal",
+                    objective.execution_id,
+                )
+            return CampaignExecutionResult(
+                objective,
+                CampaignExecutionStatus.READY,
+                "translated encounter objective to SEEK navigation",
+                objective.execution_id,
+                goal,
             )
 
         if objective.objective_id in {
