@@ -11,7 +11,15 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable
 
-from modules.goals import Goal, ReachWarp, early_pokeball_goal, introductory_rival_goal
+from modules.goals import (
+    EncounterMode,
+    Goal,
+    NavigationGoal,
+    ReachLocation,
+    ReachWarp,
+    early_pokeball_goal,
+    introductory_rival_goal,
+)
 from modules.map_data import MapRSE
 
 from .campaign_state import CampaignState, Fact, FactStatus, RunStatus
@@ -422,6 +430,9 @@ def encounter_task(
         task_kind="optional",
         priority=100,
         destination=location,
+        # Encounter acquisition is a reusable tactical navigation request;
+        # the selector decides whether this optional task is worth mounting.
+        tactical_target=NavigationGoal(ReachLocation(location), encounter_mode=EncounterMode.SEEK),
         observed=observed,
     )
 

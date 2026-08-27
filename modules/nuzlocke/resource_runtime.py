@@ -15,7 +15,7 @@ from modules.agent_control import (
     select_action,
 )
 from modules.interaction_state import InteractionPhase
-from modules.goals import Goal, ReachInteractionPosition, ReachLocation
+from modules.goals import ActivateTrigger, EncounterMode, Goal, NavigationGoal, ReachInteractionPosition, ReachLocation
 from modules.map_data import MapFRLG
 from modules.modes.util.higher_level_actions import heal_in_pokemon_center
 from modules.modes.util.items import use_item_from_bag
@@ -88,6 +88,10 @@ def discover_healing_source(location=None, observation=None) -> HealingSource | 
 
 def execute_existing_tactical_goal(goal: Goal) -> Iterator[object]:
     """Run the controller's normal tactical loop for an objective goal."""
+    if isinstance(goal, ActivateTrigger) and goal.trigger_id == "introductory_rival":
+        # Preserve the public campaign trigger goal while making its travel
+        # policy explicit at the observation-driven execution boundary.
+        goal = NavigationGoal(goal, encounter_mode=EncounterMode.AVOID)
     return AgentControlLoop(lambda: observe_agent(goal=goal), goal=goal).run()
 
 

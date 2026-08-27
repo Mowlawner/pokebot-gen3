@@ -39,8 +39,21 @@ class SemanticTarget:
 
 
 class EncounterMode(Enum):
-    NORMAL = auto()
     SEEK = auto()
+    IGNORE = auto()
+    AVOID = auto()
+    MOSTLY_AVOID = auto()
+    # Compatibility for callers that used the old default.  The old NORMAL
+    # behavior was strict encounter avoidance.
+    NORMAL = AVOID
+
+
+class TrainerMode(Enum):
+    """How navigation treats undefeated trainer sight lines."""
+
+    IGNORE = auto()
+    AVOID = auto()
+    ENGAGE = auto()
 
 
 INTRODUCTORY_RIVAL_TRIGGER_ID = "introductory_rival"
@@ -49,6 +62,13 @@ EARLY_POKEBALL_TRIGGER_ID = "early_pokeballs"
 
 class Goal:
     """Marker base class for objectives supplied by a higher-level planner."""
+
+
+@dataclass(frozen=True)
+class EngageTrainer(Goal):
+    """Intentionally activate one observed trainer by map/local identity."""
+
+    trainer_id: str
 
 
 @dataclass(frozen=True)
@@ -97,10 +117,15 @@ class ReachInteractionPosition(Goal):
 class GoalConstraints:
     avoid_trigger_ids: frozenset[str] = frozenset()
     avoid_locations: frozenset[Location] = frozenset()
+    trainer_mode: TrainerMode = TrainerMode.IGNORE
 
 
 @dataclass(frozen=True)
 class NavigationGoal(Goal):
     target: Goal
     constraints: GoalConstraints = field(default_factory=GoalConstraints)
-    encounter_mode: EncounterMode = EncounterMode.NORMAL
+    encounter_mode: EncounterMode = EncounterMode.AVOID
+    # Used only by MOSTLY_AVOID.  Keeping it on the goal makes the tradeoff
+    # explicit and allows different traversals to choose different risk
+    # tolerances without global navigator state.
+    encounter_penalty: int = 8

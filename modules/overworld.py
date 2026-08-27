@@ -5,7 +5,7 @@ from enum import Enum, auto
 from modules.context import context
 from modules.map import get_map_metadata, get_map_objects
 from modules.game import get_event_var_name
-from modules.memory import get_event_var_by_number, get_game_state_symbol
+from modules.memory import get_event_flag, get_event_var_by_number, get_game_state_symbol
 from modules.tasks import task_is_active
 from modules.map_path import Direction, _get_map_metadata
 from modules.player import get_player_avatar, player_avatar_is_controllable
@@ -27,6 +27,15 @@ class MovementState(Enum):
 
 # Emerald's MB_COUNTER value from include/constants/metatile_behaviors.h.
 EMERALD_MB_COUNTER = 0x80
+
+
+def _running_shoes_received() -> bool:
+    """Return the game-specific progression flag for running shoes."""
+    flag = "HIDE_PEWTER_CITY_RUNNING_SHOES_GUY" if context.rom.is_frlg else "RECEIVED_RUNNING_SHOES"
+    try:
+        return get_event_flag(flag)
+    except (KeyError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 class WarpActivation(Enum):
@@ -139,6 +148,10 @@ class TriggerObservation:
     # to a currently observed affordance.  Navigation remains agnostic to the
     # consequence of activating it.
     affordance_id: str | None = None
+    # Dynamic trainer sight-line hazard.  These are player positions that can
+    # activate the trainer, distinct from the adjacent interaction positions.
+    hazard_locations: frozenset[Location] = frozenset()
+    hazard_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -160,6 +173,12 @@ class ObjectObservation:
     trainer_defeated: bool | None = None
     interactable: bool = True
     elevation: int | None = None
+
+    @property
+    def trainer_id(self) -> str | None:
+        if self.trainer_type in (None, "None"):
+            return None
+        return f"trainer:{self.location[0]}:{self.local_id}"
 
 
 def resolve_object_activation_positions(
@@ -202,6 +221,40 @@ def resolve_object_activation_positions(
     return tuple(result)
 
 
+def trainer_hazard_locations(
+    trainer: ObjectObservation,
+    tiles: tuple["TileObservation", ...] | list["TileObservation"],
+    objects: tuple[ObjectObservation, ...] | list[ObjectObservation] = (),
+) -> frozenset[Location]:
+    """Return player locations visible to an undefeated trainer.
+
+    This deliberately models only cardinal sight lines.  It is deterministic,
+    independent of emulator state, and conservative when collision data is
+    incomplete.
+    """
+    if trainer.trainer_type in (None, "None") or trainer.trainer_defeated is not False:
+        return frozenset()
+    tile_by_location = {tile.location: tile for tile in tiles}
+    occupied = {obj.location for obj in objects if obj.location != trainer.location}
+    directions = (
+        tuple(Direction)
+        if trainer.trainer_type == "See All Directions"
+        else (Direction.from_string(trainer.facing or "South"),)
+    )
+    vectors = {Direction.North: (0, -1), Direction.East: (1, 0), Direction.South: (0, 1), Direction.West: (-1, 0)}
+    x, y = trainer.location[1]
+    result: set[Location] = set()
+    for direction in directions:
+        dx, dy = vectors[direction]
+        for distance in range(1, (trainer.trainer_range or 0) + 1):
+            location = (trainer.location[0], (x + dx * distance, y + dy * distance))
+            tile = tile_by_location.get(location)
+            if tile is None or tile.blocked or location in occupied:
+                break
+            result.add(location)
+    return frozenset(result)
+
+
 def evaluate_trigger_condition(trigger: TriggerObservation, current_value: int | None) -> bool | None:
     """Evaluate a normalized trigger condition without interpreting its script."""
     if trigger.condition_required_value is None:
@@ -227,6 +280,7 @@ class TileObservation:
     transition: WorldTransition | None = None
     metatile_behavior: int | None = None
     elevation: int | None = None
+    cannot_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -245,6 +299,7 @@ class OverworldObservation:
     transitions: tuple[WorldTransition, ...] = ()
     transition_in_progress: bool = False
     transition_signals: frozenset[str] = frozenset()
+    running_shoes: bool = False
 
     def tile_at(self, coordinates: Coordinate) -> TileObservation | None:
         tile = next((tile for tile in self.tiles if tile.location[1] == coordinates), None)
@@ -438,6 +493,7 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
                     has_encounters=getattr(tile, "has_encounters", False),
                     metatile_behavior=getattr(tile, "metatile_behavior", None),
                     elevation=getattr(tile, "elevation", None),
+                    cannot_run=getattr(tile, "cannot_run", False),
                 )
             )
         static_triggers: list[TriggerObservation] = []
@@ -715,6 +771,7 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
         activation_requirements = resolve_object_activation_positions(
             object_observation, objects, tiles, (map_width, map_height)
         )
+        trainer_hazards = trainer_hazard_locations(object_observation, tiles, objects)
         activation_locations = frozenset(location for location, _ in activation_requirements)
         triggers.append(
             TriggerObservation(
@@ -723,7 +780,11 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
                 activation_locations=activation_locations,
                 kind="object_interaction",
                 activation_requirements=activation_requirements,
-                affordance_id=object_observation.script or f"object:{object_observation.local_id}",
+                affordance_id=object_observation.trainer_id
+                or object_observation.script
+                or f"object:{object_observation.local_id}",
+                hazard_locations=trainer_hazards,
+                hazard_kind="trainer" if trainer_hazards else None,
             )
         )
 
@@ -832,4 +893,5 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
         dynamic_blocked_coordinates=dynamic_blocked_coordinates,
         transition_in_progress=bool(transition_signals),
         transition_signals=frozenset(transition_signals),
+        running_shoes=_running_shoes_received(),
     )

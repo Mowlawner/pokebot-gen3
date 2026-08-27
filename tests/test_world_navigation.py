@@ -18,6 +18,8 @@ from modules.goals import (
     ReachLocation,
     ReachWarp,
     EncounterMode,
+    GoalConstraints,
+    TrainerMode,
     SemanticTarget,
 )
 from modules.interaction_state import InteractionObservation
@@ -476,6 +478,36 @@ class TestWeightedNavigation(unittest.TestCase):
         plan = GoalAwareNavigator(world).plan((self.MAP, (0, 0)), ReachLocation((self.MAP, (0, 1))))
         self.assertEqual(plan.metrics.encounter_opportunities, 1)
         self.assertEqual(plan.metrics.turns_on_encounter_terrain, 1)
+
+    def test_mostly_avoid_trades_encounter_opportunities_for_distance(self):
+        # Direct route crosses two grass tiles; the detour is longer but clear.
+        coordinates = ((0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1))
+        world = NavigationWorld(
+            tiles={
+                (self.MAP, coordinate): NavigableTile(
+                    (self.MAP, coordinate), False, frozenset(Direction), 1, coordinate in {(1, 0), (2, 0)}
+                )
+                for coordinate in coordinates
+            },
+            facing=Direction.East,
+        )
+        strict = GoalAwareNavigator(world).plan(
+            (self.MAP, (0, 0)), NavigationGoal(ReachLocation((self.MAP, (2, 1))), encounter_mode=EncounterMode.AVOID)
+        )
+        weighted = GoalAwareNavigator(world).plan(
+            (self.MAP, (0, 0)),
+            NavigationGoal(
+                ReachLocation((self.MAP, (2, 1))), encounter_mode=EncounterMode.MOSTLY_AVOID, encounter_penalty=0
+            ),
+        )
+        self.assertEqual(strict.metrics.encounter_opportunities, 0)
+        self.assertGreater(strict.metrics.movement_actions, weighted.metrics.movement_actions)
+
+    def test_encounter_objective_is_translated_to_seek_navigation(self):
+        from modules.nuzlocke.campaign_objectives import encounter_task
+
+        task = encounter_task(self.MAP)
+        self.assertEqual(task.tactical_target.encounter_mode, EncounterMode.SEEK)
 
     def test_interaction_route_includes_turn_before_adjacent_move(self):
         trigger = TriggerObservation(
@@ -1115,6 +1147,48 @@ class TestWeightedNavigation(unittest.TestCase):
         self.assertEqual(first[1].action.navigation.action_type, NavigationActionType.WARP)
         self.assertEqual(settling[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
         self.assertEqual(resumed[1].action.action_type, AgentActionType.INTERACT)
+
+
+class TestTrainerAvoidance(unittest.TestCase):
+    MAP = (90, 0)
+
+    @classmethod
+    def _world(cls, coordinates, hazards=()):
+        tiles = {
+            (cls.MAP, coordinate): NavigableTile((cls.MAP, coordinate), allowed_directions=frozenset(Direction))
+            for coordinate in coordinates
+        }
+        trainer = TriggerObservation(
+            "trainer:1",
+            locations=frozenset({(cls.MAP, (1, 0))}),
+            kind="trainer",
+            hazard_locations=frozenset((cls.MAP, coordinate) for coordinate in hazards),
+            hazard_kind="trainer",
+        )
+        return NavigationWorld(tiles=tiles, triggers=(trainer,))
+
+    def test_avoid_selects_longer_trainer_free_detour(self):
+        coordinates = ((0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1))
+        world = self._world(coordinates, hazards=((1, 0),))
+        goal = NavigationGoal(
+            ReachLocation((self.MAP, (2, 0))),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+        )
+        plan = GoalAwareNavigator(world).plan((self.MAP, (0, 0)), goal)
+        destinations = {action.destination for action in plan.actions if action.destination is not None}
+        self.assertNotIn((self.MAP, (1, 0)), destinations)
+        self.assertFalse(plan.forced_trainer_exposure)
+        self.assertGreater(len(plan.actions), 2)
+
+    def test_avoid_falls_back_when_trainer_exposure_is_unavoidable(self):
+        world = self._world(((0, 0), (1, 0), (2, 0)), hazards=((1, 0),))
+        goal = NavigationGoal(
+            ReachLocation((self.MAP, (2, 0))),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+        )
+        plan = GoalAwareNavigator(world).plan((self.MAP, (0, 0)), goal)
+        self.assertIn((self.MAP, (1, 0)), {action.destination for action in plan.actions})
+        self.assertTrue(plan.forced_trainer_exposure)
 
 
 if __name__ == "__main__":

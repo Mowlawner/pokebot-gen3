@@ -592,6 +592,16 @@ class LibmgbaEmulator:
         self.press_button(button, inputs)
         self._report_fresh_input("pulse_queued_without_neutral", button, button_inputs)
 
+    def press_direction(self, direction: str, *, run: bool = False, fresh: bool = False):
+        """Press a movement direction, optionally holding the running-shoes button."""
+        inputs = input_map[direction]
+        if run:
+            inputs |= input_map["B"]
+        if fresh:
+            self.press_button_fresh(inputs=inputs)
+        else:
+            self.press_button(inputs=inputs)
+
     def _report_fresh_input(self, event: str, button: str | None, inputs: int) -> None:
         try:
             from modules.context import context

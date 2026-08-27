@@ -16,7 +16,9 @@ from modules.context import context
 from modules.console import diagnostic_print, profile_print
 from modules.goals import (
     ActivateTrigger,
+    EngageTrainer,
     Goal,
+    NavigationGoal,
     ReachInteractionPosition,
     ReachLocation,
     ReachWarp,
@@ -281,6 +283,11 @@ def _safe_wait_actions(_: AgentObservation) -> tuple[AgentAction, ...]:
     return (AgentAction(AgentActionType.WAIT_REOBSERVE, reason="interaction state is not safely actionable"),)
 
 
+def _goal_target(goal: Goal | None) -> Goal | None:
+    """Return the semantic target when a goal carries navigation policy."""
+    return goal.target if isinstance(goal, NavigationGoal) else goal
+
+
 def available_actions(observation: AgentObservation) -> tuple[AgentAction, ...]:
     """Return legal actions using a handler dedicated to the interaction state."""
 
@@ -351,12 +358,12 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
     diagnostics_enabled = bool(context.debug and getattr(context, "debug_trace", False))
     binding_diagnostics = ()
     world_diagnostics = ()
-    if diagnostics_enabled and isinstance(observation.goal, (ActivateTrigger, ReachInteractionPosition)):
+    if diagnostics_enabled and isinstance(_goal_target(observation.goal), (ActivateTrigger, ReachInteractionPosition)):
         resolution = next(
             (
                 binding
                 for binding in observation.overworld.bindings
-                if binding.binding.trigger_id == observation.goal.trigger_id
+                if binding.binding.trigger_id == _goal_target(observation.goal).trigger_id
             ),
             None,
         )
@@ -447,17 +454,27 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
             binding_diagnostics=binding_diagnostics,
             world_diagnostics=world_diagnostics,
         )
-    if isinstance(observation.goal, ActivateTrigger):
+    goal_target = _goal_target(observation.goal)
+    if isinstance(goal_target, EngageTrainer):
+        trainer = next((obj for obj in observation.overworld.objects if obj.trainer_id == goal_target.trainer_id), None)
+        if trainer is not None and trainer.trainer_defeated is True:
+            return GoalEvaluation(
+                GoalStatus.COMPLETE,
+                plan=plan,
+                reason="engaged trainer is defeated",
+                world_diagnostics=(f"trainer_id={goal_target.trainer_id!r}", "trainer_defeated=True"),
+            )
+    if isinstance(goal_target, ActivateTrigger):
         resolution = next(
             (
                 binding
                 for binding in observation.overworld.bindings
-                if binding.binding.trigger_id == observation.goal.trigger_id
+                if binding.binding.trigger_id == goal_target.trigger_id
             ),
             None,
         )
         activated = observation.interaction.metadata.get("activated_trigger_ids", ())
-        if observation.goal.trigger_id in activated:
+        if goal_target.trigger_id in activated:
             return GoalEvaluation(
                 GoalStatus.COMPLETE,
                 plan=plan,
@@ -515,7 +532,7 @@ def _select_action_instrumented(observation: AgentObservation) -> ActionDecision
     if evaluation.status is GoalStatus.NOT_APPLICABLE:
         return ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE, reason=evaluation.reason), evaluation)
     if (
-        isinstance(observation.goal, ActivateTrigger)
+        isinstance(_goal_target(observation.goal), ActivateTrigger)
         and evaluation.status is GoalStatus.REACHABLE
         and evaluation.plan is not None
         and not evaluation.plan.actions
@@ -524,7 +541,7 @@ def _select_action_instrumented(observation: AgentObservation) -> ActionDecision
             (
                 binding
                 for binding in observation.overworld.bindings
-                if binding.binding.trigger_id == observation.goal.trigger_id
+                if binding.binding.trigger_id == _goal_target(observation.goal).trigger_id
             ),
             None,
         )
@@ -532,7 +549,7 @@ def _select_action_instrumented(observation: AgentObservation) -> ActionDecision
             resolution.runtime_match
             if resolution is not None
             else any(
-                trigger.trigger_id == observation.goal.trigger_id and trigger.activation_locations
+                trigger.trigger_id == _goal_target(observation.goal).trigger_id and trigger.activation_locations
                 for trigger in observation.overworld.triggers
             )
         )
@@ -544,7 +561,7 @@ def _select_action_instrumented(observation: AgentObservation) -> ActionDecision
         return ActionDecision(
             AgentAction(
                 AgentActionType.INTERACT,
-                option=observation.goal.trigger_id,
+                option=_goal_target(observation.goal).trigger_id,
                 reason="goal activation position reached",
             ),
             evaluation,
@@ -706,7 +723,17 @@ class AgentActionExecutor:
         elif action.action_type in (AgentActionType.MOVE, AgentActionType.NAVIGATE_TOWARD_GOAL):
             if action.direction is None:
                 return ActionResult(ActionResultType.UNSUPPORTED, action, "movement direction is missing")
+            press_direction = getattr(context.emulator, "press_direction", None)
             press_button_fresh = getattr(type(context.emulator), "press_button_fresh", None)
+            if callable(press_direction):
+                press_direction(
+                    action.direction.button_name,
+                    run=bool(action.navigation is not None and action.navigation.run),
+                    fresh=bool(
+                        action.navigation is not None and action.navigation.action_type is NavigationActionType.WARP
+                    ),
+                )
+                return ActionResult(ActionResultType.EXECUTED, action)
             if (
                 action.navigation is not None
                 and action.navigation.action_type is NavigationActionType.WARP
@@ -806,10 +833,25 @@ class AgentControlLoop:
         if observation.overworld is None or self._cached_action_index >= len(self._cached_actions):
             return ()
         world = observation.overworld
+        trainer_avoidance_enabled = (
+            getattr(getattr(self._goal, "constraints", None), "trainer_mode", None) is not None
+            and getattr(self._goal.constraints.trainer_mode, "name", None) == "AVOID"
+        )
+        engagement_trainer_id = self._goal.trainer_id if isinstance(self._goal, EngageTrainer) else None
         checkpoints = {
             location
             for trigger in world.triggers
-            for locations in (trigger.locations, trigger.activation_locations, trigger.navigation_locations)
+            for locations in (
+                trigger.locations,
+                trigger.activation_locations,
+                trigger.navigation_locations,
+                *((trigger.hazard_locations,) if trainer_avoidance_enabled else ()),
+                *(
+                    (trigger.hazard_locations,)
+                    if engagement_trainer_id is not None and trigger.affordance_id == engagement_trainer_id
+                    else ()
+                ),
+            )
             for location in locations
         }
         # Treat the tiles occupied by, and immediately surrounding, runtime
@@ -933,9 +975,27 @@ class AgentControlLoop:
                     )
                 return False
             if avatar.facing_direction != action.direction.button_name:
-                context.emulator.press_button(action.direction.button_name)
+                if self._diagnostics_enabled():
+                    self._report(
+                        f"CACHED_ROUTE_DIRECTION_CORRECTION map={location[0]!r} "
+                        f"source={action.source!r} destination={action.destination!r} "
+                        f"observed_facing={avatar.facing_direction!r} "
+                        f"planned_direction={action.direction.name!r}"
+                    )
+                    press_direction = getattr(context.emulator, "press_direction", None)
+                    if callable(press_direction):
+                        press_direction(action.direction.button_name, run=bool(action.run))
+                    else:
+                        context.emulator.press_button(action.direction.button_name)
             else:
-                context.emulator.hold_button(action.direction.button_name)
+                if action.run:
+                    press_direction = getattr(context.emulator, "press_direction", None)
+                    if callable(press_direction):
+                        press_direction(action.direction.button_name, run=True)
+                    else:
+                        context.emulator.hold_button(action.direction.button_name)
+                else:
+                    context.emulator.hold_button(action.direction.button_name)
             fast_path_completed = True
             count("cached_route_fast_path_frames")
             # These counters intentionally remain zero on the fast path.  They
@@ -1228,9 +1288,11 @@ class AgentControlLoop:
 
         if self._cached_action_index >= len(self._cached_actions):
             if self._cached_evaluation.plan is not None and location == self._cached_evaluation.plan.destination:
-                if isinstance(self._goal, (ActivateTrigger, ReachInteractionPosition)):
+                if isinstance(_goal_target(self._goal), (ActivateTrigger, ReachInteractionPosition)):
                     world = NavigationWorld.from_overworld(observation.overworld)
-                    if not GoalAwareNavigator(world).satisfies(location, observation.overworld.facing, self._goal):
+                    if not GoalAwareNavigator(world).satisfies(
+                        location, observation.overworld.facing, _goal_target(self._goal)
+                    ):
                         # A plan may have reached the source tile without the
                         # final turn being accepted by the emulator. Never
                         # issue A on geometric adjacency alone.
@@ -1240,7 +1302,7 @@ class AgentControlLoop:
                         (
                             binding
                             for binding in observation.overworld.bindings
-                            if binding.binding.trigger_id == self._goal.trigger_id
+                            if binding.binding.trigger_id == _goal_target(self._goal).trigger_id
                         ),
                         None,
                     )
@@ -1248,15 +1310,15 @@ class AgentControlLoop:
                         resolution.runtime_match
                         if resolution is not None
                         else any(
-                            trigger.trigger_id == self._goal.trigger_id and trigger.activation_locations
+                            trigger.trigger_id == _goal_target(self._goal).trigger_id and trigger.activation_locations
                             for trigger in observation.overworld.triggers
                         )
                     )
-                    if isinstance(self._goal, ReachInteractionPosition):
+                    if isinstance(_goal_target(self._goal), ReachInteractionPosition):
                         return ActionDecision(
                             AgentAction(
                                 AgentActionType.INTERACT,
-                                option=self._goal.trigger_id,
+                                option=_goal_target(self._goal).trigger_id,
                                 reason="cached interaction source state reached",
                             ),
                             self._cached_evaluation,
@@ -1272,7 +1334,7 @@ class AgentControlLoop:
                     return ActionDecision(
                         AgentAction(
                             AgentActionType.INTERACT,
-                            option=self._goal.trigger_id,
+                            option=_goal_target(self._goal).trigger_id,
                             reason="cached goal activation position reached",
                         ),
                         self._cached_evaluation,
@@ -1394,8 +1456,8 @@ class AgentControlLoop:
         # not run the reached-position decision again and emit another input.
         if (
             self._started_interaction_id is not None
-            and isinstance(self._goal, (ActivateTrigger, ReachInteractionPosition))
-            and self._goal.trigger_id == self._started_interaction_id
+            and isinstance(_goal_target(self._goal), (ActivateTrigger, ReachInteractionPosition))
+            and _goal_target(self._goal).trigger_id == self._started_interaction_id
             and observation.interaction.script_active
         ):
             wait_action = AgentAction(
@@ -1697,6 +1759,30 @@ class AgentControlLoop:
                     f"ROUTE_PLAN_CREATED route_id={self._route_plan.route_id} "
                     f"actions={len(self._route_plan.actions)} checkpoints={len(self._route_plan.checkpoints)}"
                 )
+                if self._diagnostics_enabled():
+                    self._report(
+                        "ROUTE_PLAN_ACTIONS "
+                        + repr(
+                            tuple(
+                                (
+                                    index,
+                                    action.action_type.name,
+                                    action.source,
+                                    action.destination,
+                                    action.direction.name,
+                                    (
+                                        observation.overworld.tile_at(action.destination[1]).has_encounters
+                                        if observation.overworld is not None
+                                        and action.destination is not None
+                                        and action.destination[0] == observation.overworld.map_id
+                                        and observation.overworld.tile_at(action.destination[1]) is not None
+                                        else None
+                                    ),
+                                )
+                                for index, action in enumerate(self._route_plan.actions)
+                            )
+                        )
+                    )
                 self._cached_goal = self._goal
                 self._cached_world_signature = self._world_signature(observation)
                 count("navigation_replans")

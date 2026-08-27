@@ -9,6 +9,7 @@ from typing import Mapping
 
 from modules.goals import (
     ActivateTrigger,
+    EngageTrainer,
     Goal,
     NavigationGoal,
     ReachInteractionPosition,
@@ -108,6 +109,7 @@ class NavigationAction:
     # can still retain an observed transition until a map change confirms it.
     destination: Location | None
     transition_kind: str | None = None
+    run: bool = False
 
 
 @dataclass(frozen=True)
@@ -142,7 +144,18 @@ def _semantic_plan_cache_key(world: "NavigationWorld", start: Location, goal: Na
         sorted((t.kind, t.entry, t.destination, t.required_facing) for t in (world.transitions or world.warps))
     )
     blocked = tuple(sorted(location[1] for location, tile in world.tiles.items() if tile.blocked))
-    return (start, world.facing, repr(target), goal.encounter_mode.value, transitions, blocked)
+    hazards = tuple(sorted(location for trigger in world.triggers for location in trigger.hazard_locations))
+    return (
+        start,
+        world.facing,
+        world.running_shoes,
+        repr(target),
+        goal.encounter_mode.value,
+        goal.encounter_penalty,
+        transitions,
+        blocked,
+        hazards,
+    )
 
 
 def canonical_transition_identity(source: Location, kind: str | None = None) -> tuple:
@@ -221,6 +234,7 @@ class NavigableTile:
     allowed_directions: frozenset[Direction] | None = None
     traversal_cost: int = 1
     has_encounters: bool = False
+    cannot_run: bool = False
 
 
 class _DynamicTileMapping(Mapping[Location, NavigableTile]):
@@ -232,7 +246,9 @@ class _DynamicTileMapping(Mapping[Location, NavigableTile]):
         tile = self._static_tiles[location]
         if location[1] not in self._blocked or tile.blocked:
             return tile
-        return NavigableTile(tile.location, True, tile.allowed_directions, tile.traversal_cost, tile.has_encounters)
+        return NavigableTile(
+            tile.location, True, tile.allowed_directions, tile.traversal_cost, tile.has_encounters, tile.cannot_run
+        )
 
     def __iter__(self):
         return iter(self._static_tiles)
@@ -308,7 +324,12 @@ def prewarm_navigation_tiles(map_id, tiles: tuple) -> None:
             tiles,
             {
                 tile.location: NavigableTile(
-                    tile.location, tile.blocked, tile.walkable_neighbors, tile.traversal_cost, tile.has_encounters
+                    tile.location,
+                    tile.blocked,
+                    tile.walkable_neighbors,
+                    tile.traversal_cost,
+                    tile.has_encounters,
+                    tile.cannot_run,
                 )
                 for tile in tiles
             },
@@ -323,6 +344,7 @@ class NavigationWorld:
     bindings: tuple[BindingResolution, ...] = ()
     facing: Direction | None = None
     transitions: tuple[WorldTransition, ...] = ()
+    running_shoes: bool = False
     _transitions_by_source: dict[Location, tuple[WorldTransition, ...]] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -362,6 +384,7 @@ class NavigationWorld:
             transitions=tuple(
                 effective_transition(t) for t in (getattr(observation, "transitions", ()) or observation.warps)
             ),
+            running_shoes=observation.running_shoes,
         )
 
     def neighbors(self, location: Location) -> tuple[tuple[Direction, Location, bool], ...]:
@@ -410,6 +433,7 @@ class NavigationPlan:
     destination: Location | None
     metrics: "NavigationMetrics | None" = None
     candidate_metrics: tuple["NavigationMetrics", ...] = ()
+    forced_trainer_exposure: bool = False
 
 
 @dataclass(frozen=True)
@@ -640,6 +664,18 @@ def navigation_candidate_key(metrics: NavigationMetrics, encounter_mode: Encount
         metrics.turns_on_non_encounter_terrain,
         candidate_id,
     )
+
+
+def encounter_cost_components(mode: EncounterMode, penalty: int = 8) -> tuple[int, int]:
+    """Return (lexicographic exposure cost, weighted cost) per opportunity."""
+    if mode in (EncounterMode.AVOID, EncounterMode.NORMAL):
+        return 1, 1
+    if mode is EncounterMode.MOSTLY_AVOID:
+        return 0, max(0, penalty)
+    # IGNORE and SEEK intentionally do not penalize opportunities. SEEK is a
+    # campaign objective signal; selecting the encounter area remains the
+    # responsibility of the higher-level objective planner.
+    return 0, 0
 
 
 def goal_target_map(world: NavigationWorld, goal: Goal) -> MapId | None:
@@ -960,6 +996,7 @@ def plan_with_world_navigation(
         start,
         tuple(dict.fromkeys(shared_targets)),
         encounter_mode=navigation_goal.encounter_mode,
+        encounter_penalty=navigation_goal.encounter_penalty,
         algorithm=algorithm,
         target_groups=shared_target_groups,
     )
@@ -1356,6 +1393,14 @@ def navigation_diagnostics(world: NavigationWorld, start: Location, goal: Goal) 
     matching_triggers = ()
     target_positions: tuple[Location, ...] = ()
     target_maps: tuple[MapId, ...] = ()
+    trainer_diagnostics: tuple[str, ...] = ()
+    if isinstance(target, EngageTrainer):
+        matching_triggers = tuple(trigger for trigger in world.triggers if trigger.affordance_id == target.trainer_id)
+        trainer_diagnostics = (
+            f"trainer_mode={getattr(getattr(goal, 'constraints', None), 'trainer_mode', None)!r}",
+            f"selected_trainer={target.trainer_id!r}",
+            f"trainer_hazards={sum(len(trigger.hazard_locations) for trigger in matching_triggers)}",
+        )
     if isinstance(target, ActivateTrigger):
         matching_triggers = tuple(trigger for trigger in world.triggers if trigger.trigger_id == target.trigger_id)
         target_positions = tuple(
@@ -1442,7 +1487,7 @@ def navigation_diagnostics(world: NavigationWorld, start: Location, goal: Goal) 
             )
         )
     )
-    return (
+    return trainer_diagnostics + (
         f"current_map={start[0]!r}",
         f"target_map={target_maps!r}",
         f"target_positions={target_positions!r}",
@@ -1461,6 +1506,16 @@ class GoalAwareNavigator:
     @traced("individual_pathfinding")
     def plan(self, start: Location, goal: NavigationGoal | Goal, *, algorithm: str = "dijkstra") -> NavigationPlan:
         navigation_goal = goal if isinstance(goal, NavigationGoal) else NavigationGoal(goal)
+        if context.debug and getattr(context, "debug_trace", False):
+            diagnostic_print(
+                lambda: (
+                    "NAVIGATION_ENCOUNTER_POLICY: "
+                    f"mode={navigation_goal.encounter_mode.name} "
+                    f"penalty={navigation_goal.encounter_penalty} start={start!r} "
+                    f"target={navigation_goal.target!r}"
+                ),
+                trace=True,
+            )
         # Keep ordinary location routing compatible with the established
         # movement pipeline.  Orientation becomes a search dimension when the
         # goal's semantics actually depend on it (NPC/tile interaction or a
@@ -1472,7 +1527,9 @@ class GoalAwareNavigator:
         # to determine whether the goal is satisfied.
         target = navigation_goal.target
         orientation_required = self.world.facing is not None
-        emit_orientation_actions = isinstance(target, (ActivateTrigger, ReachInteractionPosition, ReachWarp))
+        emit_orientation_actions = isinstance(
+            target, (ActivateTrigger, ReachInteractionPosition, EngageTrainer, ReachWarp)
+        )
         executable_orientation = orientation_required
         if algorithm not in ("dijkstra", "astar"):
             raise ValueError(f"Unknown navigation search algorithm: {algorithm!r}")
@@ -1586,12 +1643,10 @@ class GoalAwareNavigator:
                         continue
                     turn_on_encounter = int(self.world.tiles[current].has_encounters)
                     turn_on_non_encounter = int(not turn_on_encounter)
-                    opportunity_cost = (
-                        0
-                        if navigation_goal.encounter_mode is EncounterMode.SEEK
-                        else NORMAL_ENCOUNTER_OPPORTUNITY_WEIGHT
+                    exposure_cost, opportunity_cost = encounter_cost_components(
+                        navigation_goal.encounter_mode, navigation_goal.encounter_penalty
                     )
-                    turn_cost = (turn_on_encounter, 1, 0, 0, turn_on_encounter, turn_on_non_encounter)
+                    turn_cost = (turn_on_encounter * exposure_cost, 1, 0, 0, turn_on_encounter, turn_on_non_encounter)
                     next_state = (current, turn_direction)
                     new_cost = tuple(current_cost[i] + turn_cost[i] for i in range(6))
                     if new_cost < costs.get(next_state, (float("inf"),) * 6):
@@ -1612,8 +1667,6 @@ class GoalAwareNavigator:
                     # cost. This prevents free transition cycles while
                     # preserving the existing lexicographic priorities.
                     step_cost = 1
-                elif navigation_goal.encounter_mode is EncounterMode.SEEK:
-                    step_cost = 1
                 else:
                     # Encounter terrain is charged through the explicit
                     # opportunity policy below, rather than double-counted
@@ -1633,20 +1686,15 @@ class GoalAwareNavigator:
                 # reaches T_TILE_CENTER. A stationary TURN reaches that
                 # state too, even though it does not set tookStep.
                 encounter = int(not is_warp and tile.has_encounters)
-                if navigation_goal.encounter_mode is EncounterMode.SEEK:
-                    # Encounter-seeking is intentionally only an architectural
-                    # hook in this milestone; it must not inherit normal-mode
-                    # avoidance semantics.
-                    encounter = 0
                 encounter_terrain_move = encounter
                 turn_on_encounter = int(turn_cost and self.world.tiles[current].has_encounters)
                 turn_on_non_encounter = int(turn_cost and not self.world.tiles[current].has_encounters)
-                opportunity_cost = (
-                    0 if navigation_goal.encounter_mode is EncounterMode.SEEK else NORMAL_ENCOUNTER_OPPORTUNITY_WEIGHT
+                exposure_cost, opportunity_cost = encounter_cost_components(
+                    navigation_goal.encounter_mode, navigation_goal.encounter_penalty
                 )
                 turn_opportunity = turn_cost * int(self.world.tiles[current].has_encounters)
                 new_cost = (
-                    current_cost[0] + encounter + turn_opportunity,
+                    current_cost[0] + exposure_cost * (encounter + turn_opportunity),
                     current_cost[1]
                     + NORMAL_MOVEMENT_COST_SCALE * (step_cost + turn_cost)
                     + opportunity_cost * (encounter + turn_opportunity),
@@ -1686,6 +1734,16 @@ class GoalAwareNavigator:
             return NavigationPlan(
                 selected_actions, selected_destination, selected_metrics, tuple(item[0] for item in complete_candidates)
             )
+        # Trainer avoidance is a preference, not a reason to strand the
+        # controller. If every route crosses a sight line, retry once with
+        # trainer hazards disabled and make that decision visible to callers.
+        trainer_mode = getattr(navigation_goal.constraints, "trainer_mode", None)
+        if trainer_mode is not None and trainer_mode.name == "AVOID":
+            fallback_constraints = replace(navigation_goal.constraints, trainer_mode=type(trainer_mode).IGNORE)
+            fallback_goal = replace(navigation_goal, constraints=fallback_constraints)
+            fallback = self.plan(start, fallback_goal, algorithm=algorithm)
+            record(False)
+            return replace(fallback, forced_trainer_exposure=True)
         record(False)
         raise NavigationError(f"No legal route from {start} to {navigation_goal.target!r}")
 
@@ -1695,6 +1753,7 @@ class GoalAwareNavigator:
         targets: tuple[Location, ...],
         *,
         encounter_mode: EncounterMode = EncounterMode.NORMAL,
+        encounter_penalty: int = 8,
         algorithm: str = "dijkstra",
         target_groups: tuple[tuple[Location, ...], ...] | None = None,
     ) -> dict[Location, NavigationPlan]:
@@ -1767,10 +1826,6 @@ class GoalAwareNavigator:
                 if is_warp:
                     step_cost = 1
                     encounter = 0
-                elif encounter_mode is EncounterMode.SEEK:
-                    step_cost = 1
-                    tile = self.world.tiles[neighbour]
-                    encounter = 0
                 else:
                     tile = self.world.tiles[neighbour]
                     step_cost = tile.traversal_cost - int(tile.has_encounters)
@@ -1779,9 +1834,10 @@ class GoalAwareNavigator:
                 turn_on_encounter = int(turn_cost and self.world.tiles[current].has_encounters)
                 turn_on_non_encounter = int(turn_cost and not self.world.tiles[current].has_encounters)
                 opportunity = encounter + turn_on_encounter
+                exposure_cost, opportunity_cost = encounter_cost_components(encounter_mode, encounter_penalty)
                 new_cost = (
-                    current_cost[0] + opportunity,
-                    current_cost[1] + step_cost + turn_cost + opportunity,
+                    current_cost[0] + exposure_cost * opportunity,
+                    current_cost[1] + step_cost + turn_cost + opportunity_cost * opportunity,
                     current_cost[2] + int(not is_warp),
                     current_cost[3] + encounter,
                     current_cost[4] + turn_on_encounter,
@@ -1830,10 +1886,19 @@ class GoalAwareNavigator:
         positions: list[Location] = []
         if isinstance(target, ReachLocation):
             positions = [target.location]
-        elif isinstance(target, (ActivateTrigger, ReachInteractionPosition)):
+        elif isinstance(target, (ActivateTrigger, ReachInteractionPosition, EngageTrainer)):
             for trigger in self.world.triggers:
-                if trigger.trigger_id == target.trigger_id:
-                    positions.extend(trigger.activation_locations or trigger.navigation_locations)
+                matches = (
+                    trigger.affordance_id == target.trainer_id
+                    if isinstance(target, EngageTrainer)
+                    else trigger.trigger_id == target.trigger_id
+                )
+                if matches:
+                    positions.extend(
+                        trigger.hazard_locations
+                        if isinstance(target, EngageTrainer)
+                        else (trigger.activation_locations or trigger.navigation_locations)
+                    )
         if not positions:
             return (0, 0, 0, 0, 0, 0)
         distance = (
@@ -1852,6 +1917,16 @@ class GoalAwareNavigator:
             return target.location == location if target.location is not None else location[0] == target.target_map
         if isinstance(target, ReachLocation):
             return location == target.location
+        if isinstance(target, EngageTrainer):
+            return any(
+                trigger.affordance_id == target.trainer_id
+                and (
+                    location in trigger.hazard_locations
+                    if trigger.hazard_locations
+                    else self._activation_matches(trigger, location, facing)
+                )
+                for trigger in self.world.triggers
+            )
         if isinstance(target, ActivateTrigger):
             return any(
                 target.trigger_id == trigger.trigger_id and self._activation_matches(trigger, location, facing)
@@ -1970,6 +2045,10 @@ class GoalAwareNavigator:
     def _is_undesirable(self, location: Location, constraints) -> bool:
         if location in constraints.avoid_locations:
             return True
+        trainer_mode = getattr(constraints, "trainer_mode", None)
+        if trainer_mode is not None and trainer_mode.name == "AVOID":
+            if any(location in trigger.hazard_locations for trigger in self.world.triggers):
+                return True
         return any(
             location in trigger.locations and trigger.trigger_id in constraints.avoid_trigger_ids
             for trigger in self.world.triggers
@@ -2033,6 +2112,12 @@ class GoalAwareNavigator:
                     source,
                     destination_location,
                     transition_kind=transition_kind,
+                    run=(
+                        not is_warp
+                        and self.world.running_shoes
+                        and (destination_tile := self.world.tiles.get(destination_location)) is not None
+                        and not destination_tile.cannot_run
+                    ),
                 )
             )
             current = previous
@@ -2071,8 +2156,6 @@ class GoalAwareNavigator:
                             turns_on_non_encounter += 1
                     facing = action.direction
         encounter_opportunities = encounter_terrain_moves + turns_on_encounter
-        if encounter_mode is EncounterMode.SEEK:
-            encounter_opportunities = 0
         ordinary_movement_steps = movement_actions - encounter_terrain_moves
         final_facing = self.world.facing
         total_route_cost = sum(
@@ -2087,8 +2170,8 @@ class GoalAwareNavigator:
         )
         total_route_cost += sum(1 for action in actions if action.action_type is NavigationActionType.WARP)
         total_route_cost += turns_on_encounter + turns_on_non_encounter
-        if encounter_mode is EncounterMode.NORMAL:
-            total_route_cost += encounter_opportunities * NORMAL_ENCOUNTER_OPPORTUNITY_WEIGHT
+        _, opportunity_cost = encounter_cost_components(encounter_mode)
+        total_route_cost += encounter_opportunities * opportunity_cost
         for action in actions:
             if action.action_type in (NavigationActionType.MOVE, NavigationActionType.TURN, NavigationActionType.WARP):
                 final_facing = action.direction
