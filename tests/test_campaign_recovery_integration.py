@@ -154,6 +154,39 @@ class CampaignRecoveryIntegrationTests(unittest.TestCase):
         controller.step()
         self.assertEqual(starts, ["campaign"])
 
+    def test_deferred_readiness_is_forced_again_before_tactical_resume(self):
+        objective = CampaignObjective("reach_generic", "generic", (), SimpleNamespace(evaluate=lambda _: None))
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "ready")
+        execution = CampaignExecutionResult(objective, CampaignExecutionStatus.READY, "ready", tactical_goal=Goal())
+        starts = []
+
+        class Provider:
+            def __init__(self):
+                self.calls = 0
+                self.invalidations = []
+
+            def observe(self, *_):
+                self.calls += 1
+                return readiness(ReadinessDecision.UNKNOWN if self.calls == 1 else ReadinessDecision.RECOVER)
+
+            def invalidate(self, reason):
+                self.invalidations.append(reason)
+
+        provider = Provider()
+        controller = CampaignController(
+            lambda: object(),
+            selector=lambda _: selection,
+            adapter=lambda _: execution,
+            tactical_loop_factory=lambda _: iter((starts.append("campaign"),)),
+            readiness_provider=provider.observe,
+            recovery_factory=lambda _: iter((starts.append("recovery"),)),
+        )
+        controller.step()
+        self.assertEqual(starts, [])
+        controller.step()
+        self.assertEqual(starts, ["recovery"])
+        self.assertIn("deferred_readiness_recheck", provider.invalidations)
+
     def test_critical_unknown_game_state_does_not_mount_recovery(self):
         objective = CampaignObjective("reach_generic", "generic", (), SimpleNamespace(evaluate=lambda _: None))
         selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "ready")

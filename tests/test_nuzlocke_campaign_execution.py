@@ -289,6 +289,7 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
             AgentActionType,
             AgentControlLoop,
         )
+        from modules.navigation import NavigationError
 
         loop = AgentControlLoop(lambda: None)
         terminal = ActionResult(
@@ -297,7 +298,7 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
             "warp activation failed",
         )
         with patch.object(loop, "step", return_value=(None, None, terminal)):
-            with self.assertRaises(StopIteration):
+            with self.assertRaises(NavigationError):
                 next(loop.run())
 
 

@@ -97,6 +97,10 @@ class RouteRecovery:
     # during a map transition), distinct from a known route with no center.
     observation_available: bool = True
     observation_error: str | None = None
+    # A ROM may provide full-party healing without a Pokémon Center (for
+    # example the player's mother or a rest stop).  Keep the historical
+    # Center fields for compatibility, but expose the broader capability.
+    healing_source_available: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +137,19 @@ def assess_campaign_resources(
         return ResourceDecision.CONTINUE
     if not snapshot.usable_party:
         return ResourceDecision.RECOVER_AT_CENTER if route.center_available else ResourceDecision.PRESERVE_RESOURCES
+
+    # A recover-before-completion objective must use an already-known Center
+    # opportunity before the important battle, even when the party is still
+    # above the ordinary minimum-health threshold.  Waiting until HP becomes
+    # critical defeats the purpose of the route-level recovery affordance.
+    if (
+        objective.recover_before_completion
+        and not wild_encounter
+        and route.center_available
+        and route.center_on_route
+        and snapshot.total_missing_hp > 0
+    ):
+        return ResourceDecision.RECOVER_AT_CENTER
 
     healthy = snapshot.worst_hp_ratio >= objective.minimum_hp_ratio
     # A healthy party may spend some HP before a planned recovery point. The

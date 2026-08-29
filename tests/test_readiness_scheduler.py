@@ -74,6 +74,7 @@ class ReadinessSchedulerTests(unittest.TestCase):
             overworld_availability=Availability.KNOWN,
             resource_availability=Availability.UNKNOWN,
             party_availability=Availability.KNOWN,
+            game_state="OVERWORLD",
         )
         result = CampaignReadinessPolicy().evaluate(readiness)
         self.assertEqual(result.decision, ReadinessDecision.UNKNOWN)

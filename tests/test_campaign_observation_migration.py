@@ -9,6 +9,7 @@ from modules.nuzlocke.emerald_capabilities import (
     observation_driven_emerald_campaign,
     choose_emerald_observation_action,
 )
+from modules.nuzlocke.emerald_dialogue import advance_dialogue
 from modules.nuzlocke.emerald_observation import EmeraldObservation
 
 
@@ -98,6 +99,17 @@ class CampaignObservationMigrationTests(unittest.TestCase):
             next(execution)
         self.assertEqual(emulator.press_button.call_count, 2)
         self.assertEqual(mock_observation.call_count, 2)
+
+    def test_actionable_dialogue_requests_one_fresh_a_edge(self):
+        emulator = SimpleNamespace(press_button=Mock(), press_button_fresh=Mock())
+        fake_context = SimpleNamespace(emulator=emulator, config=SimpleNamespace(), debug=False)
+        with (
+            patch("modules.nuzlocke.emerald_dialogue.context", fake_context),
+            patch("modules.nuzlocke.emerald_dialogue.observe_dialogue", return_value=(True, True)),
+        ):
+            next(advance_dialogue(actionable=True))
+        emulator.press_button_fresh.assert_called_once_with("A")
+        emulator.press_button.assert_not_called()
 
 
 if __name__ == "__main__":

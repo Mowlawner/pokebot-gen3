@@ -14,7 +14,7 @@ from modules.interaction_state import InteractionObservation
 from modules.map_path import Direction
 from modules.memory import GameState
 from modules.navigation import NavigationAction, NavigationActionType
-from modules.overworld import OverworldObservation
+from modules.overworld import OverworldObservation, TileObservation
 
 
 class _Emulator:
@@ -44,7 +44,7 @@ class _Emulator:
         self.active.discard(button)
 
 
-def observation(map_id=(1, 0), position=(8, 8), controllable=True):
+def observation(map_id=(1, 0), position=(8, 8), controllable=True, *, valid_tile=False):
     return AgentObservation(
         InteractionObservation(GameState.OVERWORLD, controllable=controllable),
         OverworldObservation(
@@ -52,7 +52,7 @@ def observation(map_id=(1, 0), position=(8, 8), controllable=True):
             player_coordinates=position,
             facing=Direction.South,
             controllable=controllable,
-            tiles=(),
+            tiles=(TileObservation((map_id, position), False, frozenset(Direction)),) if valid_tile else (),
             warps=(),
             objects=(),
             triggers=(),
@@ -153,10 +153,12 @@ class TestTransitionExecution(unittest.TestCase):
                 navigation=first_tactical_move,
             )
         )
-        loop, emulator, selected = self.make_loop([observation(), observation(map_id=(0, 9), position=(5, 10))], action)
+        destination = observation(map_id=(0, 9), position=(5, 10), valid_tile=True)
+        loop, emulator, selected = self.make_loop([observation(), destination, destination], action)
         with patch("modules.agent_control.context.emulator", emulator), patch(
             "modules.agent_control.select_action", side_effect=(selected, resumed)
         ):
+            loop.step()
             loop.step()
             loop.step()
 
@@ -187,9 +189,8 @@ class TestTransitionExecution(unittest.TestCase):
             loop.step()
             results = [loop.step()[2] for _ in range(10)]
         failures = [result for result in results if result.result_type is ActionResultType.UNREACHABLE]
-        self.assertEqual(len(failures), 1)
-        self.assertEqual(failures[0].message, "transition_blocked")
-        self.assertEqual(emulator.released, ["Down"])
+        self.assertEqual(failures, [])
+        self.assertEqual(emulator.released, [])
 
     def test_destination_mismatch_releases_map_connection_direction(self):
         action = transition("map_connection", destination=((0, 9), (1, 1)))

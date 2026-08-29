@@ -139,6 +139,38 @@ class PathMap:
                         for direction in passable_directions.split("/"):
                             dir = Direction[direction]
                             accessible_from_direction[dir] = True
+                        if tile.tile_type.startswith("Jump "):
+                            # A ledge is entered with one directional input
+                            # and the field engine carries the avatar to the
+                            # first non-ledge tile in that direction.  Model
+                            # that as one navigation edge so intermediate
+                            # ledge tiles cannot be mistaken for ordinary
+                            # walkable/encounter terrain.
+                            forced_movement_to = {}
+                            for direction in passable_directions.split("/"):
+                                movement_direction = Direction[direction]
+                                x, y = tile.local_position
+                                steps = 0
+                                while True:
+                                    if movement_direction is Direction.North:
+                                        y -= 1
+                                    elif movement_direction is Direction.East:
+                                        x += 1
+                                    elif movement_direction is Direction.South:
+                                        y += 1
+                                    else:
+                                        x -= 1
+                                    if not (0 <= x < tile.map_size[0] and 0 <= y < tile.map_size[1]):
+                                        break
+                                    next_tile = all_tiles[tile_index(x, y)]
+                                    steps += 1
+                                    if not next_tile.tile_type.startswith("Jump "):
+                                        break
+                                forced_movement_to[movement_direction] = (
+                                    tile.map_group_and_number,
+                                    (x, y),
+                                    steps,
+                                )
                 elif tile.tile_type.startswith("Impassable "):
                     impassable_directions = tile.tile_type[11:].replace(" and ", "/").split("/")
                     for direction in impassable_directions:

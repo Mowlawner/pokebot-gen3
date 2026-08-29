@@ -3,7 +3,7 @@
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from modules.context import context
-from modules.map import get_map_metadata, get_map_objects
+from modules.map import observe_live_map_identity, get_map_metadata, get_map_objects
 from modules.game import get_event_var_name
 from modules.memory import get_event_flag, get_event_var_by_number, get_game_state_symbol
 from modules.tasks import task_is_active
@@ -13,6 +13,7 @@ from modules.trigger_bindings import BindingResolution, TRIGGER_BINDINGS, resolv
 from modules.console import profile_print
 from modules.profiler import count, enabled, format_snapshot, now, timing
 from modules.stutter_trace import traced
+from modules.state_cache import state_cache
 
 MapId = tuple[int, int]
 Coordinate = tuple[int, int]
@@ -31,7 +32,10 @@ EMERALD_MB_COUNTER = 0x80
 
 def _running_shoes_received() -> bool:
     """Return the game-specific progression flag for running shoes."""
-    flag = "HIDE_PEWTER_CITY_RUNNING_SHOES_GUY" if context.rom.is_frlg else "RECEIVED_RUNNING_SHOES"
+    rom = getattr(context, "rom", None)
+    if rom is None:
+        return False
+    flag = "HIDE_PEWTER_CITY_RUNNING_SHOES_GUY" if rom.is_frlg else "RECEIVED_RUNNING_SHOES"
     try:
         return get_event_flag(flag)
     except (KeyError, RuntimeError, TypeError, ValueError):
@@ -281,6 +285,9 @@ class TileObservation:
     metatile_behavior: int | None = None
     elevation: int | None = None
     cannot_run: bool = False
+    # ROM forced movement (ledges, ice, currents): direction ->
+    # (destination location, additional forced steps).
+    forced_movement_to: dict[Direction, tuple[Location, int]] | None = None
 
 
 @dataclass(frozen=True)
@@ -300,6 +307,9 @@ class OverworldObservation:
     transition_in_progress: bool = False
     transition_signals: frozenset[str] = frozenset()
     running_shoes: bool = False
+    map_identity_source: str = "save_block"
+    save_block_map_id: MapId | None = None
+    live_map_candidates: tuple[MapId, ...] = ()
 
     def tile_at(self, coordinates: Coordinate) -> TileObservation | None:
         tile = next((tile for tile in self.tiles if tile.location[1] == coordinates), None)
@@ -494,6 +504,13 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
                     metatile_behavior=getattr(tile, "metatile_behavior", None),
                     elevation=getattr(tile, "elevation", None),
                     cannot_run=getattr(tile, "cannot_run", False),
+                    forced_movement_to=(
+                        {
+                            direction: ((forced[0], forced[1]), forced[2])
+                            for direction, forced in (getattr(tile, "forced_movement_to", None) or {}).items()
+                        }
+                        or None
+                    ),
                 )
             )
         static_triggers: list[TriggerObservation] = []
@@ -606,6 +623,11 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
     trace = getattr(context, "stutter_trace", None)
     profile_start = now()
     stage_start = now()
+    # Map/coordinate observations are the authoritative boundary for
+    # navigation.  Do not allow the per-frame avatar cache to hide a warp
+    # when the emulator callback and the bot loop have crossed different
+    # frame boundaries.
+    state_cache.player_avatar.invalidate()
     avatar = get_player_avatar()
     if avatar is None:
         reason = "player_avatar_unavailable"
@@ -614,8 +636,26 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
             trace.mark("overworld_observation_reason", reason)
         return OverworldObservationResult(OverworldObservationStatus.UNAVAILABLE, reason=reason)
     try:
-        map_id = avatar.map_group_and_number
+        save_block_map_id = avatar.map_group_and_number
+        # The active map header changes with the rendered map.  Prefer it
+        # when it is available because SaveBlock1 can still name the outdoor
+        # door tile for a few (and, on some warp paths, many) frames after a
+        # Pokémon Center interior has become visible.
+        live_map = observe_live_map_identity()
+        map_id = live_map.map_id or save_block_map_id
         player_coordinates = avatar.local_coordinates
+        if trace is not None:
+            # Preserve the evidence behind a map choice.  In particular, a
+            # save-block fallback must remain distinguishable from a resolved
+            # live header in a recovery/warp trace.
+            trace.mark("overworld_save_block_map_id", save_block_map_id)
+            trace.mark("overworld_live_map_id", live_map.map_id)
+            trace.mark("overworld_live_map_source", live_map.source)
+            trace.mark("overworld_live_map_candidates", live_map.candidates)
+            trace.mark(
+                "overworld_live_map_header_fingerprint",
+                live_map.header_fingerprint[:32] if live_map.header_fingerprint is not None else None,
+            )
         if (
             not isinstance(map_id, tuple)
             or len(map_id) != 2
@@ -894,4 +934,7 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
         transition_in_progress=bool(transition_signals),
         transition_signals=frozenset(transition_signals),
         running_shoes=_running_shoes_received(),
+        map_identity_source=live_map.source if live_map.map_id is not None else "save_block",
+        save_block_map_id=save_block_map_id,
+        live_map_candidates=live_map.candidates,
     )

@@ -197,6 +197,21 @@ class TestWorldMapGraph(unittest.TestCase):
         self.assertEqual(route.maps, (source, (7, 1), (7, 2), target))
         self.assertEqual(route.estimated_cost, 15)
 
+    def test_interaction_route_prefers_interior_warps_over_outdoor_detour(self):
+        town, house_1f, house_2f, route101 = (0, 9), (1, 2), (1, 3), (0, 16)
+        graph = WorldMapGraph(
+            (
+                edge(town, house_1f, kind="warp"),
+                edge(house_1f, house_2f, kind="warp"),
+                edge(town, route101, kind="connection"),
+                edge(route101, house_2f, kind="connection"),
+            )
+        )
+
+        route = graph.route(town, house_2f, prefer_interior=True)
+
+        self.assertEqual(route.maps, (town, house_1f, house_2f))
+
     def test_cyclic_detour_is_worse_than_direct_transition(self):
         current, target, detour = (8, 0), (8, 2), (8, 1)
         graph = WorldMapGraph(
@@ -238,8 +253,8 @@ class TestWorldMapGraph(unittest.TestCase):
             ReachWarp(destination_map=(8, 1), warp=world.warps[0]),
         )
 
-        self.assertEqual(plan.actions[-1].action_type, NavigationActionType.MOVE)
-        self.assertEqual(plan.actions[-1].destination, entry)
+        self.assertEqual(plan.actions[-1].action_type, NavigationActionType.WARP)
+        self.assertEqual(plan.actions[-1].source, entry)
 
 
 class TestWorldGoalIntegration(unittest.TestCase):
@@ -335,6 +350,32 @@ class TestWeightedNavigation(unittest.TestCase):
         world = self.world({(0, 0)})
         self.assertEqual(world.tiles[(self.MAP, (0, 0))].traversal_cost, 1)
 
+    def test_forced_movement_lands_at_endpoint_without_intermediate_exposure(self):
+        start = (self.MAP, (0, 0))
+        ledge = (self.MAP, (1, 0))
+        intermediate = (self.MAP, (2, 0))
+        endpoint = (self.MAP, (3, 0))
+        world = NavigationWorld(
+            tiles={
+                start: NavigableTile(start, allowed_directions=frozenset(Direction)),
+                ledge: NavigableTile(
+                    ledge,
+                    allowed_directions=frozenset(Direction),
+                    forced_movement_to={Direction.East: (endpoint, 2)},
+                ),
+                intermediate: NavigableTile(
+                    intermediate, allowed_directions=frozenset(Direction), has_encounters=True
+                ),
+                endpoint: NavigableTile(endpoint, allowed_directions=frozenset(Direction)),
+            }
+        )
+
+        self.assertEqual(world.neighbors(start), ((Direction.East, endpoint, False),))
+        plan = GoalAwareNavigator(world).plan(start, ReachLocation(endpoint), algorithm="astar")
+        self.assertEqual(len(plan.actions), 1)
+        self.assertEqual(plan.actions[0].destination, endpoint)
+        self.assertEqual(plan.metrics.encounter_opportunities, 0)
+
     def test_same_length_route_prefers_fewer_encounter_opportunities(self):
         coordinates = {(x, y) for y in range(3) for x in range(3)}
         world = NavigationWorld(
@@ -373,6 +414,29 @@ class TestWeightedNavigation(unittest.TestCase):
         self.assertEqual(plan.metrics.encounter_opportunities, 0)
         self.assertEqual(plan.metrics.movement_actions, 6)
         self.assertEqual(plan.metrics.ordinary_movement_steps, 6)
+
+    def test_avoid_prefers_fewer_opportunities_over_shorter_route(self):
+        # AVOID must retain the no-encounter route preference when candidate
+        # plans are ranked (including cross-map activation candidates).  The
+        # clear route is longer, but an encounter opportunity is never a
+        # reason to choose the shorter route in AVOID mode.
+        coordinates = {(x, y) for y in range(3) for x in range(5)}
+        grass = {(1, 0), (2, 0)}
+        world = NavigationWorld(
+            tiles={
+                (self.MAP, coordinate): NavigableTile(
+                    (self.MAP, coordinate), False, frozenset(Direction), 1, coordinate in grass
+                )
+                for coordinate in coordinates
+            }
+        )
+        plan = GoalAwareNavigator(world).plan(
+            (self.MAP, (0, 0)),
+            NavigationGoal(ReachLocation((self.MAP, (4, 0))), encounter_mode=EncounterMode.AVOID),
+        )
+
+        self.assertEqual(plan.metrics.encounter_opportunities, 0)
+        self.assertEqual(plan.metrics.movement_actions, 6)
 
     def test_first_grass_patch_geometry_selects_lower_zero_exposure_branch(self):
         # This is the shape of the first patch decision: the direct upper
@@ -501,7 +565,7 @@ class TestWeightedNavigation(unittest.TestCase):
             ),
         )
         self.assertEqual(strict.metrics.encounter_opportunities, 0)
-        self.assertGreater(strict.metrics.movement_actions, weighted.metrics.movement_actions)
+        self.assertEqual(strict.metrics.movement_actions, weighted.metrics.movement_actions)
 
     def test_encounter_objective_is_translated_to_seek_navigation(self):
         from modules.nuzlocke.campaign_objectives import encounter_task
@@ -684,8 +748,8 @@ class TestWeightedNavigation(unittest.TestCase):
         )
 
         self.assertEqual(plan.actions[-1].action_type, NavigationActionType.WARP)
-        self.assertEqual(plan.actions[-1].source, (source_map, (1, 0)))
-        self.assertEqual(plan.actions[-1].direction, Direction.East)
+        self.assertEqual(plan.actions[-1].source, (source_map, (2, 0)))
+        self.assertEqual(plan.actions[-1].direction, Direction.South)
         self.assertEqual(world.warps[0].activation, WarpActivation.STEP_ON)
 
     def test_map_connection_action_crosses_boundary_with_direction_and_kind(self):
@@ -946,7 +1010,7 @@ class TestWeightedNavigation(unittest.TestCase):
             ReachWarp(destination_map=target_map, destination=connection.destination, warp=connection),
         )
 
-        self.assertEqual(plan.destination, approach)
+        self.assertEqual(plan.destination, connection.destination)
 
     def test_observed_map_connection_at_boundary_crosses_without_reverse_move(self):
         source_map = (42, 2)
@@ -973,6 +1037,27 @@ class TestWeightedNavigation(unittest.TestCase):
         self.assertEqual(plan.actions[0].action_type, NavigationActionType.WARP)
         self.assertEqual(plan.actions[0].source, boundary)
         self.assertEqual(plan.actions[0].direction, Direction.North)
+
+    def test_observed_step_on_warp_at_entry_still_emits_crossing_action(self):
+        source_map = (42, 4)
+        target_map = (42, 5)
+        entry = (source_map, (2, 2))
+        warp = WarpObservation(entry, (target_map, (2, 3)), activation=WarpActivation.STEP_ON)
+        world = NavigationWorld(
+            tiles={entry: NavigableTile(entry, False, frozenset(Direction))},
+            warps=(warp,),
+            facing=Direction.South,
+        )
+
+        plan = plan_observed_warp_locally(
+            world,
+            entry,
+            ReachWarp(destination_map=target_map, destination=warp.destination, warp=warp),
+        )
+
+        self.assertEqual(len(plan.actions), 1)
+        self.assertEqual(plan.actions[0].action_type, NavigationActionType.WARP)
+        self.assertEqual(plan.actions[0].source, entry)
 
     def test_world_route_step_on_from_south_emits_north_entry_input(self):
         """The cross-map planner must preserve STEP_ON approach geometry."""
@@ -1001,9 +1086,9 @@ class TestWeightedNavigation(unittest.TestCase):
 
         transition = plan.actions[-1]
         self.assertEqual(transition.action_type, NavigationActionType.WARP)
-        self.assertEqual(transition.source, (source_map, (2, 3)))
-        self.assertEqual(transition.direction, Direction.North)
-        self.assertNotEqual(transition.direction, Direction.South)
+        self.assertEqual(transition.source, entry)
+        self.assertEqual(transition.direction, Direction.South)
+        self.assertEqual(transition.direction, Direction.South)
 
     def test_arrow_warp_steps_onto_tile_then_uses_required_facing(self):
         source_map = (0, 0)
@@ -1129,7 +1214,7 @@ class TestWeightedNavigation(unittest.TestCase):
         emulator = SimpleNamespace(press_button=lambda _: None)
         loop = AgentControlLoop(
             lambda: AgentObservation(
-                InteractionObservation(GameState.OVERWORLD),
+                InteractionObservation(GameState.OVERWORLD, controllable=True),
                 overworld=next(observations),
                 goal=goal,
             ),

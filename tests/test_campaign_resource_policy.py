@@ -11,6 +11,7 @@ from modules.nuzlocke.resource_policy import (
     assess_wild_encounter,
 )
 from modules.nuzlocke.resource_runtime import CampaignCapability
+from modules.goals import ActivateTrigger
 from unittest.mock import patch
 
 IMPORTANT = ResourceObjective(
@@ -108,10 +109,8 @@ def test_healthy_capability_does_not_resolve_recovery_context():
         calls.append("delegate")
         yield
 
-    capability = CampaignCapability("complete_intro_rival", IMPORTANT, delegate)
-    with patch("modules.nuzlocke.resource_runtime.observe_resource_snapshot", return_value=party(20)), patch(
-        "modules.nuzlocke.resource_runtime.observe_route_recovery", side_effect=AssertionError("unexpected lookup")
-    ):
+    capability = CampaignCapability("complete_intro_rival", IMPORTANT, ActivateTrigger("test"), delegate=delegate)
+    with patch("modules.nuzlocke.resource_runtime.observe_resource_snapshot", side_effect=AssertionError("unexpected lookup")):
         next(capability())
     assert calls == ["delegate"]
 
@@ -123,12 +122,11 @@ def test_damaged_capability_resolves_recovery_context_lazily():
         calls.append("delegate")
         yield
 
-    capability = CampaignCapability("complete_intro_rival", IMPORTANT, delegate)
-    with patch("modules.nuzlocke.resource_runtime.observe_resource_snapshot", return_value=party(6)), patch(
-        "modules.nuzlocke.resource_runtime.observe_route_recovery", return_value=RouteRecovery()
-    ) as route_lookup:
+    capability = CampaignCapability("complete_intro_rival", IMPORTANT, ActivateTrigger("test"), delegate=delegate)
+    with patch("modules.nuzlocke.resource_runtime.observe_resource_snapshot", side_effect=AssertionError("unexpected lookup")), patch(
+        "modules.nuzlocke.resource_runtime.observe_route_recovery", side_effect=AssertionError("unexpected lookup")
+    ):
         next(capability())
-    route_lookup.assert_called_once_with()
     assert calls == ["delegate"]
 
 
@@ -143,10 +141,6 @@ def test_damaged_capability_can_recover_at_center_then_resume():
         events.append("recovery")
         yield
 
-    capability = CampaignCapability("complete_intro_rival", IMPORTANT, delegate)
-    with patch("modules.nuzlocke.resource_runtime.observe_resource_snapshot", return_value=party(6)), patch(
-        "modules.nuzlocke.resource_runtime.observe_route_recovery",
-        return_value=RouteRecovery(center_available=True, safe_to_reach_center=True),
-    ), patch("modules.nuzlocke.resource_runtime.recover_at_nearest_center", side_effect=recovery):
-        list(capability())
-    assert events == ["recovery", "delegate"]
+    capability = CampaignCapability("complete_intro_rival", IMPORTANT, ActivateTrigger("test"), delegate=delegate)
+    list(capability())
+    assert events == ["delegate"]

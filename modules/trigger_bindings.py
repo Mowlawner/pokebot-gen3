@@ -111,7 +111,7 @@ def resolve_trigger_binding(
     timing("trigger_runtime_binding_matching", runtime_start)
     count("runtime_binding_matches")
     geometry_start = now()
-    interaction_positions = tuple(
+    runtime_interaction_positions = tuple(
         sorted(
             {
                 (candidate_x, candidate_y)
@@ -127,6 +127,30 @@ def resolve_trigger_binding(
             }
         )
     )
+    # Runtime ObjectEvents are normally the authoritative position, but an
+    # object can be absent briefly while a map/script finishes spawning it.
+    # Keep the static template useful in that interval: the template's
+    # coordinate is stable and the interaction geometry is the same adjacent
+    # four-tile geometry used for a live object.  Do not use this fallback for
+    # hidden or ambiguous templates, and always prefer the live position when
+    # one is available.
+    interaction_positions = runtime_interaction_positions
+    if not interaction_positions and static_available and static_template is not None:
+        object_x, object_y = static_template.local_coordinates
+        interaction_positions = tuple(
+            sorted(
+                {
+                    (candidate_x, candidate_y)
+                    for candidate_x, candidate_y in (
+                        (object_x, object_y - 1),
+                        (object_x + 1, object_y),
+                        (object_x, object_y + 1),
+                        (object_x - 1, object_y),
+                    )
+                    if 0 <= candidate_x < map_size[0] and 0 <= candidate_y < map_size[1]
+                }
+            )
+        )
     timing("trigger_geometry_matching", geometry_start)
     count("trigger_geometry_matches")
     timing("trigger_static_resolution", total_start)

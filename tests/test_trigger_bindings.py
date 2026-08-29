@@ -85,7 +85,10 @@ class TestTriggerBindings(unittest.TestCase):
         self.assertTrue(resolution.static_available)
         self.assertEqual(resolution.static_location, (MapRSE.ROUTE103.value, (10, 3)))
         self.assertFalse(resolution.runtime_match)
-        self.assertEqual(resolution.interaction_positions, ())
+        self.assertEqual(
+            set(resolution.interaction_positions),
+            {(10, 2), (11, 3), (10, 4), (9, 3)},
+        )
 
     def test_runtime_position_overrides_static_position(self):
         binding = get_trigger_binding("introductory_rival")

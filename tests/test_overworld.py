@@ -3,6 +3,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import modules.map as map_module
 from modules.map import MapMetadata, ObjectEvent
 from modules.map_path import Direction
 from modules.overworld import (
@@ -31,6 +32,14 @@ def _object_event() -> ObjectEvent:
 
 
 class TestOverworldPerception(unittest.TestCase):
+    def test_live_map_header_overrides_stale_save_block_map(self):
+        with patch("modules.map.context", SimpleNamespace(rom=SimpleNamespace(id="test-rom"))), patch.dict(
+            map_module._map_header_cache,
+            {"test-rom": {(0, 10): b"outdoor", (2, 2): b"pokemon-center"}},
+            clear=True,
+        ), patch("modules.map.read_symbol", return_value=b"pokemon-center"):
+            self.assertEqual(map_module.get_live_map_id(), (2, 2))
+
     def test_trainer_hazards_follow_facing_and_range(self):
         map_id = (1, 2)
         tiles = tuple(TileObservation((map_id, (x, 0)), False, frozenset(Direction), elevation=0) for x in range(5))

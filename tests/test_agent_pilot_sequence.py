@@ -11,7 +11,7 @@ from modules.agent_control import (
     select_action,
 )
 from modules.goals import ActivateTrigger, ReachLocation
-from modules.interaction_state import InteractionObservation
+from modules.interaction_state import InteractionObservation, InteractionPhase
 from modules.map_path import Direction
 from modules.memory import GameState
 from modules.overworld import OverworldObservation, TileObservation, TriggerObservation
@@ -64,12 +64,29 @@ class AgentPilotSequenceTests(TestCase):
         goal = ActivateTrigger("rival")
         observations = iter(
             (
-                AgentObservation(InteractionObservation(GameState.OVERWORLD, dialogue_waiting=True), goal=goal),
-                AgentObservation(InteractionObservation(GameState.OVERWORLD), route_world((0, 0))),
+                AgentObservation(
+                    InteractionObservation(
+                        GameState.OVERWORLD,
+                        dialogue_waiting=True,
+                        controllable=True,
+                        interaction_phase=InteractionPhase.FIELD_MESSAGE_INPUT_WAIT,
+                    ),
+                    goal=goal,
+                ),
+                AgentObservation(
+                    InteractionObservation(GameState.OVERWORLD, controllable=True), route_world((0, 0))
+                ),
                 AgentObservation(InteractionObservation(GameState.BATTLE)),
-                AgentObservation(InteractionObservation(GameState.OVERWORLD), route_world((1, 0))),
-                AgentObservation(InteractionObservation(GameState.OVERWORLD), route_world((2, 0))),
-                AgentObservation(InteractionObservation(GameState.OVERWORLD, dialogue_waiting=True)),
+                AgentObservation(InteractionObservation(GameState.OVERWORLD, controllable=True), route_world((1, 0))),
+                AgentObservation(InteractionObservation(GameState.OVERWORLD, controllable=True), route_world((2, 0))),
+                AgentObservation(
+                    InteractionObservation(
+                        GameState.OVERWORLD,
+                        dialogue_waiting=True,
+                        controllable=True,
+                        interaction_phase=InteractionPhase.FIELD_MESSAGE_INPUT_WAIT,
+                    )
+                ),
                 AgentObservation(InteractionObservation(GameState.BATTLE)),
             )
         )
@@ -96,13 +113,13 @@ class AgentPilotSequenceTests(TestCase):
         observations = iter(
             (
                 AgentObservation(
-                    InteractionObservation(GameState.OVERWORLD),
+                    InteractionObservation(GameState.OVERWORLD, controllable=True),
                     world({(0, 0), (1, 0), (2, 0)}, (0, 0)),
                     goal,
                 ),
                 AgentObservation(InteractionObservation(GameState.BATTLE)),
                 AgentObservation(
-                    InteractionObservation(GameState.OVERWORLD),
+                    InteractionObservation(GameState.OVERWORLD, controllable=True),
                     world({(0, 0), (1, 0), (2, 0)}, (1, 0)),
                 ),
             )
@@ -135,7 +152,7 @@ class AgentPilotSequenceTests(TestCase):
             "rival", frozenset({(MAP, (1, 0))}), frozenset({(MAP, (0, 0))}), "object_interaction"
         )
         observation = AgentObservation(
-            InteractionObservation(GameState.OVERWORLD),
+            InteractionObservation(GameState.OVERWORLD, controllable=True),
             OverworldObservation(
                 map_id=MAP,
                 player_coordinates=(0, 0),

@@ -70,6 +70,12 @@ from .preparation import (
 )
 from .campaign_state import CampaignFacts, CampaignState, Fact, FactStatus, RunStatus, derive_campaign_facts
 from .encounter_catalog import EncounterOpportunity, encounter_opportunities
+from .emerald_healing_catalog import (
+    HealingSourceRSE,
+    emerald_healing_sources,
+    emerald_healing_sources_for_map,
+    emerald_healing_source_for_destination,
+)
 from .campaign_simulation import CampaignCheckpoint, CampaignSimulation, simulate_checkpoint, simulate_checkpoints
 from .fixture_state import (
     FixtureStateUnavailable,
@@ -106,7 +112,6 @@ from .campaign_execution import (
     CampaignExecutionStatus,
     adapt_campaign_execution,
 )
-from .campaign_controller import CampaignController, CampaignControllerState, CampaignControllerStatus
 from .resource_policy import (
     EncounterPolicy,
     HealingResource,
@@ -119,7 +124,35 @@ from .resource_policy import (
     assess_campaign_resources,
     assess_wild_encounter,
 )
-from .resource_runtime import HealingSource, HealingSourceType, discover_healing_source, execute_heal_party
+
+
+def __getattr__(name):
+    """Load runtime modules lazily to avoid agent-control import cycles.
+
+    ``agent_control`` imports a lightweight nuzlocke submodule during its own
+    initialization. Eagerly importing the controller/resource runtime from
+    this package initializer re-enters that partially initialized module.
+    These exports remain available from ``modules.nuzlocke`` while avoiding
+    import-order-dependent collection failures under pytest.
+    """
+    if name in {"CampaignController", "CampaignControllerState", "CampaignControllerStatus"}:
+        from .campaign_controller import CampaignController, CampaignControllerState, CampaignControllerStatus
+
+        return {
+            "CampaignController": CampaignController,
+            "CampaignControllerState": CampaignControllerState,
+            "CampaignControllerStatus": CampaignControllerStatus,
+        }[name]
+    if name in {"HealingSource", "HealingSourceType", "discover_healing_source", "execute_heal_party"}:
+        from .resource_runtime import HealingSource, HealingSourceType, discover_healing_source, execute_heal_party
+
+        return {
+            "HealingSource": HealingSource,
+            "HealingSourceType": HealingSourceType,
+            "discover_healing_source": discover_healing_source,
+            "execute_heal_party": execute_heal_party,
+        }[name]
+    raise AttributeError(name)
 
 __all__ = [
     "BattleSnapshot",
@@ -197,6 +230,10 @@ __all__ = [
     "derive_campaign_facts",
     "EncounterOpportunity",
     "encounter_opportunities",
+    "HealingSourceRSE",
+    "emerald_healing_sources",
+    "emerald_healing_sources_for_map",
+    "emerald_healing_source_for_destination",
     "CampaignCheckpoint",
     "CampaignSimulation",
     "simulate_checkpoint",

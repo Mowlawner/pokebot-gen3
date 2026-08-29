@@ -75,7 +75,7 @@ for language_code in _raw_keyboard_layouts:
 def get_current_keyboard_layout() -> KeyboardLayout:
     if context.rom is None or context.rom.language.value not in keyboard_layouts:
         return keyboard_layouts["E"]
-    else:
+    elif context.rom.is_emerald:
         return keyboard_layouts[context.rom.language.value]
 
 

@@ -144,6 +144,7 @@ def readiness(hp, *, trainer=None, recovery=Availability.KNOWN, party_available=
     return build_progression_readiness_diagnostic(
         snapshot((mon(0, hp, 20),), available=party_available),
         overworld=world,
+        overworld_availability=Availability.KNOWN,
         recovery_availability=recovery,
     )
 
@@ -169,7 +170,7 @@ def test_policy_trainer_provenance_and_recovery_provenance_are_explicit():
     no_world = build_progression_readiness_diagnostic(
         snapshot((mon(0, 2, 20),)), recovery_availability=Availability.KNOWN
     )
-    assert policy.evaluate(no_world).reason is ReadinessReason.TRAINER_HAZARD_UNKNOWN
+    assert policy.evaluate(no_world).reason is ReadinessReason.OVERWORLD_UNAVAILABLE
     trainer = ((4, 4), 4, False)
     unavailable = policy.evaluate(readiness(2, trainer=trainer, recovery=Availability.UNAVAILABLE))
     assert unavailable == type(unavailable)(ReadinessDecision.UNKNOWN, ReadinessReason.RECOVERY_UNAVAILABLE)
@@ -180,13 +181,15 @@ def test_policy_trainer_provenance_and_recovery_provenance_are_explicit():
 def test_policy_handles_fainted_or_unavailable_party_and_defeated_trainer():
     policy = CampaignReadinessPolicy()
     fainted = build_progression_readiness_diagnostic(
-        snapshot((mon(0, 0, 20, fainted=True),)), recovery_availability=Availability.KNOWN
+        snapshot((mon(0, 0, 20, fainted=True),)),
+        recovery_availability=Availability.KNOWN,
+        overworld_availability=Availability.KNOWN,
     )
     assert policy.evaluate(fainted).decision is ReadinessDecision.RECOVER
     unavailable = policy.evaluate(readiness(2, party_available=False))
     assert unavailable.reason is ReadinessReason.PARTY_INFORMATION_UNKNOWN
     defeated = policy.evaluate(readiness(2, trainer=((4, 4), 4, True)))
-    assert defeated.decision is ReadinessDecision.CONTINUE
+    assert defeated.decision is ReadinessDecision.RECOVER
 
 
 def test_policy_evaluation_is_deterministic_and_does_not_mutate_input():
@@ -213,13 +216,10 @@ def test_policy_opportunistically_recovers_meaningfully_damaged_party_at_nearby_
 
 
 def test_policy_does_not_preempt_imminent_trainer_for_opportunistic_recovery():
-    value = build_progression_readiness_diagnostic(
-        snapshot((mon(0, 9, 20),)),
-        overworld=SimpleNamespace(map_id=(1, 2), player_coordinates=(3, 4), objects=()),
+    value = readiness(
+        9,
         trainer=((4, 4), 4, False),
-        recovery=RouteRecovery(center_available=True, distance_to_center=8, safe_to_reach_center=True),
-        recovery_availability=Availability.KNOWN,
-        overworld_availability=Availability.KNOWN,
+        recovery=Availability.KNOWN,
     )
     result = CampaignReadinessPolicy().evaluate(value)
     assert result.decision is ReadinessDecision.CONTINUE
@@ -231,13 +231,35 @@ def test_policy_does_not_opportunistically_recover_for_minor_damage_or_long_deto
     near = RouteRecovery(center_available=True, distance_to_center=8, safe_to_reach_center=True)
     far = RouteRecovery(center_available=True, distance_to_center=21, safe_to_reach_center=True)
     minor = build_progression_readiness_diagnostic(
-        snapshot((mon(0, 18, 20),)), overworld=world, recovery=near, recovery_availability=Availability.KNOWN
+        snapshot((mon(0, 18, 20),)),
+        overworld=world,
+        recovery=near,
+        recovery_availability=Availability.KNOWN,
+        overworld_availability=Availability.KNOWN,
     )
     distant = build_progression_readiness_diagnostic(
-        snapshot((mon(0, 9, 20),)), overworld=world, recovery=far, recovery_availability=Availability.KNOWN
+        snapshot((mon(0, 9, 20),)),
+        overworld=world,
+        recovery=far,
+        recovery_availability=Availability.KNOWN,
+        overworld_availability=Availability.KNOWN,
     )
     assert CampaignReadinessPolicy().evaluate(minor).decision is ReadinessDecision.CONTINUE
-    assert CampaignReadinessPolicy().evaluate(distant).decision is ReadinessDecision.CONTINUE
+    assert CampaignReadinessPolicy().evaluate(distant).decision is ReadinessDecision.UNKNOWN
+
+
+def test_policy_recovers_capability_boundary_without_normal_route_goal():
+    value = build_progression_readiness_diagnostic(
+        snapshot((mon(0, 10, 25),)),
+        objective_id="receive_pokedex",
+        overworld=SimpleNamespace(map_id=(1, 2), player_coordinates=(3, 4), objects=()),
+        recovery=RouteRecovery(center_available=True, distance_to_center=38, safe_to_reach_center=True),
+        recovery_availability=Availability.KNOWN,
+        overworld_availability=Availability.KNOWN,
+    )
+    result = CampaignReadinessPolicy().evaluate(value)
+    assert result.decision is ReadinessDecision.RECOVER
+    assert result.reason is ReadinessReason.OPPORTUNISTIC_RECOVERY
 
 
 def route_analysis(*detours):

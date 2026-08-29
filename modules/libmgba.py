@@ -789,8 +789,14 @@ class LibmgbaEmulator:
                     self.release_button(direction)
         except (AttributeError, RuntimeError, TypeError, ValueError):
             pass
+        # ``_fresh_input_pending`` requests this frame's release; the pulse
+        # saved in ``_fresh_pulse_pending`` must then be applied on the next
+        # frame.  Previously that second half was only mentioned in tracing,
+        # so a repeated A/direction was silently discarded after its neutral
+        # frame.
         fresh_inputs = self._fresh_input_pending
-        applied_inputs = (self._pressed_inputs | self._held_inputs) & ~fresh_inputs
+        pulse_inputs = self._fresh_pulse_pending
+        applied_inputs = (self._pressed_inputs | self._held_inputs | pulse_inputs) & ~fresh_inputs
         if fresh_inputs:
             self._report_fresh_input("neutral_frame_applied", None, applied_inputs)
         elif self._fresh_pulse_pending:

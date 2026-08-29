@@ -942,20 +942,19 @@ class MapLocation:
 
     @property
     def has_encounters(self) -> bool:
-        # Emerald's field encounter check is keyed to the tall-grass
-        # metatile behavior, not merely the generic land flag.  The latter is
-        # insufficient for Route 101 grass and caused navigation to classify
-        # those tiles as safe.
-        if self.tile_type in ("Tall Grass", "Long Grass", "Long Grass South Edge"):
-            return True
         if context.rom.is_frlg:
             return bool(self._metatile_attributes[0] & 0x0700_0000)
 
+        # RSE encounter availability is determined by the land encounter table
+        # for the map.  Avoid forcing a metatile-layout read here: navigation
+        # often has a valid observed behavior and encounter table while the
+        # layout bytes are unavailable during a transition or in a synthetic
+        # observation.
         is_land = bool(self._tile_behaviour & 1)
         if is_land:
             encounters = get_wild_encounters_for_map(self.map_group, self.map_number)
             return encounters is not None and len(encounters.land_encounters) > 0
-        return is_land
+        return False
 
     @property
     def is_surfable(self) -> bool:
@@ -1965,6 +1964,69 @@ def get_map_data_for_current_position() -> MapLocation | None:
 
 
 _map_header_cache: dict[str, dict[tuple[int, int], bytes]] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class LiveMapIdentity:
+    """The live-map lookup result and the evidence used to obtain it."""
+
+    map_id: tuple[int, int] | None
+    source: Literal["live_header", "unresolved"]
+    candidates: tuple[tuple[int, int], ...] = ()
+    header_fingerprint: str | None = None
+
+
+def _map_header_candidates(headers: dict[tuple[int, int], bytes], live_header: bytes) -> tuple[tuple[int, int], ...]:
+    """Resolve a live ``gMapHeader`` without trusting transition-mutated bytes.
+
+    The four pointer fields identify a concrete map whenever they are unique.
+    If a transition temporarily rewrites one of those fields, the layout ID is
+    still a usable identity only when it has one unambiguous ROM match.
+    """
+    exact = tuple(map_id for map_id, header in headers.items() if header == live_header)
+    if exact:
+        return exact
+    pointers = tuple(map_id for map_id, header in headers.items() if header[:0x10] == live_header[:0x10])
+    if pointers:
+        return pointers
+    if len(live_header) >= 0x16:
+        layout_id = live_header[0x14:0x16]
+        return tuple(map_id for map_id, header in headers.items() if header[0x14:0x16] == layout_id)
+    return ()
+
+
+def observe_live_map_identity() -> LiveMapIdentity:
+    """Observe the map installed in ``gMapHeader`` with provenance.
+
+    SaveBlock1 records the player's last saved location and can lag the map
+    renderer while a door warp settles.  ``gMapHeader`` is the live map
+    header used by the field engine.  Match it against the ROM-header cache
+    populated from the ROM map table on its first use.  The observer cannot
+    depend on a debug/navigation side effect having warmed that cache first.
+    """
+    try:
+        headers = _map_header_cache.get(context.rom.id, {})
+        if not headers:
+            # ``get_map_data`` fills the complete per-ROM header index before
+            # materialising its requested view.  This is a one-time cost and
+            # makes live observation self-contained.
+            get_map_data((0, 0), (0, 0))
+            headers = _map_header_cache.get(context.rom.id, {})
+        live_header = bytes(read_symbol("gMapHeader"))
+        candidates = _map_header_candidates(headers, live_header)
+        return LiveMapIdentity(
+            candidates[0] if len(candidates) == 1 else None,
+            "live_header" if len(candidates) == 1 else "unresolved",
+            candidates,
+            live_header.hex(),
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError, KeyError):
+        return LiveMapIdentity(None, "unresolved")
+
+
+def get_live_map_id() -> tuple[int, int] | None:
+    """Compatibility accessor for callers that need only a resolved map ID."""
+    return observe_live_map_identity().map_id
 
 
 def _build_map_metadata(map_id: tuple[int, int], map_header: bytes) -> MapMetadata:

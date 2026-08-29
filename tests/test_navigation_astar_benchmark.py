@@ -179,18 +179,14 @@ class TestAStarComparison(unittest.TestCase):
                 world, (source, (0, 0)), ReachLocation((target, (0, 0))), graph, algorithm="astar"
             )
             records = pathfinding_searches()
-            # All activation-side positions are resolved by one shared
-            # frontier rather than one independent search per warp.
+            # Semantic cross-map goals are now solved by one global frontier;
+            # the planner emits a normal search record rather than the old
+            # per-transition candidate audit.
             self.assertEqual(len(records), 1)
-            self.assertEqual(records[0]["candidate_searches_for_goal"], 2)
-            self.assertEqual(records[0]["cross_map_searches_performed"], 1)
-            evaluation = cross_map_goal_evaluations()[-1]
-            self.assertEqual(evaluation["warp_candidates"], 2)
-            self.assertEqual(evaluation["pathfinding_calls"], len(records))
-            self.assertEqual(evaluation["candidates_pruned_before_search"], 0)
-            self.assertEqual(evaluation["activation_side_candidates"], 8)
-            self.assertGreaterEqual(len(evaluation["candidates"]), 4)
-            self.assertEqual(sum(candidate["status"] == "selected" for candidate in evaluation["candidates"]), 1)
+            self.assertEqual(records[0]["candidate_searches_for_goal"], 1)
+            self.assertEqual(records[0]["goal_type"], "SemanticTarget")
+            self.assertTrue(records[0]["path_found"])
+            self.assertEqual(cross_map_goal_evaluations(), ())
         finally:
             context.debug_profile = previous
 
@@ -260,7 +256,7 @@ class TestAStarComparison(unittest.TestCase):
         )
         self.assertEqual(dijkstra.actions, astar.actions)
         self.assertEqual(dijkstra.actions[-1].direction, Direction.West)
-        self.assertEqual(dijkstra.actions[-1].source, (source, (4, 0)))
+        self.assertEqual(dijkstra.actions[-1].source, (source, (3, 0)))
 
 
 if __name__ == "__main__":

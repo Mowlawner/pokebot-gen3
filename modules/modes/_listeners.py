@@ -91,9 +91,11 @@ def _battle_return_to_field_complete(frame: FrameInfo) -> bool:
     """Whether the ROM has finished its battle-to-field transition.
 
     Avatar motion is deliberately not part of this boundary.  The return
-    callback/tasks are the synchronization points owned by the battle engine;
-    waiting for the avatar to be standing still can keep the battle controller
-    above a surrounding scripted dialogue indefinitely.
+    callback/tasks are the synchronization points owned by the battle engine,
+    but the battle's post-return field script is also part of that ownership.
+    Releasing the battle controller while that script is waiting in a native
+    movement callback strands the campaign controller between battle and
+    overworld ownership.
     """
     callback_ok = get_game_state_symbol() not in ("CB2_RETURNTOFIELD", "CB2_RETURNTOFIELDLOCAL")
     battle_start_absent = "Task_BattleStart" not in frame.active_tasks
@@ -101,14 +103,24 @@ def _battle_return_to_field_complete(frame: FrameInfo) -> bool:
     continue_music_absent = "Task_ReturnToFieldContinueScriptPlayMapMusic" not in frame.active_tasks
     mpl_absent = "task_mpl_807E3C8" not in frame.active_tasks
     map_objects = len(get_map_objects())
-    complete = callback_ok and no_script_absent and continue_music_absent and mpl_absent and map_objects > 0
+    script_context = get_global_script_context()
+    script_active = bool(script_context is not None and script_context.is_active)
+    complete = (
+        callback_ok
+        and no_script_absent
+        and continue_music_absent
+        and mpl_absent
+        and map_objects > 0
+        and not script_active
+    )
     diagnostic_print(
         lambda: (
             "BATTLE_RETURN_GATE: "
             f"frame={getattr(context, 'frame', None)!r} complete={complete!r} "
             f"game_state={get_game_state().name!r} game_state_symbol={get_game_state_symbol()!r} "
             f"task_battle_start={not battle_start_absent!r} return_no_script={not no_script_absent!r} "
-            f"return_continue_music={not continue_music_absent!r} task_mpl={not mpl_absent!r} map_objects={map_objects}"
+            f"return_continue_music={not continue_music_absent!r} task_mpl={not mpl_absent!r} "
+            f"map_objects={map_objects} script_active={script_active!r}"
         ),
         trace=True,
     )

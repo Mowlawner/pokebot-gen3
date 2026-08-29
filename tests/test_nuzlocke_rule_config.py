@@ -20,7 +20,7 @@ from modules.nuzlocke.snapshots import (
 )
 
 
-class TestGameState(Enum):
+class FixtureGameState(Enum):
     OVERWORLD = 1
 
 
@@ -28,7 +28,7 @@ def runtime_snapshot(frame: int) -> NuzlockeSnapshot:
     return NuzlockeSnapshot(
         frame,
         "test",
-        TestGameState.OVERWORLD,
+        FixtureGameState.OVERWORLD,
         PlayerSnapshot("May", 1, 2, "MAP", (1, 1), "Down", True),
         (),
         InventorySnapshot((), (), ()),

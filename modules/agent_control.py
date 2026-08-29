@@ -61,11 +61,48 @@ from modules.overworld import (
 from modules.player import get_player_avatar
 from modules.profiler import count, invalidation, now, profiled, timing, format_snapshot
 from modules.tasks import is_field_message_waiting_for_input
+from modules.state_cache import state_cache
 from modules.nuzlocke.readiness_diagnostics import (
     build_progression_readiness_diagnostic,
     evaluate_progression_readiness,
 )
 import json
+
+
+UNIVERSAL_REOBSERVE_FRAMES = 90
+_last_universal_observation_frame: int | None = None
+
+
+def _force_universal_reobserve() -> bool:
+    """Request a complete ROM-state observation at a fixed frame boundary.
+
+    A map warp is allowed to expose a transient ``UNKNOWN`` or ``CHANGE_MAP``
+    callback while the avatar/save-block map has already settled.  Cache
+    invalidation alone cannot reveal that state when the normal observer
+    consequently skips overworld perception, so callers use the returned
+    value to include one authoritative overworld pass at this boundary.
+    """
+    global _last_universal_observation_frame
+    emulator = getattr(context, "emulator", None)
+    get_frame_count = getattr(emulator, "get_frame_count", None)
+    if not callable(get_frame_count):
+        return False
+    try:
+        frame = get_frame_count()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+    if not isinstance(frame, int):
+        return False
+    if (
+        _last_universal_observation_frame is None
+        or frame < _last_universal_observation_frame
+        or frame - _last_universal_observation_frame >= UNIVERSAL_REOBSERVE_FRAMES
+    ):
+        if _last_universal_observation_frame is not None:
+            state_cache.invalidate_runtime_observations()
+        _last_universal_observation_frame = frame
+        return True
+    return False
 
 
 class AgentActionType(Enum):
@@ -157,8 +194,15 @@ def observe_agent(
     choice_options: tuple[str, ...] = (),
     menu_options: tuple[str, ...] = (),
     special_interaction: str | None = None,
+    require_overworld: bool = False,
 ) -> AgentObservation:
-    """Create one live observation, reading overworld data only when relevant."""
+    """Create one live observation.
+
+    ``require_overworld`` is for callers waiting on a physical map change.
+    Such callers must not let a transient UI/game-state classification decide
+    whether the map is observed.
+    """
+    force_overworld_reobserve = _force_universal_reobserve()
     trace = getattr(context, "stutter_trace", None)
     span = trace.span("observation") if trace is not None else nullcontext()
     with span:
@@ -174,6 +218,8 @@ def observe_agent(
             choice_options=choice_options,
             menu_options=menu_options,
             special_interaction=special_interaction,
+            force_overworld_reobserve=force_overworld_reobserve,
+            require_overworld=require_overworld,
         )
         diagnostic_print(
             lambda: (
@@ -197,6 +243,8 @@ def _observe_agent_instrumented(
     choice_options: tuple[str, ...] = (),
     menu_options: tuple[str, ...] = (),
     special_interaction: str | None = None,
+    force_overworld_reobserve: bool = False,
+    require_overworld: bool = False,
 ) -> AgentObservation:
     interaction_start = now()
     interaction = observe_interaction(
@@ -213,7 +261,16 @@ def _observe_agent_instrumented(
     trace = getattr(context, "stutter_trace", None)
     perception_trace_start = trace.now() if trace is not None else 0
     perception_start = now()
-    overworld = perceive_overworld() if interaction_type is InteractionType.OVERWORLD else None
+    # A settled warp can briefly retain a non-overworld callback.  The
+    # frame-based watchdog makes one bounded raw map/avatar read in that
+    # state, so recovery can hand off from an outdoor door tile to the Center
+    # interior even if normal classification has not caught up yet.  Menus,
+    # battles, and scripted scenes remain excluded from this fallback.
+    transient_map_state = interaction.game_state in (GameState.UNKNOWN, GameState.CHANGE_MAP)
+    should_perceive_overworld = require_overworld or interaction_type is InteractionType.OVERWORLD or (
+        force_overworld_reobserve and transient_map_state
+    )
+    overworld = perceive_overworld() if should_perceive_overworld else None
     timing("agent_overworld_perception", perception_start)
     count("agent_overworld_perceptions")
     if trace is not None:
@@ -225,9 +282,58 @@ def _observe_agent_instrumented(
             trace.mark("perception_duration_ms", round((trace.now() - perception_trace_start) / 1_000_000, 3))
     finalize_start = now()
     observation = AgentObservation(interaction=interaction, overworld=overworld, goal=goal)
+    _publish_recovery_handoff_observation(observation)
     timing("agent_observation_finalize", finalize_start)
     count("agent_observation_finalizations")
     return observation
+
+
+def _publish_recovery_handoff_observation(observation: AgentObservation) -> None:
+    """Expose warp progress in the GUI while the route loop still owns it.
+
+    A recovery route can physically cross a map boundary before its
+    ``ReachLocation`` loop receives the observation that completes the goal.
+    Publishing here makes that distinction visible without enabling tracing
+    or changing navigation policy.
+    """
+    from modules.goals import ReachLocation, SemanticTarget
+    from modules.nuzlocke.campaign_status import recovery_status
+
+    if not isinstance(observation.goal, ReachLocation) or observation.overworld is None:
+        return
+    controller = getattr(getattr(context, "bot_mode_instance", None), "controller", None)
+    if getattr(controller, "_execution_phase", None) != "RECOVERY":
+        return
+    status = getattr(context, "campaign_status", None)
+    if getattr(status, "objective", None) != "Recover Party":
+        return
+    destination = observation.goal.location
+    observed_map = observation.overworld.map_id
+    if observed_map == getattr(destination[0], "value", destination[0]):
+        context.campaign_status = recovery_status(
+            SemanticTarget.at(destination),
+            f"Waiting for Pokémon Center map (observed {observed_map!r} at "
+            f"{observation.overworld.player_coordinates!r})",
+        )
+        return
+    try:
+        from modules.nuzlocke.emerald_healing_catalog import emerald_healing_source_for_destination
+
+        source = emerald_healing_source_for_destination(destination)
+        interior_map = source.interior_map if source is not None else None
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        interior_map = None
+    interior_map_id = getattr(interior_map, "value", interior_map)
+    if interior_map_id is not None and observed_map == interior_map_id:
+        intent = (
+            "Destination map observed; waiting for recovery handoff"
+            if observation.overworld.controllable
+            else "Waiting for avatar control"
+        )
+        context.campaign_status = recovery_status(
+            SemanticTarget.map(interior_map_id),
+            intent,
+        )
 
 
 @dataclass(frozen=True)
@@ -447,6 +553,22 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
     count("goal_planning_attempts")
 
     if isinstance(observation.goal, (ReachLocation, ReachWarp, ReachInteractionPosition)) and not plan.actions:
+        if isinstance(observation.goal, ReachWarp) and observation.goal.warp is not None:
+            # A ReachLocation handoff may leave us standing on a step-on warp
+            # entry.  Do not interpret that source tile as having crossed the
+            # transition; recover an explicit local activation action.
+            try:
+                local_plan = plan_observed_warp_locally(world, start, observation.goal)
+            except NavigationError:
+                local_plan = None
+            if local_plan is not None and local_plan.actions:
+                return GoalEvaluation(
+                    GoalStatus.REACHABLE,
+                    plan=local_plan,
+                    reason="warp entry observed; activation still required",
+                    binding_diagnostics=binding_diagnostics,
+                    world_diagnostics=world_diagnostics,
+                )
         return GoalEvaluation(
             GoalStatus.COMPLETE,
             plan=plan,
@@ -511,7 +633,12 @@ def select_action(observation: AgentObservation) -> ActionDecision:
 def _select_action_instrumented(observation: AgentObservation) -> ActionDecision:
     interaction_type = observation.interaction_type
     if interaction_type is not InteractionType.OVERWORLD:
-        return ActionDecision(available_actions(observation)[0])
+        decision = ActionDecision(available_actions(observation)[0])
+        trace = getattr(context, "stutter_trace", None)
+        if trace is not None:
+            trace.mark("selected_agent_action", decision.action.action_type.name)
+            trace.mark("selected_agent_option", decision.action.option)
+        return decision
     # A semantic trigger can remain geometrically reachable while its script
     # owns the avatar.  Do not send the goal's interaction input again until
     # the script has returned control to the player.
@@ -758,6 +885,12 @@ class AgentActionExecutor:
 class AgentControlLoop:
     """A generator-compatible observe/select/execute loop for future mounting."""
 
+    # Runtime structures can remain cached across a warp or while a field
+    # message is being installed.  Keep the fast path bounded independently
+    # of debug/tracing overhead so those transitions eventually get a full
+    # perception pass in every mode.
+    _periodic_reobserve_after = 90
+
     def __init__(
         self,
         observe: Callable[[], AgentObservation],
@@ -786,6 +919,7 @@ class AgentControlLoop:
         self._pending_transition: _PendingTransition | None = None
         self._warp_settling = False
         self._warp_wait_observations = 0
+        self._pending_transition_watchdog_limit = 60
         self._blocked_warp: WarpObservation | None = None
         self._cached_evaluation: GoalEvaluation | None = None
         self._route_plan: RoutePlan | None = None
@@ -799,6 +933,8 @@ class AgentControlLoop:
         self._route103_object_dumped_at: set[int] = set()
         self._last_world_transition_source: tuple[tuple[int, int], tuple[int, int]] | None = None
         self._movement_batch: _MovementBatch | None = None
+        self._fast_path_frames = 0
+        self._last_observation_frame: int | None = None
         self._movement_blocked_retries = 0
         # Counts failed movement attempts for this mounted goal.  Unlike the
         # one-shot transient retry above, this survives route invalidation so
@@ -807,6 +943,7 @@ class AgentControlLoop:
         self._movement_failure_limit = 4
         self._dialogue_input_in_flight = False
         self._started_interaction_id: str | None = None
+        self._interaction_start_waits = 0
         self._last_observed_location: Location | None = None
         self._previous_observed_location: Location | None = None
 
@@ -894,6 +1031,7 @@ class AgentControlLoop:
         if self._movement_batch is not None:
             self._report(f"MOVE_BATCH: interrupted reason={reason!r}")
         self._movement_batch = None
+        self._fast_path_frames = 0
         self._in_flight_move = None
         self._in_flight_move_initial_facing = None
         reset_held_buttons = getattr(context.emulator, "reset_held_buttons", None)
@@ -910,6 +1048,10 @@ class AgentControlLoop:
         """
         batch = self._movement_batch
         if batch is None:
+            return False
+        self._fast_path_frames += 1
+        if self._force_periodic_reobserve():
+            self._cancel_movement_batch("watchdog_reobserve")
             return False
         fast_path_start = now()
         trace = getattr(context, "stutter_trace", None)
@@ -949,6 +1091,7 @@ class AgentControlLoop:
                 if batch.index >= len(batch.actions):
                     count("cached_route_batch_completions")
                     self._movement_batch = None
+                    self._fast_path_frames = 0
                     self._in_flight_move = None
                     self._in_flight_move_initial_facing = None
                     reset_held_buttons = getattr(context.emulator, "reset_held_buttons", None)
@@ -975,6 +1118,11 @@ class AgentControlLoop:
                     )
                 return False
             if avatar.facing_direction != action.direction.button_name:
+                # Turning is execution, not diagnostics.  The previous
+                # diagnostic guard made a cached route unable to take its
+                # first differently-facing step unless --debug-trace was
+                # enabled; a Pokémon Center door immediately north of the
+                # avatar exposes that exact failure.
                 if self._diagnostics_enabled():
                     self._report(
                         f"CACHED_ROUTE_DIRECTION_CORRECTION map={location[0]!r} "
@@ -982,11 +1130,11 @@ class AgentControlLoop:
                         f"observed_facing={avatar.facing_direction!r} "
                         f"planned_direction={action.direction.name!r}"
                     )
-                    press_direction = getattr(context.emulator, "press_direction", None)
-                    if callable(press_direction):
-                        press_direction(action.direction.button_name, run=bool(action.run))
-                    else:
-                        context.emulator.press_button(action.direction.button_name)
+                press_direction = getattr(context.emulator, "press_direction", None)
+                if callable(press_direction):
+                    press_direction(action.direction.button_name, run=bool(action.run))
+                else:
+                    context.emulator.press_button(action.direction.button_name)
             else:
                 if action.run:
                     press_direction = getattr(context.emulator, "press_direction", None)
@@ -1014,6 +1162,36 @@ class AgentControlLoop:
                 trace.duration("fast_path_duration_ms", trace_fast_path_start)
             if fast_path_completed:
                 timing("cached_route_fast_path_execution", fast_path_start)
+
+    def _force_periodic_reobserve(self) -> bool:
+        """Invalidate runtime caches at a frame-based observation boundary.
+
+        Most control-loop iterations already call ``self._observe``.  Cached
+        movement batches are the exception, so this boundary lives here and
+        is also checked before each normal observation.  Using the emulator
+        frame counter keeps the behavior stable across debug and headless
+        runs, whose Python-loop timing can differ substantially.
+        """
+        emulator = getattr(context, "emulator", None)
+        get_frame_count = getattr(emulator, "get_frame_count", None)
+        if not callable(get_frame_count):
+            return False
+        try:
+            frame = get_frame_count()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return False
+        if not isinstance(frame, int):
+            return False
+        if (
+            self._last_observation_frame is not None
+            and frame - self._last_observation_frame >= self._periodic_reobserve_after
+        ):
+            state_cache.invalidate_runtime_observations()
+            self._report(
+                f"WATCHDOG: forcing full observation after {self._periodic_reobserve_after} emulator frames"
+            )
+            return True
+        return False
 
     def _report(self, message: str) -> None:
         self._logger(f"AGENT_{message}")
@@ -1178,6 +1356,12 @@ class AgentControlLoop:
         route.  Only changes on the remaining route can invalidate movement;
         static topology and bindings remain conservatively invalidating.
         """
+        # A cached evaluation may be injected by a caller (or restored from
+        # an older checkpoint) without the corresponding world signature.
+        # Treat that as an unknown baseline and force the normal replan path;
+        # attempting to diff it would mask the useful recovery with a TypeError.
+        if previous is None or current is None:
+            return True, "missing_world_signature baseline"
         changed = {index for index, (old, new) in enumerate(zip(previous, current)) if old != new}
         route_locations = {location for action in remaining_actions for location in (action.source, action.destination)}
         names = {0: "map", 1: "warps", 2: "triggers", 3: "dynamic_blocked", 4: "objects", 5: "bindings"}
@@ -1388,7 +1572,17 @@ class AgentControlLoop:
             trace.mark("cached_route_active", True)
             trace.mark("cached_route_actions_remaining", len(self._cached_actions) - self._cached_action_index)
         previous_location = self._last_observed_location
+        self._force_periodic_reobserve()
         observation = self._observe()
+        emulator = getattr(context, "emulator", None)
+        get_frame_count = getattr(emulator, "get_frame_count", None)
+        if callable(get_frame_count):
+            try:
+                frame = get_frame_count()
+                if isinstance(frame, int):
+                    self._last_observation_frame = frame
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
         self._previous_observed_location = previous_location
         if observation.overworld is not None:
             self._last_observed_location = (
@@ -1458,6 +1652,18 @@ class AgentControlLoop:
             self._started_interaction_id is not None
             and isinstance(_goal_target(self._goal), (ActivateTrigger, ReachInteractionPosition))
             and _goal_target(self._goal).trigger_id == self._started_interaction_id
+            and observation.interaction.interaction_phase is InteractionPhase.FIELD_MESSAGE_INPUT_WAIT
+        ):
+            # A newly-started interaction may expose its first field message
+            # before the global script context reports active. A ready field
+            # message is the specific ownership signal, so let the dialogue
+            # handler consume it instead of waiting on the generic handoff.
+            self._started_interaction_id = None
+            self._interaction_start_waits = 0
+        if (
+            self._started_interaction_id is not None
+            and isinstance(_goal_target(self._goal), (ActivateTrigger, ReachInteractionPosition))
+            and _goal_target(self._goal).trigger_id == self._started_interaction_id
             and observation.interaction.script_active
         ):
             wait_action = AgentAction(
@@ -1473,6 +1679,31 @@ class AgentControlLoop:
                     "started interaction script owns the interaction",
                 ),
             )
+        if (
+            self._started_interaction_id is not None
+            and isinstance(_goal_target(self._goal), (ActivateTrigger, ReachInteractionPosition))
+            and _goal_target(self._goal).trigger_id == self._started_interaction_id
+            and not observation.interaction.script_active
+        ):
+            # Interaction dispatch is asynchronous. Re-emitting A every frame
+            # while the ROM is still installing the object script can race the
+            # first script/native transition (especially across a warp). Wait
+            # for the script to claim ownership before considering another A.
+            self._interaction_start_waits += 1
+            if self._interaction_start_waits <= 32:
+                wait_action = AgentAction(
+                    AgentActionType.WAIT_REOBSERVE,
+                    reason="waiting for interaction script activation",
+                )
+                return observation, ActionDecision(wait_action), ActionResult(
+                    ActionResultType.WAITING,
+                    wait_action,
+                    wait_action.reason,
+                )
+            # The input was genuinely ignored. Permit one fresh evaluation so
+            # the existing navigation/interaction machinery can retry it.
+            self._started_interaction_id = None
+            self._interaction_start_waits = 0
 
         pending = self._pending_transition
         if observation.overworld is not None and pending is not None:
@@ -1572,10 +1803,13 @@ class AgentControlLoop:
                 else:
                     pending.observations += 1
                 pending.last_position = observed
-                if pending.observations > 8:
-                    reason = "transition_blocked" if pending.moved is False else "transition_timeout"
-                    self._report(f"TRANSITION: {reason}")
-                    self._blocked_warp = self._goal.warp if isinstance(self._goal, ReachWarp) else None
+                if pending.observations >= self._pending_transition_watchdog_limit:
+                    reason = "transition_watchdog_reobserve"
+                    self._report(
+                        f"WATCHDOG: {reason} observations={pending.observations} "
+                        f"source={pending.source!r} destination={pending.destination!r}"
+                    )
+                    state_cache.invalidate_runtime_observations()
                     self._release_transition_input(pending)
                     self._pending_transition = None
                     self._expected_world_transition = None
@@ -1585,7 +1819,7 @@ class AgentControlLoop:
                     return (
                         observation,
                         ActionDecision(wait_action),
-                        ActionResult(ActionResultType.UNREACHABLE, wait_action, reason),
+                        ActionResult(ActionResultType.WAITING, wait_action, reason),
                     )
                 trace = getattr(context, "stutter_trace", None)
                 if trace is not None:
@@ -1906,6 +2140,7 @@ class AgentControlLoop:
         result = self._executor.execute(decision.action, observation)
         if result.result_type is ActionResultType.EXECUTED and decision.action.action_type is AgentActionType.INTERACT:
             self._started_interaction_id = decision.action.option
+            self._interaction_start_waits = 0
         if tactical_trace:
             diagnostic_print(
                 lambda: (

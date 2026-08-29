@@ -187,7 +187,11 @@ class TestIsWaitingForInput(unittest.TestCase):
             patch("modules.interaction_state.is_field_message_waiting_for_input", side_effect=[False, True]),
             patch(
                 "modules.interaction_state.get_global_script_context",
-                return_value=types.SimpleNamespace(native_function_name="WaitForAorBPress"),
+                return_value=types.SimpleNamespace(
+                    is_active=True,
+                    native_function_name="WaitForAorBPress",
+                    script_function_name="Std_MsgboxDefault",
+                ),
             ),
         ):
             first = observe_interaction()
@@ -206,6 +210,10 @@ class TestIsWaitingForInput(unittest.TestCase):
             patch("modules.interaction_state.player_avatar_is_controllable", return_value=False),
             patch("modules.interaction_state.task_is_active", return_value=True),
             patch("modules.interaction_state.is_field_message_waiting_for_input", return_value=True),
+            patch(
+                "modules.interaction_state.get_global_script_context",
+                return_value=types.SimpleNamespace(native_function_name="WaitForAorBPress"),
+            ),
         ):
             observation = observe_interaction()
 

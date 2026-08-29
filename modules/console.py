@@ -237,25 +237,27 @@ def print_stats(stats: "GlobalStats", encounter: "EncounterInfo") -> None:
 console = Console(theme=theme)
 
 _DIAGNOSTIC_LOG_WHITELIST = (
-    "CAMPAIGN_SELECTION_HANDOFF",
-    "CAMPAIGN_EXECUTION_HANDOFF",
-    "CAMPAIGN_TACTICAL_LOOP_BOUNDARY",
-    "CAMPAIGN_TACTICAL_LOOP_INVALIDATED",
-    "CAMPAIGN_TACTICAL_STEP_HANDOFF",
-    "CAMPAIGN_CAPABILITY_HANDOFF",
-    "CAMPAIGN_SEMANTIC_TARGET_CALL",
-    "CAMPAIGN_SEMANTIC_TARGET_RESULT",
+    # Keep the timing-sensitive recovery experiment small: retain recovery
+    # lifecycle records, post-observation coordinates, ROM transitions, and
+    # the actual input boundary, while excluding the per-frame planning and
+    # readiness dumps that can perturb the frame loop.
+    "CAMPAIGN_RECOVERY_EXECUTION: started",
+    "CAMPAIGN_RECOVERY_EXECUTION: completed",
+    "CAMPAIGN_RECOVERY_ENTRY_WARP",
+    "CAMPAIGN_RECOVERY_SOURCE",
+    "CAMPAIGN_RECOVERY_INTERACTION_PLAN",
+    "CAMPAIGN_RECOVERY_INTERACTION:",
+    "ROM_EXECUTION_TRANSITION",
+    "CAMPAIGN_TACTICAL_STEP",
     "CAMPAIGN_INTERACTION_TRACE",
-    "CAMPAIGN_NAVIGATION_TRACE",
-    "CAMPAIGN_PLAN_TRACE",
-    "CAMPAIGN:",
-    "EMULATOR_INPUT_OWNERSHIP",
-    "WARP_INPUT:",
-    "",
+    "CAMPAIGN_INTERACTION_DECISION",
+    "AGENT_DIALOGUE_INPUT",
 )
 
 
-def diagnostic_print(message: str | Callable[[], str], *, trace: bool = False) -> None:
+def diagnostic_print(
+    message: str | Callable[[], str], *, trace: bool = False, prefix: str | None = None
+) -> None:
     """Print a diagnostic message only when its configured level is enabled.
 
     ``message`` may be a callable so expensive formatting is skipped entirely
@@ -266,14 +268,23 @@ def diagnostic_print(message: str | Callable[[], str], *, trace: bool = False) -
 
     if not context.debug or (trace and not getattr(context, "debug_trace", False)):
         return
+    # Callers with lazy messages should provide the prefix explicitly. This
+    # lets a filtered trace return before evaluating expensive state reads and
+    # formatting. String messages remain backward compatible and can infer it.
+    if trace and prefix is None and isinstance(message, str):
+        prefix = message
+    if trace and prefix is not None and not prefix.startswith(_DIAGNOSTIC_LOG_WHITELIST):
+        return
     rendered = message() if callable(message) else message
-    if trace and not rendered.startswith(_DIAGNOSTIC_LOG_WHITELIST):
+    if trace and prefix is None and not rendered.startswith(_DIAGNOSTIC_LOG_WHITELIST):
         return
     console.print(rendered)
     # Lifecycle/path-boundary records must reach the pipe before a synchronous
     # operation (or KeyboardInterrupt) can prevent the normal frame flush.
     if trace:
-        console.file.flush()
+        file = getattr(console, "file", None)
+        if file is not None:
+            file.flush()
 
 
 def profile_print(message: str | Callable[[], str], *, every: int = 1) -> None:

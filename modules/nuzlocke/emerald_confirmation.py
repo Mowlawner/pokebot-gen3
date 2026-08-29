@@ -110,9 +110,14 @@ def observe_emerald_confirmation() -> EmeraldConfirmationObservation | None:
         try:
             script = get_global_script_context()
             stack = tuple(script.stack or ()) if script is not None else ()
-            if _STARTER_NICKNAME_SCRIPT in stack:
+            # At the menu boundary the active script can be represented either
+            # as the current function or as an entry in the return stack.
+            # Treat both forms as the same observed ROM ownership; otherwise
+            # this real prompt becomes UNKNOWN and the dispatcher waits.
+            script_function = getattr(script, "script_function_name", None) if script is not None else None
+            if _STARTER_NICKNAME_SCRIPT in stack or script_function == _STARTER_NICKNAME_SCRIPT:
                 context = EmeraldConfirmationContext.POKEMON_NICKNAME
-            elif _GO_SEE_RIVAL_SCRIPT in stack:
+            elif _GO_SEE_RIVAL_SCRIPT in stack or script_function == _GO_SEE_RIVAL_SCRIPT:
                 context = EmeraldConfirmationContext.GO_SEE_RIVAL
         except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
             pass

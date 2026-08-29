@@ -3,6 +3,17 @@ E2E Test Suite
 
 ## Prerequisites
 
+For a development environment, install the test runner separately from the
+application's runtime dependencies:
+
+```bash
+python -m pip install -r requirements-dev.txt
+```
+
+Running `pokebot.py` still installs and checks the application dependencies
+declared in `requirements.py`; it no longer installs pytest as a runtime
+dependency.
+
 Ensure that you have the following 3 games dumped and that they match
 these SHA1 hashes:
 
@@ -13,7 +24,46 @@ these SHA1 hashes:
 
 ## Run
 
-From **the repository root**, run one of the following commands:
+From **the repository root**, pytest is the preferred test runner. The
+existing `unittest.TestCase` tests remain supported during the migration.
+
+```bash
+# Runs all tests collected by pytest
+python -m pytest
+```
+
+The default command runs the fast unit tier and reports emulator/e2e tests as
+skipped. Enable the ROM-backed tiers explicitly:
+
+```bash
+# Runs unit tests plus ROM-backed emulator tests
+python -m pytest --run-emulator
+```
+
+```bash
+# Runs the complete local suite, including long-running e2e tests
+python -m pytest --run-e2e
+```
+
+```bash
+# Runs one test by node ID
+python -m pytest tests/test_mode_spin.py::TestSpin::test_it_catches_shinies
+```
+
+The tier markers are also available for selection:
+
+```bash
+# Runs only the fast unit tier
+python -m pytest -m unit
+```
+
+```bash
+# Runs emulator-backed tests (serially)
+python -m pytest -m emulator --run-emulator
+```
+
+The original unittest commands remain useful while the migration is in
+progress:
 
 ```bash
 # Runs all tests
@@ -29,6 +79,10 @@ python -m unittest tests.test_mode_spin
 # Runs a single test
 python -m unittest tests.test_mode_spin.TestModeSpin.test_it_catches_shinies
 ```
+
+Tests using the global emulator context, ROM-backed save states, or frame
+stepping should not yet be run in parallel. Marker assignment and fixture
+isolation are being introduced incrementally.
 
 
 ## Writing tests

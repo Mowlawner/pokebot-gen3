@@ -268,7 +268,7 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
 
     def test_semantic_map_target_prefers_progression_connection_over_interior_warp(self):
         """A globally relevant house warp must not beat the next boundary edge."""
-        from modules.world_navigation import WorldRoute
+        from modules.world_navigation import WorldEdge, WorldRoute
 
         oldale, route102, house, petalburg = (1, 1), (1, 2), (2, 0), (1, 3)
         progression = MapConnectionObservation((oldale, (8, 0)), (route102, (0, 20)), required_facing=Direction.North)
@@ -366,6 +366,52 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         ):
             selected = _observed_exit_goal(world, navigator, SemanticTarget.interaction(house, "enter_house"))
         self.assertIs(selected.warp, interior)
+
+    def test_interaction_target_allows_intermediate_interior_warp_chain(self):
+        """A second-floor interaction may require entering its first floor."""
+        from modules.world_navigation import WorldEdge, WorldRoute
+
+        town, house_1f, house_2f, route101 = (0, 9), (1, 2), (1, 3), (0, 16)
+        house_entry = WarpObservation((town, (5, 8)), (house_1f, (2, 8)))
+        route_exit = MapConnectionObservation(
+            (town, (10, 0)), (route101, (10, 28)), required_facing=Direction.North
+        )
+        world = SimpleNamespace(
+            map_id=town,
+            player_coordinates=(8, 4),
+            controllable=True,
+            transitions=(house_entry, route_exit),
+            warps=(),
+        )
+        navigator = Mock()
+        navigator.plan.side_effect = lambda start, goal, algorithm: SimpleNamespace(
+            destination=goal.warp.entry,
+            metrics=SimpleNamespace(encounter_opportunities=0, total_route_cost=1, movement_actions=1),
+        )
+
+        def downstream(transition, target, graph=None):
+            if transition is house_entry:
+                return WorldRoute((house_1f, house_2f), (), 1)
+            return WorldRoute(
+                (route101, house_2f),
+                (WorldEdge(route101, house_2f, "connection", (), ()),),
+                20,
+            )
+
+        with (
+            patch(
+                "modules.nuzlocke.emerald_capabilities.classify_transition_relevance",
+                return_value=TransitionRelevance.RELEVANT,
+            ),
+            patch("modules.nuzlocke.emerald_capabilities.transition_world_route", side_effect=downstream),
+        ):
+            selected = _observed_exit_goal(
+                world,
+                navigator,
+                SemanticTarget.interaction(house_2f, "rival_interaction"),
+            )
+
+        self.assertIs(selected.warp, house_entry)
 
     def test_recent_transition_prevents_immediate_cheap_reversal(self):
         from modules.world_navigation import WorldRoute
@@ -600,6 +646,63 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         self.assertIs(selected.warp, connection)
         self.assertEqual(selected.warp.kind, "map_connection")
 
+    def test_semantic_exit_selection_follows_world_route_after_map_transition(self):
+        """A return objective must not select the just-completed edge back."""
+        from modules.world_navigation import WorldEdge, WorldMapGraph, WorldRoute
+
+        oldale, route103, route101, lab = (0, 9), (0, 18), (0, 16), (0, 10)
+        reverse = MapConnectionObservation(
+            (oldale, (1, 0)), (route103, (1, 20)), required_facing=Direction.North
+        )
+        forward = MapConnectionObservation(
+            (oldale, (3, 0)), (route101, (3, 20)), required_facing=Direction.North
+        )
+        world = OverworldObservation(
+            oldale,
+            (2, 1),
+            Direction.North,
+            True,
+            tuple(
+                TileObservation((oldale, coordinate), False, frozenset(Direction))
+                for coordinate in ((1, 0), (2, 1), (3, 0))
+            ),
+            (),
+            (),
+            (),
+            transitions=(reverse, forward),
+        )
+        graph = WorldMapGraph(
+            (
+                WorldEdge(oldale, route103, "connection", ((1, 0),), ((1, 20),), estimated_cost=1),
+                WorldEdge(oldale, route101, "connection", ((3, 0),), ((3, 20),), estimated_cost=1),
+                WorldEdge(route101, lab, "connection", ((3, 0),), ((3, 20),), estimated_cost=1),
+            )
+        )
+        navigator = Mock()
+        navigator.plan.return_value = SimpleNamespace(
+            metrics=SimpleNamespace(encounter_opportunities=0, total_route_cost=1, movement_actions=1)
+        )
+
+        with (
+            patch("modules.world_navigation.get_world_map_graph", return_value=graph),
+            patch(
+                "modules.nuzlocke.emerald_capabilities.classify_transition_relevance",
+                return_value=TransitionRelevance.RELEVANT,
+            ),
+            patch(
+                "modules.nuzlocke.emerald_capabilities.transition_world_route",
+                return_value=WorldRoute((route101, lab), (), 1),
+            ),
+        ):
+            selected = _observed_exit_goal(
+                world,
+                navigator,
+                SemanticTarget.map(lab),
+                {"previous_transition": (route103, oldale)},
+            )
+
+        self.assertIs(selected.warp, forward)
+
     def test_aligned_map_connection_is_one_search_and_selects_cheapest_member(self):
         from modules.navigation import GoalAwareNavigator, NavigationWorld
         from modules.overworld import WarpObservation
@@ -697,6 +800,12 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         self.assertEqual(target.kind, SemanticTargetKind.INTERACTION)
         self.assertEqual(target.target_map, MapRSE.ROUTE101.value)
         self.assertEqual(target.interaction_id, "Route101_EventScript_BirchsBag")
+
+    def test_introductory_rival_targets_route_103_rival_trigger(self):
+        target = _semantic_target_for_objective("complete_intro_rival")
+        self.assertEqual(target.kind, SemanticTargetKind.INTERACTION)
+        self.assertEqual(target.target_map, MapRSE.ROUTE103.value)
+        self.assertEqual(target.interaction_id, "Route103_EventScript_Rival")
 
     def test_receive_pokedex_targets_birch_lab_map(self):
         target = _semantic_target_for_objective("receive_pokedex")
@@ -997,6 +1106,41 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             )
         )
 
+    def test_current_map_semantic_interaction_uses_static_affordance_during_spawn_gap(self):
+        map_id = MapRSE.ROUTE103.value
+        trigger = TriggerObservation(
+            "introductory_rival",
+            frozenset({(map_id, (10, 3))}),
+            frozenset(
+                {
+                    (map_id, (10, 2)),
+                    (map_id, (11, 3)),
+                    (map_id, (10, 4)),
+                    (map_id, (9, 3)),
+                }
+            ),
+            kind="semantic_object",
+            affordance_id="Route103_EventScript_Rival",
+        )
+        world = OverworldObservation(
+            map_id,
+            (10, 2),
+            Direction.South,
+            True,
+            (TileObservation((map_id, (10, 2)), False, frozenset(Direction)),),
+            (),
+            (),
+            (trigger,),
+        )
+
+        self.assertEqual(
+            _observed_interaction_goal(
+                world,
+                SemanticTarget.interaction(map_id, "Route103_EventScript_Rival"),
+            ),
+            ActivateTrigger("introductory_rival"),
+        )
+
     def test_transition_classifier_exposes_relevance_and_blocking(self):
         from modules.overworld import WarpObservation
         from modules.world_navigation import WorldMapGraph, WorldEdge
@@ -1185,7 +1329,7 @@ class EmeraldCampaignLifecycleTests(unittest.TestCase):
             patch("modules.nuzlocke.emerald_capabilities.perceive_overworld") as perceive_overworld,
             patch(
                 "modules.nuzlocke.emerald_capabilities._advance_scripted_input",
-                side_effect=lambda: advance_dialogue(),
+                side_effect=lambda *_, **__: advance_dialogue(),
             ) as advance_input,
         ):
             campaign = observation_driven_emerald_campaign()
@@ -1419,6 +1563,31 @@ class EmeraldCampaignLifecycleTests(unittest.TestCase):
         )
         self.assertIs(choose_emerald_campaign_action(observation), EmeraldCampaignAction.ENTER_NAME)
 
+    def test_observed_starter_naming_target_selects_gender_aware_nickname_action(self):
+        from modules.nuzlocke.emerald_naming import EmeraldNamingObservation, EmeraldNamingTarget
+
+        observation = SimpleNamespace(
+            starter_selection=None,
+            confirmation=None,
+            naming=EmeraldNamingObservation(
+                EmeraldNamingTarget.POKEMON_NICKNAME,
+                3,
+                0x2010000,
+                True,
+                species_id=277,
+                species_name="Treecko",
+                pokemon_gender="female",
+                personality_value=1234,
+            ),
+            actionable_dialogue=False,
+            game_state=GameState.NAMING_SCREEN,
+            title_actionable=False,
+            gender_task=None,
+            script_stack=(),
+            rom_owned_movement=False,
+        )
+        self.assertIs(choose_emerald_observation_action(observation), EmeraldCampaignAction.ENTER_POKEMON_NICKNAME)
+
     def test_naming_capability_waits_until_keyboard_is_ready(self):
         from modules.nuzlocke.emerald_naming import EmeraldNamingObservation, EmeraldNamingTarget
 
@@ -1486,12 +1655,15 @@ class EmeraldCampaignLifecycleTests(unittest.TestCase):
         with (
             patch("modules.nuzlocke.emerald_capabilities.context", fake_context),
             patch("modules.nuzlocke.emerald_capabilities._campaign_observation", side_effect=[not_ready, ready]),
-            patch("modules.nuzlocke.emerald_capabilities._naming_input") as naming_input,
+            patch(
+                "modules.nuzlocke.emerald_capabilities.type_in_naming_screen",
+                return_value=iter((None,)),
+            ) as type_name,
         ):
             generator = observation_driven_emerald_campaign()
             next(generator)
             next(generator)
-        naming_input.assert_called_once_with("ASH")
+        type_name.assert_called_once_with("ASH")
 
     def test_naming_input_reobserves_before_repeating(self):
         from modules.nuzlocke.emerald_naming import EmeraldNamingObservation, EmeraldNamingTarget
@@ -1509,13 +1681,16 @@ class EmeraldCampaignLifecycleTests(unittest.TestCase):
         with (
             patch("modules.nuzlocke.emerald_capabilities.context", fake_context),
             patch("modules.nuzlocke.emerald_capabilities._campaign_observation", side_effect=[first, same, ended]),
-            patch("modules.nuzlocke.emerald_capabilities._naming_input") as naming_input,
+            patch(
+                "modules.nuzlocke.emerald_capabilities.type_in_naming_screen",
+                return_value=iter((None, None)),
+            ) as type_name,
         ):
             generator = observation_driven_emerald_campaign()
             next(generator)
             next(generator)
             next(generator)
-        naming_input.assert_called_once_with("ASH")
+        type_name.assert_called_once_with("ASH")
 
     def test_no_to_yes_then_confirm_uses_one_input_per_observation(self):
         emulator = SimpleNamespace(press_button=Mock())

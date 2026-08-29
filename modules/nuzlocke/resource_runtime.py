@@ -16,17 +16,27 @@ from modules.agent_control import (
 )
 from modules.interaction_state import InteractionPhase
 from modules.goals import ActivateTrigger, EncounterMode, Goal, NavigationGoal, ReachInteractionPosition, ReachLocation
-from modules.map_data import MapFRLG
+from modules.map_data import MapFRLG, PokemonCenter
+from modules.map import get_map_metadata
 from modules.modes.util.higher_level_actions import heal_in_pokemon_center
 from modules.modes.util.items import use_item_from_bag
 from modules.modes.util.map import find_closest_pokemon_center
 from modules.modes.util.walking import wait_for_player_avatar_to_be_controllable
-from modules.map_path import calculate_path, PathFindingError
+from modules.map_path import calculate_path, PathFindingError, Direction
 from modules.player import get_player_location
+from modules.navigation import NavigationWorld, plan_with_world_navigation
+from modules.overworld import OverworldObservationResult, perceive_overworld
+from modules.world_navigation import get_world_map_graph
 from modules.modes.util.pc_interaction import PCAction, interact_with_pc
 from modules.modes._interface import BotModeError
 from modules.pokemon_party import get_party
 from modules.console import diagnostic_print
+from .campaign_status import recovery_status
+from modules.goals import SemanticTarget
+from .emerald_healing_catalog import (
+    emerald_healing_source_for_destination,
+    emerald_healing_sources,
+)
 
 from .resource_policy import (
     HealingResource,
@@ -35,6 +45,69 @@ from .resource_policy import (
     ResourceSnapshot,
 )
 from .resource_policy import ResourceDecision, RouteRecovery, assess_campaign_resources
+
+
+def _pulse_toward_entry(observation, destination) -> bool:
+    """Issue one fresh cardinal input toward a stalled healing entrance."""
+    overworld = getattr(observation, "overworld", None)
+    current = getattr(overworld, "player_coordinates", None)
+    target = destination[1] if isinstance(destination, tuple) and len(destination) == 2 else None
+    if current is None or target is None:
+        return False
+    dx = target[0] - current[0]
+    dy = target[1] - current[1]
+    if abs(dx) + abs(dy) != 1:
+        return False
+    direction = (
+        Direction.East if dx == 1 else Direction.West if dx == -1 else Direction.South if dy == 1 else Direction.North
+    )
+    press_direction = getattr(context.emulator, "press_direction", None)
+    if callable(press_direction):
+        press_direction(direction.button_name, run=False, fresh=True)
+    else:
+        press_button_fresh = getattr(context.emulator, "press_button_fresh", None)
+        if not callable(press_button_fresh):
+            return False
+        press_button_fresh(direction.button_name)
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_RECOVERY_ENTRY_WARP_FALLBACK: "
+            f"from={current!r} toward={target!r} direction={direction.name!r}"
+        ),
+        trace=True,
+        prefix="CAMPAIGN_RECOVERY_ENTRY_WARP_FALLBACK",
+    )
+    return True
+
+
+def _map_id_value(map_id):
+    """Normalize map enums to the tuple emitted by overworld perception."""
+    return getattr(map_id, "value", map_id)
+
+
+def _prewarm_interior_map_identity(interior_map_id) -> None:
+    """Make the live map header sufficient to identify a healing interior.
+
+    During a door warp, SaveBlock1 can retain the exterior map after the
+    interior is already visible.  ``perceive_overworld`` resolves the live
+    ``gMapHeader`` only against headers that have previously been cached.
+    Recovery must warm its known destination before waiting on that
+    observation; otherwise a stale exterior observation prevents the warp
+    controller from being created, which in turn prevents the cache warm-up.
+    """
+    try:
+        get_map_metadata(interior_map_id)
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        # Metadata warming is an observation aid, not a prerequisite for a
+        # valid recovery route. The normal handoff still reports a meaningful
+        # navigation failure if the destination itself is unavailable.
+        return
+
+
+# A recovery handoff is a map-observation boundary, not a second navigation
+# phase.  Bound a failed live-map observation so a bad ROM observation is
+# reported instead of leaving the bot motionless forever.
+_MAP_IDENTITY_RESOLUTION_TIMEOUT = 300
 
 
 class HealingSourceType(Enum):
@@ -53,21 +126,57 @@ class HealingSource:
     requires_dialogue: bool = True
     interaction_trigger_id: str | None = None
 
+    @property
+    def navigation_goal(self) -> Goal:
+        """Semantic target for reaching this source's usable interaction point."""
+        if self.interaction_trigger_id is not None:
+            return ReachInteractionPosition(self.interaction_trigger_id)
+        if self.location is not None:
+            return ReachLocation(self.location)
+        raise RuntimeError(f"Healing source {self.source_id!r} has no navigation target")
+
+
+# These are interaction affordances, not map types.  The decompilation uses
+# the same full-party healing primitive from several scripts: a Center nurse,
+# the player's mother, and the Route 111 rest stop are the ordinary
+# overworld-accessible examples.  Keep the catalog keyed by script identity so
+# other games/ROM capabilities can extend it without changing recovery policy.
+_FULL_PARTY_HEALING_SCRIPT_NAMES = frozenset(
+    {
+        "PlayersHouse_1F_EventScript_Mom",
+        "Route111_OldLadysRestStop_EventScript_OldLady",
+        "Route119_WeatherInstitute_1F_EventScript_Bed",
+        "SSTidalRooms_EventScript_Bed",
+    }
+)
+
+
+def _healing_source_type(identity: str) -> HealingSourceType | None:
+    if identity.endswith("_PokemonCenter_1F_EventScript_Nurse"):
+        return HealingSourceType.POKEMON_CENTER_NURSE
+    if identity in _FULL_PARTY_HEALING_SCRIPT_NAMES:
+        return HealingSourceType.FULL_PARTY_PROVIDER
+    return None
+
 
 def discover_healing_source(location=None, observation=None) -> HealingSource | None:
-    """Resolve a destination or an observed full-party healing affordance."""
+    """Resolve a destination or an observed full-party healing affordance.
+
+    A source is deliberately recognized from its observed interaction script,
+    not from the building it happens to occupy.  This keeps the runtime open
+    to mother/rest-stop/facility sources and lets a ROM capability add more
+    script identities without teaching the planner about map geometry.
+    """
     if observation is not None and observation.overworld is not None:
         for trigger in observation.overworld.triggers:
             identity = trigger.affordance_id or trigger.script_symbol or ""
-            if (
-                trigger.kind == "object_interaction"
-                and identity.endswith("_PokemonCenter_1F_EventScript_Nurse")
-                and trigger.activation_locations
-            ):
+            source_type = _healing_source_type(identity)
+            if trigger.kind == "object_interaction" and source_type is not None and trigger.activation_locations:
+                activation_location = next(iter(trigger.activation_locations), None)
                 return HealingSource(
                     identity,
-                    HealingSourceType.POKEMON_CENTER_NURSE,
-                    None,
+                    source_type,
+                    activation_location,
                     trigger.trigger_id,
                     True,
                     True,
@@ -82,7 +191,13 @@ def discover_healing_source(location=None, observation=None) -> HealingSource | 
     except (BotModeError, PathFindingError, RuntimeError):
         return None
     return HealingSource(
-        "nearest_full_party_source", HealingSourceType.FULL_PARTY_PROVIDER, center, center, True, True, True
+        "nearest_full_party_source",
+        HealingSourceType.FULL_PARTY_PROVIDER,
+        center.value,
+        center,
+        True,
+        True,
+        True,
     )
 
 
@@ -111,6 +226,7 @@ def _resolve_recovery_interaction() -> Iterator[object]:
         diagnostic_print(
             lambda: f"RECOVERY_PREFLIGHT_LIFECYCLE: phase=resume iteration={iteration} frame={getattr(context, 'frame', None)!r}",
             trace=True,
+            prefix="RECOVERY_PREFLIGHT_LIFECYCLE",
         )
         observation = observe_agent()
         decision = select_action(observation)
@@ -139,6 +255,7 @@ def _resolve_recovery_interaction() -> Iterator[object]:
                 f"observation_changed={previous_signature is None or signature != previous_signature!r}"
             ),
             trace=True,
+            prefix="RECOVERY_INTERACTION_PREFLIGHT",
         )
         previous_signature = signature
         if decision.action.action_type is AgentActionType.ADVANCE_DIALOGUE:
@@ -150,10 +267,12 @@ def _resolve_recovery_interaction() -> Iterator[object]:
                     f"message={getattr(result, 'message', None)!r}"
                 ),
                 trace=True,
+                prefix="RECOVERY_INTERACTION_ACTION",
             )
             diagnostic_print(
                 lambda: f"RECOVERY_PREFLIGHT_LIFECYCLE: phase=yield iteration={iteration} frame={getattr(context, 'frame', None)!r}",
                 trace=True,
+                prefix="RECOVERY_PREFLIGHT_LIFECYCLE",
             )
             yield
             continue
@@ -164,6 +283,7 @@ def _resolve_recovery_interaction() -> Iterator[object]:
                     f"iteration={iteration} decision=yield_wait={decision.action.action_type.name!r}"
                 ),
                 trace=True,
+                prefix="RECOVERY_INTERACTION_PREFLIGHT",
             )
             yield
             continue
@@ -173,6 +293,7 @@ def _resolve_recovery_interaction() -> Iterator[object]:
                 f"iteration={iteration} decision=return_waiting={decision.action.action_type.name!r}"
             ),
             trace=True,
+            prefix="RECOVERY_INTERACTION_PREFLIGHT",
         )
         return
 
@@ -282,26 +403,145 @@ def execute_heal_party() -> Iterator[object]:
                 raise RuntimeError("SOURCE_UNAVAILABLE")
             source = destination_source
         if source.interaction_trigger_id is None:
-            destination = source.interaction_target.value
+            destination = source.location
             yield from AgentControlLoop(
                 lambda: observe_agent(goal=ReachLocation(destination)), goal=ReachLocation(destination)
             ).run()
-            # The destination route ends at the entrance/warp.  Resolve the
-            # actual affordance from a fresh interior observation.
             destination_source = None
             source = None
             while source is None:
                 yield
                 interior_observation = observe_agent()
                 source = discover_healing_source(observation=interior_observation)
+        navigation_goal = source.navigation_goal
         yield from AgentControlLoop(
-            lambda: observe_agent(goal=ReachInteractionPosition(source.interaction_trigger_id)),
-            goal=ReachInteractionPosition(source.interaction_trigger_id),
+            lambda: observe_agent(goal=navigation_goal),
+            goal=navigation_goal,
         ).run()
         yield from _execute_healing_source_interaction(source)
         return
 
 
+def execute_planned_recovery(destination, planned_source=None) -> Iterator[object]:
+    """Execute recovery at the Center selected by campaign planning.
+
+    The route destination is intentionally passed in from the plan.  The
+    interaction affordance is still discovered from a fresh interior
+    observation, but execution never reselects a different Center.
+    """
+    if party_is_restored():
+        return
+    context.campaign_status = recovery_status(
+        SemanticTarget.at(destination),
+        "Navigate to healing source",
+    )
+    yield from AgentControlLoop(
+        lambda: observe_agent(goal=ReachLocation(destination)),
+        goal=ReachLocation(destination),
+    ).run()
+    center = next((candidate for candidate in PokemonCenter if candidate.value == destination), None)
+    catalog_source = planned_source or emerald_healing_source_for_destination(destination)
+    if center is not None:
+        yield from _wait_for_center_interior(center)
+    elif catalog_source is not None:
+        yield from _wait_for_healing_interior(catalog_source)
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_RECOVERY_INTERIOR: "
+            f"phase=entered_destination destination={destination!r} "
+            f"frame={getattr(context, 'frame', None)!r}"
+        ),
+        trace=True,
+        prefix="CAMPAIGN_RECOVERY_INTERIOR",
+    )
+    interior_map = getattr(
+        catalog_source,
+        "interior_map",
+        getattr(center, "name", None),
+    )
+    context.campaign_status = recovery_status(
+        SemanticTarget.map(interior_map),
+        "Navigate to nurse" if center is not None else "Navigate to healing source",
+    )
+    while True:
+        # This loop's only completion condition is a physical map change.
+        # Observe the map on every frame, including the transient CHANGE_MAP
+        # classification produced by a door warp.
+        observation = observe_agent(require_overworld=True)
+        source = discover_healing_source(observation=observation)
+        if source is not None:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_RECOVERY_SOURCE: "
+                    f"source={source.source_id!r} trigger={source.interaction_trigger_id!r} "
+                    f"activation_observed=True frame={getattr(context, 'frame', None)!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_RECOVERY_SOURCE",
+            )
+            context.campaign_status = recovery_status(
+                SemanticTarget.interaction(
+                    getattr(observation.overworld, "map_id", interior_map),
+                    source.interaction_trigger_id or source.source_id,
+                ),
+                "Navigate to nurse" if getattr(source, "source_type", None) is HealingSourceType.POKEMON_CENTER_NURSE
+                else "Navigate to healing source",
+            )
+            # The nurse is separated from the player by the Center counter.
+            # Reaching the Center map is not the same as reaching an
+            # activation position; use the observed trigger geometry so the
+            # navigator can select the tile in front of (or beyond) the
+            # counter, exactly as ordinary object interactions do.
+            if source.interaction_trigger_id is not None:
+                interaction_goal = getattr(
+                    source,
+                    "navigation_goal",
+                    ReachInteractionPosition(source.interaction_trigger_id),
+                )
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_RECOVERY_INTERACTION_PLAN: "
+                        f"goal={interaction_goal!r} frame={getattr(context, 'frame', None)!r}"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_RECOVERY_INTERACTION_PLAN",
+                )
+                yield from AgentControlLoop(
+                    lambda: observe_agent(goal=interaction_goal),
+                    goal=interaction_goal,
+                ).run()
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_RECOVERY_INTERACTION: "
+                    f"phase=position_reached trigger={source.interaction_trigger_id!r} "
+                    f"frame={getattr(context, 'frame', None)!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_RECOVERY_INTERACTION",
+            )
+            context.campaign_status = recovery_status(
+                SemanticTarget.interaction(
+                    getattr(observation.overworld, "map_id", interior_map),
+                    source.interaction_trigger_id or source.source_id,
+                ),
+                "Interact with nurse" if getattr(source, "source_type", None) is HealingSourceType.POKEMON_CENTER_NURSE
+                else "Interact with healing source",
+            )
+            yield from _execute_healing_source_interaction(source)
+            if not party_is_restored():
+                raise RuntimeError("HEALING_NOT_CONFIRMED")
+            context.campaign_status = recovery_status(
+                SemanticTarget.interaction(
+                    getattr(observation.overworld, "map_id", interior_map),
+                    source.interaction_trigger_id or source.source_id,
+                ),
+                "Healing confirmed",
+            )
+            return
+        if observation.interaction_type.name == "DIALOGUE" or not observation.interaction.controllable:
+            decision = select_action(observation)
+            AgentActionExecutor().execute(decision.action, observation)
+        yield
 def _execute_healing_source_interaction(source: HealingSource) -> Iterator[object]:
     """Interact with a reached semantic healing source through shared control.
 
@@ -313,6 +553,9 @@ def _execute_healing_source_interaction(source: HealingSource) -> Iterator[objec
     interaction_started = False
     interaction_start_observations = 0
     last_observation = None
+    last_party_restored = False
+    dialogue_input_in_flight: tuple[object, ...] | None = None
+    dialogue_input_waits = 0
     # Script activation is asynchronous: the overworld can remain apparently
     # controllable for several observations after the A input is accepted.
     # Keep ownership during that transition, but retain a bounded failure
@@ -321,28 +564,54 @@ def _execute_healing_source_interaction(source: HealingSource) -> Iterator[objec
     while True:
         if (
             last_observation is not None
-            and party_is_restored()
-            and last_observation.interaction.controllable
+            and last_party_restored
             and not last_observation.interaction.script_active
             and last_observation.interaction.interaction_phase is InteractionPhase.NONE
         ):
             diagnostic_print("HEAL_PARTY_COMPLETE: party_fully_restored=True interaction_finished=True", trace=True)
             return
         observation = observe_agent()
+        if interaction_started and observation.overworld is not None:
+            context.campaign_status = recovery_status(
+                SemanticTarget.interaction(
+                    observation.overworld.map_id,
+                    source.interaction_trigger_id or source.source_id,
+                ),
+                "Confirm healing",
+            )
         party_restored = party_is_restored()
         # Restored HP is not the same boundary as completion of the nurse's
-        # event script.  Emerald restores the party before displaying the
-        # closing messages, so leave the capability mounted until the ROM has
-        # returned to ordinary overworld control.
+        # event script. Emerald restores the party before displaying the
+        # closing messages, so leave the capability mounted until the script
+        # itself ends. Avatar controllability can lag that fact by one frame;
+        # waiting for it gives the prior dialogue A an opportunity to be
+        # consumed as a new nurse interaction.
         interaction_finished = (
-            observation.interaction.controllable
-            and not observation.interaction.script_active
+            not observation.interaction.script_active
             and observation.interaction.interaction_phase is InteractionPhase.NONE
         )
         if party_restored and interaction_finished:
             diagnostic_print("HEAL_PARTY_COMPLETE: party_fully_restored=True interaction_finished=True", trace=True)
             return
         last_observation = observation
+        last_party_restored = party_restored
+        input_signature = (
+            observation.interaction.script_active,
+            observation.interaction.script_function,
+            observation.interaction.native_function,
+            observation.interaction.interaction_phase,
+            observation.interaction.choice_menu_active,
+            observation.interaction.choice_menu_input_ready,
+            observation.interaction.choice_selected,
+        )
+        if dialogue_input_in_flight is not None:
+            if input_signature == dialogue_input_in_flight:
+                dialogue_input_waits += 1
+                if dialogue_input_waits <= 3:
+                    yield
+                    continue
+            dialogue_input_in_flight = None
+            dialogue_input_waits = 0
         # A script may remain active while its task-owned confirmation menu
         # is already accepting input.  The task-backed interaction
         # observation is the authoritative ownership boundary for this
@@ -359,6 +628,9 @@ def _execute_healing_source_interaction(source: HealingSource) -> Iterator[objec
         ):
             decision = select_action(observation)
             executor.execute(decision.action, observation)
+            if decision.action.action_type is AgentActionType.ADVANCE_DIALOGUE:
+                dialogue_input_in_flight = input_signature
+                dialogue_input_waits = 0
             yield
             continue
         if observation.interaction.script_active:
@@ -389,6 +661,7 @@ def _execute_healing_source_interaction(source: HealingSource) -> Iterator[objec
                 f"timeout={interaction_start_timeout}"
             ),
             trace=True,
+            prefix="INTERACTION_STARTING",
         )
         yield
 
@@ -433,32 +706,61 @@ def observe_route_recovery() -> RouteRecovery:
             if trace is not None:
                 trace.duration("campaign_route_recovery_observation_duration_ms", started)
             return result
-        distance = len(calculate_path(location, center_location))
+        try:
+            distance = len(calculate_path(location, center_location))
+        except PathFindingError:
+            # The legacy pathfinder deliberately cannot cross map warps. Use
+            # the same world planner that executes campaign navigation for
+            # recovery sources inside interiors such as Birch's Lab.
+            overworld = perceive_overworld()
+            if isinstance(overworld, OverworldObservationResult):
+                raise
+            plan, route = plan_with_world_navigation(
+                NavigationWorld.from_overworld(overworld),
+                location,
+                ReachLocation(center_location),
+                get_world_map_graph(),
+            )
+            if plan.metrics is None or plan.destination is None:
+                raise PathFindingError("world recovery route has no executable metrics")
+            distance = plan.metrics.total_route_cost
+            if distance is None:
+                raise PathFindingError("world recovery route has no cost")
         result = RouteRecovery(center_available=True, distance_to_center=distance, safe_to_reach_center=True)
         if trace is not None:
             trace.duration("campaign_route_recovery_observation_duration_ms", started)
         return result
     except (BotModeError, PathFindingError):
         # A valid observation with no usable route is known, not transient.
-        result = RouteRecovery()
+        local_catalog_source = next(
+            (
+                source
+                for source in emerald_healing_sources()
+                if source.outdoor_location[0] == location[0]
+                or source.interior_map == location[0]
+            ),
+            None,
+        )
+        result = RouteRecovery(healing_source_available=local_catalog_source is not None)
         if trace is not None:
             trace.duration("campaign_route_recovery_observation_duration_ms", started)
         return result
 
 
-def recover_at_nearest_center() -> Iterator[object]:
+def recover_at_nearest_center(current_location=None, selected_center=None) -> Iterator[object]:
     """Perform an existing Center healing flow and verify its result."""
     yield from _resolve_recovery_interaction()
     yield from wait_for_player_avatar_to_be_controllable()
     # Reuse the same current location representation required by Center
     # pathfinding; omitting it makes the helper rediscover from None and
     # causes calculate_path(None, ...).
-    center = find_closest_pokemon_center(get_player_location())
+    center = selected_center or find_closest_pokemon_center(current_location or get_player_location())
     yield from _navigate_recovery_to_center(center)
     yield from _wait_for_center_interior(center)
     diagnostic_print(
         lambda: f"CENTER_EXIT_HEAL_CALL: phase=before frame={getattr(context, 'frame', None)!r} emulator_frame={context.emulator.get_frame_count()!r} center={center!r}",
         trace=True,
+        prefix="CAMPAIGN_RECOVERY_HANDOFF",
     )
     diagnostic_print(
         lambda: f"CENTER_HEAL_BEGIN: frame={getattr(context, 'frame', None)!r} emulator_frame={context.emulator.get_frame_count()!r} center={center!r}",
@@ -487,27 +789,156 @@ def _navigate_recovery_to_center(center) -> Iterator[object]:
 def _wait_for_center_interior(center) -> Iterator[object]:
     """Wait for the selected Center entry warp to produce a stable interior."""
     outdoor_map = center.value[0]
+    outdoor_map_id = _map_id_value(outdoor_map)
     interior_name = (
         "PALLET_TOWN_PLAYERS_HOUSE_1F" if center.name == "PalletTown" else f"{outdoor_map.name}_POKEMON_CENTER_1F"
     )
     interior_map = getattr(MapFRLG if isinstance(outdoor_map, MapFRLG) else type(outdoor_map), interior_name, None)
     if interior_map is None:
         raise RuntimeError(f"No Pokémon Center interior map is defined for {outdoor_map!r}")
+    interior_map_id = _map_id_value(interior_map)
+    _prewarm_interior_map_identity(interior_map_id)
+    interior_observed = False
+    last_position = None
+    settled_observations = 0
+    unresolved_map_observations = 0
     while True:
-        observation = observe_agent()
+        # A healing-source entrance has the same map-transition contract as a
+        # Pokémon Center entrance; do not gate its map observation on UI state.
+        observation = observe_agent(require_overworld=True)
         overworld = observation.overworld
         observed_map = getattr(overworld, "map_id", None)
+        map_source = getattr(overworld, "map_identity_source", "unavailable")
+        save_block_map = getattr(overworld, "save_block_map_id", None)
+        live_candidates = getattr(overworld, "live_map_candidates", ())
         controllable = getattr(overworld, "controllable", False)
+        position = (observed_map, getattr(overworld, "player_coordinates", None))
+        if position == last_position:
+            settled_observations += 1
+        else:
+            last_position = position
+            settled_observations = 0
+        interior_confirmed = observed_map == interior_map_id and map_source == "live_header"
+        if interior_confirmed and not interior_observed:
+            # Publish the map transition independently of the later control
+            # handoff.  During a warp the map can be authoritative before the
+            # avatar is actionable; hiding this phase made a stalled entry
+            # look like the outdoor route was still running.
+            context.campaign_status = recovery_status(
+                SemanticTarget.map(interior_map_id),
+                "Entering Pokémon Center",
+            )
+            interior_observed = True
+        if not interior_confirmed:
+            context.campaign_status = recovery_status(
+                SemanticTarget.at(center.value),
+                f"Waiting for Pokémon Center map (map={observed_map!r}, source={map_source}, "
+                f"save={save_block_map!r}, candidates={live_candidates!r}, "
+                f"position={getattr(overworld, 'player_coordinates', None)!r})",
+            )
+        elif not controllable:
+            context.campaign_status = recovery_status(
+                SemanticTarget.map(interior_map_id),
+                "Waiting for avatar control",
+            )
         diagnostic_print(
             lambda: (
                 "CAMPAIGN_RECOVERY_HANDOFF: "
-                f"observed_map={observed_map!r} expected_interior={interior_map!r} "
-                f"controllable={controllable!r} proceeding={observed_map == interior_map and controllable}"
+                f"observed_map={observed_map!r} expected_interior={interior_map_id!r} "
+                f"source={map_source!r} controllable={controllable!r} "
+                f"proceeding={interior_confirmed and controllable}"
             ),
             trace=True,
         )
-        if observed_map == interior_map and controllable:
+        if interior_confirmed and controllable:
             return
+        if interior_confirmed:
+            unresolved_map_observations = 0
+        else:
+            unresolved_map_observations += 1
+            if unresolved_map_observations >= _MAP_IDENTITY_RESOLUTION_TIMEOUT:
+                raise RuntimeError(
+                    "Pokémon Center map identity did not resolve after entry: "
+                    f"expected={interior_map_id!r} observed={observed_map!r} source={map_source!r} "
+                    f"save_block={save_block_map!r} candidates={live_candidates!r}"
+                )
+        # ReachLocation(center.value) terminates on the outdoor door tile.
+        # Issue the one required entry step only while the *live* header says
+        # that the avatar is still outside.  Once it has crossed the door,
+        # this loop never starts another exterior route from a save-block
+        # fallback: it only waits for the authoritative interior observation.
+        if (
+            overworld is not None
+            and observed_map == outdoor_map_id
+            and map_source == "live_header"
+            and controllable
+            and settled_observations == 0
+        ):
+            adjacent_to_entry = (
+                isinstance(position[1], tuple)
+                and len(position[1]) == 2
+                and position[1] != center.value[1]
+                and abs(position[1][0] - center.value[1][0])
+                + abs(position[1][1] - center.value[1][1])
+                == 1
+            )
+            if adjacent_to_entry:
+                _pulse_toward_entry(observation, center.value)
+        yield
+
+
+def _wait_for_healing_interior(source) -> Iterator[object]:
+    """Own the entrance warp for a non-Center catalog healing source."""
+    interior_observed = False
+    last_position = None
+    settled_observations = 0
+    unresolved_map_observations = 0
+    interior_map_id = _map_id_value(source.interior_map)
+    _prewarm_interior_map_identity(interior_map_id)
+    while True:
+        observation = observe_agent(require_overworld=True)
+        overworld = observation.overworld
+        observed_map = getattr(overworld, "map_id", None)
+        map_source = getattr(overworld, "map_identity_source", "unavailable")
+        save_block_map = getattr(overworld, "save_block_map_id", None)
+        live_candidates = getattr(overworld, "live_map_candidates", ())
+        position = (observed_map, getattr(overworld, "player_coordinates", None))
+        if position == last_position:
+            settled_observations += 1
+        else:
+            last_position = position
+            settled_observations = 0
+        interior_confirmed = observed_map == interior_map_id and map_source == "live_header"
+        if interior_confirmed and not interior_observed:
+            context.campaign_status = recovery_status(
+                SemanticTarget.map(interior_map_id),
+                "Entering healing location",
+            )
+            interior_observed = True
+        if not interior_confirmed:
+            context.campaign_status = recovery_status(
+                SemanticTarget.at(source.outdoor_location),
+                f"Waiting for healing-location map (map={observed_map!r}, source={map_source}, "
+                f"save={save_block_map!r}, candidates={live_candidates!r}, "
+                f"position={getattr(overworld, 'player_coordinates', None)!r})",
+            )
+        elif not getattr(overworld, "controllable", False):
+            context.campaign_status = recovery_status(
+                SemanticTarget.map(interior_map_id),
+                "Waiting for avatar control",
+            )
+        if interior_confirmed and getattr(overworld, "controllable", False):
+            return
+        if interior_confirmed:
+            unresolved_map_observations = 0
+        else:
+            unresolved_map_observations += 1
+            if unresolved_map_observations >= _MAP_IDENTITY_RESOLUTION_TIMEOUT:
+                raise RuntimeError(
+                    "Healing-location map identity did not resolve after entry: "
+                    f"expected={interior_map_id!r} observed={observed_map!r} source={map_source!r} "
+                    f"save_block={save_block_map!r} candidates={live_candidates!r}"
+                )
         yield
 
 
@@ -542,7 +973,19 @@ def execute_campaign_recovery() -> Iterator[object]:
         trace=True,
     )
     if route.center_available and route.safe_to_reach_center:
-        yield from recover_at_nearest_center()
+        # The legacy helper navigates to the nurse's object tile itself
+        # (behind the counter).  That can leave the avatar stationary at the
+        # Center entrance while the helper continues issuing inputs.  Use the
+        # observed healing-source path so navigation terminates on the
+        # counter's activation tile before interacting.
+        current_location = get_player_location()
+        center = find_closest_pokemon_center(current_location)
+        if hasattr(center, "value"):
+            yield from execute_planned_recovery(center.value)
+        else:
+            # Keep lightweight capability fixtures and third-party center
+            # providers compatible until they expose a concrete destination.
+            yield from recover_at_nearest_center(current_location, center)
         diagnostic_print("CAMPAIGN_RECOVERY_EXECUTION: completed=True method=center", trace=True)
         return
     snapshot = observe_resource_snapshot()

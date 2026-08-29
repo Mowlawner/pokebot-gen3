@@ -268,12 +268,7 @@ def is_field_message_task_waiting_for_input() -> bool:
         return (
             task is not None
             and task.data_value(0) == 2
-            and printer.active
-            and printer.raw_state
-            in {
-                "Clear",
-                "ScrollStart",
-            }
+            and not printer.active
         )
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
         return False

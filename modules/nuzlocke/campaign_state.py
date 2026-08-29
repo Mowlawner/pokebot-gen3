@@ -122,13 +122,15 @@ def derive_campaign_facts(
     pokemon_get = _flag(observation.flags, "SYS_POKEMON_GET", available)
     setup = Fact.known(intro.value >= 3) if intro.is_known else Fact(None, intro.status)
     rival_met = Fact.known(rival.value >= 3) if rival.is_known else Fact(None, rival.status)
-    starter = (
-        # State 2 is the ROM-owned lab nickname/rival prompt sequence. Keep
-        # obtain_starter active until that script sets state 3 and releases.
-        Fact.known(lab.value >= 3 and pokemon_get.value)
-        if lab.is_known and pokemon_get.is_known
-        else Fact(None, lab.status if lab.status is not FactStatus.KNOWN else pokemon_get.status)
-    )
+    # Party insertion happens *before* GiveStarterEvent has handled the
+    # starter nickname Yes/No prompt.  It is therefore not completion of the
+    # campaign objective: using it here lets CampaignController unmount the
+    # only capability that can observe and answer that prompt.  The ROM's
+    # post-prompt lab state and SYS_POKEMON_GET are the completion boundary.
+    if lab.is_known and pokemon_get.is_known:
+        starter = Fact.known(lab.value >= 3 and pokemon_get.value)
+    else:
+        starter = Fact(None, lab.status if lab.status is not FactStatus.KNOWN else pokemon_get.status)
     pokedex = _flag(observation.flags, "RECEIVED_POKEDEX_FROM_BIRCH", available)
     system_dex = _flag(observation.flags, "SYS_POKEDEX_GET", available)
     if pokedex.is_known and system_dex.is_known:

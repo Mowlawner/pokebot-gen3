@@ -60,6 +60,10 @@ class StateCacheItem(Generic[T]):
     def checked(self) -> None:
         self._last_check_frame = context.emulator.get_frame_count()
 
+    def invalidate(self) -> None:
+        """Force the next read to refresh, even if the frame counter is stale."""
+        self._last_check_frame = -1
+
 
 class StateCache:
     def __init__(self):
@@ -99,6 +103,25 @@ class StateCache:
         self._last_encounter_log = StateCacheItem(None)
         self._last_shiny_log = StateCacheItem(None)
         self._battle_state = StateCacheItem(None)
+
+    def invalidate_runtime_observations(self) -> None:
+        """Invalidate live emulator reads without discarding cached values.
+
+        This is used at watchdog boundaries.  A warp can leave the emulator
+        frame counter/cache boundary out of sync with the visible game state;
+        retaining the values is useful for fallback code, but the next
+        observation must reread the ROM-owned runtime structures.
+        """
+        for item in (
+            self._player,
+            self._player_avatar,
+            self._game_state,
+            self._tasks,
+            self._global_script_context,
+            self._immediate_script_context,
+            self._battle_state,
+        ):
+            item.invalidate()
 
     @property
     def party(self) -> StateCacheItem["Party | None"]:

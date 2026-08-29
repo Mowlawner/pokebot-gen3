@@ -9,8 +9,10 @@ from modules.map import (
     ObjectEvent,
     ObjectEventTemplate,
     get_map_data,
+    get_live_map_id,
     get_map_metadata,
     inspect_map_connections,
+    observe_live_map_identity,
 )
 
 
@@ -90,6 +92,46 @@ class TestMapMetadata(unittest.TestCase):
         self.assertIs(map_b, self.metadata_b)
         self.assertIs(other_rom_map_a, self.metadata_a)
         self.assertEqual(build.call_count, 3)
+
+    def test_live_map_id_populates_its_own_header_index(self):
+        header = bytes(range(0x1C))
+        header_cache = {}
+        with (
+            patch("modules.map.context", SimpleNamespace(rom=self.rom_a)),
+            patch("modules.map._map_header_cache", header_cache),
+            patch("modules.map.get_map_data") as warm,
+            patch("modules.map.read_symbol", return_value=header),
+        ):
+            warm.side_effect = lambda *_: header_cache.update({"rom-a": {self.map_a: header}})
+            self.assertEqual(get_live_map_id(), self.map_a)
+        warm.assert_called_once_with((0, 0), (0, 0))
+
+    def test_live_map_id_uses_unique_stable_pointer_identity(self):
+        stable = bytes(range(0x10))
+        cached_header = stable + bytes(0x0C)
+        live_header = stable + bytes([0xFF]) * 0x0C
+        with (
+            patch("modules.map.context", SimpleNamespace(rom=self.rom_a)),
+            patch("modules.map._map_header_cache", {"rom-a": {self.map_a: cached_header}}),
+            patch("modules.map.read_symbol", return_value=live_header),
+        ):
+            self.assertEqual(get_live_map_id(), self.map_a)
+
+    def test_live_map_identity_rejects_ambiguous_header_match(self):
+        shared_header = bytes(range(0x1C))
+        with (
+            patch("modules.map.context", SimpleNamespace(rom=self.rom_a)),
+            patch(
+                "modules.map._map_header_cache",
+                {"rom-a": {self.map_a: shared_header, self.map_b: shared_header}},
+            ),
+            patch("modules.map.read_symbol", return_value=shared_header),
+        ):
+            identity = observe_live_map_identity()
+
+        self.assertIsNone(identity.map_id)
+        self.assertEqual(identity.source, "unresolved")
+        self.assertEqual(identity.candidates, (self.map_a, self.map_b))
 
     def test_object_template_lookup_uses_metadata_without_get_map_data(self):
         data = bytearray(0x24)

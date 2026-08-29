@@ -1,6 +1,6 @@
 """Emerald's fresh-game opening sequence."""
 
-from enum import Enum, IntEnum, auto
+from enum import IntEnum
 from dataclasses import dataclass
 from datetime import datetime
 import random
@@ -46,6 +46,7 @@ from modules.tasks import (
     is_waiting_for_input,
     task_is_active,
 )
+from modules.nuzlocke.emerald_opening_state import OpeningSequenceState
 from ._interface import BotMode, BotModeError
 
 _starter_handoff_pending = False
@@ -81,29 +82,6 @@ def consume_starter_handoff() -> bool:
     pending = _starter_handoff_pending
     _starter_handoff_pending = False
     return pending
-
-
-class OpeningSequenceState(Enum):
-    TITLE = auto()
-    MAIN_MENU = auto()
-    PLAYER_NAMING = auto()
-    TRUCK = auto()
-    LITTLEROOT_TOWN = auto()
-    POST_CLOCK_TOWN = auto()
-    PLAYER_HOUSE_2F = auto()
-    CLOCK_SETTING = auto()
-    PLAYER_HOUSE_1F = auto()
-    PLAYER_HOUSE_1F_POST_CLOCK_ARRIVAL = auto()
-    BIRCH_HOUSE_1F = auto()
-    BIRCH_HOUSE_2F = auto()
-    BIRCH_POKEBALL = auto()
-    MAY_SEQUENCE = auto()
-    ROUTE_101 = auto()
-    STARTER_SELECTION = auto()
-    SCRIPTED_INTRO = auto()
-    UNKNOWN = auto()
-    OPTIONS_MENU = auto()
-    COMPLETE = auto()
 
 
 @dataclass(frozen=True)
@@ -973,7 +951,11 @@ def _advance_scripted_input(field_message_lifecycle_active: bool = False) -> Gen
             source="_advance_scripted_input",
             reason=waiting_reason or "scripted input predicate returned true",
         )
-        context.emulator.press_button("A")
+        press_button_fresh = getattr(type(context.emulator), "press_button_fresh", None)
+        if callable(press_button_fresh):
+            press_button_fresh("A")
+        else:
+            context.emulator.press_button("A")
         if context.debug and getattr(context, "debug_trace", False):
             try:
                 after_inputs = context.emulator.get_inputs()

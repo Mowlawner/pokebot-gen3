@@ -60,6 +60,11 @@ _closest_pokemon_centers: dict[MapFRLG | MapRSE, list[PokemonCenter]] = {
     MapRSE.MOSSDEEP_CITY: [PokemonCenter.MossdeepCity],
     MapRSE.EVER_GRANDE_CITY: [PokemonCenter.EvergrandeCity],
     MapRSE.OLDALE_TOWN: [PokemonCenter.OldaleTown],
+    # Birch's Lab has no Center of its own, but the player can leave
+    # Littleroot and reach Oldale's Center through Route 101.  Keep the
+    # interior in the recovery registry so post-battle readiness can still
+    # route an injured party to a healing source after the lab dialogue.
+    MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB: [PokemonCenter.OldaleTown],
     MapRSE.DEWFORD_TOWN: [PokemonCenter.DewfordTown],
     MapRSE.LAVARIDGE_TOWN: [PokemonCenter.LavaridgeTown],
     MapRSE.FALLARBOR_TOWN: [PokemonCenter.FallarborTown],
@@ -241,6 +246,12 @@ def find_closest_pokemon_center(
                 pass
 
     if pokemon_center is None:
+        # ``calculate_path`` intentionally does not cross map warps.  The
+        # lab-to-Oldale recovery route is nevertheless executable by the
+        # world navigation planner, so retain the registered Center as the
+        # recovery destination and let that planner validate the route.
+        if training_spot_map is MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB:
+            return PokemonCenter.OldaleTown
         raise BotModeError("Could not find a suitable path from here to a Pokemon Center nearby.")
 
     return pokemon_center

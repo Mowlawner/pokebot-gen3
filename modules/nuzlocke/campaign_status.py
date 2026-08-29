@@ -47,4 +47,15 @@ def format_campaign_status(status: CampaignStatus | None) -> str:
     return f"Objective: {objective}\nTarget: {_target_text(status.target)}\nIntent: {status.intent}"
 
 
-__all__ = ["CampaignStatus", "format_campaign_status"]
+def recovery_status(target: SemanticTarget | None, intent: str) -> CampaignStatus:
+    """Return the GUI projection for the currently executing recovery phase.
+
+    Recovery is an execution interruption of the selected campaign objective,
+    but it uses the same projection as ordinary campaign work so the GUI can
+    show the concrete target and current intent.  The runtime is responsible
+    for publishing this only after the corresponding observation boundary.
+    """
+    return CampaignStatus("Recover Party", target, intent)
+
+
+__all__ = ["CampaignStatus", "format_campaign_status", "recovery_status"]

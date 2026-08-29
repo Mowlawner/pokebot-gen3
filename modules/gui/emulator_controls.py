@@ -142,6 +142,11 @@ class EmulatorControls:
 
     def on_frame_render(self):
         self._update_stats()
+        # Campaign/recovery status is published by the frame-driven control
+        # loop. Refresh this label every rendered frame so the GUI cannot
+        # retain a stale objective/target/intent while the emulator advances.
+        if self.campaign_status is not None:
+            self.campaign_status.config(text=format_campaign_status(context.campaign_status))
         if context.bot_mode != self.last_known_bot_mode:
             self.last_known_bot_mode = context.bot_mode
             self.update()

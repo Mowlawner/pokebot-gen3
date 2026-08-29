@@ -61,7 +61,7 @@ class CampaignFactsTests(unittest.TestCase):
         self.assertFalse(facts.nuzlocke_started.value)
         self.assertFalse(facts.pokeballs_ready.value)
 
-    def test_starter_remains_incomplete_during_lab_nickname_sequence(self):
+    def test_starter_is_not_complete_during_lab_nickname_sequence(self):
         facts = self.state(
             flags=(NamedFlag("SYS_POKEMON_GET", True),),
             variables=(NamedVariable("BIRCH_LAB_STATE", 2),),

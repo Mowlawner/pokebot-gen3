@@ -1,5 +1,6 @@
 """Autonomous execution of the small ordered Emerald campaign."""
 
+from dataclasses import replace
 from typing import Generator
 import traceback
 
@@ -20,18 +21,24 @@ from modules.nuzlocke.resource_policy import (
 )
 from modules.nuzlocke.resource_runtime import (
     execute_campaign_recovery,
+    execute_planned_recovery,
     observe_resource_snapshot,
     observe_route_recovery,
 )
+from modules.nuzlocke.campaign_planner import RecoveryStop
+from modules.nuzlocke.emerald_healing_catalog import emerald_healing_sources
+from modules.nuzlocke.emerald_healing_catalog import emerald_healing_source_for_destination
 from modules.nuzlocke.level_cap import evaluate_battle_entry
 from modules.modes._interface import BotModeError
 from modules.nuzlocke.readiness_diagnostics import (
     Availability,
+    CampaignReadinessPolicy,
     ReadinessObservationScheduler,
     build_progression_readiness_diagnostic,
 )
 from modules.nuzlocke.snapshots import get_nuzlocke_snapshot
 from modules.overworld import perceive_overworld, OverworldObservationResult
+from modules.interaction_state import InteractionPhase, observe_interaction
 from modules.player import get_player_avatar
 from modules.memory import GameState, get_game_state
 from modules.pokemon_party import get_party
@@ -61,7 +68,14 @@ class CampaignProgressionMode(BotMode):
             selector=plan_campaign,
             campaign_boundary_handler=runtime_campaign_boundary,
             readiness_provider=self._readiness_scheduler.observe,
-            recovery_factory=lambda _readiness: execute_campaign_recovery(),
+            recovery_factory=lambda stop: (
+                execute_planned_recovery(
+                    stop.destination,
+                    emerald_healing_source_for_destination(stop.destination),
+                )
+                if isinstance(stop, RecoveryStop)
+                else execute_campaign_recovery()
+            ),
         )
         self._readiness_evaluated = False
 
@@ -82,8 +96,11 @@ class CampaignProgressionMode(BotMode):
 
     def _readiness_input(self, objective, goal):
         self._readiness_evaluated = True
-        snapshot = get_nuzlocke_snapshot()
+        # Perceive the overworld first.  The callback-based game-state reader
+        # can briefly report UNKNOWN at a battle/script boundary even when
+        # the authoritative overworld observation has already become stable.
         overworld = perceive_overworld()
+        snapshot = get_nuzlocke_snapshot()
         diagnostic_print(
             lambda: (
                 "READINESS_INPUT_LIFECYCLE: "
@@ -95,6 +112,7 @@ class CampaignProgressionMode(BotMode):
         )
         overworld_availability = Availability.KNOWN
         overworld_reason = None
+        stable_overworld = False
         if isinstance(overworld, OverworldObservationResult):
             diagnostic_print(
                 lambda: (
@@ -109,6 +127,77 @@ class CampaignProgressionMode(BotMode):
             overworld_availability = Availability.UNKNOWN
             overworld_reason = overworld.reason
             overworld = None
+        elif not getattr(overworld, "controllable", False):
+            # Coordinates and party state can remain readable while a battle
+            # return or scripted post-battle sequence still owns the field.
+            # Do not let readiness mount recovery during that interval; doing
+            # so replaces the campaign loop before its dialogue can advance.
+            overworld_availability = Availability.UNKNOWN
+            overworld_reason = "player avatar is not controllable"
+        elif getattr(overworld, "transition_in_progress", False):
+            # A controllable bit can lead the rest of a warp/script transition.
+            # Do not let recovery take ownership until the transition signals
+            # have cleared.
+            overworld_availability = Availability.UNKNOWN
+            overworld_reason = "overworld transition is in progress"
+        else:
+            # The avatar can become controllable before a post-battle native
+            # script has released the field. Use the shared interaction
+            # classifier so recovery cannot mount during dialogue or a native
+            # script wait, while allowing it as soon as the interaction phase
+            # is genuinely clear.
+            try:
+                interaction = observe_interaction()
+                interaction_phase = getattr(interaction, "interaction_phase", InteractionPhase.NONE)
+                dialogue_owned = (
+                    interaction_phase
+                    in {
+                        InteractionPhase.FIELD_MESSAGE_RENDER_WAIT,
+                        InteractionPhase.FIELD_MESSAGE_INPUT_WAIT,
+                        InteractionPhase.CHOICE_MENU_INPUT_WAIT,
+                    }
+                    or (
+                        interaction_phase is InteractionPhase.SCRIPT_NATIVE_WAIT
+                        and (
+                            # A native script can own the field before it
+                            # exposes a dialogue box (for example, the
+                            # post-battle rival exit movement). Readiness
+                            # must not mount a recovery plan across that
+                            # ownership boundary.
+                            getattr(interaction, "script_active", False)
+                            or
+                            getattr(interaction, "dialogue_waiting", False)
+                            or getattr(interaction, "field_message_lifecycle_active", False)
+                            or getattr(interaction, "native_function", None)
+                            in {"WaitForAorBPress", "IsFieldMessageBoxHidden"}
+                        )
+                    )
+                )
+                if dialogue_owned:
+                    overworld_availability = Availability.UNKNOWN
+                    overworld_reason = (
+                        "interaction phase is active: "
+                        f"{getattr(interaction_phase, 'name', None)}"
+                    )
+            except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+                pass
+            stable_overworld = overworld_availability is Availability.KNOWN
+
+        # ``get_nuzlocke_snapshot`` and ``perceive_overworld`` read different
+        # emulator signals.  When only the callback classifier is unknown,
+        # use the validated stable-overworld boundary instead of deferring
+        # indefinitely.  Never normalize a known non-overworld state, and
+        # never do this while dialogue or a transition owns the field.
+        if stable_overworld and getattr(snapshot, "game_state", None) is GameState.UNKNOWN:
+            snapshot = replace(snapshot, game_state=GameState.OVERWORLD)
+            diagnostic_print(
+                lambda: (
+                    "READINESS_GAME_STATE_NORMALIZED: "
+                    "snapshot_state='UNKNOWN' observation_state='STABLE_OVERWORLD' "
+                    "normalized_state='OVERWORLD'"
+                ),
+                trace=True,
+            )
         resources = observe_resource_snapshot()
         resource_availability = (
             Availability.KNOWN
@@ -124,9 +213,14 @@ class CampaignProgressionMode(BotMode):
             resources.observation_status is not ResourceObservationStatus.VALID
             or not resources.usable_party
             or resources.worst_hp_ratio < minimum_hp_ratio
+            or resources.worst_hp_ratio <= CampaignReadinessPolicy().opportunistic_hp_ratio
         )
         recovery = observe_route_recovery() if recovery_needed else RouteRecovery()
-        recovery_available = recovery.center_available or bool(resources.bag_healing_items)
+        recovery_available = (
+            recovery.center_available
+            or getattr(recovery, "healing_source_available", False)
+            or bool(resources.bag_healing_items)
+        )
         recovery_availability = (
             Availability.UNKNOWN
             if not recovery.observation_available
@@ -196,9 +290,17 @@ class CampaignProgressionMode(BotMode):
                 operation = "NavigationWorld.from_overworld"
                 world = NavigationWorld.from_overworld(overworld)
                 operation = "candidate enumeration"
-                candidates = tuple(
-                    ReachLocation(center.value) for center in pokemon_center_candidates(current_location)
-                )
+                if context.rom.is_rse:
+                    # The world planner chooses the nearest reachable source;
+                    # the catalog deliberately includes non-Center sources.
+                    candidates = tuple(
+                        ReachLocation(source.outdoor_location)
+                        for source in emerald_healing_sources()
+                    )
+                else:
+                    candidates = tuple(
+                        ReachLocation(center.value) for center in pokemon_center_candidates(current_location)
+                    )
                 candidate_goals = candidates
                 operation = "WorldMapGraph acquisition"
                 graph = get_world_map_graph()
@@ -304,6 +406,15 @@ class CampaignProgressionMode(BotMode):
         return BattleAction.Fight
 
     def on_battle_ended(self, outcome) -> None:
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_BATTLE_ENDED: "
+                f"frame={getattr(context, 'frame', None)!r} outcome={outcome!r} "
+                f"objective={getattr(getattr(self.controller, 'last_selection', None), 'objective', None)!r} "
+                f"facts={runtime_campaign_state().campaign_facts!r}"
+            ),
+            trace=True,
+        )
         scheduler = getattr(self, "_readiness_scheduler", None)
         if scheduler is not None:
             scheduler.invalidate("battle_ended")

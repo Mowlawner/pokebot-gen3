@@ -1,0 +1,7 @@
+# Development and test-only dependencies.
+#
+# The application dependencies remain canonical in requirements.py because
+# PokéBot resolves platform-specific packages and the native mGBA runtime
+# there. This file contains only tools that should not be installed as part of
+# the packaged application's runtime dependency check.
+pytest~=8.3.0

@@ -26,7 +26,7 @@ from modules.nuzlocke.snapshots import (
 )
 
 
-class TestGameState(Enum):
+class FixtureGameState(Enum):
     OVERWORLD = 1
 
 
@@ -57,7 +57,7 @@ class CampaignStateTests(unittest.TestCase):
             NuzlockeSnapshot(
                 frame=20,
                 game_id="Pokemon Emerald",
-                game_state=TestGameState.OVERWORLD if available else None,
+                game_state=FixtureGameState.OVERWORLD if available else None,
                 player=PlayerSnapshot("Brendan", map_id[0], map_id[1], "Raw Map", (4, 5), "Down", available),
                 party=(party_pokemon,),
                 inventory=InventorySnapshot(

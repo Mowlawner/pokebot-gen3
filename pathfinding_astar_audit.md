@@ -1,8 +1,14 @@
 # RIVai overworld pathfinding audit
 
-Status: investigation only. Production navigation still uses the default
-`algorithm="dijkstra"`; A* is available only when explicitly requested by a
-benchmark or diagnostic caller. No emulator was run for this audit.
+Last reviewed: 2026-08-29
+
+Status: investigation with follow-up implementation. Production navigation
+still uses the default `algorithm="dijkstra"`; A* is available only when
+explicitly requested by a benchmark or diagnostic caller. Since the original
+audit, ordinary semantic cross-map goals use a global observed-world search,
+multi-target activation searches share one frontier, and semantic cross-map
+plans have an in-process cache. No emulator was run for this audit or its
+follow-up validation.
 
 ## Architecture
 
@@ -34,13 +40,19 @@ correctly faced. Warp entries, directional arrow warps, escalator activation
 source tiles, and their required facing are represented by
 `WarpObservation` and are preserved by the planner.
 
-Cross-map planning first gets a map-level route from `WorldMapGraph`. For its
-first edge it enumerates every source boundary coordinate, then tries up to
-four adjacent activation positions for an ordinary warp (or the explicit
-activation source for an escalator-like observation). Each reachable candidate
-gets a fresh local search; the shortest local action plan is selected. Thus a
-single goal evaluation may perform one search per candidate, plus failed
-activation-side probes. It does not reuse local search state.
+For ordinary semantic cross-map goals, planning still consults
+`WorldMapGraph`, but then builds a lazy observed-world overlay and runs one
+global state search across the reachable maps. It no longer evaluates only the
+first map edge with one fresh search per activation side. The planner preserves
+`(Location, facing)`, directed transitions, and the lexicographic encounter
+objective while reconstructing the executable crossing actions. Explicit
+observed map-connection goals retain a local approach path where the runtime
+transition is already known.
+
+The lower-level `plan_many_locations()` API also supports shared-frontier
+search for multiple activation targets. Its current compatibility path is
+exhaustive rather than candidate-pruned, but it avoids repeating the same
+state search for every target.
 
 ## Profiling
 
@@ -53,10 +65,12 @@ fields include candidates considered, searches performed, aggregate duration,
 fastest/slowest search, and aggregate expanded nodes. When disabled, no
 per-search record or timer is allocated.
 
-The candidate count is not necessarily the search count: activation probing
-can produce multiple searches for one warp candidate. This is the principal
-architecture finding relevant to the reported approximately 471 ms of
-pathfinding across three goal evaluations.
+For the legacy explicit-candidate path, candidate and activation-side counts
+still describe attempted terminal states and can differ from search count. For
+ordinary semantic cross-map goals, the profiler records the regular global
+search instead; the cross-map candidate-evaluation profiler remains empty in
+the current semantic fixture. This distinction is important when comparing
+the earlier approximately 471 ms pathfinding report with current traces.
 
 ## Heuristic correctness
 
@@ -101,20 +115,20 @@ local interpreter timings, not emulator timing claims.
 
 1. A* can preserve the exact NORMAL and SEEK objective with the conservative
    heuristic above, but its useful heuristic is suppressed around warps.
-2. The measured local node reduction is real in deterministic fixtures, but
-   cross-map planning can still dominate because it repeats searches for
-   candidate activation positions.
-3. The current architecture performs no candidate pruning, result caching,
-   equivalent-state reuse, or shared multi-candidate search. Given the stated
-   471 ms / 490 ms / three-evaluation profile, reducing the number of searches
-   is likely to provide a larger and lower-risk first gain than replacing each
-   search algorithm.
+2. The measured local node reduction is real in deterministic fixtures. The
+   shared frontier now removes repeated local searches for multiple activation
+   targets, while global semantic planning handles ordinary cross-map goals in
+   one state search.
+3. Candidate pruning and reverse/multi-source search remain unimplemented.
+   Semantic cross-map result caching is now present, but its validity depends
+   on the observed-world cache key and session lifetime.
 
-Recommendation: **D) optimize the cross-map/candidate-search architecture
-first**, then reassess **C) use A* only for warp-free local searches**. Keep
-Dijkstra as the production fallback until emulator-backed route replays verify
-that candidate pruning and any A* use preserve all interaction and encounter
-semantics.
+Recommendation: **D) optimize and validate the cross-map architecture first**
+has been partially executed through global planning and shared-frontier
+search. Next, validate cache invalidation and live transition semantics, then
+reassess **C) use A* only for warp-free local searches**. Keep Dijkstra as the
+production default until emulator-backed route replays verify any A* use and
+all interaction/encounter semantics.
 
 ## Cross-map audit milestone
 
@@ -123,40 +137,32 @@ The live call chain is:
 `select_action(observation)` → `evaluate_goal(observation)` →
 `NavigationWorld.from_overworld(...)` → `plan_with_world_navigation(...)`.
 
-`evaluate_goal` constructs a fresh `NavigationWorld` for each overworld goal
-evaluation. Static tile objects and the map-level `WorldMapGraph` are reused
-through their existing caches; dynamic blocked coordinates, warps, triggers,
-bindings, and facing come from the current observation. A cross-map goal asks
-the graph for one map route and evaluates only its first edge. It does not
-search all world-map routes or all outgoing edges.
+`evaluate_goal` constructs a `NavigationWorld` from the current observation.
+Static tile objects and the map-level `WorldMapGraph` are reused through their
+existing caches; dynamic blocked coordinates, warps, triggers, bindings, and
+facing come from the current observation.
 
-For that edge, `source_coordinates` is the static candidate list. A runtime
-warp with explicit activation locations contributes those locations. A normal
-runtime warp contributes four adjacent activation-side states, in fixed
-North/East/South/West geometry order. A source without a matching runtime warp
-is searched as the source coordinate itself. Each attempted activation side
-creates a new `GoalAwareNavigator(world).plan(start, ReachLocation(...))`.
-The first reachable side ends that source's side loop; all source coordinates
-are still evaluated. Therefore the current number of searches is:
+For ordinary semantic cross-map goals, `plan_with_world_navigation()` builds a
+lazy global world overlay and `GoalAwareNavigator.plan()` searches the exact
+reachable state graph. It does not stop after evaluating only the first map
+edge. The search preserves facing, directed warps, interaction predicates,
+and the lexicographic encounter objective. A completed semantic route may be
+reused when the observed-world cache key is unchanged.
 
-`sum(attempted activation sides until first reachable side for each source)`.
+The explicit candidate compatibility path still derives activation positions
+from the graph's source coordinates and runtime warp observations. When it is
+used, `plan_many_locations()` searches all requested activation targets from
+one shared `(Location, facing)` frontier, then the caller adds candidate-
+specific facing/transition actions and ranks complete plans with
+`navigation_candidate_key()`. It no longer creates one fresh search per
+activation side or chooses a winner by action count alone.
 
-It is not necessarily equal to either the number of warp candidates or the
-number of activation sides. Searches always start at the current player state;
-there are no searches from warp destinations. Candidate ordering is the graph's
-source-coordinate order and has no pruning effect. The winning source is then
-chosen by `len(local_plan.actions)`, after each local search has independently
-optimized its own lexicographic search key. SEEK reaches the same candidate
-machinery, but its local search sets encounter contributions to zero and uses
-unit movement cost. No cross-map candidate is currently pruned or dominated.
-
-The audit profiler now records one disabled-by-default cross-map evaluation and
-one record per attempted activation side. It reports source-candidate count,
-activation-side count, rejected/pruned/dominated counts, pathfound/no-route
-counts, calls, expanded nodes, pathfinding time, total cross-map planning time,
-running best encounter count, running best secondary cost, and the selected
-candidate. Per-search records carry the candidate identifier. Normal operation
-does not allocate these records or take profiling timers.
+Candidate pruning is still absent: shared search is exhaustive for the
+requested targets, and the candidate diagnostics continue to report zero
+rejected, pruned, or dominated candidates. Ordinary semantic cross-map goals
+produce one regular pathfinding record rather than a per-candidate audit
+record; the current semantic fixture has no `cross_map_goal_evaluations()`
+records.
 
 ## Bounds and pruning analysis
 
@@ -188,89 +194,94 @@ first and route cost second.
 
 ## Ordering, reuse, and multi-source search
 
-Candidate ordering is promising only if it finds a strong incumbent early. The
-signals listed in the milestone—geometry, destination distance, exposure
-estimates, and prior success—are not sufficient proofs by themselves. They can
-be benchmarked as orderings, but cannot change semantics unless used only to
-order complete evaluation. The current deterministic two-warp fixture performs
-four searches in both Dijkstra and A* orderings; with no admissible candidate
-bound, reordering alone cannot reduce that count.
+Candidate ordering is still promising only if it finds a strong incumbent
+early. The signals listed in the milestone—geometry, destination distance,
+exposure estimates, and prior success—are not sufficient proofs by themselves.
+They can be benchmarked as orderings, but cannot change semantics unless used
+only to order complete evaluation. The current shared-frontier path reduces
+the representative fixture from six independent searches to one exhaustive
+search; this is state reuse, not candidate pruning.
 
 The existing static tile prewarm is safe only for immutable map tile metadata.
 Dynamic blocking remains an observation-time overlay. The world graph cache is
-safe under its ROM-id key and static map metadata, while a completed candidate
-route is stale when player position/facing, dynamic blocks, warps, triggers,
-bindings, encounter mode, constraints, or relevant map data changes. Searches
-from the same `(world snapshot, start state, target state, mode, constraints,
-algorithm)` could be cached, but the current implementation does not expose a
-validated snapshot key, so no route cache was added in this milestone.
+safe under its ROM-id key and static map metadata. Semantic cross-map plans now
+have an in-process cache keyed by player location/facing, movement capability,
+semantic target, encounter settings, dynamic blocked coordinates, hazards, and
+runtime transition identity/destination. The cache is cleared at an
+emulator/session boundary, but it is not a general cache for every local or
+explicit-candidate route and does not yet include a planner-version field.
 
-Reverse or multi-source search is not yet safe as a drop-in replacement. The
-state must include facing, and reversing an interaction requires preserving
-source-location and required-facing predicates. Reversing encounter costs is
+Reverse search is not yet safe as a drop-in replacement. The state must
+include facing, and reversing an interaction requires preserving source-
+location and required-facing predicates. Reversing encounter costs is
 possible in principle only with the exact action semantics for movement and
 stationary turns. Directional warps and escalators are directed transitions,
-not ordinary undirected edges. A future multi-source search would need a
-super-source over valid activation states and a reverse transition model that
-preserves all of those predicates; the current representation has no such
-reverse model. This is a design opportunity, not an implemented optimization.
+not ordinary undirected edges. Forward multi-target search is now implemented
+for activation positions, but a reverse multi-source search would still need a
+new transition model preserving all of those predicates.
 
 ## Repeated benchmark result
 
 The existing deterministic fixtures cover Littleroot/Route 101-style local
 routes, grass detours, multi-side interaction, facing-constrained interaction,
-escalator activation, cross-map candidates, and SEEK. The cross-map fixture was
-run for 30 deterministic repetitions per algorithm. It produced four fresh
-searches per decision (two source coordinates, with failed side probes), and
-the following medians on the local Python interpreter:
+escalator activation, cross-map candidates, and SEEK. The local A* comparison
+still reports the historical 30-run interpreter measurements below:
 
-| algorithm | calls | expanded nodes total | pathfinding time | cross-map planning time |
+| algorithm | average nodes | worst nodes | average search ms | worst search ms |
 |---|---:|---:|---:|---:|
-| Dijkstra | 4 | 32 | 0.129 ms | 0.162 ms |
-| A* | 4 | 32 | 0.160 ms | 0.193 ms |
+| Dijkstra | 173.0 | 486 | 1.160 | 3.778 |
+| A* | 40.0 | 86 | 0.453 | 1.162 |
 
-This small warp-containing fixture correctly gives A* a zero heuristic, so it
-does not reduce nodes or calls. The earlier warp-free fixtures show A* reducing
-individual nodes substantially, but that is category A/C (faster or smaller
-individual searches), not category B (fewer searches). The primary milestone
-metric D—total goal-planning time—remains dominated by the number and shape of
-candidate searches in realistic cross-map cases. No emulator was run.
+The current shared-frontier benchmark reports six independent local searches
+and 59 expanded nodes for the old per-target model, versus one search and six
+expanded nodes for `plan_many_locations()` (current local run: 0.087 ms for
+the shared search). The semantic cross-map fixture likewise records one
+global search for both algorithms and no per-candidate evaluation records.
+These are local interpreter measurements, not emulator timing claims. No
+emulator was run.
 
 ## Conclusions and implementation sequence
 
-1. Current searches per cross-map goal are the attempted activation sides per
-   source, with one fresh search per attempt; the measured fixture is four.
-2. Demonstrably unnecessary searches today: none proven; safe-pruning rate is
-   0%. Failed side probes are repeated work, but eliminating them requires a
-   validated multi-target search or a proof-equivalent cache.
+1. Ordinary semantic cross-map goals now use one global state search, with an
+   in-process semantic-route cache for unchanged effective inputs. The
+   explicit-candidate compatibility path uses one shared frontier rather than
+   one fresh search per activation side.
+2. Safe-pruning rate remains 0%. Shared-frontier search removes duplicate
+   state exploration without proving any candidate dominated; candidate
+   pruning and reverse search remain open work.
 3. Safe bounds: zero encounter exposure, Manhattan movement lower bound only
    on warp-free graphs, and zero turn lower bound. They are not yet sufficient
    for general cross-map candidate pruning.
 4. Candidate ordering has no current material pruning benefit because no safe
    incumbent bound exists. It should be benchmarked only as an experimental
    ordering.
-5. Static tile and map-graph reuse already exists. Dynamic route caching is
-   possible only with a complete world-state invalidation key; it was not
-   introduced.
-6. Reverse/multi-source search is not presently viable without extending the
+5. Static tile and map-graph reuse already exists. Semantic cross-map route
+   caching is now present, with explicit session-boundary invalidation; a
+   general local-route cache is not.
+6. Forward multi-target search is implemented for activation positions, while
+   reverse search is not presently viable without extending the
    state/transition model for facing, turns, encounter exposure, interaction
    predicates, and directed warps.
-7. Cross-map A* saved no calls or nodes in the warp fixture and was slightly
-   slower in this small timing sample. Warp-free A* gains do not address the
-   architectural call count.
-8. Recommended sequence, pending approval: (a) collect profiler data on
-   realistic frame traces; (b) benchmark orderings without changing selection;
-   (c) specify and test a full snapshot cache key; (d) design a proof-backed
-   multi-source search; (e) only then consider production pruning or local A*.
+7. Cross-map A* still does not reduce calls when the conservative warp
+   heuristic is zero. Warp-free A* gains do not by themselves justify enabling
+   A* in production.
+8. Recommended next sequence: (a) collect profiler data on realistic frame
+   traces; (b) validate semantic-cache invalidation and transition behavior;
+   (c) benchmark safe candidate orderings; (d) design proof-backed candidate
+   pruning or reverse search; (e) reassess production A* after emulator
+   validation.
 
-No production algorithm, candidate order, route cache, or pruning rule was
-changed by this milestone. Dijkstra remains the production default.
+The follow-up changed cross-map semantic planning, added shared-frontier
+search, corrected candidate ranking to use the canonical navigation objective,
+and added semantic route caching. No production A* selection or speculative
+candidate-pruning rule was enabled; Dijkstra remains the production default.
 
 ## Focused architecture audit (2026-08-16)
 
-This section records the audit against the current worktree, including the
-reuse and candidate-selection questions that are not answered by the local
-A* comparison alone.
+This section preserves the 2026-08-16 baseline. The cross-map call-path and
+candidate-selection findings below were superseded by the follow-up shared
+frontier/global-search work described in the sections above; remaining
+open-work statements are retained where they still apply.
 
 ### Expensive call graph
 
@@ -283,12 +294,14 @@ AgentControlLoop / caller
                  -> optional _DynamicTileMapping wrapper
             -> plan_with_world_navigation(world, start, goal)
                  -> WorldMapGraph.route(...)
-                 -> for each source coordinate
-                      -> for each activation-side choice
-                           -> GoalAwareNavigator(world).plan(...)
-                                -> lexicographic Dijkstra over
-                                   (Location, facing)
+                 -> lazy global-world overlay
+                 -> GoalAwareNavigator(world).plan(...)
+                      -> lexicographic Dijkstra over (Location, facing)
                  -> append directed transition / score final route
+
+The explicit-candidate compatibility path instead calls
+`plan_many_locations()` once to share the local frontier across activation
+targets.
 ```
 
 Separate paths also matter when measuring a frame: `_overworld_actions` can
@@ -331,73 +344,58 @@ three-goal loop to collapse.
 
 ### Repeated candidate searches
 
-For one graph edge, the exact current search count is:
+The old per-edge implementation attempted activation sides one at a time.
+The current explicit-candidate path groups those targets and calls
+`plan_many_locations()` once from the shared `(start location, world.facing)`
+state. The search is exhaustive for the requested targets, so unreachable
+targets are still accounted for without repeating the state expansion. In the
+current benchmark this reduces six independent searches and 59 expanded nodes
+to one search and six expanded nodes.
 
-```text
-sum over source candidates of
-    activation-side attempts until the first reachable side
-```
-
-An ordinary runtime warp can attempt four adjacent source states. An
-explicit activation-location warp (including escalators) uses its explicit
-source states. A source with no matching runtime warp is searched as the
-source coordinate. Every attempt starts from the same `(start location,
-world.facing)` snapshot and creates a new navigator. The local goal differs
-by activation coordinate, so these searches are not generally equivalent.
-
-In the existing two-warp deterministic fixture, four calls occur: the first
-side of each warp is unreachable and the second side is reachable. The
-profiler reports four candidate records and four searches, with zero safe
-prunes or dominance rejections. This is repeated work only in the sense that
-the searches share a start and transition graph; no current invariant proves
-that any one candidate has the same optimal route as another.
+Ordinary semantic cross-map goals take the global-world path instead and
+record one global search. Candidate-specific transition actions are still
+added after local target reconstruction where needed.
 
 ### Cross-map winner objective mismatch
 
-The local search for each candidate correctly optimizes NORMAL's
-lexicographic objective, but the cross-map winner is selected by:
+The former cross-map winner rule selected by action count alone:
 
 ```python
 min(candidate_plans, key=lambda item: len(item[1].actions))
 ```
 
-This can violate NORMAL. A deterministic sparse fixture demonstrated:
+That could violate NORMAL when a longer route avoided an encounter. The
+current selector uses `navigation_candidate_key()` and ranks complete plans by
+the canonical objective:
 
 | candidate | local actions | encounter opportunities | route cost |
 |---|---:|---:|---:|
 | A | 1 | 1 | 1 |
 | B | 5 | 0 | 8 |
 
-The current selector chooses A, while NORMAL requires B. This is an
-existing correctness bug, not a performance optimization. It was not fixed
-in this milestone and no candidate ordering or pruning should be built on
-the current winner rule until the objective is reviewed. A focused regression
-fixture should be added when the correctness fix is scheduled; changing the
-assertion now would change production semantics and is outside this audit.
+The focused ranking test verifies that candidate B sorts ahead of A under
+NORMAL. This correctness issue is resolved in the current worktree; future
+candidate ordering or pruning must preserve the same ranking tuple.
 
 ### Multi-target search feasibility
 
-A forward multi-target search is feasible in principle, but not as a simple
-replacement using the current API. A safe version could put all valid
-activation states into one search and retain, for each reached target, the
-complete predecessor chain and metrics. It must keep `(Location, facing)` as
-the state, retain stationary turns, charge encounter-terrain moves and turns,
-and apply each target's source/facing predicate after the same forward
-transition rules.
+A forward multi-target search is now implemented as
+`GoalAwareNavigator.plan_many_locations()`. It retains `(Location, facing)` as
+the state, preserves the encounter objective, reconstructs a plan for each
+reachable target, and leaves candidate-specific facing/transition actions to
+the caller. The implementation is intentionally exhaustive: it does not prove
+arbitrary candidates dominated and therefore does not perform candidate
+pruning.
 
-The existing search returns on the first satisfied goal and stores one
-predecessor map. It has no result set for multiple goals and no representation
-for candidate-specific completion actions (directional warp input,
-escalator source/facing, or interaction completion). A reverse multi-source
-search would require a new reverse transition model for directed warps,
-dynamic blocked tiles, facing-dependent turns, and interaction predicates;
-the current forward model cannot safely supply that. Therefore this is a
-design opportunity, not a safe optimization to implement now.
+A reverse multi-source search would still require a new reverse transition
+model for directed warps, dynamic blocked tiles, facing-dependent turns, and
+interaction predicates. That remains a design opportunity, not an implemented
+optimization.
 
 ### Route-cache feasibility
 
-Caching a completed local plan is possible only for an immutable snapshot.
-The minimum key must include:
+Caching a completed plan is possible only for an immutable effective
+observation. The ideal complete key must include:
 
 ```text
 map/static tile identity and map-graph identity
@@ -410,57 +408,64 @@ goal type, destination/trigger, constraints, encounter mode
 search algorithm and relevant planner version
 ```
 
-The existing executor signature covers many runtime invalidation fields but
-does not include the goal, player facing, static tile identity, or all
-planner semantics as a standalone stable hash. It is therefore not a
-complete route-cache key. Building and hashing the full key may also cost
-meaningful time for large observations. No cache was added.
+The current semantic cross-map cache includes player location/facing, movement
+capability, semantic target, encounter settings, dynamic blocked coordinates,
+hazards, and runtime transition identity/destination. Static tile metadata is
+treated as process/session-stable and the cache is cleared at an emulator or
+session boundary. This is sufficient for the current semantic route use, but
+it is not a complete general local-route key: it does not include an explicit
+planner-version field and does not cache every explicit-candidate route.
 
 ### Benchmark matrix and status
 
 | Alternative | Calls / nodes | Route semantics | Result |
 |---|---:|---|---|
-| Current local Dijkstra | fixture-dependent; 4 calls / 32 nodes in the two-warp case | baseline | production default |
+| Current local Dijkstra | fixture-dependent; production baseline | baseline | production default |
 | Shared world model | same 90 calls / 3,840 nodes as separate-world model | identical | safe, small allocation win |
-| Reused exact search result | would reduce identical repeated `(world,start,goal,mode)` calls to one | identical only for a complete snapshot key | feasible later, no cache added |
-| Multi-target search | not implemented | requires new result/transition representation | defer |
+| Shared-frontier multi-target search | old model: 6 calls / 59 nodes; current model: 1 call / 6 nodes in the representative fixture | identical target plans and candidate ranking | implemented |
+| Semantic cross-map cache | repeated unchanged semantic requests reuse one plan | identical while the effective cache key is unchanged | implemented with session-boundary invalidation |
+| Reused exact local search result | would reduce identical repeated `(world,start,goal,mode)` calls to one | identical only for a complete snapshot key | not implemented generally |
+| Reverse/multi-source search | not implemented | requires a reverse transition model | defer |
 | Experimental A* | warp-free: 173→40 average nodes in existing 30-run comparison; warp case: 32→32 | identical in fixtures | do not enable by default |
 
-The shared-world and exact-reuse rows are architectural models, not
-production modifications. The existing benchmark tests verify identical
-actions, encounter metrics, and route costs for Dijkstra/A* fixtures. No
-experimental multi-target implementation exists to benchmark honestly.
+The shared-world row is an architectural benchmark. The shared-frontier and
+semantic-cache rows describe current implementation. The benchmark tests
+verify identical actions, encounter metrics, and route costs for Dijkstra/A*
+fixtures, and the current shared-frontier test verifies the reduction in
+searches and expanded nodes. No emulator-backed performance result exists.
 
 ### Recommended sequence
 
-1. Fix and regression-test the cross-map NORMAL winner objective separately;
-   correctness risk is high, performance benefit is neutral-to-positive, and
-   emulator validation is straightforward.
-2. Thread one immutable `NavigationWorld` through any real multi-goal
-   evaluation context; low complexity/risk and easy to validate, but expect a
-   modest benefit because static tiles are already cached.
-3. Add opt-in counters for world construction and goal identity to the
-   existing profiler, then collect real frame traces. This separates
-   perception, planning, candidate enumeration, search, scoring, and cached
-   execution before choosing a larger change.
-4. Specify a complete snapshot key and benchmark exact-result reuse on
-   repeated unchanged decisions; medium complexity and high invalidation risk.
-5. Design a forward multi-target search with explicit per-target completion
-   records and prove equivalence against the current planner before any
-   production use; potentially high benefit, highest implementation risk.
-6. Reassess warp-free A* after architectural reuse. Its deterministic local
-   gains do not reduce cross-map call count.
+1. **Complete:** fix and regression-test the cross-map NORMAL winner objective;
+   candidate ranking now uses the canonical navigation objective.
+2. **Complete for the current candidate path:** thread a shared frontier
+   through multi-target activation evaluation; benchmarked search count and
+   node reductions are recorded above.
+3. **Partial:** collect profiler data on realistic frame traces. Detailed
+   search and cross-map diagnostics exist, but no emulator-backed performance
+   characterization has been completed.
+4. **Partial:** validate semantic-cache invalidation and determine whether a
+   broader complete snapshot key is worthwhile; the current cache is limited
+   to semantic cross-map plans.
+5. **Complete for forward activation targets:** multi-target search preserves
+   the required state and candidate ranking. Reverse search remains open.
+6. **Open:** reassess warp-free A* after live transition validation. Its
+   deterministic local gains do not reduce cross-map calls when the warp
+   heuristic is zero.
 
-Do not optimize yet: speculative candidate pruning, candidate reordering as
-if it were pruning, reverse search, incomplete route caching, production A*,
-per-frame logging, or perception. Perception is a separate substantial cost
-and deterministic Python fixtures cannot establish emulator performance.
+Do not enable speculative candidate pruning, candidate reordering as if it
+were pruning, reverse search, incomplete general route caching, production A*,
+per-frame logging, or perception changes based only on deterministic fixtures.
+Perception is a separate substantial cost and emulator traces are still needed
+to establish production performance.
 
 ### Validation
 
-The focused unittest suite passed: 47 tests covering foundation, world
-navigation, interaction/facing, encounters, diagnostics, and A* benchmark
-fixtures. `pytest` is unavailable in the configured environment (`No module
-named pytest`). No emulator was run, so no emulator-performance claim is
-made. Production navigation files were not changed by this audit; the
-worktree already contained user changes before the audit began.
+The current unit tier passes **958 tests**, with **38 emulator tests
+deselected**, under the configured Python 3.12.13 environment
+(`pytest -q -m unit`). The focused A* benchmark module passes all six tests and
+reports the current shared-frontier comparison of six searches/59 expanded
+nodes versus one search/six expanded nodes. No emulator was run, so no
+emulator-performance claim is made. The navigation follow-up changed
+semantic cross-map planning, shared-frontier search, candidate ranking, and
+semantic route caching; Dijkstra remains the production default.

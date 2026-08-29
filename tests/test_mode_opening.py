@@ -274,6 +274,8 @@ class TestEmeraldOpeningState(unittest.TestCase):
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
 
         mode = EmeraldOpeningMode()
+        mode._resolved_player_gender = "male"
+        mode.phase = OpeningSequenceState.TRUCK
         resolved_destination = types.SimpleNamespace(
             map_group_and_number=MapRSE.LITTLEROOT_TOWN.value,
         )
@@ -399,6 +401,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         )
 
         mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.TRUCK
         location = types.SimpleNamespace(
             map_group_and_number=MapRSE.INSIDE_OF_TRUCK.value,
             warps=[
@@ -509,6 +512,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
 
         mode = EmeraldOpeningMode()
+        mode._resolved_player_gender = "male"
         mode.phase = OpeningSequenceState.LITTLEROOT_TOWN
         with (
             patch("modules.modes.opening._littleroot_arrival_ready", return_value=True),
@@ -559,6 +563,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
 
         mode = EmeraldOpeningMode()
+        mode._resolved_player_gender = "male"
         mode.phase = OpeningSequenceState.PLAYER_HOUSE_1F
         with (
             patch("modules.modes.opening._player_house_1f_ready_for_navigation", return_value=True),
@@ -578,6 +583,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
 
         mode = EmeraldOpeningMode()
+        mode._resolved_player_gender = "male"
         mode.phase = OpeningSequenceState.PLAYER_HOUSE_1F
         mode._pending_house_warp_destination = MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F
         with (
@@ -656,6 +662,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
 
         mode = EmeraldOpeningMode()
+        mode._resolved_player_gender = "male"
         mode.phase = OpeningSequenceState.PLAYER_HOUSE_1F_POST_CLOCK_ARRIVAL
         with (
             patch("modules.modes.opening._current_map_id", return_value=MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F.value),
@@ -674,11 +681,12 @@ class TestEmeraldOpeningState(unittest.TestCase):
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
 
         mode = EmeraldOpeningMode()
+        mode._resolved_player_gender = "female"
         mode.phase = OpeningSequenceState.POST_CLOCK_TOWN
         with patch("modules.modes.opening._warp_to", return_value=iter(())) as warp:
             list(mode._advance_phase(OpeningSequenceState.LITTLEROOT_TOWN))
 
-        warp.assert_called_once_with(MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_1F, expecting_script=True)
+        warp.assert_called_once_with(MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F, expecting_script=True)
         self.assertIs(mode.phase, OpeningSequenceState.BIRCH_HOUSE_1F)
 
     def test_birch_house_waits_for_arrival_script_before_navigating_upstairs(self):
@@ -686,6 +694,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
 
         mode = EmeraldOpeningMode()
+        mode._resolved_player_gender = "female"
         mode.phase = OpeningSequenceState.BIRCH_HOUSE_1F
         with (
             patch("modules.modes.opening._birch_house_1f_ready_for_navigation", return_value=False),
@@ -702,7 +711,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         ):
             list(mode._advance_phase(OpeningSequenceState.BIRCH_HOUSE_1F))
 
-        warp.assert_called_once_with(MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F)
+        warp.assert_called_once_with(MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F)
         self.assertIs(mode.phase, OpeningSequenceState.BIRCH_HOUSE_2F)
 
     def test_birch_house_reconciles_observed_second_floor_before_warp_returns(self):
@@ -723,6 +732,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
 
         mode = EmeraldOpeningMode()
+        mode._resolved_player_gender = "female"
         mode.phase = OpeningSequenceState.BIRCH_HOUSE_2F
         emulator = unittest.mock.Mock()
         with (
@@ -739,7 +749,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
             list(mode._advance_phase(OpeningSequenceState.BIRCH_HOUSE_2F))
 
         navigate.assert_called_once_with(
-            MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F,
+            MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_2F,
             (6, 4),
             avoid_scripted_events=False,
         )
@@ -769,6 +779,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
 
         mode = EmeraldOpeningMode()
+        mode._resolved_player_gender = "female"
         mode.phase = OpeningSequenceState.MAY_SEQUENCE
         with (
             patch("modules.modes.opening._may_sequence_event_complete", return_value=True),
@@ -776,7 +787,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         ):
             list(mode._advance_phase(OpeningSequenceState.BIRCH_HOUSE_2F))
 
-        warp.assert_called_once_with(MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_1F, expecting_script=True)
+        warp.assert_called_once_with(MapRSE.LITTLEROOT_TOWN_BRENDANS_HOUSE_1F, expecting_script=True)
         self.assertIs(mode.phase, OpeningSequenceState.MAY_SEQUENCE)
 
     def test_may_sequence_leaves_house_after_descending(self):
@@ -799,6 +810,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
 
         mode = EmeraldOpeningMode()
+        mode._resolved_player_gender = "male"
         mode.phase = OpeningSequenceState.PLAYER_HOUSE_2F
         with (
             patch.object(mode, "_can_navigate", return_value=True),
@@ -887,6 +899,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         from modules.modes.opening import EmeraldOpeningMode, OpeningSequenceState
 
         mode = EmeraldOpeningMode()
+        mode._resolved_player_gender = "male"
         mode.phase = OpeningSequenceState.CLOCK_SETTING
         with (
             patch.object(mode, "_can_navigate", return_value=True),
@@ -1312,7 +1325,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
             opening_context.emulator = emulator
             list(_advance_scripted_input())
 
-        emulator.press_button.assert_called_once_with("A")
+        emulator.press_button.assert_not_called()
 
     def test_scripted_input_preserves_field_message_lifecycle_at_native_wait(self):
         from modules.modes.opening import EmeraldOpeningCapability, _advance_scripted_input
@@ -1361,6 +1374,7 @@ class TestEmeraldOpeningState(unittest.TestCase):
         )
 
         mode = EmeraldOpeningMode()
+        mode.phase = OpeningSequenceState.TRUCK
         diagnostics = OpeningDiagnostics(
             OpeningSequenceState.TRUCK,
             OpeningSequenceState.TRUCK,

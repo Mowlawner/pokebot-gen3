@@ -138,7 +138,14 @@ class WorldMapGraph:
         return self._outgoing.get(map_id, ())
 
     @traced("world_map_route_calculation")
-    def route(self, source_map: MapId, target_map: MapId) -> WorldRoute:
+    def route(self, source_map: MapId, target_map: MapId, *, prefer_interior: bool = False) -> WorldRoute:
+        """Return the cheapest route, optionally preferring interior warps.
+
+        The ordinary route remains a weighted shortest path.  Interaction
+        targets may opt into a large boundary penalty so an all-warp route
+        through a building (for example, first floor to second floor) beats
+        an outdoor detour that only happens to be globally reachable.
+        """
         if source_map == target_map:
             return WorldRoute((source_map,), ())
         # Dijkstra retains the old insertion-order behavior for equal-cost
@@ -156,7 +163,10 @@ class WorldMapGraph:
             if current == target_map:
                 return self._unroll(came_from, target_map, distance)
             for edge in self.outgoing(current):
-                next_distance = distance + max(1, edge.estimated_cost)
+                edge_cost = max(1, edge.estimated_cost)
+                if prefer_interior and edge.kind == "connection":
+                    edge_cost += 1_000_000
+                next_distance = distance + edge_cost
                 if next_distance >= distances.get(edge.destination_map, float("inf")):
                     continue
                 distances[edge.destination_map] = next_distance

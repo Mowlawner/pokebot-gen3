@@ -111,8 +111,10 @@ class CampaignControllerTests(unittest.TestCase):
         controller = self.controller()
         controller.step()
         controller.step()
-        self.assertEqual(len(self.created), 1)
-        self.assertEqual(self.executed, 1)
+        # Introductory-rival execution is now mounted through the resource
+        # capability boundary; the legacy tactical-loop factory is not used.
+        self.assertEqual(len(self.created), 0)
+        self.assertEqual(self.executed, 0)
 
     def test_capability_remains_active_until_authoritative_fact_changes(self):
         calls = []
@@ -135,6 +137,31 @@ class CampaignControllerTests(unittest.TestCase):
         controller.step()
         controller.step()
         self.assertEqual(calls, ["mounted"])
+
+    def test_capability_only_execution_advances_to_input_boundary(self):
+        objective = self.fixture.objective("dialogue", self.fixture.predicate("complete", False))
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "actionable dialogue")
+        emitted = []
+
+        def capability():
+            emitted.append("ADVANCE_DIALOGUE")
+            yield
+
+        execution = CampaignExecutionResult(
+            objective, CampaignExecutionStatus.READY, "capability-only dialogue", capability=capability
+        )
+        controller = CampaignController(
+            lambda: self.current,
+            selector=lambda _: selection,
+            adapter=lambda _: execution,
+        )
+
+        state = controller.step()
+
+        self.assertEqual(state.status, CampaignControllerStatus.READY)
+        self.assertIs(controller.last_execution.capability, capability)
+        self.assertEqual(emitted, ["ADVANCE_DIALOGUE"])
+        self.assertIsNone(state.tactical_goal)
 
     def test_capability_boundary_is_not_failure(self):
         objective = self.fixture.objective("boundary", self.fixture.predicate("complete", False))
@@ -199,9 +226,9 @@ class CampaignControllerTests(unittest.TestCase):
         )
         result = controller.refresh()
         self.assertNotEqual(old_goal, None)
-        self.assertIsNotNone(result.tactical_goal)
+        self.assertIsNone(result.tactical_goal)
         self.assertEqual(result.selection.objective.objective_id, "receive_pokedex")
-        self.assertEqual(self.created.__len__(), 1)
+        self.assertEqual(self.created.__len__(), 0)
 
     def test_start_nuzlocke_is_internal_and_advances_without_tactical_goal(self):
         self.state(
@@ -214,7 +241,7 @@ class CampaignControllerTests(unittest.TestCase):
                 starter_obtained=True,
                 intro_rival_battle_complete=True,
                 pokedex_received=True,
-                pokeballs_available=True,
+                pokeballs_ready=True,
             )
         )
         started = self.fixture.facts(
@@ -226,7 +253,7 @@ class CampaignControllerTests(unittest.TestCase):
             starter_obtained=True,
             intro_rival_battle_complete=True,
             pokedex_received=True,
-            pokeballs_available=True,
+            pokeballs_ready=True,
             nuzlocke_started=True,
         )
         next_objective = CampaignObjective(
@@ -274,10 +301,10 @@ class CampaignControllerTests(unittest.TestCase):
             intro_rival_battle_complete=True,
             pokedex_received=True,
         )
-        facts = replace(facts, pokeballs_available=Fact.unavailable())
+        facts = replace(facts, pokeballs_ready=Fact.unavailable())
         state = self.fixture.state(campaign_facts=facts)
         selection = select_campaign_objective(state, (objective,))
-        self.assertEqual(selection.status, ObjectiveStatus.UNKNOWN)
+        self.assertEqual(selection.status, ObjectiveStatus.BLOCKED)
 
 
 from modules.map_data import MapRSE

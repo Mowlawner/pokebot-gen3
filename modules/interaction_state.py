@@ -21,6 +21,7 @@ from modules.tasks import (
     task_is_active,
 )
 from modules.profiler import count, now, timing
+from modules.console import diagnostic_print
 
 
 class InteractionType(Enum):
@@ -85,9 +86,9 @@ def _observe_field_message_waiting(state: GameState | Any) -> bool:
             input_waiting = is_waiting_for_input()
             if (
                 script_context is not None
-                and script_context.is_active
-                and script_context.native_function_name == "WaitForAorBPress"
-                and script_context.script_function_name == "Std_MsgboxDefault"
+                and getattr(script_context, "is_active", False)
+                and getattr(script_context, "native_function_name", None) == "WaitForAorBPress"
+                and getattr(script_context, "script_function_name", None) == "Std_MsgboxDefault"
                 and input_waiting
             ):
                 _field_message_lifecycle_active = True
@@ -105,24 +106,24 @@ def _observe_field_message_waiting(state: GameState | Any) -> bool:
         # Emerald stops the global script.  It must not keep an old message
         # lifecycle actionable or cause the next A to be dispatched to the
         # field object in front of the player.
-        if script_context is not None and not script_context.is_active and not draw_task_active:
+        if script_context is not None and not getattr(script_context, "is_active", False) and not draw_task_active:
             _field_message_lifecycle_active = False
             _field_message_advance_ready = False
             return False
         waiting = is_field_message_waiting_for_input(_field_message_lifecycle_active or draw_task_active)
-        native_name = None
-        if not waiting:
-            script_context = get_global_script_context()
-            native_name = script_context.native_function_name if script_context is not None else None
+        # Keep the native name available even when the higher-level waiting
+        # predicate is true. The hidden-box callback is a transition inside a
+        # field-message lifecycle, not proof that the message accepts input.
+        native_name = script_context.native_function_name if script_context is not None else None
         # A field-message task can report input-waiting while its native
         # message box is still hidden. Preserve the lifecycle for ownership,
         # but do not expose that transition as actionable dialogue.
         task_input_ready = is_field_message_task_waiting_for_input()
         hidden_transition = (
             waiting
-            and script_context is not None
-            and script_context.native_function_name == "IsFieldMessageBoxHidden"
-            and (_field_message_lifecycle_active or draw_task_active)
+            and native_name == "IsFieldMessageBoxHidden"
+            and _field_message_lifecycle_active
+            and not draw_task_active
             and not task_input_ready
         )
         if hidden_transition:
@@ -138,6 +139,7 @@ def _observe_field_message_waiting(state: GameState | Any) -> bool:
             and not hidden_transition
             and not waiting
             and native_name in _FIELD_MESSAGE_TRANSITION_NATIVES
+            and (task_input_ready or draw_task_active)
         )
         if (
             task_input_ready
@@ -199,6 +201,7 @@ def observe_interaction(
     callers can enrich this observation with their parsed options.
     """
 
+    global _field_message_advance_ready
     interaction_start = now()
     state_start = now()
     state = get_game_state()
@@ -211,8 +214,8 @@ def observe_interaction(
     controllable_start = now()
     controllable = player_avatar_is_controllable()
     script_context = get_global_script_context()
-    script_active = bool(script_context is not None and script_context.is_active)
-    native_function = script_context.native_function_name if script_context is not None else None
+    script_active = bool(script_context is not None and getattr(script_context, "is_active", False))
+    native_function = getattr(script_context, "native_function_name", None) if script_context is not None else None
     # Keep the common boundary independent of the nuzlocke package initializer
     # (which imports the campaign controller and would create a cycle here).
     # Task_HandleYesNoInput is Emerald's generic field Yes/No owner; the
@@ -225,10 +228,37 @@ def observe_interaction(
     choice_menu_input_ready = bool(confirmation is not None and confirmation.input_ready)
     choice_selected = confirmation.selected.name if confirmation is not None and confirmation.selected else None
     observed_choice_options = choice_options or (confirmation.options if confirmation is not None else ())
+    # ``Std_MsgboxYesNo`` first displays an ordinary field message, then
+    # installs the Yes/No menu.  Its script identity alone is therefore not
+    # an actionable choice boundary: classifying the initial message as a
+    # choice would suppress the A input that advances it and prevents the
+    # menu task from ever being created.  The generic confirmation observer
+    # recognizes ``Task_HandleYesNoInput`` once it exists.  Retain this
+    # fallback only for the verified task/printer boundary used by field
+    # prompts that expose their ready state through ``Task_DrawFieldMessage``.
+    if (
+        confirmation is None
+        and script_context is not None
+        and getattr(script_context, "script_function_name", None) == "Std_MsgboxYesNo"
+        and script_active
+    ):
+        choice_menu_input_ready = is_field_message_task_waiting_for_input()
+        if choice_menu_input_ready:
+            choice_menu_active = True
+            observed_choice_options = choice_options or ("YES", "NO")
+            try:
+                cursor = read_symbol("sMenu", offset=0x02, size=1)[0]
+                choice_selected = ("YES", "NO")[cursor]
+            except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+                choice_selected = None
     if choice_menu_active:
         interaction_phase = InteractionPhase.CHOICE_MENU_INPUT_WAIT
     elif (_field_message_advance_ready and script_active and native_function == "IsFieldMessageBoxHidden") or (
         script_active and dialogue_waiting and native_function == "WaitForAorBPress"
+    ) or (
+        script_active
+        and dialogue_waiting
+        and native_function == "IsFieldMessageBoxHidden"
     ):
         interaction_phase = InteractionPhase.FIELD_MESSAGE_INPUT_WAIT
     elif _field_message_lifecycle_active and native_function == "IsFieldMessageBoxHidden":
@@ -251,6 +281,27 @@ def observe_interaction(
             printer_active, printer_state = printer_data
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
         pass
+    if script_context is not None and getattr(script_context, "script_function_name", None) == "LittlerootTown_ProfessorBirchsLab_EventScript_GiveStarterEvent":
+        # GiveStarterEvent uses IsFieldMessageBoxHidden while its printer is
+        # still active.  A is intentionally accepted in this state to finish
+        # or accelerate the message; the generic hidden-box debounce would
+        # otherwise leave the campaign waiting forever on the first lab line.
+        if field_message_task_active and printer_active:
+            _field_message_advance_ready = True
+            interaction_phase = InteractionPhase.FIELD_MESSAGE_INPUT_WAIT
+        diagnostic_print(
+            lambda: (
+                "LAB_DIALOGUE_GATE: "
+                f"frame={getattr(context, 'frame', None)!r} "
+                f"native={native_function!r} script_active={script_active!r} "
+                f"task_active={field_message_task_active!r} task_state={field_message_task_state!r} "
+                f"printer_active={printer_active!r} printer_state={printer_state!r} "
+                f"waiting_for_input={is_waiting_for_input()!r} "
+                f"dialogue_waiting={dialogue_waiting!r} lifecycle={_field_message_lifecycle_active!r} "
+                f"advance_ready={_field_message_advance_ready!r} phase={interaction_phase.name!r}"
+            ),
+            trace=True,
+        )
     trace = getattr(context, "stutter_trace", None)
     if trace is not None and callable(getattr(trace, "mark", None)):
         trace.mark("interaction_game_state", getattr(state, "name", repr(state)))
@@ -258,6 +309,10 @@ def observe_interaction(
         trace.mark("interaction_field_message_lifecycle", _field_message_lifecycle_active)
         trace.mark("interaction_field_message_ready", _field_message_advance_ready)
         trace.mark("interaction_controllable", controllable)
+        trace.mark("interaction_phase", interaction_phase.name)
+        trace.mark("interaction_choice_active", choice_menu_active)
+        trace.mark("interaction_choice_ready", choice_menu_input_ready)
+        trace.mark("interaction_choice_selected", choice_selected)
     timing("agent_interaction_controllability_check", controllable_start)
     count("interaction_controllability_checks")
     timing("agent_interaction_observation", interaction_start)
@@ -272,7 +327,7 @@ def observe_interaction(
         field_message_lifecycle_active=_field_message_lifecycle_active,
         field_message_advance_ready=_field_message_advance_ready,
         script_active=script_active,
-        script_function=(script_context.script_function_name if script_context is not None else None),
+        script_function=(getattr(script_context, "script_function_name", None) if script_context is not None else None),
         native_function=native_function,
         interaction_phase=interaction_phase,
         choice_menu_active=choice_menu_active,

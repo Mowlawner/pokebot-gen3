@@ -14,6 +14,7 @@ from modules.nuzlocke.resource_runtime import _execute_healing_source_interactio
 from modules.nuzlocke.resource_runtime import _resolve_recovery_interaction
 from modules.nuzlocke.resource_runtime import _navigate_recovery_to_center
 from modules.nuzlocke.resource_runtime import _wait_for_center_interior
+from modules.nuzlocke.resource_runtime import execute_planned_recovery
 from modules.agent_control import AgentAction, AgentActionType, ActionDecision
 from modules.agent_control import AgentObservation
 from modules.interaction_state import InteractionObservation
@@ -22,6 +23,47 @@ from modules.map_data import MapRSE, PokemonCenter
 
 
 class CampaignCapabilityTests(unittest.TestCase):
+    def test_planned_recovery_navigates_to_observed_nurse_before_interacting(self):
+        nurse = type(
+            "Nurse",
+            (),
+            {
+                "source_id": "nurse",
+                "interaction_trigger_id": "object:nurse",
+            },
+        )()
+        interior = type(
+            "Observation",
+            (),
+            {
+                "overworld": type("World", (), {})(),
+                "interaction_type": type("InteractionType", (), {"name": "OVERWORLD"})(),
+                "interaction": type("Interaction", (), {"controllable": True})(),
+            },
+        )()
+        navigation_goals = []
+
+        class FakeLoop:
+            def __init__(self, *, goal):
+                navigation_goals.append(goal)
+
+            def run(self):
+                return iter(())
+
+        with patch("modules.nuzlocke.resource_runtime.party_is_restored", side_effect=[False, True]), patch(
+            "modules.nuzlocke.resource_runtime.AgentControlLoop", side_effect=lambda _factory, goal: FakeLoop(goal=goal)
+        ), patch(
+            "modules.nuzlocke.resource_runtime.observe_agent", return_value=interior
+        ), patch(
+            "modules.nuzlocke.resource_runtime.discover_healing_source", return_value=nurse
+        ), patch(
+            "modules.nuzlocke.resource_runtime._execute_healing_source_interaction", return_value=iter(())
+        ):
+            list(execute_planned_recovery(("OldaleTown", (6, 16))))
+
+        self.assertEqual(len(navigation_goals), 2)
+        self.assertEqual(navigation_goals[1].trigger_id, "object:nurse")
+
     def test_observed_center_nurse_becomes_healing_affordance(self):
         trigger = type(
             "Trigger",
@@ -46,6 +88,27 @@ class CampaignCapabilityTests(unittest.TestCase):
         self.assertEqual(source.interaction_trigger_id, trigger.trigger_id)
         self.assertEqual(source.interaction_target, trigger.trigger_id)
 
+    def test_observed_non_center_full_party_sources_are_healing_affordances(self):
+        for script in (
+            "PlayersHouse_1F_EventScript_Mom",
+            "Route111_OldLadysRestStop_EventScript_OldLady",
+        ):
+            trigger = type(
+                "Trigger",
+                (),
+                {
+                    "kind": "object_interaction",
+                    "affordance_id": script,
+                    "script_symbol": script,
+                    "activation_locations": frozenset({((1, 1), (4, 4))}),
+                    "trigger_id": f"object:1:{script}",
+                },
+            )()
+            observation = type("Observation", (), {"overworld": type("World", (), {"triggers": (trigger,)})()})()
+            source = discover_healing_source(observation=observation)
+            self.assertIsNotNone(source)
+            self.assertEqual(source.source_type, HealingSourceType.FULL_PARTY_PROVIDER)
+
     def test_healing_source_dialogue_uses_common_action_and_fresh_completion(self):
         source = HealingSource("nurse", HealingSourceType.FULL_PARTY_PROVIDER, None, None)
         dialogue = AgentObservation(InteractionObservation(GameState.OVERWORLD, dialogue_waiting=True))
@@ -55,7 +118,7 @@ class CampaignCapabilityTests(unittest.TestCase):
             ActionDecision(AgentAction(AgentActionType.ADVANCE_DIALOGUE)),
             ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE)),
         ]
-        with patch("modules.nuzlocke.resource_runtime.party_is_restored", side_effect=[False, False, True]), patch(
+        with patch("modules.nuzlocke.resource_runtime.party_is_restored", side_effect=[False, True]), patch(
             "modules.nuzlocke.resource_runtime.observe_agent", side_effect=[dialogue, overworld]
         ), patch("modules.nuzlocke.resource_runtime.select_action", side_effect=actions), patch(
             "modules.nuzlocke.resource_runtime.AgentActionExecutor", return_value=executor
@@ -84,11 +147,12 @@ class CampaignCapabilityTests(unittest.TestCase):
         dialogue = AgentObservation(
             InteractionObservation(GameState.OVERWORLD, dialogue_waiting=True, controllable=False)
         )
+        finished = AgentObservation(InteractionObservation(GameState.OVERWORLD, controllable=True))
         executor = type("Executor", (), {"execute": lambda self, action, observed: None})()
         with patch(
             "modules.nuzlocke.resource_runtime.party_is_restored", side_effect=[False, False, False, True]
         ), patch(
-            "modules.nuzlocke.resource_runtime.observe_agent", side_effect=[overworld, overworld, dialogue]
+            "modules.nuzlocke.resource_runtime.observe_agent", side_effect=[overworld, overworld, dialogue, finished]
         ), patch(
             "modules.nuzlocke.resource_runtime.select_action",
             return_value=ActionDecision(AgentAction(AgentActionType.ADVANCE_DIALOGUE)),
@@ -110,8 +174,9 @@ class CampaignCapabilityTests(unittest.TestCase):
         )
         actions = []
         executor = type("Executor", (), {"execute": lambda self, action, observed: actions.append(action)})()
-        with patch("modules.nuzlocke.resource_runtime.party_is_restored", side_effect=[False, False, True]), patch(
-            "modules.nuzlocke.resource_runtime.observe_agent", return_value=script_owned
+        finished = AgentObservation(InteractionObservation(GameState.OVERWORLD, controllable=True))
+        with patch("modules.nuzlocke.resource_runtime.party_is_restored", side_effect=[False, False, True, True]), patch(
+            "modules.nuzlocke.resource_runtime.observe_agent", side_effect=[script_owned, script_owned, script_owned, finished]
         ), patch("modules.nuzlocke.resource_runtime.AgentActionExecutor", return_value=executor):
             list(_execute_healing_source_interaction(source))
         # The active script preserves ownership without emitting another
@@ -124,6 +189,7 @@ class CampaignCapabilityTests(unittest.TestCase):
             InteractionObservation(
                 GameState.OVERWORLD,
                 controllable=True,
+                dialogue_waiting=True,
                 script_active=True,
                 choice_options=("YES", "NO"),
                 choice_menu_active=True,
@@ -132,8 +198,9 @@ class CampaignCapabilityTests(unittest.TestCase):
         )
         executor = type("Executor", (), {"execute": lambda self, action, observed: None})()
         decisions = [ActionDecision(AgentAction(AgentActionType.CHOOSE_DIALOGUE_OPTION, option="YES"))]
+        finished = AgentObservation(InteractionObservation(GameState.OVERWORLD, controllable=True))
         with patch("modules.nuzlocke.resource_runtime.party_is_restored", side_effect=[False, True]), patch(
-            "modules.nuzlocke.resource_runtime.observe_agent", return_value=confirmation
+            "modules.nuzlocke.resource_runtime.observe_agent", side_effect=[confirmation, finished]
         ), patch("modules.nuzlocke.resource_runtime.select_action", side_effect=decisions), patch(
             "modules.nuzlocke.resource_runtime.AgentActionExecutor", return_value=executor
         ):
@@ -213,15 +280,101 @@ class CampaignCapabilityTests(unittest.TestCase):
 
     def test_recovery_handoff_waits_for_stable_center_interior(self):
         transient = type(
-            "Observation", (), {"overworld": type("World", (), {"map_id": MapRSE.OLDALE_TOWN, "controllable": True})()}
+            "Observation", (), {"overworld": type("World", (), {"map_id": MapRSE.OLDALE_TOWN.value, "controllable": True, "map_identity_source": "live_header"})()}
         )()
         stable = type(
             "Observation",
             (),
-            {"overworld": type("World", (), {"map_id": MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F, "controllable": True})()},
+            {"overworld": type("World", (), {"map_id": MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value, "controllable": True, "map_identity_source": "live_header"})()},
         )()
         with patch("modules.nuzlocke.resource_runtime.observe_agent", side_effect=[transient, stable]):
             self.assertEqual(list(_wait_for_center_interior(PokemonCenter.OldaleTown)), [None])
+
+    def test_recovery_handoff_warms_center_interior_before_observing_warp(self):
+        interior = type(
+            "Observation",
+            (),
+            {
+                "overworld": type(
+                    "World",
+                    (),
+                    {
+                        "map_id": MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value,
+                        "controllable": True,
+                        "map_identity_source": "live_header",
+                    },
+                )()
+            },
+        )()
+        with patch("modules.nuzlocke.resource_runtime.get_map_metadata") as warm, patch(
+            "modules.nuzlocke.resource_runtime.observe_agent", return_value=interior
+        ):
+            self.assertEqual(list(_wait_for_center_interior(PokemonCenter.OldaleTown)), [])
+        warm.assert_called_once_with(MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value)
+
+    def test_recovery_handoff_rejects_save_block_only_interior_identity(self):
+        stale_interior = type(
+            "Observation",
+            (),
+            {
+                "overworld": type(
+                    "World",
+                    (),
+                    {
+                        "map_id": MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value,
+                        "controllable": True,
+                        "map_identity_source": "save_block",
+                        "save_block_map_id": MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value,
+                        "live_map_candidates": (),
+                    },
+                )()
+            },
+        )()
+        with patch("modules.nuzlocke.resource_runtime.get_map_metadata"), patch(
+            "modules.nuzlocke.resource_runtime.observe_agent", return_value=stale_interior
+        ) as observe, patch("modules.nuzlocke.resource_runtime._MAP_IDENTITY_RESOLUTION_TIMEOUT", 2):
+            with self.assertRaisesRegex(RuntimeError, "map identity did not resolve"):
+                list(_wait_for_center_interior(PokemonCenter.OldaleTown))
+        self.assertEqual(observe.call_count, 2)
+        self.assertEqual(observe.call_args.kwargs, {"require_overworld": True})
+
+    def test_recovery_handoff_reobserves_stale_frozen_exterior(self):
+        stale = type(
+            "Observation",
+            (),
+            {
+                "overworld": type(
+                    "World",
+                    (),
+                    {
+                        "map_id": MapRSE.OLDALE_TOWN.value,
+                        "player_coordinates": (6, 17),
+                        "controllable": False,
+                        "map_identity_source": "save_block",
+                    },
+                )()
+            },
+        )()
+        interior = type(
+            "Observation",
+            (),
+            {
+                "overworld": type(
+                    "World",
+                    (),
+                    {
+                        "map_id": MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value,
+                        "player_coordinates": (7, 8),
+                        "controllable": True,
+                        "map_identity_source": "live_header",
+                    },
+                )()
+            },
+        )()
+        with patch("modules.nuzlocke.resource_runtime.get_map_metadata"), patch(
+            "modules.nuzlocke.resource_runtime.observe_agent", side_effect=[stale] * 91 + [interior]
+        ):
+            self.assertEqual(len(list(_wait_for_center_interior(PokemonCenter.OldaleTown))), 91)
 
     def test_capability_delegates_original_tactical_goal_without_readiness_preflight(self):
         goal = ActivateTrigger("introductory_rival")

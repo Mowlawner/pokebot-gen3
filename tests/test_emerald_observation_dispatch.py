@@ -98,13 +98,34 @@ class EmeraldObservationDispatchTests(unittest.TestCase):
             EmeraldCampaignAction.ADVANCE_CLOCK,
         )
 
-    def test_semantic_interaction_target_uses_generic_overworld_dispatch(self):
+    def test_wall_clock_target_preempts_generic_overworld_dispatch(self):
         self.assertIs(
             choose_emerald_observation_action(
                 self.observation(
                     objective_id="set_wall_clock",
                     semantic_target=SemanticTarget.interaction((1, 3), "WallClockScript"),
-                    clock_target=((3, 4), "Up"),
+                    clock_target=((4, 4), "Up"),
+                )
+            ),
+            EmeraldCampaignAction.NAVIGATE_TO_CLOCK,
+        )
+
+    def test_observed_wall_clock_affordance_uses_generic_interaction_dispatch(self):
+        trigger = SimpleNamespace(
+            trigger_id="bg:clock",
+            affordance_id="WallClockScript",
+            script_symbol="WallClockScript",
+            condition_active=True,
+            activation_locations=frozenset({((1, 3), (3, 4))}),
+        )
+        overworld = SimpleNamespace(map_id=(1, 3), triggers=(trigger,))
+        self.assertIs(
+            choose_emerald_observation_action(
+                self.observation(
+                    objective_id="set_wall_clock",
+                    semantic_target=SemanticTarget.interaction((1, 3), "WallClockScript"),
+                    clock_target=((4, 4), "Up"),
+                    overworld=overworld,
                 )
             ),
             EmeraldCampaignAction.ADVANCE_OBSERVED_OVERWORLD,
@@ -237,7 +258,7 @@ class EmeraldObservationDispatchTests(unittest.TestCase):
             patch("modules.nuzlocke.emerald_capabilities._emerald_observation", side_effect=[dialogue, after]),
             patch(
                 "modules.nuzlocke.emerald_capabilities._advance_scripted_input",
-                side_effect=lambda: (emulator.press_button("A") for _ in [0]),
+                side_effect=lambda _lifecycle_active: (emulator.press_button("A") for _ in [0]),
             ),
         ):
             execution = observation_driven_emerald_campaign()

@@ -17,6 +17,17 @@ from modules.map_data import MapRSE
 from .campaign_objectives import CampaignObjective, ObjectiveSelection, ObjectiveStatus
 
 
+@dataclass(frozen=True)
+class _EmeraldCampaignDelegate:
+    objective_id: str
+
+    def __call__(self, _objective: Goal) -> Iterator[object]:
+        """Run the Emerald observation owner for this campaign milestone."""
+        from .emerald_capabilities import emerald_campaign_capability
+
+        yield from emerald_campaign_capability(self.objective_id)
+
+
 class CampaignExecutionStatus(Enum):
     READY = "ready"
     BLOCKED = "blocked"
@@ -111,6 +122,8 @@ class CampaignExecutionAdapter:
                     "complete_intro_rival has no valid introductory rival goal",
                     objective.execution_id,
                 )
+            # The introductory-rival script includes Emerald-owned dialogue,
+            # yes/no confirmation, and the starter nickname screen.
             from .resource_runtime import CampaignCapability
 
             return CampaignExecutionResult(
@@ -119,7 +132,12 @@ class CampaignExecutionAdapter:
                 "translated to the existing introductory rival tactical goal",
                 objective.execution_id,
                 goal,
-                capability=CampaignCapability(objective.objective_id, objective.resource_policy, goal),
+                capability=CampaignCapability(
+                    objective.objective_id,
+                    objective.resource_policy,
+                    goal,
+                    delegate=_EmeraldCampaignDelegate(objective.objective_id),
+                ),
             )
 
         if objective.objective_id.startswith("obtain_encounter:"):

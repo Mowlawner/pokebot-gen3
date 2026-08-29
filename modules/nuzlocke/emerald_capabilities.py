@@ -36,19 +36,17 @@ from modules.overworld import perceive_overworld, WorldTransition
 from modules.player import player_avatar_is_controllable, player_avatar_is_rom_owned_movement
 from modules.player import get_player
 from modules.start_game import resolve_start_game_initialization
-from modules.modes.opening import (
-    OpeningSequenceState,
-    _advance_scripted_input,
-    _active_clock_task,
-    _clock_input_direction,
-    _clock_time_mode,
-    _emerald_clock_time,
-    _wall_clock_interaction,
-    _player_house_map,
-    _rival_house_map,
-    EmeraldOpeningCapability,
-    get_opening_sequence_state,
+from .emerald_clock import (
+    _current_map_id,
+    active_clock_task as _active_clock_task,
+    clock_input_direction as _clock_input_direction,
+    clock_time_mode as _clock_time_mode,
+    emerald_clock_time as _emerald_clock_time,
+    player_house_map as _player_house_map,
+    rival_house_map as _rival_house_map,
+    wall_clock_interaction as _wall_clock_interaction,
 )
+from .emerald_opening_state import OpeningSequenceState
 from modules.tasks import (
     get_global_script_context,
     get_task,
@@ -70,6 +68,70 @@ from .emerald_confirmation import (
     EmeraldConfirmationObservation,
     observe_emerald_confirmation,
 )
+from .emerald_dialogue import advance_dialogue, dialogue_state_snapshot, observe_dialogue
+
+
+# Compatibility hooks for existing campaign tests and diagnostics.  These
+# names now resolve to the extracted, phase-free dialogue implementation; they
+# are not imports from the legacy opening mode.
+_advance_scripted_input = advance_dialogue
+
+
+class EmeraldOpeningCapability:
+    _dialogue_state_snapshot = staticmethod(dialogue_state_snapshot)
+
+
+def _uses_shared_runtime_context() -> bool:
+    """Avoid leaking live sibling-module perception into synthetic frames."""
+    from modules.context import context as shared_context
+
+    return context is shared_context
+
+
+def _compatibility_opening_state(player_gender: object | None = None) -> OpeningSequenceState:
+    """Compatibility classifier for the legacy campaign observation adapter.
+
+    The observation-driven campaign executor does not call this function. It
+    remains here only for callers and tests that still consume the old
+    ``EmeraldCampaignObservation`` shape while the legacy opening mode is
+    being retired from the campaign path.
+    """
+    try:
+        game_state = get_game_state()
+    except (AttributeError, RuntimeError, ValueError, TypeError):
+        return OpeningSequenceState.UNKNOWN
+    state_map = {
+        GameState.TITLE_SCREEN: OpeningSequenceState.TITLE,
+        GameState.MAIN_MENU: OpeningSequenceState.MAIN_MENU,
+        GameState.OPTIONS_MENU: OpeningSequenceState.OPTIONS_MENU,
+        GameState.NAMING_SCREEN: OpeningSequenceState.PLAYER_NAMING,
+        GameState.CHOOSE_STARTER: OpeningSequenceState.STARTER_SELECTION,
+    }
+    if game_state in state_map:
+        return state_map[game_state]
+    if _active_clock_task() is not None:
+        return OpeningSequenceState.CLOCK_SETTING
+    map_id = _current_map_id()
+    if map_id == MapRSE.INSIDE_OF_TRUCK.value:
+        return OpeningSequenceState.TRUCK
+    if map_id == MapRSE.LITTLEROOT_TOWN.value:
+        return OpeningSequenceState.LITTLEROOT_TOWN
+    if map_id == _player_house_map(2, player_gender).value:
+        return OpeningSequenceState.PLAYER_HOUSE_2F
+    if map_id == _player_house_map(1, player_gender).value:
+        return OpeningSequenceState.PLAYER_HOUSE_1F
+    if map_id == _rival_house_map(1, player_gender).value:
+        return OpeningSequenceState.BIRCH_HOUSE_1F
+    if map_id == _rival_house_map(2, player_gender).value:
+        return OpeningSequenceState.BIRCH_HOUSE_2F
+    if map_id == MapRSE.ROUTE101.value:
+        return OpeningSequenceState.ROUTE_101
+    return OpeningSequenceState.SCRIPTED_INTRO
+
+
+# Kept as a patchable compatibility name for older callers. The campaign
+# executor does not call this phase classifier.
+get_opening_sequence_state = _compatibility_opening_state
 from .emerald_observation import EmeraldObservation
 from .emerald_starter_selection import (
     EmeraldStarterSelectionPhase,
@@ -237,6 +299,13 @@ def choose_emerald_observation_action(observation: EmeraldObservation) -> Emeral
             if observation.naming.keyboard_ready
             else EmeraldCampaignAction.WAIT
         )
+    # The field-message lifecycle can remain actionable for a frame while
+    # GiveStarterEvent has already transferred ownership to DoNamingScreen.
+    # Never consume that stale dialogue edge on the naming UI.
+    if observation.game_state is GameState.NAMING_SCREEN:
+        if observation.naming is not None and observation.naming.target is EmeraldNamingTarget.PLAYER_NAME:
+            return EmeraldCampaignAction.ENTER_NAME if observation.naming.keyboard_ready else EmeraldCampaignAction.WAIT
+        return EmeraldCampaignAction.WAIT
     if observation.actionable_dialogue:
         return EmeraldCampaignAction.ADVANCE_DIALOGUE
     if _GO_SEE_RIVAL_SCRIPT in observation.script_stack:
@@ -315,10 +384,16 @@ def choose_emerald_observation_action(observation: EmeraldObservation) -> Emeral
             return EmeraldCampaignAction.WAIT
     if observation.rom_owned_movement:
         return EmeraldCampaignAction.WAIT
-    if observation.semantic_target is not None and observation.overworld is not None:
-        # Interaction targets are resolved from the current affordance
-        # observation.  The campaign does not own coordinates, facing, or
-        # the interaction button.
+    if (
+        observation.semantic_target is not None
+        and observation.overworld is not None
+        and observation.semantic_target.target_map == getattr(observation.overworld, "map_id", None)
+        and _observed_interaction_goal(observation.overworld, observation.semantic_target) is not None
+    ):
+        # Once the ROM affordance is observed, let the generic interaction
+        # navigator activate it.  This is important for the wall clock: the
+        # physical approach tile alone does not guarantee that the observed
+        # BG event will accept a direct A press.
         return EmeraldCampaignAction.ADVANCE_OBSERVED_OVERWORLD
     if (
         observation.objective_id == "set_wall_clock"
@@ -333,6 +408,11 @@ def choose_emerald_observation_action(observation: EmeraldObservation) -> Emeral
                 return EmeraldCampaignAction.INTERACT_CLOCK
             return EmeraldCampaignAction.FACE_CLOCK
         return EmeraldCampaignAction.NAVIGATE_TO_CLOCK
+    if observation.semantic_target is not None and observation.overworld is not None:
+        # Other interaction targets are resolved from the current affordance
+        # observation.  The campaign does not own coordinates, facing, or
+        # the interaction button.
+        return EmeraldCampaignAction.ADVANCE_OBSERVED_OVERWORLD
     if observation.controllable and observation.overworld is not None:
         return EmeraldCampaignAction.ADVANCE_OBSERVED_OVERWORLD
     return EmeraldCampaignAction.WAIT
@@ -377,6 +457,24 @@ def _observed_exit_goal(
         return abs(warp.entry[1][0] - world.player_coordinates[0]) + abs(warp.entry[1][1] - world.player_coordinates[1])
 
     graph = None
+    route_graph = None
+    planned_next_maps: frozenset | None = None
+    if semantic_target is not None and semantic_target.target_map is not None:
+        # Use the world route as a direction-of-travel constraint, not merely
+        # as a score for each observed exit.  Without this, a reverse edge can
+        # remain cheaper than the next edge after a map transition and the
+        # frame-local tactical planner can bounce between the two maps.
+        try:
+            from modules.world_navigation import get_world_map_graph
+
+            route_graph = get_world_map_graph()
+            world_route = route_graph.route(world.map_id, semantic_target.target_map)
+            if world_route.edges:
+                planned_next_maps = frozenset(
+                    edge.destination_map for edge in world_route.edges if edge.source_map == world.map_id
+                )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            route_graph = None
     relevance = {
         transition: (
             classify_transition_relevance(transition, semantic_target, graph)
@@ -446,8 +544,9 @@ def _observed_exit_goal(
         # because their local activation tile is closer.  Retain warp
         # candidates as a fallback when no connection can advance the route;
         # this preserves necessary backtracking and maps whose only observed
-        # exit is an interior transition.  Explicit interaction targets are
-        # intentionally unaffected.
+        # exit is an interior transition.  Remote interaction targets follow
+        # the same progression rule; only a warp directly entering the target
+        # map is allowed to outrank a boundary connection.
         # A direct boundary connection to the semantic target map is the
         # correct progression edge even when the target is an interaction.
         # Otherwise interior warps can win on local cost and send the player
@@ -469,6 +568,14 @@ def _observed_exit_goal(
             return None
 
     candidates = sorted(exits, key=distance)
+    if planned_next_maps:
+        progressing = tuple(
+            transition
+            for transition in candidates
+            if transition.destination is not None and transition.destination[0] in planned_next_maps
+        )
+        if progressing:
+            candidates = progressing
 
     def connection_key(transition):
         """Identify the ROM connection strip represented by aligned entries."""
@@ -492,19 +599,6 @@ def _observed_exit_goal(
             transition.activation_direction,
         )
 
-    planning_groups: list[tuple[object, ...]] = []
-    connection_groups: dict[tuple, list[object]] = {}
-    for transition in candidates:
-        key = connection_key(transition)
-        if key is None:
-            planning_groups.append((transition,))
-        elif key not in connection_groups:
-            group: list[object] = []
-            connection_groups[key] = group
-            planning_groups.append(group)
-            group.append(transition)
-        else:
-            connection_groups[key].append(transition)
     downstream_routes: dict[object, object] = {}
     if semantic_target is not None:
         goal_candidates: list[tuple[int, object, object]] = []
@@ -519,11 +613,55 @@ def _observed_exit_goal(
             goal_candidates.append((downstream.estimated_cost if downstream is not False else 0, warp, downstream))
         if not goal_candidates:
             return None
+        # Prefer a locally observed boundary connection whenever it has a
+        # viable downstream route.  Interior warps are often physically
+        # closer, but selecting one solely on that distance can strand the
+        # campaign in a house loop instead of advancing toward its semantic
+        # map target.
+        progressing_connections = tuple(
+            warp
+            for warp in candidates
+            if warp.kind == "map_connection" and downstream_routes.get(warp) not in (None, False)
+        )
+        if semantic_target.kind is SemanticTargetKind.MAP:
+            direct_target_warps = tuple()
+        else:
+            direct_target_warps = tuple(
+                warp
+                for warp in candidates
+                if warp.kind != "map_connection"
+                and warp.destination is not None
+                and (
+                    warp.destination[0] == semantic_target.target_map
+                    or (
+                        downstream_routes.get(warp) not in (None, False)
+                        and all(edge.kind == "warp" for edge in downstream_routes[warp].edges)
+                    )
+                )
+            )
+        if progressing_connections and not direct_target_warps:
+            candidates = progressing_connections
+            goal_candidates = [
+                candidate for candidate in goal_candidates if candidate[1] in progressing_connections
+            ]
         # Do not discard a transition solely because its static downstream
         # estimate is higher.  That estimate says nothing about whether the
         # transition's activation tile is locally reachable from the current
         # observation.  Local feasibility must be established before the
         # combined route score is compared.
+    planning_groups: list[tuple[object, ...]] = []
+    connection_groups: dict[tuple, list[object]] = {}
+    for transition in candidates:
+        key = connection_key(transition)
+        if key is None:
+            planning_groups.append((transition,))
+        elif key not in connection_groups:
+            group: list[object] = []
+            connection_groups[key] = group
+            planning_groups.append(group)
+            group.append(transition)
+        else:
+            connection_groups[key].append(transition)
     ranked: list[tuple[tuple, object]] = []
     previous_transition = None if navigation_progress is None else navigation_progress.get("previous_transition")
     # Evaluate every observed candidate that could advance the semantic goal.
@@ -844,7 +982,15 @@ def _observed_interaction_goal(
         return None
     for trigger in world.triggers:
         identities = (trigger.trigger_id, trigger.affordance_id, trigger.script_symbol)
-        if interaction_id in identities and trigger.condition_active is not False and trigger.activation_locations:
+        matches = interaction_id in identities
+        if interaction_id == "wall_clock":
+            # Keep the campaign target stable while accepting each gender/map
+            # specific ROM script at the observation boundary.
+            matches = matches or any(
+                isinstance(identity, str) and identity.endswith("_EventScript_WallClock")
+                for identity in identities
+            )
+        if matches and trigger.condition_active is not False and trigger.activation_locations:
             return ActivateTrigger(trigger.trigger_id)
     return None
 
@@ -924,7 +1070,7 @@ def _resolve_player_campaign_initialization(rng: RandomSource | None = None) -> 
         # Use a session-stable RNG so that re-mounting the capability for
         # different objectives (e.g. set_wall_clock, meet_rival) produces
         # the same choice.
-        session_id = getattr(context.nuzlocke_runtime, "session_id", None)
+        session_id = getattr(getattr(context, "nuzlocke_runtime", None), "session_id", None)
         rng = random.Random(session_id)
     return resolve_start_game_initialization(name_config, gender_config, rng)
 
@@ -943,7 +1089,7 @@ def _resolve_player_campaign_name(rng: RandomSource | None = None) -> str | None
         return None
     try:
         if rng is None:
-            session_id = getattr(context.nuzlocke_runtime, "session_id", None)
+            session_id = getattr(getattr(context, "nuzlocke_runtime", None), "session_id", None)
             rng = random.Random(session_id)
         return resolve_start_game_initialization(configured, gender, rng).name
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
@@ -1017,45 +1163,16 @@ def _campaign_observation(field_message_lifecycle_active: bool = False) -> Emera
     _, configured_gender = _start_game_values()
     gender_task = _active_gender_task()
     try:
+        # Keep one authority for field-message lifecycle classification.  The
+        # old opening adapter used to duplicate this predicate here, which
+        # allowed a stale native callback or printer snapshot to disagree
+        # with the interaction observer used by execution.
         dialogue_state = EmeraldOpeningCapability._dialogue_state_snapshot()
-        birch_task = next(
-            (
-                name
-                for name in ((dialogue_state[9] if len(dialogue_state) > 9 else ()) or ())
-                if name.startswith("Task_NewGameBirchSpeech")
-            ),
-            None,
+        dialogue_waiting, field_message_lifecycle_active = observe_dialogue(
+            field_message_lifecycle_active,
+            state=dialogue_state,
+            advanceable_predicate=is_emerald_field_dialogue_advanceable,
         )
-        if dialogue_state[0]:
-            field_message_lifecycle_active = True
-        # A field-script message can briefly leave the coarse game-state
-        # classifier at UNKNOWN while its authoritative script/native state
-        # is already waiting for A.  The script predicate is more specific
-        # than the coarse state and must remain the source of truth here.
-        dialogue_waiting = is_emerald_field_dialogue_advanceable(
-            task_active=dialogue_state[0],
-            task_name=birch_task,
-            script_active=dialogue_state[2],
-            native_function_name=dialogue_state[3],
-            script_function_name=dialogue_state[4],
-            input_waiting=dialogue_state[5],
-            field_message_lifecycle_active=field_message_lifecycle_active,
-        )
-        if dialogue_waiting:
-            field_message_lifecycle_active = True
-        # Do not let a completed message make every later native wait look
-        # like dialogue.  The opening predicate uses the same lifecycle edge.
-        if (
-            field_message_lifecycle_active
-            and not dialogue_state[0]
-            and not (
-                dialogue_state[3] == "WaitForAorBPress"
-                and dialogue_state[4] == "Std_MsgboxDefault"
-                and dialogue_state[5]
-            )
-            and not dialogue_state[7]
-        ):
-            field_message_lifecycle_active = False
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
         dialogue_waiting = False
     try:
@@ -1082,7 +1199,7 @@ def _campaign_observation(field_message_lifecycle_active: bool = False) -> Emera
         and menu_observation.raw_option_values[0] == 2
     )
     return EmeraldCampaignObservation(
-        get_opening_sequence_state(configured_gender),
+        _compatibility_opening_state(configured_gender),
         observed_text_speed_fast or state.campaign_facts.text_speed_fast.value is True,
         state.campaign_facts.new_game_setup_complete.value is True,
         dialogue_waiting,
@@ -1115,24 +1232,52 @@ def _emerald_observation(
     copied into this structure and cannot influence the new dispatcher.
     """
     legacy = _campaign_observation(field_message_lifecycle_active)
-    try:
-        starter_selection = observe_emerald_starter_selection()
-    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+    live_context = _uses_shared_runtime_context()
+    if live_context:
+        try:
+            starter_selection = observe_emerald_starter_selection()
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            starter_selection = None
+    else:
+        # Sibling observers retain the canonical context object even when a
+        # caller replaces this module's action context with a test double.
         starter_selection = None
     # These observations own the frame; constructing a navigation world would
     # be both unnecessary work and an architectural leak of lower-priority
     # navigation into UI/script ownership.
-    if legacy.dialogue_waiting or legacy.rom_owned_movement:
+    if not live_context or legacy.dialogue_waiting or legacy.rom_owned_movement:
         overworld = None
     else:
         try:
             overworld = perceive_overworld()
         except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
             overworld = None
-    try:
-        game_state = get_game_state()
-    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
-        game_state = None
+    if live_context:
+        try:
+            game_state = get_game_state()
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            game_state = None
+    else:
+        game_state = {
+            OpeningSequenceState.TITLE: GameState.TITLE_SCREEN,
+            OpeningSequenceState.MAIN_MENU: GameState.MAIN_MENU,
+            OpeningSequenceState.OPTIONS_MENU: GameState.OPTIONS_MENU,
+            OpeningSequenceState.PLAYER_NAMING: GameState.NAMING_SCREEN,
+            OpeningSequenceState.STARTER_SELECTION: GameState.CHOOSE_STARTER,
+        }.get(legacy.state)
+    if legacy.naming_observation is not None:
+        naming = legacy.naming_observation
+        diagnostic_print(
+            lambda: (
+                "EMERALD_NAMING_OBSERVATION: "
+                f"frame={getattr(context, 'frame', None)!r} game_state={game_state!r} "
+                f"target={naming.target.name!r} template={naming.template_number!r} "
+                f"pointer={naming.screen_pointer!r} keyboard_ready={naming.keyboard_ready!r} "
+                f"species={naming.species_name!r} species_id={naming.species_id!r} "
+                f"gender={naming.pokemon_gender!r} personality={naming.personality_value!r}"
+            ),
+            trace=True,
+        )
     # Menu/naming observations remain authoritative if the cheap game-state
     # read is temporarily unavailable during a transition.
     if game_state not in {
@@ -1147,31 +1292,39 @@ def _emerald_observation(
                 if legacy.menu_observation.menu_kind is EmeraldMenuKind.OPTIONS_MENU
                 else GameState.MAIN_MENU
             )
-        elif legacy.naming_observation is not None:
+        elif (
+            legacy.naming_observation is not None
+            and legacy.naming_observation.screen_pointer is not None
+        ):
             game_state = GameState.NAMING_SCREEN
-    try:
-        startup_tasks = tuple(task.symbol for task in (get_tasks() or ()))
-    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
-        startup_tasks = ()
-    try:
-        script = get_global_script_context()
-        script_stack = (
-            tuple(symbol for symbol in (getattr(script, "stack", ()) or ()) if isinstance(symbol, str))
-            if script is not None
-            else ()
-        )
-        native_task_state = (
-            (
-                getattr(script, "native_function_name", None),
-                getattr(script, "script_function_name", None),
-                getattr(script, "is_active", None),
-            )
-            if script is not None
-            else (None, None, None)
-        )
-    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+    if not live_context:
         script_stack = ()
         native_task_state = (None, None, None)
+        startup_tasks = ()
+    else:
+        try:
+            startup_tasks = tuple(task.symbol for task in (get_tasks() or ()))
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            startup_tasks = ()
+        try:
+            script = get_global_script_context()
+            script_stack = (
+                tuple(symbol for symbol in (getattr(script, "stack", ()) or ()) if isinstance(symbol, str))
+                if script is not None
+                else ()
+            )
+            native_task_state = (
+                (
+                    getattr(script, "native_function_name", None),
+                    getattr(script, "script_function_name", None),
+                    getattr(script, "is_active", None),
+                )
+                if script is not None
+                else (None, None, None)
+            )
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            script_stack = ()
+            native_task_state = (None, None, None)
     if overworld is not None:
         map_id = overworld.map_id
         coordinates = overworld.player_coordinates
@@ -1179,11 +1332,14 @@ def _emerald_observation(
     else:
         map_id = None
         coordinates = None
-        try:
-            controllable = player_avatar_is_controllable()
-        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        if live_context:
+            try:
+                controllable = player_avatar_is_controllable()
+            except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+                controllable = False
+        else:
             controllable = False
-    observed_text_speed_fast = _observed_text_speed_fast()
+    observed_text_speed_fast = _observed_text_speed_fast() if live_context else None
     facts = (
         ("text_speed_fast", legacy.text_speed_fast if observed_text_speed_fast is None else observed_text_speed_fast),
         ("new_game_setup_complete", legacy.new_game_setup_complete),
@@ -1193,19 +1349,20 @@ def _emerald_observation(
         ("wall_clock_set", _safe_event_flag("SET_WALL_CLOCK")),
     )
     clock_interaction = None
-    try:
-        task_name = _active_clock_task()
-        task = get_task(task_name) if task_name is not None else None
-        if task is not None:
-            clock_interaction = (
-                task_name,
-                task.data_value(0),
-                task.data_value(2),
-                task.data_value(3),
-                task.data_value(1),
-            )
-    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
-        pass
+    if live_context:
+        try:
+            task_name = _active_clock_task()
+            task = get_task(task_name) if task_name is not None else None
+            if task is not None:
+                clock_interaction = (
+                    task_name,
+                    task.data_value(0),
+                    task.data_value(2),
+                    task.data_value(3),
+                    task.data_value(1),
+                )
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            pass
     clock_target = None
     if objective_id == "set_wall_clock" and map_id is not None:
         try:
@@ -1234,7 +1391,9 @@ def _emerald_observation(
         trace.mark("rom_owned_movement", legacy.rom_owned_movement)
         trace.mark("controllable", controllable)
         trace.mark("native_task_state", repr(native_task_state))
+        trace.mark("script_stack", script_stack)
         trace.mark("startup_tasks", startup_tasks)
+        trace.mark("confirmation", repr(legacy.confirmation_observation))
         try:
             trace.mark("littleroot_intro_state", get_event_var("LITTLEROOT_INTRO_STATE"))
             trace.mark("littleroot_rival_state", get_event_var("LITTLEROOT_RIVAL_STATE"))
@@ -1297,6 +1456,18 @@ def _semantic_target_for_objective(objective_id: str | None) -> SemanticTarget |
             lambda: f"CAMPAIGN_SEMANTIC_TARGET_RESULT: objective_id={objective_id!r} target={result!r}", trace=True
         )
         return result
+    if objective_id == "complete_intro_rival":
+        # This is a Route 103 overworld trigger. The earlier ``meet_rival``
+        # objective intentionally targets the rival's house, but it must not
+        # be reused for the subsequent introductory battle.
+        result = SemanticTarget.interaction(
+            MapRSE.ROUTE103.value,
+            interaction_id="Route103_EventScript_Rival",
+        )
+        diagnostic_print(
+            lambda: f"CAMPAIGN_SEMANTIC_TARGET_RESULT: objective_id={objective_id!r} target={result!r}", trace=True
+        )
+        return result
     if objective_id not in {"set_wall_clock", "meet_rival"}:
         return None
 
@@ -1307,22 +1478,7 @@ def _semantic_target_for_objective(objective_id: str | None) -> SemanticTarget |
         ).value
         interaction_id = "wall_clock" if objective_id == "set_wall_clock" else None
         try:
-            metadata = get_map_metadata(target_map)
-            if objective_id == "set_wall_clock":
-                # The map's script identity is the semantic affordance
-                # identity. It is independent of the physical clock tile.
-                interaction_id = (
-                    next(
-                        (
-                            event.script_symbol
-                            for event in metadata.bg_events
-                            if event.kind == "Script" and event.script_symbol.endswith("_EventScript_WallClock")
-                        ),
-                        None,
-                    )
-                    or interaction_id
-                )
-            else:
+            if objective_id == "meet_rival":
                 # Meeting the rival is the ROM's rival Poké Ball interaction,
                 # not an instruction to visit an arbitrary upstairs map.
                 # Resolve the script from the current house metadata so the
@@ -1350,11 +1506,10 @@ def _semantic_target_for_objective(objective_id: str | None) -> SemanticTarget |
                             trace=True,
                         )
                         return result
-                rival_metadata = get_map_metadata(target_map)
                 interaction_id = next(
                     (
                         obj.script_symbol
-                        for obj in rival_metadata.objects
+                        for obj in get_map_metadata(target_map).objects
                         if obj.script_symbol is not None and obj.script_symbol.endswith("_EventScript_RivalsPokeBall")
                     ),
                     None,
@@ -1481,9 +1636,25 @@ def _menu_button(
     return None
 
 
+def _press_confirmation_button(button: str) -> None:
+    """Emit a new input edge for a ROM-owned Yes/No handler.
+
+    A confirmation task can be installed immediately after a dialogue A.
+    ``press_button`` intentionally suppresses a repeated held input, whereas
+    the new task needs its own JOY_NEW edge.  Keep this scoped to confirmed
+    Yes/No observations; ordinary dialogue retains its normal lifecycle.
+    """
+    press_fresh = getattr(context.emulator, "press_button_fresh", None)
+    if callable(press_fresh):
+        press_fresh(button)
+    else:
+        context.emulator.press_button(button)
+
+
 def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iterator[object]:
     """Execute at most one bounded action, then yield for fresh perception."""
     field_message_lifecycle_active = False
+    last_stable_map_id = None
 
     def higher_priority_actionable() -> bool:
         # Re-observe through the same normalized pipeline.  Avoid recursion by
@@ -1506,9 +1677,15 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
     pending_nickname_quiet_frames = 0
     pending_go_see_rival_confirmation = None
     pending_go_see_rival_quiet_frames = 0
+    pending_dialogue = False
+    pending_dialogue_quiet_frames = 0
+    post_clock_dialogue_reset_done = False
+    pending_menu_signature = None
+    pending_menu_action = None
     awaiting_nickname_screen = False
     nickname = None
     nickname_input = None
+    player_name_input = None
     if objective_id == "obtain_starter":
         configured = configured_emerald_starter()
         resolved_starter = resolve_emerald_starter(configured, rng)
@@ -1516,8 +1693,146 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
         clock_target_time = _emerald_clock_time(_clock_time_mode(), rng=rng)
     while True:
         observation = _emerald_observation(field_message_lifecycle_active, objective_id)
+        # A field-message lifecycle belongs to the map/script that created
+        # it. Do not carry the pre-warp printer state into the first stable
+        # frame on the destination map; doing so makes the destination's
+        # first dialogue intermittently look like a stale transition.
+        if (
+            observation.map_id is not None
+            and last_stable_map_id is not None
+            and observation.map_id != last_stable_map_id
+        ):
+            field_message_lifecycle_active = False
+            observation = _emerald_observation(False, objective_id)
+        if observation.map_id is not None:
+            last_stable_map_id = observation.map_id
         field_message_lifecycle_active = observation.dialogue_lifecycle_active
         action = choose_emerald_observation_action(observation)
+        diagnostic_print(
+            lambda: (
+                "EMERALD_CAMPAIGN_DECISION: "
+                f"frame={getattr(context, 'frame', None)!r} objective={objective_id!r} "
+                f"action={action.name!r} game_state={observation.game_state!r} "
+                f"dialogue_actionable={observation.dialogue_actionable!r} "
+                f"dialogue_lifecycle={observation.dialogue_lifecycle_active!r} "
+                f"script={observation.native_task_state!r} tasks={observation.startup_tasks!r}"
+            ),
+            trace=True,
+        )
+        # The pure dispatcher cannot own session RNG. Resolve Random once per
+        # mounted capability, then apply that stable choice to the observed
+        # starter menu instead of waiting forever on the literal setting.
+        starter = observation.starter_selection
+        if (
+            objective_id == "obtain_starter"
+            and starter is not None
+            and starter.phase is EmeraldStarterSelectionPhase.CHOOSING
+            and starter.input_ready
+            and resolved_starter is not None
+        ):
+            target_index = starter.choices.index(resolved_starter)
+            if starter.selected_index < target_index:
+                action = EmeraldCampaignAction.MOVE_STARTER_RIGHT
+            elif starter.selected_index > target_index:
+                action = EmeraldCampaignAction.MOVE_STARTER_LEFT
+            else:
+                action = EmeraldCampaignAction.CHOOSE_STARTER
+        # A clock interaction starts a new ROM-owned dialogue lifecycle.  Do
+        # not carry the previous field-message debounce state across that
+        # boundary or the first clock prompt will be suppressed forever.
+        if action is EmeraldCampaignAction.INTERACT_CLOCK or observation.clock_interaction is not None:
+            pending_dialogue = False
+            pending_dialogue_quiet_frames = 0
+            post_clock_dialogue_reset_done = False
+        elif (
+            objective_id == "set_wall_clock"
+            and observation.semantic_target is not None
+            and observation.overworld is not None
+            and observation.semantic_target.target_map == getattr(observation.overworld, "map_id", None)
+            and _observed_interaction_goal(observation.overworld, observation.semantic_target) is not None
+        ):
+            # The generic observed-overworld interaction can activate the
+            # clock affordance. Treat that as the start of a new dialogue
+            # lifecycle too.
+            pending_dialogue = False
+            pending_dialogue_quiet_frames = 0
+            post_clock_dialogue_reset_done = False
+        elif (
+            objective_id == "set_wall_clock"
+            and action is EmeraldCampaignAction.ADVANCE_DIALOGUE
+            and pending_dialogue
+            and observation.map_id is None
+            and not post_clock_dialogue_reset_done
+        ):
+            # The clock's ROM script temporarily removes the map projection
+            # before exposing its first field prompt. This is a new dialogue
+            # lifecycle even though the previous field message debounce flag
+            # is still set.
+            pending_dialogue = False
+            pending_dialogue_quiet_frames = 0
+            post_clock_dialogue_reset_done = True
+        if objective_id == "set_wall_clock":
+            diagnostic_print(
+                lambda: (
+                    "EMERALD_CLOCK_DECISION: "
+                    f"frame={getattr(context, 'frame', None)!r} action={action.name!r} "
+                    f"map={observation.map_id!r} coordinates={observation.coordinates!r} "
+                    f"clock_target={observation.clock_target!r} facing="
+                    f"{getattr(observation.overworld, 'facing', None)!r} "
+                    f"clock_interaction={observation.clock_interaction!r} "
+                    f"dialogue_actionable={observation.dialogue_actionable!r} "
+                    f"dialogue_lifecycle={observation.dialogue_lifecycle_active!r} "
+                    f"wall_clock_fact={dict(observation.campaign_facts).get('wall_clock_set')!r}"
+                ),
+                trace=True,
+            )
+        if not observation.dialogue_actionable:
+            pending_dialogue = False
+            pending_dialogue_quiet_frames = 0
+        elif action is EmeraldCampaignAction.ADVANCE_DIALOGUE and pending_dialogue:
+            # Normally the ROM changes the printer/task state after the fresh
+            # edge.  Some Birch messages keep the same actionable observation
+            # for several frames, however; permanently suppressing input here
+            # strands the script.  Give the handoff two neutral frames, then
+            # retry from the current observation if the ROM still wants A.
+            if pending_dialogue_quiet_frames < 2:
+                pending_dialogue_quiet_frames += 1
+                action = EmeraldCampaignAction.WAIT
+            else:
+                pending_dialogue = False
+                pending_dialogue_quiet_frames = 0
+        if objective_id == "set_wall_clock":
+            diagnostic_print(
+                lambda: (
+                    "EMERALD_CLOCK_DISPATCH: "
+                    f"frame={getattr(context, 'frame', None)!r} action={action.name!r} "
+                    f"pending_dialogue={pending_dialogue!r} "
+                    f"dialogue_actionable={observation.dialogue_actionable!r}"
+                ),
+                trace=True,
+            )
+
+        menu_actions = {
+            EmeraldCampaignAction.ENTER_OPTIONS,
+            EmeraldCampaignAction.ADVANCE_TEXT_SPEED,
+            EmeraldCampaignAction.EXIT_OPTIONS,
+            EmeraldCampaignAction.START_NEW_GAME,
+        }
+        menu_signature = (
+            observation.ui_mode,
+            tuple(observation.campaign_facts),
+            getattr(observation.menu, "cursor", None),
+            repr(observation.menu),
+        )
+        if action in menu_actions:
+            if pending_menu_signature == menu_signature and pending_menu_action is action:
+                action = EmeraldCampaignAction.WAIT
+            else:
+                pending_menu_signature = None
+                pending_menu_action = None
+        else:
+            pending_menu_signature = None
+            pending_menu_action = None
         if observation.naming is not None:
             awaiting_nickname_screen = False
         elif awaiting_nickname_screen and observation.confirmation is None:
@@ -1647,7 +1962,13 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
                 context.emulator.press_button(button)
                 issued = True
         elif action is EmeraldCampaignAction.ADVANCE_DIALOGUE:
+            # The executor owns the same-frame dialogue observation.  Passing
+            # only the lifecycle keeps this boundary compatible with the
+            # legacy helper contract and avoids making a stale dispatcher
+            # decision authoritative at execution time.
             yield from _advance_scripted_input(field_message_lifecycle_active)
+            pending_dialogue = True
+            pending_dialogue_quiet_frames = 0
             issued = True
         elif action is EmeraldCampaignAction.ENTER_NAME:
             if observation.naming is None or observation.naming.target is not EmeraldNamingTarget.PLAYER_NAME:
@@ -1655,8 +1976,14 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
                 continue
             if resolved_player_initialization is None:
                 resolved_player_initialization = _resolve_player_campaign_initialization(rng)
-            _naming_input(resolved_player_initialization.name)
-            issued = True
+            if player_name_input is None:
+                player_name_input = type_in_naming_screen(resolved_player_initialization.name)
+            try:
+                next(player_name_input)
+            except StopIteration:
+                player_name_input = None
+            yield
+            continue
         elif action is EmeraldCampaignAction.CHOOSE_GENDER:
             if resolved_player_initialization is None:
                 resolved_player_initialization = _resolve_player_campaign_initialization(rng)
@@ -1674,7 +2001,7 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
             ):
                 yield
                 continue
-            context.emulator.press_button("Up")
+            _press_confirmation_button("Up")
             if confirmation.context is EmeraldConfirmationContext.POKEMON_NICKNAME:
                 pending_nickname_confirmation = nickname_confirmation_signature
             elif confirmation.context is EmeraldConfirmationContext.GO_SEE_RIVAL:
@@ -1690,7 +2017,7 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
             ):
                 yield
                 continue
-            context.emulator.press_button("A")
+            _press_confirmation_button("A")
             issued = True
         elif action is EmeraldCampaignAction.CHOOSE_POKEMON_NICKNAME:
             confirmation = observation.confirmation
@@ -1702,7 +2029,7 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
             ):
                 yield
                 continue
-            context.emulator.press_button("A")
+            _press_confirmation_button("A")
             pending_nickname_confirmation = nickname_confirmation_signature
             pending_nickname_quiet_frames = 0
             awaiting_nickname_screen = True
@@ -1717,19 +2044,38 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
             ):
                 yield
                 continue
-            context.emulator.press_button("A")
+            _press_confirmation_button("A")
             pending_go_see_rival_confirmation = go_see_rival_signature
             pending_go_see_rival_quiet_frames = 0
             issued = True
         elif action is EmeraldCampaignAction.ENTER_POKEMON_NICKNAME:
             naming = observation.naming
             if naming is None or not naming.keyboard_ready or naming.species_name is None:
+                diagnostic_print(
+                    lambda: (
+                        "EMERALD_NAMING_ACTION: action='ENTER_POKEMON_NICKNAME' "
+                        f"result='WAIT' naming={naming!r}"
+                    ),
+                    trace=True,
+                )
                 yield
                 continue
             if nickname is None:
                 nickname = generate_pokemon_nickname(naming.species_name, naming.pokemon_gender)
+                diagnostic_print(
+                    lambda: (
+                        "EMERALD_NAMING_ACTION: action='ENTER_POKEMON_NICKNAME' "
+                        f"result='GENERATED' nickname={nickname!r} species={naming.species_name!r} "
+                        f"gender={naming.pokemon_gender!r}"
+                    ),
+                    trace=True,
+                )
             if nickname_input is None:
                 nickname_input = type_in_naming_screen(nickname, max_length=POKEMON_NICKNAME_MAX_LENGTH)
+                diagnostic_print(
+                    lambda: "EMERALD_NAMING_ACTION: action='ENTER_POKEMON_NICKNAME' result='KEYBOARD_STARTED'",
+                    trace=True,
+                )
             try:
                 next(nickname_input)
             except StopIteration:
@@ -1740,7 +2086,22 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
             context.emulator.press_button(observation.clock_target[1])
             issued = True
         elif action is EmeraldCampaignAction.INTERACT_CLOCK:
-            context.emulator.press_button("A")
+            # The clock script immediately opens a field message.  Use a
+            # fresh edge here so the interaction A cannot be carried across
+            # the script handoff and consume the first dialogue advance.
+            press_button_fresh = getattr(context.emulator, "press_button_fresh", None)
+            if callable(press_button_fresh):
+                context.emulator.press_button_fresh("A")
+            else:
+                context.emulator.press_button("A")
+            diagnostic_print(
+                lambda: (
+                    "EMERALD_CLOCK_INPUT: "
+                    f"frame={getattr(context, 'frame', None)!r} action='INTERACT_CLOCK' "
+                    "button='A' fresh=True emitted=True"
+                ),
+                trace=True,
+            )
             issued = True
         elif action is EmeraldCampaignAction.NAVIGATE_TO_CLOCK:
             target = observation.clock_target
@@ -1772,15 +2133,23 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
                 continue
             if (current_hour, current_minute) == clock_target_time:
                 context.emulator.press_button("A")
+                clock_button = "A"
             else:
-                context.emulator.press_button(
-                    _clock_input_direction(
+                clock_button = _clock_input_direction(
                         current_hour,
                         current_minute,
                         clock_target_time[0],
                         clock_target_time[1],
                     )
-                )
+                context.emulator.press_button(clock_button)
+            diagnostic_print(
+                lambda: (
+                    "EMERALD_CLOCK_INPUT: "
+                    f"frame={getattr(context, 'frame', None)!r} action='ADVANCE_CLOCK' "
+                    f"button={clock_button!r} interaction={interaction!r} emitted=True"
+                ),
+                trace=True,
+            )
             issued = True
         elif action is EmeraldCampaignAction.CONFIRM_CLOCK:
             interaction = observation.clock_interaction
@@ -1829,6 +2198,9 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
             yield
             continue
 
+        if issued and action in menu_actions:
+            pending_menu_signature = menu_signature
+            pending_menu_action = action
         yield
 
 

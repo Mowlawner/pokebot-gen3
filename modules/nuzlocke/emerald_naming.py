@@ -17,6 +17,7 @@ from enum import Enum, auto
 
 from modules.keyboard import get_naming_screen_data
 from modules.memory import GameState, get_game_state, read_symbol, unpack_uint32
+from modules.console import diagnostic_print
 from modules.memory import unpack_uint16
 from modules.pokemon import get_species_by_index
 
@@ -58,11 +59,14 @@ _TEMPLATES = {
 
 def observe_emerald_naming() -> EmeraldNamingObservation | None:
     """Observe the active naming target, or ``None`` outside the naming UI."""
-    if get_game_state() is not GameState.NAMING_SCREEN:
-        return None
+    game_state = get_game_state()
     try:
         pointer = unpack_uint32(read_symbol("sNamingScreen", size=4))
         if pointer == 0:
+            diagnostic_print(
+                lambda: f"EMERALD_NAMING_REJECT: frame={getattr(__import__('modules.context', fromlist=['context']).context, 'frame', None)!r} reason='null_screen_pointer' game_state={game_state!r}",
+                trace=True,
+            )
             return EmeraldNamingObservation(EmeraldNamingTarget.UNKNOWN, None, None, False)
         value = _read_dynamic_byte(pointer, _TEMPLATE_NUMBER_OFFSET)
         target = _TEMPLATES.get(value, EmeraldNamingTarget.UNKNOWN)
@@ -87,6 +91,10 @@ def observe_emerald_naming() -> EmeraldNamingObservation | None:
             personality,
         )
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        diagnostic_print(
+            lambda: f"EMERALD_NAMING_REJECT: frame={getattr(__import__('modules.context', fromlist=['context']).context, 'frame', None)!r} reason='observer_read_error' game_state={game_state!r}",
+            trace=True,
+        )
         return EmeraldNamingObservation(EmeraldNamingTarget.UNKNOWN, None, None, False)
 
 
@@ -101,6 +109,14 @@ def _read_dynamic_bytes(pointer: int, offset: int, size: int) -> bytes:
     from modules.context import context
 
     return context.emulator.read_bytes(pointer + offset, size)
+
+
+def _read_field_byte(offset: int) -> int:
+    return read_symbol("sNamingScreen", offset=offset, size=1)[0]
+
+
+def _read_field_bytes(offset: int, size: int) -> bytes:
+    return read_symbol("sNamingScreen", offset=offset, size=size)
 
 
 __all__ = ["EmeraldNamingObservation", "EmeraldNamingTarget", "observe_emerald_naming"]

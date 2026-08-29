@@ -44,14 +44,26 @@ class TestDiagnosticPrint(unittest.TestCase):
         from modules.console import diagnostic_print
 
         sink = types.SimpleNamespace(print=unittest.mock.Mock())
-        message = unittest.mock.Mock(return_value="trace")
+        message = unittest.mock.Mock(return_value="CAMPAIGN_RECOVERY_SOURCE: trace")
         context = types.SimpleNamespace(debug=True, debug_trace=False)
         with patch("modules.context.context", context), patch("modules.console.console", sink):
-            diagnostic_print(message, trace=True)
+            diagnostic_print(message, trace=True, prefix="CAMPAIGN_RECOVERY_SOURCE")
         message.assert_not_called()
 
         context.debug_trace = True
         with patch("modules.context.context", context), patch("modules.console.console", sink):
-            diagnostic_print(message, trace=True)
+            diagnostic_print(message, trace=True, prefix="CAMPAIGN_RECOVERY_SOURCE")
         message.assert_called_once_with()
-        sink.print.assert_called_once_with("trace")
+        sink.print.assert_called_once_with("CAMPAIGN_RECOVERY_SOURCE: trace")
+
+    def test_filtered_lazy_trace_does_not_evaluate_message(self):
+        from modules.console import diagnostic_print
+
+        sink = types.SimpleNamespace(print=unittest.mock.Mock())
+        message = unittest.mock.Mock(return_value="CAMPAIGN_PLAN_TRACE: expensive")
+        context = types.SimpleNamespace(debug=True, debug_trace=True)
+        with patch("modules.context.context", context), patch("modules.console.console", sink):
+            diagnostic_print(message, trace=True, prefix="UNSELECTED_TRACE")
+
+        message.assert_not_called()
+        sink.print.assert_not_called()

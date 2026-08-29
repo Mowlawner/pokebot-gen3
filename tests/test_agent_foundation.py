@@ -160,8 +160,8 @@ class GoalAwareNavigationTests(TestCase):
         )
         self.assertTrue(navigator.satisfies(source, Direction.West, ReachWarp(destination_map=destination[0])))
         plan = navigator.plan((map_id, (1, 0)), ReachWarp(destination_map=destination[0]))
-        self.assertEqual(plan.destination, source)
-        self.assertEqual(plan.actions[-1].action_type, NavigationActionType.TURN)
+        self.assertEqual(plan.destination, destination)
+        self.assertEqual(plan.actions[-1].action_type, NavigationActionType.WARP)
         self.assertEqual(plan.actions[-1].direction, Direction.West)
 
     def test_interaction_goal_requires_turn_and_never_finishes_on_adjacency_alone(self):
@@ -334,9 +334,10 @@ class GoalAwareNavigationTests(TestCase):
         plan = GoalAwareNavigator(world(tiles, warps=(far, near))).plan(
             start, ReachWarp(destination_map=("outside", 0))
         )
-        self.assertEqual(plan.destination, (("test"), (1, 0)))
-        self.assertEqual(len(plan.actions), 1)
-        self.assertEqual(plan.actions[0].direction, Direction.East)
+        self.assertEqual(plan.destination, (("outside", 0), (0, 0)))
+        self.assertEqual(len(plan.actions), 2)
+        self.assertEqual(plan.actions[-1].action_type, NavigationActionType.WARP)
+        self.assertEqual(plan.actions[-1].direction, Direction.East)
 
     def test_reach_warp_preserves_source_identity_for_equal_destinations(self):
         destination = (("outside", 0), (9, 9))
@@ -347,7 +348,7 @@ class GoalAwareNavigationTests(TestCase):
 
         self.assertTrue(navigator.satisfies(("test", (1, 2)), None, selected))
         self.assertFalse(navigator.satisfies(("test", (1, 0)), None, selected))
-        self.assertEqual(navigator.plan(("test", (0, 1)), selected).destination, ("test", (1, 2)))
+        self.assertEqual(navigator.plan(("test", (0, 1)), selected).destination, destination)
 
     def test_cross_map_plan_restricts_candidates_to_selected_warp(self):
         source = "test"
