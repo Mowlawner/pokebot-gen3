@@ -20,6 +20,13 @@ jobs:
       - name: Install native audio runtime
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libportaudio2
 
+      - name: Install native mGBA Python bindings
+        run: |
+          curl --fail --location --silent --show-error \
+            https://github.com/hanzi/libmgba-py/releases/download/0.2.0-2/libmgba-py_0.2.0_ubuntu-lunar.zip \
+            --output /tmp/libmgba-py.zip
+          unzip -q /tmp/libmgba-py.zip -d .
+
       - name: Install runtime and test dependencies
         run: |
           python -m pip install --upgrade pip
