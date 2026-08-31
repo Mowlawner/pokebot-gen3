@@ -81,9 +81,8 @@ def handle_battle(
         elif task_is_active("Task_EvolutionScene"):
             yield from handle_evolution_scene(strategy)
         elif (
-            (instruction == "BattleScript_HandleFaintedMon" or task_is_active("Task_HandleChooseMonInput"))
-            and get_battle_state().own_side.is_fainted
-        ):
+            instruction == "BattleScript_HandleFaintedMon" or task_is_active("Task_HandleChooseMonInput")
+        ) and get_battle_state().own_side.is_fainted:
             yield from handle_fainted_pokemon(strategy)
         elif instruction in (
             "BattleScript_TryNicknameCaughtMon",

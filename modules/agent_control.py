@@ -70,7 +70,6 @@ from modules.nuzlocke.readiness_diagnostics import (
 )
 import json
 
-
 UNIVERSAL_REOBSERVE_FRAMES = 90
 _last_universal_observation_frame: int | None = None
 
@@ -273,8 +272,10 @@ def _observe_agent_instrumented(
     # interior even if normal classification has not caught up yet.  Menus,
     # battles, and scripted scenes remain excluded from this fallback.
     transient_map_state = interaction.game_state in (GameState.UNKNOWN, GameState.CHANGE_MAP)
-    should_perceive_overworld = require_overworld or interaction_type is InteractionType.OVERWORLD or (
-        force_overworld_reobserve and transient_map_state
+    should_perceive_overworld = (
+        require_overworld
+        or interaction_type is InteractionType.OVERWORLD
+        or (force_overworld_reobserve and transient_map_state)
     )
     if overworld_observation is not None:
         overworld = overworld_observation
@@ -471,9 +472,7 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
         return GoalEvaluation(GoalStatus.NOT_APPLICABLE, reason="goal requires an overworld observation")
 
     goal_target = _goal_target(observation.goal)
-    if isinstance(goal_target, ActivateTrigger) and _trigger_condition_completed(
-        observation, goal_target.trigger_id
-    ):
+    if isinstance(goal_target, ActivateTrigger) and _trigger_condition_completed(observation, goal_target.trigger_id):
         return GoalEvaluation(
             GoalStatus.COMPLETE,
             reason="trigger condition is inactive; ROM scene already completed",
@@ -640,7 +639,10 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
         trace_world_start.duration("navigation_planning_duration_ms", trace_planning_start)
     count("goal_planning_attempts")
 
-    if isinstance(goal_target, (SemanticTarget, ReachLocation, ReachWarp, ReachInteractionPosition)) and not plan.actions:
+    if (
+        isinstance(goal_target, (SemanticTarget, ReachLocation, ReachWarp, ReachInteractionPosition))
+        and not plan.actions
+    ):
         if isinstance(observation.goal, ReachWarp) and observation.goal.warp is not None:
             # A ReachLocation handoff may leave us standing on a step-on warp
             # entry.  Do not interpret that source tile as having crossed the
@@ -1344,9 +1346,7 @@ class AgentControlLoop:
             and frame - self._last_observation_frame >= self._periodic_reobserve_after
         ):
             state_cache.invalidate_runtime_observations()
-            self._report(
-                f"WATCHDOG: forcing full observation after {self._periodic_reobserve_after} emulator frames"
-            )
+            self._report(f"WATCHDOG: forcing full observation after {self._periodic_reobserve_after} emulator frames")
             return True
         return False
 
@@ -1652,9 +1652,8 @@ class AgentControlLoop:
                         # issue A on geometric adjacency alone.
                         self._invalidate_plan("interaction_precondition_not_ready")
                         return None
-                    if (
-                        isinstance(_goal_target(self._goal), ReachInteractionPosition)
-                        and _trigger_requires_input(observation, _goal_target(self._goal).trigger_id)
+                    if isinstance(_goal_target(self._goal), ReachInteractionPosition) and _trigger_requires_input(
+                        observation, _goal_target(self._goal).trigger_id
                     ):
                         return ActionDecision(
                             AgentAction(
@@ -1860,10 +1859,14 @@ class AgentControlLoop:
                     AgentActionType.WAIT_REOBSERVE,
                     reason="waiting for interaction script activation",
                 )
-                return observation, ActionDecision(wait_action), ActionResult(
-                    ActionResultType.WAITING,
-                    wait_action,
-                    wait_action.reason,
+                return (
+                    observation,
+                    ActionDecision(wait_action),
+                    ActionResult(
+                        ActionResultType.WAITING,
+                        wait_action,
+                        wait_action.reason,
+                    ),
                 )
             # The input was genuinely ignored. Permit one fresh evaluation so
             # the existing navigation/interaction machinery can retry it.

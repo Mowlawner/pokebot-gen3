@@ -380,9 +380,9 @@ def main_loop() -> None:
                         if is_starter_flow_controller:
                             diagnostic_print(
                                 lambda: (
-                                "STARTER_FLOW: main_loop after next(controller) "
-                                f"controller={active_controller_qualname!r} "
-                                f"stack={[controller.__qualname__ for controller in context.controller_stack]!r}"
+                                    "STARTER_FLOW: main_loop after next(controller) "
+                                    f"controller={active_controller_qualname!r} "
+                                    f"stack={[controller.__qualname__ for controller in context.controller_stack]!r}"
                                 ),
                                 trace=True,
                             )

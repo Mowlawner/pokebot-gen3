@@ -5,7 +5,11 @@ from types import SimpleNamespace
 from modules.goals import Goal, ReachLocation
 from modules.navigation import IntermediateRouteAnalysis, RouteAnalysis
 from modules.nuzlocke.campaign_controller import CampaignController, CampaignControllerStatus
-from modules.nuzlocke.campaign_execution import CampaignExecutionResult, CampaignExecutionStatus, adapt_campaign_execution
+from modules.nuzlocke.campaign_execution import (
+    CampaignExecutionResult,
+    CampaignExecutionStatus,
+    adapt_campaign_execution,
+)
 from modules.nuzlocke.campaign_objectives import (
     CampaignObjective,
     CampaignPredicate,
@@ -431,9 +435,7 @@ class CampaignControllerTests(unittest.TestCase):
         self.assertEqual(controller.current_objective_id, "pending_readiness")
 
     def test_targetless_capability_mounts_across_unknown_post_battle_readiness(self):
-        objective = next(
-            item for item in initial_emerald_campaign() if item.objective_id == "receive_pokedex"
-        )
+        objective = next(item for item in initial_emerald_campaign() if item.objective_id == "receive_pokedex")
         selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "pokedex frontier")
         mounted = []
 

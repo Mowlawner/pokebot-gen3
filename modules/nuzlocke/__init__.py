@@ -157,6 +157,7 @@ def __getattr__(name):
         }[name]
     raise AttributeError(name)
 
+
 __all__ = [
     "BattleSnapshot",
     "BattlePokemonSnapshot",

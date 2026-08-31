@@ -226,36 +226,28 @@ class CampaignProgressionMode(BotMode):
             try:
                 interaction = observe_interaction()
                 interaction_phase = getattr(interaction, "interaction_phase", InteractionPhase.NONE)
-                dialogue_owned = (
-                    interaction_phase
-                    in {
-                        InteractionPhase.FIELD_MESSAGE_RENDER_WAIT,
-                        InteractionPhase.FIELD_MESSAGE_INPUT_WAIT,
-                        InteractionPhase.CHOICE_MENU_INPUT_WAIT,
-                    }
-                    or (
-                        interaction_phase is InteractionPhase.SCRIPT_NATIVE_WAIT
-                        and (
-                            # A native script can own the field before it
-                            # exposes a dialogue box (for example, the
-                            # post-battle rival exit movement). Readiness
-                            # must not mount a recovery plan across that
-                            # ownership boundary.
-                            getattr(interaction, "script_active", False)
-                            or
-                            getattr(interaction, "dialogue_waiting", False)
-                            or getattr(interaction, "field_message_lifecycle_active", False)
-                            or getattr(interaction, "native_function", None)
-                            in {"WaitForAorBPress", "IsFieldMessageBoxHidden"}
-                        )
+                dialogue_owned = interaction_phase in {
+                    InteractionPhase.FIELD_MESSAGE_RENDER_WAIT,
+                    InteractionPhase.FIELD_MESSAGE_INPUT_WAIT,
+                    InteractionPhase.CHOICE_MENU_INPUT_WAIT,
+                } or (
+                    interaction_phase is InteractionPhase.SCRIPT_NATIVE_WAIT
+                    and (
+                        # A native script can own the field before it
+                        # exposes a dialogue box (for example, the
+                        # post-battle rival exit movement). Readiness
+                        # must not mount a recovery plan across that
+                        # ownership boundary.
+                        getattr(interaction, "script_active", False)
+                        or getattr(interaction, "dialogue_waiting", False)
+                        or getattr(interaction, "field_message_lifecycle_active", False)
+                        or getattr(interaction, "native_function", None)
+                        in {"WaitForAorBPress", "IsFieldMessageBoxHidden"}
                     )
                 )
                 if dialogue_owned:
                     overworld_availability = Availability.UNKNOWN
-                    overworld_reason = (
-                        "interaction phase is active: "
-                        f"{getattr(interaction_phase, 'name', None)}"
-                    )
+                    overworld_reason = "interaction phase is active: " f"{getattr(interaction_phase, 'name', None)}"
             except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
                 pass
             stable_overworld = overworld_availability is Availability.KNOWN
@@ -282,8 +274,7 @@ class CampaignProgressionMode(BotMode):
         # snapshot independently confirms that an empty party is real.
         resource_party_available = bool(resources.party) or bool(getattr(snapshot, "party_available", False))
         resource_observation_valid = (
-            resources.observation_status is ResourceObservationStatus.VALID
-            and resource_party_available
+            resources.observation_status is ResourceObservationStatus.VALID and resource_party_available
         )
         resource_availability = Availability.KNOWN if resource_observation_valid else Availability.UNKNOWN
         trace = getattr(context, "stutter_trace", None)
@@ -497,8 +488,7 @@ class CampaignProgressionMode(BotMode):
                 try:
                     location = get_player_avatar().map_group_and_number
                     legal_capture_target = bool(
-                        runtime is not None
-                        and runtime.capture_target_for(location, is_wild=True, is_trainer=False)
+                        runtime is not None and runtime.capture_target_for(location, is_wild=True, is_trainer=False)
                     )
                 except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
                     legal_capture_target = False
@@ -530,8 +520,7 @@ class CampaignProgressionMode(BotMode):
             try:
                 location = get_player_avatar().map_group_and_number
                 legal_capture_target = bool(
-                    runtime is not None
-                    and runtime.capture_target_for(location, is_wild=True, is_trainer=False)
+                    runtime is not None and runtime.capture_target_for(location, is_wild=True, is_trainer=False)
                 )
             except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
                 legal_capture_target = False

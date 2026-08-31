@@ -91,8 +91,7 @@ def _pulse_toward_entry(observation, destination) -> bool:
         press_button_fresh(direction.button_name)
     diagnostic_print(
         lambda: (
-            "CAMPAIGN_RECOVERY_ENTRY_WARP_FALLBACK: "
-            f"from={current!r} toward={target!r} direction={direction.name!r}"
+            "CAMPAIGN_RECOVERY_ENTRY_WARP_FALLBACK: " f"from={current!r} toward={target!r} direction={direction.name!r}"
         ),
         trace=True,
         prefix="CAMPAIGN_RECOVERY_ENTRY_WARP_FALLBACK",
@@ -134,12 +133,7 @@ def _navigation_plan_from_legacy_path(start, waypoints) -> NavigationPlan | None
         map_id = getattr(waypoint, "map", None)
         coordinates = getattr(waypoint, "coordinates", None)
         direction = getattr(waypoint, "direction", None)
-        if (
-            map_id is None
-            or not isinstance(coordinates, tuple)
-            or len(coordinates) != 2
-            or direction is None
-        ):
+        if map_id is None or not isinstance(coordinates, tuple) or len(coordinates) != 2 or direction is None:
             return None
         destination = (map_id, coordinates)
         is_warp = bool(getattr(waypoint, "is_warp", False)) or destination[0] != current[0]
@@ -491,9 +485,7 @@ def execute_heal_party() -> Iterator[object]:
         if source.interaction_trigger_id is None:
             destination = source.location
             navigation_goal = _recovery_navigation_goal(destination)
-            yield from AgentControlLoop(
-                lambda: observe_agent(goal=navigation_goal), goal=navigation_goal
-            ).run()
+            yield from AgentControlLoop(lambda: observe_agent(goal=navigation_goal), goal=navigation_goal).run()
             destination_source = None
             source = None
             while source is None:
@@ -518,11 +510,7 @@ def _preparation_training_location(training_map) -> tuple[tuple, tuple[tuple[int
     """
     map_id = _map_id_value(training_map)
     map_data = get_map_data(map_id, (0, 0))
-    candidates = tuple(sorted(
-        tile.local_position
-        for tile in get_map_all_tiles(map_data)
-        if tile.has_encounters
-    ))
+    candidates = tuple(sorted(tile.local_position for tile in get_map_all_tiles(map_data) if tile.has_encounters))
     if not candidates:
         raise BotModeError(f"no land encounter tile is available on training map {map_id!r}")
     return map_id, candidates
@@ -605,7 +593,16 @@ def _preparation_navigation_goal(
             for coordinates in candidates:
                 try:
                     plan_with_world_navigation(world, start, ReachLocation((training_map, coordinates)))
-                except (AttributeError, IndexError, KeyError, NavigationError, PathFindingError, RuntimeError, TypeError, ValueError) as error:
+                except (
+                    AttributeError,
+                    IndexError,
+                    KeyError,
+                    NavigationError,
+                    PathFindingError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as error:
                     last_error = error
                     diagnostic_print(
                         lambda: (
@@ -630,8 +627,7 @@ def _preparation_navigation_goal(
         (
             obj
             for obj in getattr(overworld, "objects", ())
-            if getattr(obj, "trainer_id", None) is not None
-            and getattr(obj, "trainer_defeated", None) is False
+            if getattr(obj, "trainer_id", None) is not None and getattr(obj, "trainer_defeated", None) is False
         ),
         key=lambda obj: (
             abs(obj.location[1][0] - start[1][0]) + abs(obj.location[1][1] - start[1][1]),
@@ -646,7 +642,16 @@ def _preparation_navigation_goal(
         )
         try:
             plan_with_world_navigation(world, start, trainer_goal)
-        except (AttributeError, IndexError, KeyError, NavigationError, PathFindingError, RuntimeError, TypeError, ValueError) as error:
+        except (
+            AttributeError,
+            IndexError,
+            KeyError,
+            NavigationError,
+            PathFindingError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
             last_error = error
             diagnostic_print(
                 lambda: (
@@ -732,11 +737,7 @@ def execute_campaign_preparation(training_map, *, target_level: int) -> Iterator
             if not pokemon.is_egg
             and (
                 runtime is None
-                or (
-                    (identity := PokemonIdentity.from_pokemon(pokemon))
-                    is not None
-                    and identity not in dead
-                )
+                or ((identity := PokemonIdentity.from_pokemon(pokemon)) is not None and identity not in dead)
             )
         )
         return bool(living) and all(pokemon.level >= target_level for pokemon in living)
@@ -1004,8 +1005,11 @@ def execute_planned_recovery(destination, planned_source=None, planned_route=Non
                     getattr(observation.overworld, "map_id", interior_map),
                     source.interaction_trigger_id or source.source_id,
                 ),
-                "Navigate to nurse" if getattr(source, "source_type", None) is HealingSourceType.POKEMON_CENTER_NURSE
-                else "Navigate to healing source",
+                (
+                    "Navigate to nurse"
+                    if getattr(source, "source_type", None) is HealingSourceType.POKEMON_CENTER_NURSE
+                    else "Navigate to healing source"
+                ),
             )
             # The nurse is separated from the player by the Center counter.
             # Reaching the Center map is not the same as reaching an
@@ -1044,8 +1048,11 @@ def execute_planned_recovery(destination, planned_source=None, planned_route=Non
                     getattr(observation.overworld, "map_id", interior_map),
                     source.interaction_trigger_id or source.source_id,
                 ),
-                "Interact with nurse" if getattr(source, "source_type", None) is HealingSourceType.POKEMON_CENTER_NURSE
-                else "Interact with healing source",
+                (
+                    "Interact with nurse"
+                    if getattr(source, "source_type", None) is HealingSourceType.POKEMON_CENTER_NURSE
+                    else "Interact with healing source"
+                ),
             )
             yield from _execute_healing_source_interaction(source)
             if not party_is_restored():
@@ -1062,6 +1069,8 @@ def execute_planned_recovery(destination, planned_source=None, planned_route=Non
             decision = select_action(observation)
             executor.execute(decision.action, observation)
         yield
+
+
 def _execute_healing_source_interaction(source: HealingSource) -> Iterator[object]:
     """Interact with a reached semantic healing source through shared control.
 
@@ -1293,8 +1302,7 @@ def observe_route_recovery() -> RouteRecovery:
             (
                 source
                 for source in emerald_healing_sources()
-                if source.outdoor_location[0] == location[0]
-                or source.interior_map == location[0]
+                if source.outdoor_location[0] == location[0] or source.interior_map == location[0]
             ),
             None,
         )
@@ -1436,9 +1444,7 @@ def _wait_for_center_interior(center) -> Iterator[object]:
                 isinstance(position[1], tuple)
                 and len(position[1]) == 2
                 and position[1] != center.value[1]
-                and abs(position[1][0] - center.value[1][0])
-                + abs(position[1][1] - center.value[1][1])
-                == 1
+                and abs(position[1][0] - center.value[1][0]) + abs(position[1][1] - center.value[1][1]) == 1
             )
             if adjacent_to_entry:
                 _pulse_toward_entry(observation, center.value)

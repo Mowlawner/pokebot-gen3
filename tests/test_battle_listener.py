@@ -270,7 +270,9 @@ class BattleListenerLifecycleTests(unittest.TestCase):
             patch("modules.battle_handler.context", fake_context),
             patch("modules.battle_handler.battle_is_active", side_effect=(True, False)),
             patch("modules.battle_handler.get_game_state", return_value=GameState.PARTY_MENU),
-            patch("modules.battle_handler.task_is_active", side_effect=lambda name: name == "Task_HandleChooseMonInput"),
+            patch(
+                "modules.battle_handler.task_is_active", side_effect=lambda name: name == "Task_HandleChooseMonInput"
+            ),
         ):
             transition = _advance_after_party_wipe()
             next(transition)
@@ -285,6 +287,7 @@ class BattleListenerLifecycleTests(unittest.TestCase):
             own_side=SimpleNamespace(left_battler=active, right_battler=None, active_battlers=[active]),
             is_double_battle=False,
         )
+
         class FakeParty:
             non_fainted_pokemon = [SimpleNamespace(name="healed-dead", current_hp=10, is_egg=False)]
 
@@ -337,9 +340,17 @@ class BattleListenerLifecycleTests(unittest.TestCase):
             patch("modules.battle_handler.get_battle_state", return_value=battle_state),
             patch("modules.battle_handler.get_party", return_value=FakeParty()),
             patch("modules.battle_handler.get_party_size", return_value=2),
-            patch("modules.battle_handler.get_game_state", side_effect=(GameState.BATTLE, GameState.PARTY_MENU, GameState.OVERWORLD)),
-            patch("modules.battle_handler.task_is_active", side_effect=lambda name: name == "Task_HandleChooseMonInput"),
-            patch("modules.battle_handler.get_current_battle_script_instruction", return_value="BattleScript_HandleFaintedMon"),
+            patch(
+                "modules.battle_handler.get_game_state",
+                side_effect=(GameState.BATTLE, GameState.PARTY_MENU, GameState.OVERWORLD),
+            ),
+            patch(
+                "modules.battle_handler.task_is_active", side_effect=lambda name: name == "Task_HandleChooseMonInput"
+            ),
+            patch(
+                "modules.battle_handler.get_current_battle_script_instruction",
+                return_value="BattleScript_HandleFaintedMon",
+            ),
             patch("modules.battle_handler.battle_is_active", return_value=True),
             patch("modules.battle_handler.get_current_party_menu_index", return_value=0),
             patch("modules.battle_handler.context", SimpleNamespace(bot_mode="Campaign Progression", emulator=Mock())),

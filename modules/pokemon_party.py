@@ -6,7 +6,6 @@ from modules.pokemon import Pokemon, Move, Species, Ability
 from modules.state_cache import state_cache
 from modules.tasks import get_global_script_context, get_task
 
-
 _POKEMON_CENTER_RETURN_SCRIPT = "EventScript_PkmnCenterNurse_ReturnPkmn"
 
 

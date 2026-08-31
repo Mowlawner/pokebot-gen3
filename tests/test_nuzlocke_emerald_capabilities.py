@@ -16,7 +16,14 @@ from modules.nuzlocke.emerald_capabilities import (
     _observed_local_destination_goal,
     _semantic_target_for_objective,
 )
-from modules.goals import ActivateTrigger, GoalConstraints, NavigationGoal, SemanticTarget, SemanticTargetKind, TrainerMode
+from modules.goals import (
+    ActivateTrigger,
+    GoalConstraints,
+    NavigationGoal,
+    SemanticTarget,
+    SemanticTargetKind,
+    TrainerMode,
+)
 from modules.map_path import Direction
 from modules.map_data import MapRSE
 from modules.overworld import (
@@ -539,9 +546,7 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
 
         town, house_1f, house_2f, route101 = (0, 9), (1, 2), (1, 3), (0, 16)
         house_entry = WarpObservation((town, (5, 8)), (house_1f, (2, 8)))
-        route_exit = MapConnectionObservation(
-            (town, (10, 0)), (route101, (10, 28)), required_facing=Direction.North
-        )
+        route_exit = MapConnectionObservation((town, (10, 0)), (route101, (10, 28)), required_facing=Direction.North)
         world = SimpleNamespace(
             map_id=town,
             player_coordinates=(8, 4),
@@ -666,15 +671,9 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         from modules.world_navigation import WorldRoute
 
         route104, woods, rustboro = (0, 19), (24, 11), (0, 3)
-        previous = WarpObservation(
-            (route104, (11, 38)), (woods, (17, 38)), required_facing=Direction.South
-        )
-        reverse = WarpObservation(
-            (woods, (17, 38)), (route104, (11, 38)), required_facing=Direction.North
-        )
-        forward = WarpObservation(
-            (woods, (15, 5)), (route104, (11, 30)), required_facing=Direction.North
-        )
+        previous = WarpObservation((route104, (11, 38)), (woods, (17, 38)), required_facing=Direction.South)
+        reverse = WarpObservation((woods, (17, 38)), (route104, (11, 38)), required_facing=Direction.North)
+        forward = WarpObservation((woods, (15, 5)), (route104, (11, 30)), required_facing=Direction.North)
         world = SimpleNamespace(
             map_id=woods,
             player_coordinates=(17, 38),
@@ -715,12 +714,8 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         from modules.world_navigation import WorldRoute
 
         route104, woods, rustboro = (0, 19), (24, 11), (0, 3)
-        reverse = WarpObservation(
-            (woods, (17, 38)), (route104, (11, 38)), required_facing=Direction.North
-        )
-        forward = WarpObservation(
-            (woods, (14, 5)), (route104, (10, 30)), required_facing=Direction.North
-        )
+        reverse = WarpObservation((woods, (17, 38)), (route104, (11, 38)), required_facing=Direction.North)
+        forward = WarpObservation((woods, (14, 5)), (route104, (10, 30)), required_facing=Direction.North)
         world = SimpleNamespace(
             map_id=woods,
             player_coordinates=(17, 38),
@@ -858,9 +853,7 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         target_map = (25, 41)
         detour_map = (25, 42)
         wrong_boundary_map = (25, 43)
-        direct = MapConnectionObservation(
-            (source, (3, 0)), (target_map, (3, 9)), required_facing=Direction.North
-        )
+        direct = MapConnectionObservation((source, (3, 0)), (target_map, (3, 9)), required_facing=Direction.North)
         detour = WarpObservation((source, (2, 1)), (detour_map, (1, 1)))
         wrong_boundary = MapConnectionObservation(
             (source, (4, 1)), (wrong_boundary_map, (4, 9)), required_facing=Direction.East
@@ -906,9 +899,7 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             patch(
                 "modules.nuzlocke.emerald_capabilities.transition_world_route",
                 side_effect=lambda warp, _target, _graph: (
-                    WorldRoute((target_map,), (), 0)
-                    if warp is direct
-                    else WorldRoute((detour_map, target_map), (), 10)
+                    WorldRoute((target_map,), (), 0) if warp is direct else WorldRoute((detour_map, target_map), (), 10)
                 ),
             ),
         ):
@@ -982,12 +973,8 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         from modules.world_navigation import WorldEdge, WorldMapGraph, WorldRoute
 
         oldale, route103, route101, lab = (0, 9), (0, 18), (0, 16), (0, 10)
-        reverse = MapConnectionObservation(
-            (oldale, (1, 0)), (route103, (1, 20)), required_facing=Direction.North
-        )
-        forward = MapConnectionObservation(
-            (oldale, (3, 0)), (route101, (3, 20)), required_facing=Direction.North
-        )
+        reverse = MapConnectionObservation((oldale, (1, 0)), (route103, (1, 20)), required_facing=Direction.North)
+        forward = MapConnectionObservation((oldale, (3, 0)), (route101, (3, 20)), required_facing=Direction.North)
         world = OverworldObservation(
             oldale,
             (2, 1),

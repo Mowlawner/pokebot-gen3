@@ -86,7 +86,6 @@ from .emerald_confirmation import (
 from .emerald_campaign_registry import emerald_capability_definition
 from .emerald_dialogue import advance_dialogue, dialogue_state_snapshot, observe_dialogue
 
-
 # Compatibility hooks for existing campaign tests and diagnostics.  These
 # names now resolve to the extracted, phase-free dialogue implementation; they
 # are not imports from the legacy opening mode.
@@ -623,6 +622,7 @@ def _observed_exit_goal(
         if navigation_policy is None:
             return target
         return replace(navigation_policy, target=target)
+
     if planned_next_maps:
         progressing = tuple(
             transition
@@ -712,9 +712,7 @@ def _observed_exit_goal(
             )
         if progressing_connections and not direct_target_warps:
             candidates = progressing_connections
-            goal_candidates = [
-                candidate for candidate in goal_candidates if candidate[1] in progressing_connections
-            ]
+            goal_candidates = [candidate for candidate in goal_candidates if candidate[1] in progressing_connections]
         # Do not discard a transition solely because its static downstream
         # estimate is higher.  That estimate says nothing about whether the
         # transition's activation tile is locally reachable from the current
@@ -751,10 +749,7 @@ def _observed_exit_goal(
             return (
                 warp.entry == previous_destination
                 and warp.destination == previous_entry
-                and not (
-                    semantic_target is not None
-                    and semantic_target.target_map == previous_entry[0]
-                )
+                and not (semantic_target is not None and semantic_target.target_map == previous_entry[0])
             )
         # Preserve compatibility with older callers/tests that provide only
         # the source and destination map IDs.
@@ -1015,11 +1010,7 @@ def observation_driven_overworld_progression(
             pending_destination = getattr(pending_transition, "destination", None)
             if pending_entry is not None and pending_destination is not None:
                 destination = pending_destination
-                if (
-                    destination is not None
-                    and current.map_id == destination[0]
-                    and current.map_id != pending_entry[0]
-                ):
+                if destination is not None and current.map_id == destination[0] and current.map_id != pending_entry[0]:
                     # mGBA can expose the destination map header before the
                     # avatar has a valid coordinate in that map. Boundary
                     # coordinates such as (19, -1) are a transition settling
@@ -1233,11 +1224,7 @@ def observation_driven_overworld_progression(
         progress = execution_cache.setdefault("navigation_progress", {})
         if goal.warp is not None and goal.destination is not None:
             progress["pending_transition"] = goal.warp
-        tactical_goal = (
-            replace(navigation_policy, target=goal)
-            if navigation_policy is not None
-            else goal
-        )
+        tactical_goal = replace(navigation_policy, target=goal) if navigation_policy is not None else goal
         loop = AgentControlLoop(lambda: navigation_observation(tactical_goal), goal=tactical_goal).run()
         execution_cache["overworld"] = (cache_key, loop)
         try:
@@ -1367,14 +1354,9 @@ def _observed_interaction_goal(
             # Keep the campaign target stable while accepting each gender/map
             # specific ROM script at the observation boundary.
             matches = matches or any(
-                isinstance(identity, str) and identity.endswith("_EventScript_WallClock")
-                for identity in identities
+                isinstance(identity, str) and identity.endswith("_EventScript_WallClock") for identity in identities
             )
-        if (
-            matches
-            and trigger.condition_active is not False
-            and trigger.activation_locations
-        ):
+        if matches and trigger.condition_active is not False and trigger.activation_locations:
             matching_triggers.append(trigger)
     if not matching_triggers:
         return None
@@ -1385,11 +1367,7 @@ def _observed_interaction_goal(
     # can change from ``introductory_rival`` to an ephemeral object ID between
     # observations and lose its campaign handoff.
     trigger = next(
-        (
-            candidate
-            for candidate in matching_triggers
-            if str(getattr(candidate, "kind", "")).startswith("semantic_")
-        ),
+        (candidate for candidate in matching_triggers if str(getattr(candidate, "kind", "")).startswith("semantic_")),
         matching_triggers[0],
     )
     # Coordinate scripts fire on tile entry; object interactions need an
@@ -1785,10 +1763,7 @@ def _emerald_observation(
                 if legacy.menu_observation.menu_kind is EmeraldMenuKind.OPTIONS_MENU
                 else GameState.MAIN_MENU
             )
-        elif (
-            legacy.naming_observation is not None
-            and legacy.naming_observation.screen_pointer is not None
-        ):
+        elif legacy.naming_observation is not None and legacy.naming_observation.screen_pointer is not None:
             game_state = GameState.NAMING_SCREEN
     if not live_context:
         script_stack = ()
@@ -1847,9 +1822,7 @@ def _emerald_observation(
         rival_complete = (
             True
             if defeated_rival is True or hidden_rival is True
-            else False
-            if defeated_rival is False and hidden_rival is False
-            else None
+            else False if defeated_rival is False and hidden_rival is False else None
         )
         facts += (("intro_rival_battle_complete", rival_complete),)
     clock_interaction = None
@@ -1904,9 +1877,11 @@ def _emerald_observation(
             trace.mark("hide_route_103_rival", hidden_rival)
             trace.mark(
                 "intro_rival_battle_complete",
-                True if defeated_rival is True or hidden_rival is True
-                else False if defeated_rival is False and hidden_rival is False
-                else None,
+                (
+                    True
+                    if defeated_rival is True or hidden_rival is True
+                    else False if defeated_rival is False and hidden_rival is False else None
+                ),
             )
             trace.mark("littleroot_intro_state", get_event_var("LITTLEROOT_INTRO_STATE"))
             trace.mark("littleroot_rival_state", get_event_var("LITTLEROOT_RIVAL_STATE"))
@@ -2611,8 +2586,7 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
             if naming is None or not naming.keyboard_ready or naming.species_name is None:
                 diagnostic_print(
                     lambda: (
-                        "EMERALD_NAMING_ACTION: action='ENTER_POKEMON_NICKNAME' "
-                        f"result='WAIT' naming={naming!r}"
+                        "EMERALD_NAMING_ACTION: action='ENTER_POKEMON_NICKNAME' " f"result='WAIT' naming={naming!r}"
                     ),
                     trace=True,
                 )
@@ -2694,11 +2668,11 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
                 clock_button = "A"
             else:
                 clock_button = _clock_input_direction(
-                        current_hour,
-                        current_minute,
-                        clock_target_time[0],
-                        clock_target_time[1],
-                    )
+                    current_hour,
+                    current_minute,
+                    clock_target_time[0],
+                    clock_target_time[1],
+                )
                 context.emulator.press_button(clock_button)
             diagnostic_print(
                 lambda: (

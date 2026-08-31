@@ -73,9 +73,7 @@ class AgentPilotSequenceTests(TestCase):
                     ),
                     goal=goal,
                 ),
-                AgentObservation(
-                    InteractionObservation(GameState.OVERWORLD, controllable=True), route_world((0, 0))
-                ),
+                AgentObservation(InteractionObservation(GameState.OVERWORLD, controllable=True), route_world((0, 0))),
                 AgentObservation(InteractionObservation(GameState.BATTLE)),
                 AgentObservation(InteractionObservation(GameState.OVERWORLD, controllable=True), route_world((1, 0))),
                 AgentObservation(InteractionObservation(GameState.OVERWORLD, controllable=True), route_world((2, 0))),

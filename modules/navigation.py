@@ -1408,9 +1408,11 @@ def plan_with_world_navigation(
         (
             (start[0], activation_position)
             if connection_activation and activation_position is not None
-            else (start[0], source_coordinates)
-            if directional_activation
-            else (start[0], activation_position or source_coordinates)
+            else (
+                (start[0], source_coordinates)
+                if directional_activation
+                else (start[0], activation_position or source_coordinates)
+            )
         ),
         (edge.destination_map, destination_coordinates),
         transition_kind="map_connection" if edge.kind == "connection" else edge.kind,

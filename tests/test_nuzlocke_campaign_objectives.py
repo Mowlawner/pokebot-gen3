@@ -786,9 +786,7 @@ class CampaignObjectiveTests(unittest.TestCase):
         state = self.state(campaign_facts=self.facts(**complete, visited_petalburg=True))
         self.assertEqual(select_available_campaign_task(state).objective.objective_id, "complete_petalburg_wally")
         state = self.state(
-            campaign_facts=self.facts(
-                **complete, visited_petalburg=True, petalburg_wally_scene_complete=True
-            )
+            campaign_facts=self.facts(**complete, visited_petalburg=True, petalburg_wally_scene_complete=True)
         )
         self.assertEqual(select_available_campaign_task(state).objective.objective_id, "complete_petalburg_woods")
         state = self.state(

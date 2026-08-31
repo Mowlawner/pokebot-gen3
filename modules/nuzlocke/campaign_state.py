@@ -160,9 +160,7 @@ def derive_campaign_facts(
     text_speed = (
         Fact.unavailable()
         if not available
-        else Fact.known(observation.text_speed == 2)
-        if observation.text_speed is not None
-        else Fact.unknown()
+        else Fact.known(observation.text_speed == 2) if observation.text_speed is not None else Fact.unknown()
     )
     intro = _var(observation.variables, "LITTLEROOT_INTRO_STATE", available)
     rival = _var(observation.variables, "LITTLEROOT_RIVAL_STATE", available)
@@ -230,15 +228,11 @@ def derive_campaign_facts(
     if petalburg_city_state.is_known and petalburg_city_state.value < 3:
         petalburg_wally_scene = Fact.known(False)
     elif petalburg_city_state.is_known and petalburg_gym_state.is_known:
-        petalburg_wally_scene = Fact.known(
-            petalburg_city_state.value >= 3 and petalburg_gym_state.value >= 2
-        )
+        petalburg_wally_scene = Fact.known(petalburg_city_state.value >= 3 and petalburg_gym_state.value >= 2)
     else:
         petalburg_wally_scene = Fact(
             None,
-            petalburg_gym_state.status
-            if petalburg_city_state.is_known
-            else petalburg_city_state.status,
+            petalburg_gym_state.status if petalburg_city_state.is_known else petalburg_city_state.status,
         )
     petalburg_woods_state = _var(observation.variables, "PETALBURG_WOODS_STATE", available)
     # The Woods researcher/Aqua scene completes in the ROM by setting this
@@ -348,9 +342,7 @@ class CampaignState:
     session_id: str | None
     known_session_ids: tuple[str, ...]
     campaign_facts: CampaignFacts = dataclass_field(
-        default_factory=lambda: CampaignFacts(
-            *(Fact.unavailable() for _ in CampaignFacts.__dataclass_fields__)
-        )
+        default_factory=lambda: CampaignFacts(*(Fact.unavailable() for _ in CampaignFacts.__dataclass_fields__))
     )
     # This is an observation boundary, not remembered campaign progress.  It
     # lets the planner mount title/menu opening work while keeping an

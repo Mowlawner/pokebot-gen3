@@ -514,7 +514,11 @@ class NuzlockeRuntime:
             self._event_sink(event, session_id)
             self._pending_durable_events.pop(0)
             committed += 1
-        if self._event_store is not None and self._latest_snapshot is not None and self._latest_campaign_facts is not None:
+        if (
+            self._event_store is not None
+            and self._latest_snapshot is not None
+            and self._latest_campaign_facts is not None
+        ):
             # Provenance is intentionally committed at the same boundary as
             # the event batch.  Without this, milestone observations would
             # create profile writes on ordinary frames even when event

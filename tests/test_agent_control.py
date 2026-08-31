@@ -150,13 +150,16 @@ class AgentActionSelectionTests(TestCase):
             world=world,
             goal=ReachLocation((MAP, (0, 0))),
         )
-        observed = replace(observed, interaction=InteractionObservation(
-            GameState.OVERWORLD,
-            controllable=True,
-            script_active=True,
-            script_function="SomeInteraction",
-            native_function="WaitForEffect",
-        ))
+        observed = replace(
+            observed,
+            interaction=InteractionObservation(
+                GameState.OVERWORLD,
+                controllable=True,
+                script_active=True,
+                script_function="SomeInteraction",
+                native_function="WaitForEffect",
+            ),
+        )
         decision = select_action(observed)
         self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
 
@@ -187,7 +190,8 @@ class AgentActionSelectionTests(TestCase):
         self.assertEqual(decision.action.navigation.action_type, NavigationActionType.MOVE)
         self.assertEqual(decision.action.direction, Direction.East)
         self.assertIn(
-            "observed transition planned locally; global route not consulted", decision.goal_evaluation.world_diagnostics
+            "observed transition planned locally; global route not consulted",
+            decision.goal_evaluation.world_diagnostics,
         )
 
     def test_arrival_at_directional_observed_warp_emits_activation_input(self):
@@ -275,7 +279,10 @@ class AgentActionSelectionTests(TestCase):
         self.assertEqual(activation[1].action.direction, Direction.East)
         self.assertEqual(arrived[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
         self.assertIsNone(loop._expected_world_transition)
-        self.assertEqual(emulator.press_direction.call_args_list, [call("Right", run=False, fresh=False), call("Right", run=False, fresh=True)])
+        self.assertEqual(
+            emulator.press_direction.call_args_list,
+            [call("Right", run=False, fresh=False), call("Right", run=False, fresh=True)],
+        )
 
     def test_failed_local_directional_activation_is_not_repeated_forever(self):
         destination = (("destination", 0), (10, 19))
@@ -406,9 +413,7 @@ class AgentActionSelectionTests(TestCase):
             requires_input=False,
         )
         world = overworld({(0, 0)}, triggers=(trigger,))
-        decision = select_action(
-            observation(GameState.OVERWORLD, world=world, goal=ActivateTrigger("coord:0:152:0"))
-        )
+        decision = select_action(observation(GameState.OVERWORLD, world=world, goal=ActivateTrigger("coord:0:152:0")))
 
         self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
         self.assertEqual(decision.action.reason, "automatic coordinate trigger fires on tile entry")
@@ -758,7 +763,9 @@ class AgentActionSelectionTests(TestCase):
             "modules.agent_control.context.debug", False
         ), patch("modules.agent_control.context.debug_trace", False), patch(
             "modules.agent_control.get_game_state", return_value=GameState.OVERWORLD
-        ), patch("modules.agent_control.is_field_message_waiting_for_input", return_value=False), patch(
+        ), patch(
+            "modules.agent_control.is_field_message_waiting_for_input", return_value=False
+        ), patch(
             "modules.agent_control.get_player_avatar", return_value=avatar
         ):
             self.assertTrue(loop._advance_movement_batch())
@@ -1300,7 +1307,10 @@ class AgentExecutionTests(TestCase):
         self.assertEqual(resumed[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
         self.assertEqual(resumed[1].goal_evaluation.status, GoalStatus.COMPLETE)
         self.assertIsNone(loop._expected_world_transition)
-        self.assertEqual(emulator.press_direction.call_args_list, [call("Right", run=False, fresh=False), call("Right", run=False, fresh=True)])
+        self.assertEqual(
+            emulator.press_direction.call_args_list,
+            [call("Right", run=False, fresh=False), call("Right", run=False, fresh=True)],
+        )
 
     def test_warp_activation_waits_for_standing_on_warp_source(self):
         source_map = (0, 0)
@@ -1379,7 +1389,10 @@ class AgentExecutionTests(TestCase):
         self.assertEqual(activated[1].action.navigation.action_type, NavigationActionType.WARP)
         self.assertEqual(activated[2].result_type, ActionResultType.EXECUTED)
         self.assertEqual(completed[1].goal_evaluation.status, GoalStatus.COMPLETE)
-        self.assertEqual(emulator.press_direction.call_args_list, [call("Right", run=False, fresh=False), call("Right", run=False, fresh=True)])
+        self.assertEqual(
+            emulator.press_direction.call_args_list,
+            [call("Right", run=False, fresh=False), call("Right", run=False, fresh=True)],
+        )
 
     def test_executor_rejects_input_for_unknown_state(self):
         action = available_actions(observation(GameState.UNKNOWN))[0]

@@ -128,9 +128,7 @@ class TestTransitionExecution(unittest.TestCase):
 
     def test_destination_observation_clears_pending_transition(self):
         action = transition()
-        loop, emulator, selected = self.make_loop(
-            [observation(), observation(map_id=(0, 9), valid_tile=True)], action
-        )
+        loop, emulator, selected = self.make_loop([observation(), observation(map_id=(0, 9), valid_tile=True)], action)
         resumed = ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE))
         with patch("modules.agent_control.context.emulator", emulator), patch(
             "modules.agent_control.select_action", side_effect=(selected, resumed)
@@ -241,9 +239,7 @@ class TestTransitionExecution(unittest.TestCase):
 
     def test_map_connection_releases_direction_at_destination_without_changing_pending_behavior(self):
         action = transition("map_connection")
-        loop, emulator, selected = self.make_loop(
-            [observation(), observation(map_id=(0, 9), valid_tile=True)], action
-        )
+        loop, emulator, selected = self.make_loop([observation(), observation(map_id=(0, 9), valid_tile=True)], action)
         with patch("modules.agent_control.context.emulator", emulator), patch(
             "modules.agent_control.select_action",
             side_effect=(selected, ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE))),

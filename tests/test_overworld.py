@@ -35,11 +35,15 @@ def _object_event() -> ObjectEvent:
 
 class TestOverworldPerception(unittest.TestCase):
     def test_live_map_header_overrides_stale_save_block_map(self):
-        with patch("modules.map.context", SimpleNamespace(rom=SimpleNamespace(id="test-rom"))), patch.dict(
-            map_module._map_header_cache,
-            {"test-rom": {(0, 10): b"outdoor", (2, 2): b"pokemon-center"}},
-            clear=True,
-        ), patch("modules.map.read_symbol", return_value=b"pokemon-center"):
+        with (
+            patch("modules.map.context", SimpleNamespace(rom=SimpleNamespace(id="test-rom"))),
+            patch.dict(
+                map_module._map_header_cache,
+                {"test-rom": {(0, 10): b"outdoor", (2, 2): b"pokemon-center"}},
+                clear=True,
+            ),
+            patch("modules.map.read_symbol", return_value=b"pokemon-center"),
+        ):
             self.assertEqual(map_module.get_live_map_id(), (2, 2))
 
     def test_trainer_hazards_follow_facing_and_range(self):
@@ -80,9 +84,7 @@ class TestOverworldPerception(unittest.TestCase):
         fallback = static_trainer_observations(map_id, SimpleNamespace(objects=(template,)), ())
         self.assertEqual(len(fallback), 1)
         self.assertEqual(fallback[0].trainer_id, "trainer:(11, 3):3")
-        tiles = tuple(
-            TileObservation((map_id, (x, 9)), False, frozenset(Direction), elevation=3) for x in range(5)
-        )
+        tiles = tuple(TileObservation((map_id, (x, 9)), False, frozenset(Direction), elevation=3) for x in range(5))
         self.assertEqual(
             trainer_hazard_locations(fallback[0], tiles),
             frozenset({(map_id, (1, 9)), (map_id, (0, 9))}),
@@ -234,12 +236,17 @@ class TestOverworldPerception(unittest.TestCase):
             bg_events=(),
             coord_events=(),
         )
-        with patch(
-            "modules.overworld._get_map_metadata",
-            side_effect=lambda map_id: SimpleNamespace(tiles=tuple(tile((x, y)) for y in range(2) for x in range(3))),
-        ), patch(
-            "modules.overworld.get_map_metadata",
-            side_effect=lambda map_id: source if map_id == source_id else destination,
+        with (
+            patch(
+                "modules.overworld._get_map_metadata",
+                side_effect=lambda map_id: SimpleNamespace(
+                    tiles=tuple(tile((x, y)) for y in range(2) for x in range(3))
+                ),
+            ),
+            patch(
+                "modules.overworld.get_map_metadata",
+                side_effect=lambda map_id: source if map_id == source_id else destination,
+            ),
         ):
             prewarm_static_map_observation(source_id)
         static = __import__("modules.overworld", fromlist=["_static_map_observations"])._static_map_observations[
@@ -269,9 +276,7 @@ class TestOverworldPerception(unittest.TestCase):
                 map_group=destination[0], map_number=destination[1], local_position=(0, 0)
             ),
         )
-        path_map = SimpleNamespace(
-            tiles=[tile((x, y)) for y in range(3) for x in range(3)]
-        )
+        path_map = SimpleNamespace(tiles=[tile((x, y)) for y in range(3) for x in range(3)])
         map_data = SimpleNamespace(
             map_size=(3, 3),
             warps=(warp_data,),
@@ -280,8 +285,9 @@ class TestOverworldPerception(unittest.TestCase):
             coord_events=(),
             bg_events=(),
         )
-        with patch("modules.overworld._get_map_metadata", return_value=path_map), patch(
-            "modules.overworld.get_map_metadata", return_value=map_data
+        with (
+            patch("modules.overworld._get_map_metadata", return_value=path_map),
+            patch("modules.overworld.get_map_metadata", return_value=map_data),
         ):
             prewarm_static_map_observation(map_id)
 

@@ -80,9 +80,7 @@ class BattleStrategy:
         from modules.pokemon_party import get_party
 
         active_indices = {
-            battler.party_index
-            for battler in battle_state.own_side.active_battlers
-            if battler is not None
+            battler.party_index for battler in battle_state.own_side.active_battlers if battler is not None
         }
         return any(
             index not in active_indices and not pokemon.is_egg and pokemon.current_hp > 0

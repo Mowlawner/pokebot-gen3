@@ -75,10 +75,7 @@ def _canonical_campaign_objective_ranks() -> dict[str, int]:
     """
     from .campaign_objectives import initial_emerald_campaign
 
-    return {
-        objective.objective_id: index
-        for index, objective in enumerate(initial_emerald_campaign())
-    }
+    return {objective.objective_id: index for index, objective in enumerate(initial_emerald_campaign())}
 
 
 def _retention_order_allows(active_id: str, selected_id: str) -> bool:
@@ -300,7 +297,10 @@ class CampaignController:
                 and (pending_failure is None or pending_failure.value is not True)
                 and pending_prerequisites_safe
             )
-            if selection.objective is None or selection.objective.objective_id != pending_readiness_objective.objective_id:
+            if (
+                selection.objective is None
+                or selection.objective.objective_id != pending_readiness_objective.objective_id
+            ):
                 diagnostic_print(
                     lambda: (
                         "CAMPAIGN_READINESS_OWNERSHIP_CHECK: "
@@ -356,9 +356,7 @@ class CampaignController:
         if active_objective is not None and selection.objective is not None:
             active_completion = active_objective.completion.evaluate(observed_state)
             active_failure = (
-                active_objective.failure.evaluate(observed_state)
-                if active_objective.failure is not None
-                else None
+                active_objective.failure.evaluate(observed_state) if active_objective.failure is not None else None
             )
             prerequisites_safe = all(
                 prerequisite.evaluate(observed_state).value is not False
@@ -454,12 +452,14 @@ class CampaignController:
             trace.mark("campaign_mounted_objective", self._tactical_loop_objective_id)
             trace.mark(
                 "campaign_intro_rival_completion",
-                None
-                if intro_completion is None
-                else {
-                    "status": getattr(getattr(intro_completion, "status", None), "value", None),
-                    "value": getattr(intro_completion, "value", None),
-                },
+                (
+                    None
+                    if intro_completion is None
+                    else {
+                        "status": getattr(getattr(intro_completion, "status", None), "value", None),
+                        "value": getattr(intro_completion, "value", None),
+                    }
+                ),
             )
             trace.mark("campaign_execution_phase", self._execution_phase)
         self.last_selection = selection
@@ -485,7 +485,10 @@ class CampaignController:
         }
         if execution.status in terminal_status:
             self._terminal(execution, terminal_status[execution.status])
-            diagnostic_print(lambda: f"CAMPAIGN_REFRESH_RETURN: frame={getattr(context, 'frame', None)!r} branch='terminal_execution' status={self.status.value!r} reason={self.transition_reason!r}", trace=True)
+            diagnostic_print(
+                lambda: f"CAMPAIGN_REFRESH_RETURN: frame={getattr(context, 'frame', None)!r} branch='terminal_execution' status={self.status.value!r} reason={self.transition_reason!r}",
+                trace=True,
+            )
             return self.state
         if execution.status is not CampaignExecutionStatus.READY or execution.objective is None:
             self._terminal(
@@ -497,7 +500,10 @@ class CampaignController:
                 ),
                 CampaignControllerStatus.FAILED,
             )
-            diagnostic_print(lambda: f"CAMPAIGN_REFRESH_RETURN: frame={getattr(context, 'frame', None)!r} branch='malformed_ready' status={self.status.value!r} reason={self.transition_reason!r}", trace=True)
+            diagnostic_print(
+                lambda: f"CAMPAIGN_REFRESH_RETURN: frame={getattr(context, 'frame', None)!r} branch='malformed_ready' status={self.status.value!r} reason={self.transition_reason!r}",
+                trace=True,
+            )
             return self.state
         if execution.tactical_goal is None and execution.capability is None:
             self._terminal(
@@ -509,7 +515,10 @@ class CampaignController:
                 ),
                 CampaignControllerStatus.FAILED,
             )
-            diagnostic_print(lambda: f"CAMPAIGN_REFRESH_RETURN: frame={getattr(context, 'frame', None)!r} branch='missing_execution_target' status={self.status.value!r} reason={self.transition_reason!r}", trace=True)
+            diagnostic_print(
+                lambda: f"CAMPAIGN_REFRESH_RETURN: frame={getattr(context, 'frame', None)!r} branch='missing_execution_target' status={self.status.value!r} reason={self.transition_reason!r}",
+                trace=True,
+            )
             return self.state
         objective_id = execution.objective.objective_id
         if self._campaign_plan is None or self._campaign_plan.parent_objective_id != objective_id:
@@ -682,14 +691,15 @@ class CampaignController:
                 )
                 self._readiness_recheck_pending = True
                 self._pending_readiness_objective_id = objective_id
-                targetless_capability_boundary = (
-                    execution.capability is not None and execution.tactical_goal is None
-                )
+                targetless_capability_boundary = execution.capability is not None and execution.tactical_goal is None
                 if not targetless_capability_boundary:
                     self.status = CampaignControllerStatus.READY
                     self._execution_phase = "CAMPAIGN"
                     self.transition_reason = f"readiness deferred: {evaluated.readiness_reason.value}"
-                    diagnostic_print(lambda: f"CAMPAIGN_REFRESH_RETURN: frame={getattr(context, 'frame', None)!r} branch='readiness_deferred' status={self.status.value!r} reason={self.transition_reason!r}", trace=True)
+                    diagnostic_print(
+                        lambda: f"CAMPAIGN_REFRESH_RETURN: frame={getattr(context, 'frame', None)!r} branch='readiness_deferred' status={self.status.value!r} reason={self.transition_reason!r}",
+                        trace=True,
+                    )
                     return self.state
                 diagnostic_print(
                     lambda: (
@@ -763,7 +773,10 @@ class CampaignController:
                     if self._recovery_factory is None:
                         raise RuntimeError("recovery factory is unavailable")
                     self._tactical_loop = self._recovery_factory(stop)
-                    diagnostic_print(lambda: f"CAMPAIGN_RECOVERY_GENERATOR: event=created controller_id={id(self)!r} loop_id={id(self._tactical_loop)!r} frame={getattr(context, 'frame', None)!r}", trace=True)
+                    diagnostic_print(
+                        lambda: f"CAMPAIGN_RECOVERY_GENERATOR: event=created controller_id={id(self)!r} loop_id={id(self._tactical_loop)!r} frame={getattr(context, 'frame', None)!r}",
+                        trace=True,
+                    )
                     diagnostic_print(
                         lambda: f"CAMPAIGN_RECOVERY_FACTORY: evaluation_id={id(evaluated)} invoked=True method={getattr(self._recovery_factory, '__name__', type(self._recovery_factory).__name__)}",
                         trace=True,
@@ -774,7 +787,10 @@ class CampaignController:
                     self._execution_phase = "BLOCKED"
                     self._recovery_status = "UNAVAILABLE"
                     self.transition_reason = f"recovery unavailable: {error}"
-                    diagnostic_print(lambda: f"CAMPAIGN_REFRESH_RETURN: frame={getattr(context, 'frame', None)!r} branch='recovery_unavailable' status={self.status.value!r} reason={self.transition_reason!r}", trace=True)
+                    diagnostic_print(
+                        lambda: f"CAMPAIGN_REFRESH_RETURN: frame={getattr(context, 'frame', None)!r} branch='recovery_unavailable' status={self.status.value!r} reason={self.transition_reason!r}",
+                        trace=True,
+                    )
                     return self.state
                 self._execution_phase = "RECOVERY"
                 self._recovery_status = "ACTIVE"
@@ -783,7 +799,10 @@ class CampaignController:
                 self._tactical_loop_objective_id = objective_id
                 self.status = CampaignControllerStatus.READY
                 self.transition_reason = f"recover before {objective_id}"
-                diagnostic_print(lambda: f"CAMPAIGN_REFRESH_RETURN: frame={getattr(context, 'frame', None)!r} branch='recovery_mounted' status={self.status.value!r} reason={self.transition_reason!r}", trace=True)
+                diagnostic_print(
+                    lambda: f"CAMPAIGN_REFRESH_RETURN: frame={getattr(context, 'frame', None)!r} branch='recovery_mounted' status={self.status.value!r} reason={self.transition_reason!r}",
+                    trace=True,
+                )
                 return self.state
         if (
             self.current_objective_id != objective_id
@@ -908,9 +927,7 @@ class CampaignController:
             self._tactical_loop = None
             self._tactical_loop_objective_id = None
             self.status = CampaignControllerStatus.UNKNOWN
-            self.transition_reason = (
-                f"campaign refresh failed; will re-evaluate: {type(error).__name__}: {error!r}"
-            )
+            self.transition_reason = f"campaign refresh failed; will re-evaluate: {type(error).__name__}: {error!r}"
             diagnostic_print(
                 lambda: (
                     "CAMPAIGN_REFRESH_EXCEPTION: "
@@ -952,7 +969,10 @@ class CampaignController:
                 # tactical failure.
                 self._tactical_loop = None
                 self.transition_reason = "capability boundary; awaiting authoritative completion"
-                diagnostic_print(lambda: f"CAMPAIGN_STEP_RETURN: controller_id={id(self)!r} frame={getattr(context, 'frame', None)!r} branch='capability_boundary' status={self.status.value!r} reason={self.transition_reason!r} input_emitted=unknown", trace=True)
+                diagnostic_print(
+                    lambda: f"CAMPAIGN_STEP_RETURN: controller_id={id(self)!r} frame={getattr(context, 'frame', None)!r} branch='capability_boundary' status={self.status.value!r} reason={self.transition_reason!r} input_emitted=unknown",
+                    trace=True,
+                )
                 return self.state
             self._terminal(
                 CampaignExecutionResult(
@@ -969,9 +989,7 @@ class CampaignController:
             # select the current objective and rebuild fresh execution state.
             self._tactical_loop = None
             self.status = CampaignControllerStatus.UNKNOWN
-            self.transition_reason = (
-                f"tactical execution failed; will re-evaluate: {type(error).__name__}: {error!r}"
-            )
+            self.transition_reason = f"tactical execution failed; will re-evaluate: {type(error).__name__}: {error!r}"
             diagnostic_print(
                 lambda: (
                     f"CAMPAIGN_STEP_RETURN: controller_id={id(self)!r} "

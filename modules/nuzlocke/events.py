@@ -246,9 +246,7 @@ class NuzlockeEventObserver:
             # never get a chance to claim a legal encounter.  An incomplete
             # BATTLE_STARTING snapshot still remains a baseline and will be
             # promoted by the normal ready transition below.
-            if (
-                self._battle_is_ready(snapshot)
-            ):
+            if self._battle_is_ready(snapshot):
                 battle = snapshot.battle
                 return (
                     BattleStarted(
@@ -270,9 +268,7 @@ class NuzlockeEventObserver:
             self._battle_is_ready(snapshot)
             and self._previous_ready_battle is None
             and (
-                previous_battle is None
-                or previous_battle.battle is None
-                or not self._battle_is_ready(previous_battle)
+                previous_battle is None or previous_battle.battle is None or not self._battle_is_ready(previous_battle)
             )
         ):
             battle = snapshot.battle

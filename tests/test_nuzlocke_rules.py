@@ -52,8 +52,13 @@ class TestNuzlockeRules(unittest.TestCase):
     def test_subsequent_wild_encounter_is_ineligible_but_legal_to_fight(self):
         captured = PokemonIdentity(99, 20, 30)
         state = reduce_rules(
-            (self.start(), PokemonCaptured(2, captured, self.a), self.end(), self.start(3),
-             PokemonCaptured(4, self.wild, self.a))
+            (
+                self.start(),
+                PokemonCaptured(2, captured, self.a),
+                self.end(),
+                self.start(3),
+                PokemonCaptured(4, self.wild, self.a),
+            )
         )
         self.assertTrue(state.legal)
         self.assertEqual(state.violations, ())

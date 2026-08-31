@@ -171,6 +171,7 @@ class TestNuzlockeRuntime(unittest.TestCase):
             self.assertFalse(runtime.observed_projection.state.nuzlocke_started)
             self.assertFalse(path.with_name(path.name + ".provenance").exists())
             self.assertEqual(len(tuple(path.parent.glob("events.json.stale-*"))), 0)
+
     @staticmethod
     def wild_battle(frame, map_number=2, inventory=None, inventory_available=True, pokedex_received=None):
         inventory = inventory or InventorySnapshot((), (), ())
@@ -243,9 +244,7 @@ class TestNuzlockeRuntime(unittest.TestCase):
         inventory = InventorySnapshot((), (ItemQuantity("Poké Ball", 1),), ())
         runtime.update(replace(snapshot(1, pokedex_received=True), inventory=inventory))
 
-        first = runtime.update(
-            self.wild_battle(2, inventory=inventory, pokedex_received=True)
-        )
+        first = runtime.update(self.wild_battle(2, inventory=inventory, pokedex_received=True))
         next(event for event in first if isinstance(event, BattleStarted))
         self.assertTrue(runtime.capture_target_for((1, 2), is_wild=True, is_trainer=False))
         # The first battle resolves as a non-capture outcome for this focused
@@ -253,9 +252,7 @@ class TestNuzlockeRuntime(unittest.TestCase):
         runtime.update(snapshot(3, pokedex_received=True))
         self.assertNotEqual(runtime.rules_projection.state.encounter_for((1, 2)).status, "none")
 
-        repeat = runtime.update(
-            self.wild_battle(4, inventory=inventory, pokedex_received=True)
-        )
+        repeat = runtime.update(self.wild_battle(4, inventory=inventory, pokedex_received=True))
         next(event for event in repeat if isinstance(event, BattleStarted))
         self.assertTrue(runtime.rules_projection.state.legal)
         self.assertEqual(len(runtime.rules_projection.state.violations), 0)
@@ -529,9 +526,7 @@ class TestNuzlockeRuntime(unittest.TestCase):
             first = NuzlockeRuntime(event_sink=store, event_store=store)
             inventory = InventorySnapshot((), (ItemQuantity("Poké Ball", 1),), ())
             first.update(replace(snapshot(1, pokedex_received=True), inventory=inventory))
-            events = first.update(
-                self.wild_battle(2, inventory=inventory, pokedex_received=True)
-            )
+            events = first.update(self.wild_battle(2, inventory=inventory, pokedex_received=True))
             self.assertEqual(type(events[0]).__name__, "BattleStarted")
             self.assertEqual(store.last_sequence(), 1)
 

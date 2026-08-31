@@ -85,7 +85,8 @@ class EmeraldCampaignRegistryTests(unittest.TestCase):
                 "devon_corp_3f_scene_complete",
                 "visited_rustboro",
                 "first_badge_obtained",
-            } <= registered
+            }
+            <= registered
         )
 
     def test_devon_capabilities_are_registry_owned(self):

@@ -43,4 +43,3 @@ class PokemonPartyTests(unittest.TestCase):
             self.assertIs(get_party(), cached_party)
 
         emulator._core.run_frame.assert_not_called()
-

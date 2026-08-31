@@ -34,8 +34,7 @@ def _eligible_indices(*, only_non_fainted: bool = False) -> tuple[int, ...]:
     return tuple(
         index
         for index, pokemon in enumerate(get_party())
-        if _is_eligible_pokemon(pokemon)
-        and (not only_non_fainted or pokemon.current_hp > 0)
+        if _is_eligible_pokemon(pokemon) and (not only_non_fainted or pokemon.current_hp > 0)
     )
 
 
@@ -62,9 +61,7 @@ class NuzlockeLevelBalancingBattleStrategy(LevelBalancingBattleStrategy):
 
     def has_replacement_after_faint(self, battle_state: BattleState) -> bool:
         active_indices = {
-            battler.party_index
-            for battler in battle_state.own_side.active_battlers
-            if battler is not None
+            battler.party_index for battler in battle_state.own_side.active_battlers if battler is not None
         }
         return any(index not in active_indices for index in _eligible_indices(only_non_fainted=True))
 
@@ -79,15 +76,9 @@ class NuzlockeLevelBalancingBattleStrategy(LevelBalancingBattleStrategy):
         if action[0] is TurnAction.RotateLead:
             replacement = get_party()[action[1]]
             active_indices = {
-                battler.party_index
-                for battler in battle_state.own_side.active_battlers
-                if battler is not None
+                battler.party_index for battler in battle_state.own_side.active_battlers if battler is not None
             }
-            if (
-                not _is_eligible_pokemon(replacement)
-                or replacement.current_hp <= 0
-                or action[1] in active_indices
-            ):
+            if not _is_eligible_pokemon(replacement) or replacement.current_hp <= 0 or action[1] in active_indices:
                 util = BattleStrategyUtil(battle_state)
                 move = util.get_strongest_move_against(
                     battle_state.own_side.active_battler,
@@ -127,12 +118,9 @@ class EmeraldIntroRivalBattleStrategy(DefaultBattleStrategy):
                 ):
                     self._opening_growls_used += 1
                     context.battle_decision_source = "EMERALD INTRO RIVAL SETUP"
-                    context.battle_decision_detail = (
-                        f"opening Growl {self._opening_growls_used}/{self._OPENING_GROWLS}"
-                    )
+                    context.battle_decision_detail = f"opening Growl {self._opening_growls_used}/{self._OPENING_GROWLS}"
                     context.message = (
-                        f"EMERALD INTRO RIVAL SETUP: Growl "
-                        f"{self._opening_growls_used}/{self._OPENING_GROWLS}"
+                        f"EMERALD INTRO RIVAL SETUP: Growl " f"{self._opening_growls_used}/{self._OPENING_GROWLS}"
                     )
                     return TurnAction.use_move(index)
         return super().decide_turn(battle_state)

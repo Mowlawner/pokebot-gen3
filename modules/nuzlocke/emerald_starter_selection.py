@@ -22,7 +22,6 @@ class StarterRandomSource(Protocol):
         """Return one item from ``sequence``."""
 
 
-
 class EmeraldStarterSelectionPhase(Enum):
     """Observed phase of Emerald's starter chooser interaction."""
 

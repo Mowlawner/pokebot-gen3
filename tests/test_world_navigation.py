@@ -364,9 +364,7 @@ class TestWeightedNavigation(unittest.TestCase):
                     allowed_directions=frozenset(Direction),
                     forced_movement_to={Direction.East: (endpoint, 2)},
                 ),
-                intermediate: NavigableTile(
-                    intermediate, allowed_directions=frozenset(Direction), has_encounters=True
-                ),
+                intermediate: NavigableTile(intermediate, allowed_directions=frozenset(Direction), has_encounters=True),
                 endpoint: NavigableTile(endpoint, allowed_directions=frozenset(Direction)),
             }
         )

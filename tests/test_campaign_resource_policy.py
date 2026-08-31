@@ -110,7 +110,9 @@ def test_healthy_capability_does_not_resolve_recovery_context():
         yield
 
     capability = CampaignCapability("complete_intro_rival", IMPORTANT, ActivateTrigger("test"), delegate=delegate)
-    with patch("modules.nuzlocke.resource_runtime.observe_resource_snapshot", side_effect=AssertionError("unexpected lookup")):
+    with patch(
+        "modules.nuzlocke.resource_runtime.observe_resource_snapshot", side_effect=AssertionError("unexpected lookup")
+    ):
         next(capability())
     assert calls == ["delegate"]
 
@@ -123,7 +125,9 @@ def test_damaged_capability_resolves_recovery_context_lazily():
         yield
 
     capability = CampaignCapability("complete_intro_rival", IMPORTANT, ActivateTrigger("test"), delegate=delegate)
-    with patch("modules.nuzlocke.resource_runtime.observe_resource_snapshot", side_effect=AssertionError("unexpected lookup")), patch(
+    with patch(
+        "modules.nuzlocke.resource_runtime.observe_resource_snapshot", side_effect=AssertionError("unexpected lookup")
+    ), patch(
         "modules.nuzlocke.resource_runtime.observe_route_recovery", side_effect=AssertionError("unexpected lookup")
     ):
         next(capability())

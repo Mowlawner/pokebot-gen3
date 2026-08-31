@@ -326,12 +326,10 @@ def observe_interaction(
                 choice_selected = None
     if choice_menu_active:
         interaction_phase = InteractionPhase.CHOICE_MENU_INPUT_WAIT
-    elif (_field_message_advance_ready and script_active and native_function == "IsFieldMessageBoxHidden") or (
-        script_active and dialogue_waiting and native_function == "WaitForAorBPress"
-    ) or (
-        script_active
-        and dialogue_waiting
-        and native_function == "IsFieldMessageBoxHidden"
+    elif (
+        (_field_message_advance_ready and script_active and native_function == "IsFieldMessageBoxHidden")
+        or (script_active and dialogue_waiting and native_function == "WaitForAorBPress")
+        or (script_active and dialogue_waiting and native_function == "IsFieldMessageBoxHidden")
     ):
         interaction_phase = InteractionPhase.FIELD_MESSAGE_INPUT_WAIT
     elif _field_message_lifecycle_active and native_function == "IsFieldMessageBoxHidden":
@@ -362,7 +360,11 @@ def observe_interaction(
             text_printers_disabled = read_symbol("gDisableTextPrinters", size=1)[0]
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
         pass
-    if script_context is not None and getattr(script_context, "script_function_name", None) == "LittlerootTown_ProfessorBirchsLab_EventScript_GiveStarterEvent":
+    if (
+        script_context is not None
+        and getattr(script_context, "script_function_name", None)
+        == "LittlerootTown_ProfessorBirchsLab_EventScript_GiveStarterEvent"
+    ):
         # GiveStarterEvent uses IsFieldMessageBoxHidden while its printer is
         # still active.  A is intentionally accepted in this state to finish
         # or accelerate the message; the generic hidden-box debounce would
@@ -381,9 +383,13 @@ def observe_interaction(
                 f"dialogue_waiting={dialogue_waiting!r} lifecycle={_field_message_lifecycle_active!r} "
                 f"advance_ready={_field_message_advance_ready!r} phase={interaction_phase.name!r}"
             ),
-        trace=True,
-    )
-    if script_context is not None and getattr(script_context, "script_function_name", None) == "PetalburgCity_Gym_EventScript_ReturnFromWallyTutorial":
+            trace=True,
+        )
+    if (
+        script_context is not None
+        and getattr(script_context, "script_function_name", None)
+        == "PetalburgCity_Gym_EventScript_ReturnFromWallyTutorial"
+    ):
         diagnostic_print(
             lambda: (
                 "WALLY_DIALOGUE_GATE: "
@@ -396,7 +402,7 @@ def observe_interaction(
                 f"dialogue_waiting={dialogue_waiting!r} lifecycle={_field_message_lifecycle_active!r} "
                 f"advance_ready={_field_message_advance_ready!r} phase={interaction_phase.name!r}"
             ),
-                trace=True,
+            trace=True,
         )
     render_rescue_state = (
         bool(getattr(getattr(context, "rom", None), "is_emerald", False))

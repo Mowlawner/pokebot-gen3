@@ -106,9 +106,7 @@ class CampaignFactsTests(unittest.TestCase):
         self.assertEqual(selection.status, ObjectiveStatus.READY)
 
     def test_intro_rival_completion_is_unknown_when_hide_signal_is_unavailable(self):
-        facts = self.state(
-            flags=(NamedFlag("DEFEATED_RIVAL_ROUTE103", False),)
-        ).campaign_facts
+        facts = self.state(flags=(NamedFlag("DEFEATED_RIVAL_ROUTE103", False),)).campaign_facts
 
         self.assertEqual(facts.intro_rival_battle_complete.status, FactStatus.UNKNOWN)
 
@@ -189,7 +187,8 @@ class CampaignFactsTests(unittest.TestCase):
                     "DELIVERED_DEVON_GOODS",
                     "VISITED_RUSTBORO_CITY",
                 )
-            ) + (NamedFlag("DEFEATED_RUSTBORO_GYM", False),),
+            )
+            + (NamedFlag("DEFEATED_RUSTBORO_GYM", False),),
             variables=(
                 NamedVariable("RUSTBORO_CITY_STATE", 5),
                 NamedVariable("RUSTURF_TUNNEL_STATE", 2),
@@ -221,9 +220,7 @@ class CampaignFactsTests(unittest.TestCase):
                 NamedFlag("DEFEATED_RUSTBORO_GYM", True),
             )
         ).campaign_facts
-        missing_badge_observation = self.state(
-            flags=(NamedFlag("VISITED_RUSTBORO_CITY", True),)
-        ).campaign_facts
+        missing_badge_observation = self.state(flags=(NamedFlag("VISITED_RUSTBORO_CITY", True),)).campaign_facts
 
         self.assertFalse(not_reached.roxanne_available.value)
         self.assertFalse(already_defeated.roxanne_available.value)
@@ -247,9 +244,7 @@ class CampaignFactsTests(unittest.TestCase):
         self.assertTrue(completed.petalburg_wally_scene_complete.value)
 
     def test_petalburg_wally_completion_is_unknown_without_gym_state(self):
-        facts = self.state(
-            variables=(NamedVariable("PETALBURG_CITY_STATE", 3),)
-        ).campaign_facts
+        facts = self.state(variables=(NamedVariable("PETALBURG_CITY_STATE", 3),)).campaign_facts
 
         self.assertEqual(facts.petalburg_wally_scene_complete.status, FactStatus.UNKNOWN)
 

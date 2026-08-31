@@ -255,9 +255,7 @@ _DIAGNOSTIC_LOG_WHITELIST = (
 )
 
 
-def diagnostic_print(
-    message: str | Callable[[], str], *, trace: bool = False, prefix: str | None = None
-) -> None:
+def diagnostic_print(message: str | Callable[[], str], *, trace: bool = False, prefix: str | None = None) -> None:
     """Print a diagnostic message only when its configured level is enabled.
 
     ``message`` may be a callable so expensive formatting is skipped entirely

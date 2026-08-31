@@ -169,13 +169,16 @@ class BattleListener(BotListener):
         """
         if frame.game_state is not GameState.PARTY_MENU:
             return False
-        if not (frame.task_is_active("Task_HandleChooseMonInput") or any(
-            frame.script_is_active(script_name)
-            for script_name in (
-                "EventScript_DoTrainerBattle",
-                "EventScript_DoTrainerBattleFromApproach",
+        if not (
+            frame.task_is_active("Task_HandleChooseMonInput")
+            or any(
+                frame.script_is_active(script_name)
+                for script_name in (
+                    "EventScript_DoTrainerBattle",
+                    "EventScript_DoTrainerBattleFromApproach",
+                )
             )
-        )):
+        ):
             return False
         # A stale choose-mon task can survive a completed trainer battle in a
         # save-state.  It is not a restored battle selection unless the ROM's
@@ -392,10 +395,7 @@ class BattleListener(BotListener):
             if self._stale_party_menu_cleanup_stage == 1:
                 if frame.task_is_active("Task_ShowStartMenu"):
                     diagnostic_print(
-                        lambda: (
-                            "BATTLE_STALE_START_MENU_READY: "
-                            f"frame={getattr(context, 'frame', None)!r}"
-                        ),
+                        lambda: ("BATTLE_STALE_START_MENU_READY: " f"frame={getattr(context, 'frame', None)!r}"),
                         trace=True,
                     )
                     # The task is first observed on the frame where its
@@ -414,8 +414,7 @@ class BattleListener(BotListener):
                 if frame.task_is_active("Task_ShowStartMenu"):
                     diagnostic_print(
                         lambda: (
-                            "BATTLE_STALE_START_MENU_DISMISS: "
-                            f"frame={getattr(context, 'frame', None)!r} input='B'"
+                            "BATTLE_STALE_START_MENU_DISMISS: " f"frame={getattr(context, 'frame', None)!r} input='B'"
                         ),
                         trace=True,
                     )

@@ -24,9 +24,7 @@ class CampaignStatusTests(unittest.TestCase):
         self.assertEqual(format_campaign_status(CampaignStatus.complete_status()), "Campaign: COMPLETE")
 
     def test_recovery_uses_the_campaign_projection_format(self):
-        text = format_campaign_status(
-            recovery_status(SemanticTarget.map((1, 2)), "Navigate to nurse")
-        )
+        text = format_campaign_status(recovery_status(SemanticTarget.map((1, 2)), "Navigate to nurse"))
         self.assertEqual(
             text,
             "Objective: Recover Party\nTarget: map (1, 2) (Littleroot Town Mays House 1F)\nIntent: Navigate to nurse",

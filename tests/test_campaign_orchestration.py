@@ -96,7 +96,9 @@ class CampaignOrchestrationTests(unittest.TestCase):
             ),
         ), patch("modules.modes.campaign.get_nuzlocke_snapshot", return_value=snapshot), patch(
             "modules.modes.campaign.get_game_state", return_value=None
-        ), patch("modules.modes.campaign.observe_resource_snapshot", return_value=resources), patch(
+        ), patch(
+            "modules.modes.campaign.observe_resource_snapshot", return_value=resources
+        ), patch(
             "modules.modes.campaign.observe_route_recovery"
         ) as observe_recovery, patch(
             "modules.modes.campaign.build_progression_readiness_diagnostic", return_value=object()
@@ -135,17 +137,22 @@ class CampaignOrchestrationTests(unittest.TestCase):
         with patch(
             "modules.modes.campaign.perceive_overworld",
             return_value=overworld,
-        ), patch("modules.modes.campaign.publish_shared_overworld_observation"), patch(
-            "modules.modes.campaign.get_nuzlocke_snapshot", return_value=snapshot
-        ), patch("modules.modes.campaign.get_game_state", return_value=GameState.OVERWORLD), patch(
-            "modules.modes.campaign.observe_interaction", return_value=SimpleNamespace(
+        ), patch(
+            "modules.modes.campaign.publish_shared_overworld_observation"
+        ), patch("modules.modes.campaign.get_nuzlocke_snapshot", return_value=snapshot), patch(
+            "modules.modes.campaign.get_game_state", return_value=GameState.OVERWORLD
+        ), patch(
+            "modules.modes.campaign.observe_interaction",
+            return_value=SimpleNamespace(
                 interaction_phase=SimpleNamespace(),
                 script_active=False,
                 dialogue_waiting=False,
                 field_message_lifecycle_active=False,
                 native_function=None,
-            )
-        ), patch("modules.modes.campaign.observe_resource_snapshot", return_value=resources), patch(
+            ),
+        ), patch(
+            "modules.modes.campaign.observe_resource_snapshot", return_value=resources
+        ), patch(
             "modules.modes.campaign.observe_route_recovery"
         ) as observe_recovery:
             diagnostic = mode._readiness_input(objective, None)

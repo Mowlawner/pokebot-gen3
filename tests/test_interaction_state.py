@@ -197,13 +197,17 @@ class InteractionStateTests(unittest.TestCase):
         # its initial text is advanceable, but the Yes/No task is absent.
         with patch.object(interaction_state, "_field_message_lifecycle_active", True), patch.object(
             interaction_state, "_field_message_advance_ready", True
+        ), patch("modules.interaction_state._observe_field_message_waiting", return_value=False), patch(
+            "modules.interaction_state.get_game_state", return_value=GameState.OVERWORLD
         ), patch(
-            "modules.interaction_state._observe_field_message_waiting", return_value=False
-        ), patch("modules.interaction_state.get_game_state", return_value=GameState.OVERWORLD), patch(
             "modules.interaction_state.get_global_script_context", return_value=script
-        ), patch("modules.interaction_state.is_field_message_task_waiting_for_input", return_value=False), patch(
+        ), patch(
+            "modules.interaction_state.is_field_message_task_waiting_for_input", return_value=False
+        ), patch(
             "modules.interaction_state.get_task", return_value=None
-        ), patch("modules.interaction_state.player_avatar_is_controllable", return_value=True), patch(
+        ), patch(
+            "modules.interaction_state.player_avatar_is_controllable", return_value=True
+        ), patch(
             "modules.nuzlocke.emerald_confirmation.observe_emerald_confirmation", return_value=None
         ):
             observation = observe_interaction()
@@ -225,11 +229,17 @@ class InteractionStateTests(unittest.TestCase):
             "modules.interaction_state.get_game_state", return_value=GameState.OVERWORLD
         ), patch("modules.interaction_state.get_global_script_context", return_value=script), patch(
             "modules.interaction_state.is_field_message_waiting_for_input", return_value=True
-        ), patch("modules.interaction_state.is_field_message_task_waiting_for_input", return_value=False), patch(
+        ), patch(
+            "modules.interaction_state.is_field_message_task_waiting_for_input", return_value=False
+        ), patch(
             "modules.interaction_state.task_is_active", return_value=True
-        ), patch("modules.interaction_state.get_task", return_value=SimpleNamespace(data_value=lambda _: 2)), patch(
+        ), patch(
+            "modules.interaction_state.get_task", return_value=SimpleNamespace(data_value=lambda _: 2)
+        ), patch(
             "modules.interaction_state.read_symbol", return_value=bytes((1, 2))
-        ), patch("modules.interaction_state.player_avatar_is_controllable", return_value=True), patch(
+        ), patch(
+            "modules.interaction_state.player_avatar_is_controllable", return_value=True
+        ), patch(
             "modules.nuzlocke.emerald_confirmation.observe_emerald_confirmation", return_value=None
         ):
             observation = observe_interaction()

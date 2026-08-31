@@ -130,10 +130,7 @@ def build_campaign_plan(
         and getattr(candidate, "first_route", None) is not None
         and (
             critical
-            or (
-                getattr(candidate, "total_cost", None) is not None
-                and getattr(candidate, "detour", None) is not None
-            )
+            or (getattr(candidate, "total_cost", None) is not None and getattr(candidate, "detour", None) is not None)
         )
     )
     if not candidates:
@@ -181,10 +178,16 @@ def build_campaign_plan(
         selected = min(
             candidates,
             key=lambda candidate: (
-                getattr(getattr(candidate, "first_route", None), "metrics", None).total_route_cost
-                if getattr(getattr(candidate, "first_route", None), "metrics", None) is not None
-                else float("inf"),
-                getattr(candidate, "total_cost", None) if getattr(candidate, "total_cost", None) is not None else float("inf"),
+                (
+                    getattr(getattr(candidate, "first_route", None), "metrics", None).total_route_cost
+                    if getattr(getattr(candidate, "first_route", None), "metrics", None) is not None
+                    else float("inf")
+                ),
+                (
+                    getattr(candidate, "total_cost", None)
+                    if getattr(candidate, "total_cost", None) is not None
+                    else float("inf")
+                ),
             ),
         )
     else:

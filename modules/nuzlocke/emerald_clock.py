@@ -20,7 +20,6 @@ from modules.player import get_player, get_player_avatar
 from modules.start_game import RandomSource
 from modules.tasks import get_task, task_is_active
 
-
 _CLOCK_TASKS = (
     "Task_SetClock_WaitFadeIn",
     "Task_SetClock_HandleInput",

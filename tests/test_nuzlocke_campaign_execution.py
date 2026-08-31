@@ -80,7 +80,11 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
                     self.assertIsNotNone(result.capability, objective_id)
                 continue
             result = adapt_campaign_execution(self.ready(objective))
-            self.assertEqual(result.status, CampaignExecutionStatus.READY if objective_id in supported else CampaignExecutionStatus.UNSUPPORTED, objective_id)
+            self.assertEqual(
+                result.status,
+                CampaignExecutionStatus.READY if objective_id in supported else CampaignExecutionStatus.UNSUPPORTED,
+                objective_id,
+            )
             self.assertEqual(result.execution_id, objective.execution_id, objective_id)
 
     def test_party_restoration_mounts_healing_capability(self):
@@ -138,10 +142,13 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
         )
 
     def test_preparation_capability_uses_registry_owned_target_level(self):
-        with patch(
-            "modules.nuzlocke.resource_runtime.execute_campaign_preparation",
-            return_value=iter(("training",)),
-        ) as execute, patch("modules.nuzlocke.resource_runtime.get_party", return_value=()):
+        with (
+            patch(
+                "modules.nuzlocke.resource_runtime.execute_campaign_preparation",
+                return_value=iter(("training",)),
+            ) as execute,
+            patch("modules.nuzlocke.resource_runtime.get_party", return_value=()),
+        ):
             result = adapt_campaign_execution(self.ready(self.objectives["prepare_roxanne"]))
             self.assertEqual(result.status, CampaignExecutionStatus.READY)
             self.assertIsNotNone(result.capability)
@@ -257,7 +264,9 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
             patch("modules.modes.campaign.context", fake_context),
             patch("modules.modes.campaign.get_player_avatar", return_value=avatar),
             patch("modules.modes.campaign.get_party", return_value=()),
-            patch("modules.modes.campaign.runtime_campaign_state", return_value=SimpleNamespace(campaign_facts=object())),
+            patch(
+                "modules.modes.campaign.runtime_campaign_state", return_value=SimpleNamespace(campaign_facts=object())
+            ),
             patch("modules.modes.campaign.evaluate_battle_entry", return_value=SimpleNamespace(allowed=True)),
             patch("modules.modes.campaign.diagnostic_print"),
         ):
@@ -328,8 +337,9 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
             return FakeLoop()
 
         cache = {}
-        with patch.object(capabilities, "perceive_overworld", return_value=world), patch.object(
-            capabilities, "AgentControlLoop", side_effect=fake_constructor
+        with (
+            patch.object(capabilities, "perceive_overworld", return_value=world),
+            patch.object(capabilities, "AgentControlLoop", side_effect=fake_constructor),
         ):
             progression = capabilities.observation_driven_overworld_progression(
                 semantic_target=target, execution_cache=cache
@@ -373,12 +383,14 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
             return FakeLoop()
 
         cache = {}
-        with patch.object(capabilities, "perceive_overworld", return_value=world), patch.object(
-            capabilities, "AgentControlLoop", side_effect=fake_constructor
-        ), patch.object(
-            capabilities,
-            "_observed_exit_goal",
-            return_value=ReachWarp(destination_map=(1, 0), destination=((1, 0), (8, 2)), warp=world.warps[0]),
+        with (
+            patch.object(capabilities, "perceive_overworld", return_value=world),
+            patch.object(capabilities, "AgentControlLoop", side_effect=fake_constructor),
+            patch.object(
+                capabilities,
+                "_observed_exit_goal",
+                return_value=ReachWarp(destination_map=(1, 0), destination=((1, 0), (8, 2)), warp=world.warps[0]),
+            ),
         ):
             progression = capabilities.observation_driven_overworld_progression(
                 semantic_target=target, execution_cache=cache
@@ -431,9 +443,11 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
             return FakeLoop()
 
         cache = {}
-        with patch.object(capabilities, "perceive_overworld", return_value=world), patch.object(
-            capabilities, "AgentControlLoop", side_effect=fake_constructor
-        ), patch.object(capabilities, "GoalAwareNavigator"):
+        with (
+            patch.object(capabilities, "perceive_overworld", return_value=world),
+            patch.object(capabilities, "AgentControlLoop", side_effect=fake_constructor),
+            patch.object(capabilities, "GoalAwareNavigator"),
+        ):
             progression = capabilities.observation_driven_overworld_progression(
                 semantic_target=target, execution_cache=cache
             )
@@ -494,12 +508,14 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
             return FakeLoop()
 
         cache = {}
-        with patch.object(capabilities, "perceive_overworld", return_value=world), patch.object(
-            capabilities, "AgentControlLoop", side_effect=fake_constructor
-        ), patch.object(
-            capabilities,
-            "_observed_exit_goal",
-            side_effect=AssertionError("the east exit must not be selected on the ROM gate tile"),
+        with (
+            patch.object(capabilities, "perceive_overworld", return_value=world),
+            patch.object(capabilities, "AgentControlLoop", side_effect=fake_constructor),
+            patch.object(
+                capabilities,
+                "_observed_exit_goal",
+                side_effect=AssertionError("the east exit must not be selected on the ROM gate tile"),
+            ),
         ):
             progression = capabilities.observation_driven_overworld_progression(
                 semantic_target=target, execution_cache=cache

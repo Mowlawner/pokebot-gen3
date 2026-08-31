@@ -27,7 +27,9 @@ class GlobalNavigationTests(unittest.TestCase):
         warp = WarpObservation((source_map, (2, 0)), (target_map, (0, 0)))
         observed = world(source_map, [(0, 0), (1, 0), (2, 0)], (warp,), facing=Direction.East)
 
-        with patch("modules.navigation.get_world_map_graph", side_effect=AssertionError("global search is unnecessary")):
+        with patch(
+            "modules.navigation.get_world_map_graph", side_effect=AssertionError("global search is unnecessary")
+        ):
             plan, route = plan_with_world_navigation(
                 observed,
                 (source_map, (0, 0)),
