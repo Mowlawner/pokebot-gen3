@@ -13,12 +13,6 @@ from modules.console import console, diagnostic_print
 from modules.context import context
 from modules.debug import debug
 from modules.game import set_rom
-from modules.gui.create_profile_screen import CreateProfileScreen
-from modules.gui.emulator_screen import EmulatorScreen
-from modules.gui.load_state_window import LoadStateWindow
-from modules.gui.select_profile_screen import SelectProfileScreen
-from modules.libmgba import LibmgbaEmulator, input_map
-from modules.profiles import ProfileLock
 from modules.sprites import choose_random_sprite, crop_sprite_square
 from modules.version import pokebot_name, pokebot_version
 
@@ -35,6 +29,9 @@ class PokebotGui:
         no_theme: bool = False,
         use_opengl: bool = False,
     ):
+        from modules.gui.create_profile_screen import CreateProfileScreen
+        from modules.gui.emulator_screen import EmulatorScreen
+
         if not no_theme:
             theme = "equilux" if darkdetect.isDark() else "clam"
             self.window = ThemedTk(className="PokeBot", theme=theme)
@@ -45,7 +42,7 @@ class PokebotGui:
         self._main_loop = main_loop
         self._on_exit = on_exit
         self._startup_settings: "StartupSettings | None" = None
-        self._profile_lock: ProfileLock | None = None
+        self._profile_lock = None
         self.inputs_enabled = True
         self.is_headless = False
 
@@ -68,6 +65,8 @@ class PokebotGui:
 
     def _apply_key_config(self) -> None:
         """Applies key settings from the configuration."""
+        from modules.libmgba import input_map
+
         key_config = context.config.keys
         self._gba_keys: dict[str, int] = {}
         for key, val in dict(key_config.gba).items():
@@ -142,6 +141,9 @@ class PokebotGui:
         self._select_profile_screen.enable()
 
     def _run_profile(self, profile: "Profile") -> None:
+        from modules.libmgba import LibmgbaEmulator
+        from modules.profiles import ProfileLock
+
         self._reset_screen()
         source = "CLI" if self._startup_settings and self._startup_settings.profile is profile else "GUI"
         diagnostic_print(lambda: f"Profile selected: {profile.path} (source: {source})")
@@ -202,6 +204,8 @@ class PokebotGui:
                     case "save_state":
                         context.emulator.create_save_state("Manual")
                     case "load_state":
+                        from modules.gui.load_state_window import LoadStateWindow
+
                         LoadStateWindow(self.window)
                     case "toggle_stepping_mode":
                         self._emulator_screen.toggle_stepping_mode()
