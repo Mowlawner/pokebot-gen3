@@ -110,6 +110,7 @@ class TestNuzlockeSnapshots(unittest.TestCase):
             "modules.memory": types.SimpleNamespace(
                 GameState=FakeState,
                 get_game_state=Mock(return_value=FakeState.OVERWORLD),
+                game_has_started=Mock(return_value=True),
                 get_event_flag=Mock(return_value=False),
             ),
             "modules.pokemon_party": types.SimpleNamespace(get_party=Mock(return_value=(FakePokemon(),))),
@@ -151,6 +152,7 @@ class TestNuzlockeSnapshots(unittest.TestCase):
 
     def test_unavailable_readers_produce_an_unavailable_snapshot(self):
         import modules.nuzlocke.snapshots as snapshots
+        from modules.nuzlocke.snapshots import CampaignObservationLifecycle
 
         class FakeState(Enum):
             TITLE_SCREEN = 1
@@ -164,7 +166,11 @@ class TestNuzlockeSnapshots(unittest.TestCase):
             "modules.items": types.SimpleNamespace(get_item_bag=Mock(return_value=None)),
             "modules.memory": types.SimpleNamespace(
                 get_game_state=Mock(return_value=None),
-                get_event_flag=Mock(return_value=False),
+                game_has_started=Mock(return_value=False),
+                get_event_flag=Mock(return_value=True),
+                get_event_var=Mock(return_value=0xFFFF),
+                get_save_block=Mock(return_value=b"\xff\xff"),
+                unpack_uint16=Mock(return_value=0xFFFF),
             ),
             "modules.pokemon_party": types.SimpleNamespace(get_party=Mock(return_value=None)),
             "modules.pokemon_storage": types.SimpleNamespace(get_pokemon_storage=Mock(return_value=None)),
@@ -195,6 +201,118 @@ class TestNuzlockeSnapshots(unittest.TestCase):
         self.assertFalse(result.party_available)
         self.assertFalse(result.inventory_available)
         self.assertFalse(result.pc_available)
+        self.assertFalse(result.campaign_observation.available)
+        self.assertEqual(
+            result.campaign_observation.lifecycle,
+            CampaignObservationLifecycle.UNAVAILABLE,
+        )
+        self.assertTrue(result.campaign_observation.flags[0].value)
+
+    def test_title_screen_placeholder_is_marked_fresh_without_exposing_flags(self):
+        import modules.nuzlocke.snapshots as snapshots
+        from modules.nuzlocke.snapshots import CampaignObservationLifecycle
+
+        class FakeState(Enum):
+            TITLE_SCREEN = 1
+
+        fake_context = types.SimpleNamespace(
+            emulator=types.SimpleNamespace(get_frame_count=lambda: 8),
+            rom=types.SimpleNamespace(game_name="Pokémon Emerald"),
+        )
+        readers = {
+            "modules.context": types.SimpleNamespace(context=fake_context),
+            "modules.items": types.SimpleNamespace(get_item_bag=Mock(return_value=None)),
+            "modules.memory": types.SimpleNamespace(
+                get_game_state=Mock(return_value=FakeState.TITLE_SCREEN),
+                game_has_started=Mock(return_value=False),
+                get_event_flag=Mock(return_value=True),
+                get_event_var=Mock(return_value=0xFFFF),
+                get_save_block=Mock(return_value=b"\xff\xff"),
+                unpack_uint16=Mock(return_value=0xFFFF),
+            ),
+            "modules.pokemon_party": types.SimpleNamespace(get_party=Mock(return_value=None)),
+            "modules.pokemon_storage": types.SimpleNamespace(get_pokemon_storage=Mock(return_value=None)),
+            "modules.player": types.SimpleNamespace(
+                get_player=Mock(return_value=None),
+                get_player_avatar=Mock(return_value=None),
+                get_player_location=Mock(),
+                player_avatar_is_controllable=Mock(return_value=False),
+            ),
+        }
+        old_modules = {name: sys.modules.get(name) for name in readers}
+        try:
+            sys.modules.update(readers)
+            result = snapshots.get_nuzlocke_snapshot()
+        finally:
+            for name, module in old_modules.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
+
+        self.assertFalse(result.campaign_observation.available)
+        self.assertEqual(
+            result.campaign_observation.lifecycle,
+            CampaignObservationLifecycle.FRESH_START,
+        )
+        self.assertTrue(result.campaign_observation.flags[0].value)
+
+    def test_pre_save_opening_ui_states_are_marked_fresh(self):
+        import modules.nuzlocke.snapshots as snapshots
+        from modules.nuzlocke.snapshots import CampaignObservationLifecycle
+
+        class FakeState(Enum):
+            TITLE_SCREEN = 1
+            MAIN_MENU = 2
+            OPTIONS_MENU = 3
+            NAMING_SCREEN = 4
+            CHOOSE_STARTER = 5
+
+        fake_context = types.SimpleNamespace(
+            emulator=types.SimpleNamespace(get_frame_count=lambda: 9),
+            rom=types.SimpleNamespace(game_name="Pokémon Emerald"),
+        )
+        memory = types.SimpleNamespace(
+            get_game_state=Mock(return_value=FakeState.TITLE_SCREEN),
+            game_has_started=Mock(return_value=False),
+            get_event_flag=Mock(return_value=True),
+            get_event_var=Mock(return_value=0xFFFF),
+            get_save_block=Mock(return_value=b"\xff\xff"),
+            unpack_uint16=Mock(return_value=0xFFFF),
+        )
+        readers = {
+            "modules.context": types.SimpleNamespace(context=fake_context),
+            "modules.items": types.SimpleNamespace(get_item_bag=Mock(return_value=None)),
+            "modules.memory": memory,
+            "modules.pokemon_party": types.SimpleNamespace(get_party=Mock(return_value=None)),
+            "modules.pokemon_storage": types.SimpleNamespace(get_pokemon_storage=Mock(return_value=None)),
+            "modules.player": types.SimpleNamespace(
+                get_player=Mock(return_value=None),
+                get_player_avatar=Mock(return_value=None),
+                get_player_location=Mock(),
+                player_avatar_is_controllable=Mock(return_value=False),
+            ),
+        }
+        old_modules = {name: sys.modules.get(name) for name in readers}
+        try:
+            sys.modules.update(readers)
+            for state in (
+                FakeState.TITLE_SCREEN,
+                FakeState.MAIN_MENU,
+                FakeState.OPTIONS_MENU,
+                FakeState.NAMING_SCREEN,
+                FakeState.CHOOSE_STARTER,
+            ):
+                memory.get_game_state.return_value = state
+                result = snapshots.get_nuzlocke_snapshot()
+                self.assertEqual(result.campaign_observation.lifecycle, CampaignObservationLifecycle.FRESH_START)
+                self.assertFalse(result.campaign_observation.available)
+        finally:
+            for name, module in old_modules.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
 
     def test_malformed_storage_pokemon_is_not_normalized(self):
         import modules.nuzlocke.snapshots as snapshots
@@ -221,6 +339,7 @@ class TestNuzlockeSnapshots(unittest.TestCase):
             "modules.items": types.SimpleNamespace(get_item_bag=Mock(return_value=None)),
             "modules.memory": types.SimpleNamespace(
                 get_game_state=Mock(return_value=FakeState.OVERWORLD),
+                game_has_started=Mock(return_value=True),
                 get_event_flag=Mock(return_value=False),
             ),
             "modules.pokemon_party": types.SimpleNamespace(get_party=Mock(return_value=None)),
@@ -297,6 +416,7 @@ class TestNuzlockeSnapshots(unittest.TestCase):
             "modules.memory": types.SimpleNamespace(
                 GameState=FakeState,
                 get_game_state=Mock(return_value=FakeState.BATTLE_STARTING),
+                game_has_started=Mock(return_value=True),
                 get_event_flag=Mock(return_value=False),
             ),
             "modules.pokemon_party": types.SimpleNamespace(get_party=Mock(return_value=None)),
@@ -365,6 +485,7 @@ class TestNuzlockeSnapshots(unittest.TestCase):
             "modules.memory": types.SimpleNamespace(
                 GameState=FakeState,
                 get_game_state=Mock(return_value=FakeState.BATTLE_STARTING),
+                game_has_started=Mock(return_value=True),
                 get_event_flag=Mock(return_value=False),
             ),
             "modules.pokemon_party": types.SimpleNamespace(get_party=Mock(return_value=None)),

@@ -6,7 +6,7 @@ import traceback
 
 from modules.context import context
 from modules.console import diagnostic_print
-from modules.nuzlocke.campaign_controller import CampaignController, runtime_campaign_boundary, runtime_campaign_state
+from modules.nuzlocke.campaign_controller import CampaignController, runtime_campaign_state
 from modules.nuzlocke.campaign_objectives import plan_campaign
 from modules.nuzlocke.campaign_status import CampaignStatus
 
@@ -20,13 +20,11 @@ from modules.nuzlocke.resource_policy import (
     assess_wild_encounter,
 )
 from modules.nuzlocke.resource_runtime import (
-    execute_campaign_recovery,
     execute_planned_recovery,
     observe_resource_snapshot,
     observe_route_recovery,
 )
-from modules.nuzlocke.campaign_planner import RecoveryStop
-from modules.nuzlocke.emerald_healing_catalog import emerald_healing_sources
+from modules.nuzlocke.emerald_healing_catalog import emerald_healing_sources_for_map
 from modules.nuzlocke.emerald_healing_catalog import emerald_healing_source_for_destination
 from modules.nuzlocke.level_cap import evaluate_battle_entry
 from modules.modes._interface import BotModeError
@@ -37,7 +35,11 @@ from modules.nuzlocke.readiness_diagnostics import (
     build_progression_readiness_diagnostic,
 )
 from modules.nuzlocke.snapshots import get_nuzlocke_snapshot
-from modules.overworld import perceive_overworld, OverworldObservationResult
+from modules.overworld import (
+    perceive_overworld,
+    OverworldObservationResult,
+    publish_shared_overworld_observation,
+)
 from modules.interaction_state import InteractionPhase, observe_interaction
 from modules.player import get_player_avatar
 from modules.memory import GameState, get_game_state
@@ -46,18 +48,53 @@ from modules.goals import ReachLocation
 from modules.navigation import NavigationWorld, RouteCostAnalyzer
 from modules.world_navigation import get_world_map_graph
 from modules.modes.util.map import pokemon_center_candidates
+from modules.battle_strategies.nuzlocke_level_balancing import (
+    EmeraldIntroRivalBattleStrategy,
+    NuzlockeLevelBalancingBattleStrategy,
+    RoxanneBattleStrategy,
+)
+
+
+def _overworld_position_is_coherent(overworld) -> bool:
+    """Return whether the observed avatar position belongs to the map model.
+
+    During a map connection Emerald can publish the destination map header
+    before it publishes a valid destination coordinate (for example ``y ==
+    -1``).  That observation is useful to the transition executor, but it is
+    not safe input for campaign readiness or recovery route selection.
+    """
+    tile_at = getattr(overworld, "tile_at", None)
+    if not callable(tile_at):
+        # Lightweight test/dry-run observations may not expose topology. Keep
+        # their historical behavior and let the normal readiness checks apply.
+        return True
+    coordinates = getattr(overworld, "player_coordinates", None)
+    if not isinstance(coordinates, tuple) or len(coordinates) != 2:
+        return False
+    try:
+        return tile_at(coordinates) is not None
+    except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+        return False
 
 
 class CampaignProgressionMode(BotMode):
+    """Bot mode that delegates each frame to observation-driven campaign planning."""
+
     @staticmethod
     def name() -> str:
+        """Return the user-facing mode name."""
+
         return "Campaign Progression"
 
     @staticmethod
     def is_selectable() -> bool:
+        """Return whether the active ROM supports Emerald campaign execution."""
+
         return context.rom is not None and context.rom.is_emerald
 
     def __init__(self):
+        """Create the campaign controller and readiness scheduler."""
+
         self._readiness_scheduler = ReadinessObservationScheduler(
             self._readiness_input,
             self._cheap_readiness_context,
@@ -66,24 +103,27 @@ class CampaignProgressionMode(BotMode):
         self.controller = CampaignController(
             runtime_campaign_state,
             selector=plan_campaign,
-            campaign_boundary_handler=runtime_campaign_boundary,
             readiness_provider=self._readiness_scheduler.observe,
-            recovery_factory=lambda stop: (
-                execute_planned_recovery(
-                    stop.destination,
-                    emerald_healing_source_for_destination(stop.destination),
-                )
-                if isinstance(stop, RecoveryStop)
-                else execute_campaign_recovery()
+            # CampaignPlan owns recovery selection.  There is deliberately no
+            # fallback here that can reopen the healing catalog or select a
+            # different Center after the plan has been composed.
+            recovery_factory=lambda stop: execute_planned_recovery(
+                stop.destination,
+                emerald_healing_source_for_destination(stop.destination),
+                planned_route=stop.route,
             ),
         )
         self._readiness_evaluated = False
 
     def _campaign_controller(self):
+        """Return the controller owned by this mode instance."""
+
         return self.controller
 
     @staticmethod
     def _cheap_readiness_context():
+        """Read inexpensive position inputs used to age readiness diagnostics."""
+
         try:
             avatar = get_player_avatar()
             return (
@@ -94,13 +134,41 @@ class CampaignProgressionMode(BotMode):
         except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
             return None
 
+    @staticmethod
+    def _recovery_candidate_goals(current_location, recovery, *, is_rse):
+        """Return a bounded set of recovery destinations for readiness analysis.
+
+        ``observe_route_recovery`` has already selected the nearest safe
+        source.  Readiness only needs to compare that route with the active
+        objective, so enumerating every healing source in the region is both
+        redundant and capable of blocking the tactical loop for a long time.
+        Keep same-map sources when present (there can be more than one in a
+        future ROM), otherwise compare the selected destination only.
+        """
+        if is_rse:
+            local_sources = emerald_healing_sources_for_map(current_location[0])
+            if local_sources:
+                return tuple(ReachLocation(source.outdoor_location) for source in local_sources)
+            selected = getattr(recovery, "center_location", None)
+            if selected is not None:
+                return (ReachLocation(selected),)
+
+        centers = pokemon_center_candidates(current_location)
+        return tuple(ReachLocation(center.value) for center in centers[:1])
+
     def _readiness_input(self, objective, goal):
+        """Build the current readiness diagnostic from shared ROM observations."""
+
         self._readiness_evaluated = True
         # Perceive the overworld first.  The callback-based game-state reader
         # can briefly report UNKNOWN at a battle/script boundary even when
         # the authoritative overworld observation has already become stable.
         overworld = perceive_overworld()
-        snapshot = get_nuzlocke_snapshot()
+        publish_shared_overworld_observation(overworld)
+        runtime = getattr(context, "nuzlocke_runtime", None)
+        snapshot = getattr(runtime, "latest_snapshot", None) if runtime is not None else None
+        if snapshot is None:
+            snapshot = get_nuzlocke_snapshot()
         diagnostic_print(
             lambda: (
                 "READINESS_INPUT_LIFECYCLE: "
@@ -140,6 +208,15 @@ class CampaignProgressionMode(BotMode):
             # have cleared.
             overworld_availability = Availability.UNKNOWN
             overworld_reason = "overworld transition is in progress"
+        elif not _overworld_position_is_coherent(overworld):
+            # The destination header and avatar coordinates are read from
+            # different ROM structures.  A map connection can therefore
+            # briefly expose an out-of-bounds coordinate while the map is
+            # settling.  Do not mount recovery from that half-observation;
+            # doing so would replace the campaign loop before the transition
+            # executor can observe its postcondition.
+            overworld_availability = Availability.UNKNOWN
+            overworld_reason = "avatar coordinate is not present in current overworld topology"
         else:
             # The avatar can become controllable before a post-battle native
             # script has released the field. Use the shared interaction
@@ -149,36 +226,28 @@ class CampaignProgressionMode(BotMode):
             try:
                 interaction = observe_interaction()
                 interaction_phase = getattr(interaction, "interaction_phase", InteractionPhase.NONE)
-                dialogue_owned = (
-                    interaction_phase
-                    in {
-                        InteractionPhase.FIELD_MESSAGE_RENDER_WAIT,
-                        InteractionPhase.FIELD_MESSAGE_INPUT_WAIT,
-                        InteractionPhase.CHOICE_MENU_INPUT_WAIT,
-                    }
-                    or (
-                        interaction_phase is InteractionPhase.SCRIPT_NATIVE_WAIT
-                        and (
-                            # A native script can own the field before it
-                            # exposes a dialogue box (for example, the
-                            # post-battle rival exit movement). Readiness
-                            # must not mount a recovery plan across that
-                            # ownership boundary.
-                            getattr(interaction, "script_active", False)
-                            or
-                            getattr(interaction, "dialogue_waiting", False)
-                            or getattr(interaction, "field_message_lifecycle_active", False)
-                            or getattr(interaction, "native_function", None)
-                            in {"WaitForAorBPress", "IsFieldMessageBoxHidden"}
-                        )
+                dialogue_owned = interaction_phase in {
+                    InteractionPhase.FIELD_MESSAGE_RENDER_WAIT,
+                    InteractionPhase.FIELD_MESSAGE_INPUT_WAIT,
+                    InteractionPhase.CHOICE_MENU_INPUT_WAIT,
+                } or (
+                    interaction_phase is InteractionPhase.SCRIPT_NATIVE_WAIT
+                    and (
+                        # A native script can own the field before it
+                        # exposes a dialogue box (for example, the
+                        # post-battle rival exit movement). Readiness
+                        # must not mount a recovery plan across that
+                        # ownership boundary.
+                        getattr(interaction, "script_active", False)
+                        or getattr(interaction, "dialogue_waiting", False)
+                        or getattr(interaction, "field_message_lifecycle_active", False)
+                        or getattr(interaction, "native_function", None)
+                        in {"WaitForAorBPress", "IsFieldMessageBoxHidden"}
                     )
                 )
                 if dialogue_owned:
                     overworld_availability = Availability.UNKNOWN
-                    overworld_reason = (
-                        "interaction phase is active: "
-                        f"{getattr(interaction_phase, 'name', None)}"
-                    )
+                    overworld_reason = "interaction phase is active: " f"{getattr(interaction_phase, 'name', None)}"
             except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
                 pass
             stable_overworld = overworld_availability is Availability.KNOWN
@@ -199,23 +268,51 @@ class CampaignProgressionMode(BotMode):
                 trace=True,
             )
         resources = observe_resource_snapshot()
-        resource_availability = (
-            Availability.KNOWN
-            if resources.observation_status is ResourceObservationStatus.VALID
-            else Availability.UNKNOWN
+        # The party reader can briefly return a valid empty tuple while a
+        # battle-return script is handing control back. That is not evidence
+        # of a wiped party: treat it as unavailable unless the campaign
+        # snapshot independently confirms that an empty party is real.
+        resource_party_available = bool(resources.party) or bool(getattr(snapshot, "party_available", False))
+        resource_observation_valid = (
+            resources.observation_status is ResourceObservationStatus.VALID and resource_party_available
         )
+        resource_availability = Availability.KNOWN if resource_observation_valid else Availability.UNKNOWN
+        trace = getattr(context, "stutter_trace", None)
+        if trace is not None and callable(getattr(trace, "mark", None)):
+            trace.mark("campaign_snapshot_party_available", getattr(snapshot, "party_available", None))
+            trace.mark("campaign_snapshot_party_count", len(getattr(snapshot, "party", ()) or ()))
+            trace.mark("campaign_resource_party_count", len(resources.party))
+            trace.mark("campaign_resource_usable_party_count", len(resources.usable_party))
+            trace.mark("campaign_resource_worst_hp_ratio", resources.worst_hp_ratio)
+            trace.mark("campaign_resource_party_available", resource_party_available)
         # Route recovery is only a policy input when the party may actually
         # need recovery.  Computing it here on every readiness refresh walks
         # the map synchronously, which stalls the active tactical controller
         # even when the party is healthy and already navigating normally.
         minimum_hp_ratio = getattr(getattr(objective, "resource_policy", None), "minimum_hp_ratio", 0.5)
         recovery_needed = (
-            resources.observation_status is not ResourceObservationStatus.VALID
-            or not resources.usable_party
-            or resources.worst_hp_ratio < minimum_hp_ratio
-            or resources.worst_hp_ratio <= CampaignReadinessPolicy().opportunistic_hp_ratio
+            overworld_availability is Availability.KNOWN
+            and resource_observation_valid
+            and (
+                not resources.usable_party
+                or resources.worst_hp_ratio < minimum_hp_ratio
+                or resources.worst_hp_ratio <= CampaignReadinessPolicy().opportunistic_hp_ratio
+            )
         )
-        recovery = observe_route_recovery() if recovery_needed else RouteRecovery()
+        if trace is not None and callable(getattr(trace, "mark", None)):
+            trace.mark("campaign_recovery_needed", recovery_needed)
+        if overworld_availability is not Availability.KNOWN:
+            recovery = RouteRecovery(
+                observation_available=False,
+                observation_error=overworld_reason or "overworld_observation_unavailable",
+            )
+        elif not resource_observation_valid:
+            recovery = RouteRecovery(
+                observation_available=False,
+                observation_error=resources.observation_error or "resource_observation_unavailable",
+            )
+        else:
+            recovery = observe_route_recovery() if recovery_needed else RouteRecovery()
         recovery_available = (
             recovery.center_available
             or getattr(recovery, "healing_source_available", False)
@@ -254,6 +351,8 @@ class CampaignProgressionMode(BotMode):
                 f"frame={getattr(snapshot, 'frame', None)!r} map={getattr(overworld, 'map_id', None)!r} "
                 f"location={getattr(overworld, 'player_coordinates', None)!r} "
                 f"party={party_rows!r} party_status={getattr(snapshot, 'party_available', None)!r} resource_status={resource_status!r} "
+                f"resource_party_count={len(resources.party)!r} resource_usable_party_count={len(resources.usable_party)!r} "
+                f"resource_party_available={resource_party_available!r} recovery_needed={recovery_needed!r} "
                 f"recovery_availability={getattr(recovery_availability, 'value', None)!r} center_available={recovery_center_available!r} "
                 f"center_safe={recovery_safe!r} distance_to_center={recovery_distance!r} "
                 "distance_metric='calculate_path step count' "
@@ -278,7 +377,13 @@ class CampaignProgressionMode(BotMode):
                 ),
                 trace=True,
             )
-        if recovery_needed and overworld is not None and goal is not None and snapshot.player_available:
+        if (
+            recovery_needed
+            and overworld is not None
+            and overworld_availability is Availability.KNOWN
+            and goal is not None
+            and snapshot.player_available
+        ):
             operation = "initialization"
             candidate_goals = ()
             current_location = None
@@ -291,15 +396,16 @@ class CampaignProgressionMode(BotMode):
                 world = NavigationWorld.from_overworld(overworld)
                 operation = "candidate enumeration"
                 if context.rom.is_rse:
-                    # The world planner chooses the nearest reachable source;
-                    # the catalog deliberately includes non-Center sources.
-                    candidates = tuple(
-                        ReachLocation(source.outdoor_location)
-                        for source in emerald_healing_sources()
+                    candidates = self._recovery_candidate_goals(
+                        current_location,
+                        recovery,
+                        is_rse=True,
                     )
                 else:
-                    candidates = tuple(
-                        ReachLocation(center.value) for center in pokemon_center_candidates(current_location)
+                    candidates = self._recovery_candidate_goals(
+                        current_location,
+                        recovery,
+                        is_rse=False,
                     )
                 candidate_goals = candidates
                 operation = "WorldMapGraph acquisition"
@@ -373,7 +479,61 @@ class CampaignProgressionMode(BotMode):
             )
             if not legality.allowed:
                 raise BotModeError(f"Campaign battle entry rejected: {legality.reason}")
+
+            # A preparation area still owns the first legal wild encounter.
+            # Resolve that ownership before selecting the training strategy;
+            # otherwise the strategy would defeat a catchable encounter.
+            if encounter is not None and controller is not None and controller.last_selection is not None:
+                runtime = getattr(context, "nuzlocke_runtime", None)
+                try:
+                    location = get_player_avatar().map_group_and_number
+                    legal_capture_target = bool(
+                        runtime is not None and runtime.capture_target_for(location, is_wild=True, is_trainer=False)
+                    )
+                except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+                    legal_capture_target = False
+                if legal_capture_target:
+                    diagnostic_print(
+                        lambda: (
+                            "CAMPAIGN_WILD_CAPTURE_HANDOFF: "
+                            f"location={location!r} action='Catch' objective="
+                            f"{controller.last_selection.objective.objective_id!r}"
+                        ),
+                        trace=True,
+                    )
+                    return BattleAction.Catch
+            if objective.objective_id == "prepare_roxanne":
+                return NuzlockeLevelBalancingBattleStrategy()
+            if objective.objective_id == "defeat_roxanne":
+                return RoxanneBattleStrategy()
+            if objective.objective_id == "complete_intro_rival":
+                return EmeraldIntroRivalBattleStrategy()
         if encounter is not None and controller is not None and controller.last_selection is not None:
+            # The Nuzlocke rules projection is authoritative about whether
+            # this wild battle owns the area's first legal encounter.  Make
+            # that decision at the listener boundary so Campaign Progression
+            # can use the existing CatchStrategy; relying only on the later
+            # battle-state property lets the opening turn fall through to a
+            # defeating move when the projection has just crossed the battle
+            # start boundary.
+            runtime = getattr(context, "nuzlocke_runtime", None)
+            try:
+                location = get_player_avatar().map_group_and_number
+                legal_capture_target = bool(
+                    runtime is not None and runtime.capture_target_for(location, is_wild=True, is_trainer=False)
+                )
+            except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+                legal_capture_target = False
+            if legal_capture_target:
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_WILD_CAPTURE_HANDOFF: "
+                        f"location={location!r} action='Catch' objective="
+                        f"{controller.last_selection.objective.objective_id!r}"
+                    ),
+                    trace=True,
+                )
+                return BattleAction.Catch
             objective = controller.last_selection.objective
             resource_policy = getattr(objective, "resource_policy", None)
             if resource_policy is not None:
@@ -406,6 +566,8 @@ class CampaignProgressionMode(BotMode):
         return BattleAction.Fight
 
     def on_battle_ended(self, outcome) -> None:
+        """Invalidate readiness after a battle changes party or route state."""
+
         diagnostic_print(
             lambda: (
                 "CAMPAIGN_BATTLE_ENDED: "
@@ -420,6 +582,8 @@ class CampaignProgressionMode(BotMode):
             scheduler.invalidate("battle_ended")
 
     def run(self) -> Generator:
+        """Yield frame boundaries while the campaign controller remains active."""
+
         # CampaignProgression owns campaign intent from the first observation.
         # The selected objective's executor owns frame-local emulator details.
         previous = None

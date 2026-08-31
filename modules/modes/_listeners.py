@@ -12,7 +12,7 @@ def clear_transient_battle_message() -> None:
 
 from modules.debug import debug
 from modules.encounter import handle_encounter, EncounterInfo, log_encounter
-from modules.map import get_map_objects, get_map_data_for_current_position
+from modules.map import get_map_objects
 from modules.map_data import MapFRLG, MapRSE, is_safari_map
 from modules.memory import (
     GameState,
@@ -36,11 +36,18 @@ from modules.player import (
 )
 from modules.pokemon import StatusCondition, clear_opponent, get_opponent
 from modules.pokemon_party import get_party
-from modules.tasks import get_global_script_context, task_is_active, get_task, get_tasks
+from modules.tasks import (
+    get_global_script_context,
+    is_field_message_task_waiting_for_input,
+    task_is_active,
+    get_task,
+    get_tasks,
+)
 from ._interface import BattleAction, BotListener, BotMode, FrameInfo
 from .util import isolate_inputs, save_the_game, leave_safari_zone
 from ..battle_handler import handle_battle
 from ..battle_state import (
+    battle_is_active,
     get_last_battle_outcome,
     BattleOutcome,
     get_encounter_type,
@@ -143,6 +150,45 @@ class BattleListener(BotListener):
         self._reported_end_of_battle = False
         self._current_action: BattleAction | None = None
         self._post_battle_wait_frames = 0
+        self._post_battle_message_input_issued = False
+        # 0 = no stale-menu cleanup, 1 = party menu closed, waiting for the
+        # owning start menu to appear, 2 = start menu appeared and needs one
+        # task tick before input, 3 = start-menu close requested.
+        self._stale_party_menu_cleanup_stage = 0
+
+    @staticmethod
+    def _is_restored_battle_party_selection(frame: FrameInfo) -> bool:
+        """Recognize a battle resumed from a save-state at party selection.
+
+        Emerald uses ``GameState.PARTY_MENU`` while asking the player to send
+        out a replacement Pokémon.  That state is also used by ordinary field
+        party-menu interactions, so the listener must require battle-owned ROM
+        evidence before taking control.  The choose-mon task is the strongest
+        signal; the trainer-battle scripts cover the short transition where
+        the task has not been installed yet.
+        """
+        if frame.game_state is not GameState.PARTY_MENU:
+            return False
+        if not (
+            frame.task_is_active("Task_HandleChooseMonInput")
+            or any(
+                frame.script_is_active(script_name)
+                for script_name in (
+                    "EventScript_DoTrainerBattle",
+                    "EventScript_DoTrainerBattleFromApproach",
+                )
+            )
+        ):
+            return False
+        # A stale choose-mon task can survive a completed trainer battle in a
+        # save-state.  It is not a restored battle selection unless the ROM's
+        # battle callback is still active and the outcome is unresolved.
+        try:
+            if not battle_is_active() or get_last_battle_outcome() is not BattleOutcome.InProgress:
+                return False
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            return False
+        return True
 
     @staticmethod
     def _controller_boundary_snapshot() -> str:
@@ -176,8 +222,13 @@ class BattleListener(BotListener):
         )
 
     def handle_frame(self, bot_mode: BotMode, frame: FrameInfo):
+        if self._dismiss_stale_completed_battle_party_menu(frame):
+            return
+        restored_battle_party_selection = self._is_restored_battle_party_selection(frame)
         if (not self._in_battle or self._reported_end_of_battle) and (
-            frame.game_state in self.battle_states or frame.task_is_active("Task_BattleStart")
+            frame.game_state in self.battle_states
+            or frame.task_is_active("Task_BattleStart")
+            or restored_battle_party_selection
         ):
             self._in_battle = True
             diagnostic_print(
@@ -191,6 +242,18 @@ class BattleListener(BotListener):
             self._reported_end_of_battle = False
             self._current_action = None
             self._post_battle_wait_frames = 0
+            self._post_battle_message_input_issued = False
+            self._stale_party_menu_cleanup_stage = 0
+
+            if restored_battle_party_selection:
+                # The battle-start frame occurred before this process was
+                # restored.  Replaying on_battle_started would duplicate
+                # encounter/battle history and could choose a new strategy;
+                # the ROM is already waiting for the next party member, so
+                # resume with the normal battle controller directly.
+                self._reported_start_of_battle = True
+                self._current_action = BattleAction.Fight
+                context.controller_stack.append(self.fight(DefaultBattleStrategy()))
 
         elif self._in_battle and not self._reported_start_of_battle and get_game_state() == GameState.BATTLE:
             self._reported_start_of_battle = True
@@ -210,7 +273,12 @@ class BattleListener(BotListener):
             if encounter_type is EncounterType.Trainer and not isinstance(action, BattleStrategy):
                 action = BattleAction.Fight
             elif encounter_type is EncounterType.Tutorial:
-                action = BattleAction.CustomAction
+                # Modes that own the tutorial can still return CustomAction,
+                # but campaign mode explicitly requests Fight so the ROM's
+                # Wally battle script is advanced by the normal controller.
+                # Previously this branch overwrote that request and left the
+                # campaign loop waiting forever in GameState.BATTLE.
+                action = action if action is BattleAction.Fight else BattleAction.CustomAction
             elif action is None:
                 action = handle_encounter(self._active_wild_encounter)
 
@@ -313,6 +381,86 @@ class BattleListener(BotListener):
             elif is_starting_to_become_visible:
                 self._was_starting_to_become_visible = True
 
+    def _dismiss_stale_completed_battle_party_menu(self, frame: FrameInfo) -> bool:
+        """Release a completed battle's stale party-menu task after restart.
+
+        A save-state can be captured between the battle callback returning and
+        the ROM clearing ``Task_HandleChooseMonInput``.  The task is no longer
+        a battle-owned replacement prompt when the callback is inactive and
+        the outcome is terminal.  Dismiss it once so campaign execution can
+        resume from the overworld boundary.
+        """
+        stale_task = frame.game_state is GameState.PARTY_MENU and frame.task_is_active("Task_HandleChooseMonInput")
+        if not stale_task:
+            if self._stale_party_menu_cleanup_stage == 1:
+                if frame.task_is_active("Task_ShowStartMenu"):
+                    diagnostic_print(
+                        lambda: ("BATTLE_STALE_START_MENU_READY: " f"frame={getattr(context, 'frame', None)!r}"),
+                        trace=True,
+                    )
+                    # The task is first observed on the frame where its
+                    # initialization callback is still running.  A B pulse
+                    # on that frame is consumed before HandleStartMenuInput
+                    # is installed, so defer the actual dismissal one frame.
+                    self._stale_party_menu_cleanup_stage = 2
+                    return True
+                # ``Task_ClosePartyMenuAndSetCB2`` briefly returns the ROM to
+                # an overworld callback before the owning start menu's fade
+                # task is installed. Keep cleanup ownership across that
+                # transient boundary; otherwise the campaign listener can
+                # resume and the stale start menu remains open.
+                return self._stale_party_menu_cleanup_stage == 1
+            if self._stale_party_menu_cleanup_stage == 2:
+                if frame.task_is_active("Task_ShowStartMenu"):
+                    diagnostic_print(
+                        lambda: (
+                            "BATTLE_STALE_START_MENU_DISMISS: " f"frame={getattr(context, 'frame', None)!r} input='B'"
+                        ),
+                        trace=True,
+                    )
+                    press_button_fresh = getattr(type(context.emulator), "press_button_fresh", None)
+                    if callable(press_button_fresh):
+                        context.emulator.press_button_fresh("B")
+                    else:
+                        context.emulator.press_button("B")
+                    self._stale_party_menu_cleanup_stage = 3
+                    return True
+                # The task disappeared before it was ready for input. Let
+                # the normal campaign listeners re-observe the resulting
+                # boundary instead of manufacturing another button press.
+                self._stale_party_menu_cleanup_stage = 0
+                return False
+            if self._stale_party_menu_cleanup_stage == 3:
+                if frame.game_state is GameState.OVERWORLD and not frame.task_is_active("Task_ShowStartMenu"):
+                    self._stale_party_menu_cleanup_stage = 0
+                    return False
+                return True
+            return False
+        try:
+            completed = not battle_is_active() and get_last_battle_outcome() is not BattleOutcome.InProgress
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            self._stale_party_menu_cleanup_stage = 0
+            return False
+        if not completed:
+            self._stale_party_menu_cleanup_stage = 0
+            return False
+        if self._stale_party_menu_cleanup_stage == 0:
+            diagnostic_print(
+                lambda: (
+                    "BATTLE_STALE_PARTY_MENU_DISMISS: "
+                    f"frame={getattr(context, 'frame', None)!r} input='B' "
+                    f"outcome={get_last_battle_outcome()!r}"
+                ),
+                trace=True,
+            )
+            press_button_fresh = getattr(type(context.emulator), "press_button_fresh", None)
+            if callable(press_button_fresh):
+                context.emulator.press_button_fresh("B")
+            else:
+                context.emulator.press_button("B")
+            self._stale_party_menu_cleanup_stage = 1
+        return True
+
     @debug.track
     def _wait_until_battle_is_over(self):
         diagnostic_print(
@@ -329,18 +477,64 @@ class BattleListener(BotListener):
                     ),
                     trace=True,
                 )
-            if get_game_state() != GameState.OVERWORLD or get_map_data_for_current_position().map_type != "Underwater":
+            # ``handle_battle`` returns as soon as the battle main callback
+            # stops being active, but the ROM may still need a few B presses
+            # while it is in a battle transition state.  Once it has returned
+            # to OVERWORLD, field scripts own input (for example the Devon
+            # researcher scene), so this controller must only yield and let
+            # that script finish.
+            if get_game_state() in self.battle_states:
                 diagnostic_print(
                     lambda: f"BATTLE_POSTWAIT_INPUT: frame={getattr(context, 'frame', None)!r} input='B' in_battle={self._in_battle!r} battle_active={__import__('modules.battle_state', fromlist=['battle_is_active']).battle_is_active()!r} game_state={get_game_state().name!r}",
                     trace=True,
                 )
                 context.emulator.press_button("B")
+                self._post_battle_message_input_issued = False
+            elif self._post_battle_field_message_ready():
+                # A trainer/tutorial can hand a field-message script back to
+                # the overworld before the battle listener has released its
+                # stack frame. Advance one ready message with a fresh A edge,
+                # then wait for the ROM to leave the message boundary. This
+                # preserves script ownership without the old every-frame B
+                # spam that could be consumed by the next script command.
+                if not self._post_battle_message_input_issued:
+                    diagnostic_print(
+                        lambda: (
+                            "BATTLE_POSTWAIT_FIELD_MESSAGE_INPUT: "
+                            f"frame={getattr(context, 'frame', None)!r} input='A'"
+                        ),
+                        trace=True,
+                    )
+                    press_button_fresh = getattr(type(context.emulator), "press_button_fresh", None)
+                    if callable(press_button_fresh):
+                        context.emulator.press_button_fresh("A")
+                    else:
+                        context.emulator.press_button("A")
+                    self._post_battle_message_input_issued = True
+            else:
+                self._post_battle_message_input_issued = False
             yield
 
         diagnostic_print(
             lambda: "BATTLE_CONTROLLER_RETURN: " + self._controller_boundary_snapshot(),
             trace=True,
         )
+
+    @staticmethod
+    def _post_battle_field_message_ready() -> bool:
+        """Return whether a post-battle ordinary field message accepts A."""
+        try:
+            if is_field_message_task_waiting_for_input():
+                return True
+            script_context = get_global_script_context()
+            return bool(
+                script_context is not None
+                and script_context.is_active
+                and script_context.native_function_name == "WaitForAorBPress"
+                and script_context.script_function_name == "Std_MsgboxDefault"
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            return False
 
     @isolate_inputs
     @debug.track

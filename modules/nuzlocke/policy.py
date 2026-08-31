@@ -27,6 +27,8 @@ from .events import (
 
 
 class PersistenceClass(str, Enum):
+    """Destination class for an observed event in runtime persistence."""
+
     DURABLE = "durable"
     EPHEMERAL = "ephemeral"
     DIAGNOSTIC = "diagnostic"
@@ -68,13 +70,19 @@ class EventStatistics:
     """Low-overhead counts for development diagnostics, not per-frame output."""
 
     def __init__(self) -> None:
+        """Create empty counters for observed event classifications."""
+
         self._counts: Counter[tuple[PersistenceClass, str]] = Counter()
 
     def record(self, event: Event, persistence_class: PersistenceClass | None = None) -> None:
+        """Increment the counter for an event and its persistence class."""
+
         classification = persistence_class or classify_event(event)
         self._counts[(classification, type(event).__name__)] += 1
 
     def snapshot(self) -> dict[str, dict[str, int]]:
+        """Return event counts grouped by persistence class and type."""
+
         result: dict[str, dict[str, int]] = {classification.value: {} for classification in PersistenceClass}
         for (classification, event_type), count in self._counts.items():
             result[classification.value][event_type] = count

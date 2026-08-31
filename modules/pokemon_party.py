@@ -4,6 +4,34 @@ from modules.context import context
 from modules.memory import read_symbol, get_event_var
 from modules.pokemon import Pokemon, Move, Species, Ability
 from modules.state_cache import state_cache
+from modules.tasks import get_global_script_context, get_task
+
+_POKEMON_CENTER_RETURN_SCRIPT = "EventScript_PkmnCenterNurse_ReturnPkmn"
+
+
+def _party_read_is_during_nurse_message_render() -> bool:
+    """Avoid speculative emulation while Emerald renders the nurse return text.
+
+    A party slot can be transiently invalid while Emerald restores the party.
+    The normal retry path peeks one native frame ahead, but that frame can
+    re-enter the known mGBA render stall.  The controller will own the next
+    fresh-B pulse; this read must remain passive until then.
+    """
+    try:
+        if not context.rom.is_emerald:
+            return False
+        script_context = get_global_script_context()
+        task = get_task("Task_DrawFieldMessage")
+        return bool(
+            script_context is not None
+            and getattr(script_context, "is_active", False)
+            and getattr(script_context, "script_function_name", None) == _POKEMON_CENTER_RETURN_SCRIPT
+            and getattr(script_context, "native_function_name", None) == "IsFieldMessageBoxHidden"
+            and task is not None
+            and task.data_value(0) == 2
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+        return False
 
 
 class PartyPokemon(Pokemon):
@@ -135,6 +163,12 @@ def get_party() -> Party:
         # In order to still get a valid result, we will 'peek' into next frame's memory by
         # (1) advancing the emulation by one frame, (2) reading the memory, (3) restoring the previous
         # frame's state, so we don't mess with frame accuracy.
+        if pokemon is None and state_cache.party.value is not None and _party_read_is_during_nurse_message_render():
+            # Returning the last valid snapshot is safe for the frame-level
+            # observers and, importantly, keeps this path from calling
+            # peek_frame() while the nurse's message printer is rendering.
+            return state_cache.party.value
+
         if pokemon is None:
             retries = 5
             with context.emulator.peek_frame():

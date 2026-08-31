@@ -29,6 +29,7 @@ from modules.overworld import (
     WarpObservation,
     WarpActivation,
     prewarm_static_map_observation,
+    static_map_transitions,
 )
 from modules.trigger_bindings import BindingResolution
 from modules.world_navigation import WorldMapGraph, WorldNavigationError, WorldRoute, get_world_map_graph
@@ -205,12 +206,12 @@ def effective_transition(transition: WorldTransition) -> WorldTransition:
             ),
             trace=True,
         )
-    return WorldTransition(
-        transition.entry,
-        observation.observed_destination,
-        required_facing=transition.required_facing,
-        kind=transition.kind,
-    )
+    # Reconcile only the destination learned from the live ROM.  Rebuilding
+    # the object as a generic WorldTransition silently discards executable
+    # metadata (notably DIRECTIONAL_STEP/arrow-warp activation), which can
+    # make a north-facing arrow warp fall back to the avatar's current
+    # direction and drive the player away from its source tile.
+    return replace(transition, destination=observation.observed_destination)
 
 
 def transitions_match(left: WorldTransition, right: WorldTransition) -> bool:
@@ -242,6 +243,11 @@ class NavigableTile:
     has_encounters: bool = False
     cannot_run: bool = False
     forced_movement_to: Mapping[Direction, tuple[Location, int]] | None = None
+    # RSE/FRLG elevation is part of collision semantics. In particular,
+    # elevation 1 is normally water while walkable ground is elevation 3.
+    # Keep it optional so synthetic worlds and incomplete observations retain
+    # their historical, topology-only behavior.
+    elevation: int | None = None
 
 
 class _DynamicTileMapping(Mapping[Location, NavigableTile]):
@@ -254,13 +260,14 @@ class _DynamicTileMapping(Mapping[Location, NavigableTile]):
         if location[1] not in self._blocked or tile.blocked:
             return tile
         return NavigableTile(
-            tile.location,
-            True,
-            tile.allowed_directions,
-            tile.traversal_cost,
-            tile.has_encounters,
-            tile.cannot_run,
-            tile.forced_movement_to,
+            location=tile.location,
+            blocked=True,
+            allowed_directions=tile.allowed_directions,
+            traversal_cost=tile.traversal_cost,
+            has_encounters=tile.has_encounters,
+            cannot_run=tile.cannot_run,
+            forced_movement_to=tile.forced_movement_to,
+            elevation=tile.elevation,
         )
 
     def __iter__(self):
@@ -344,6 +351,7 @@ def prewarm_navigation_tiles(map_id, tiles: tuple) -> None:
                     tile.has_encounters,
                     tile.cannot_run,
                     getattr(tile, "forced_movement_to", None),
+                    getattr(tile, "elevation", None),
                 )
                 for tile in tiles
             },
@@ -359,6 +367,8 @@ class NavigationWorld:
     facing: Direction | None = None
     transitions: tuple[WorldTransition, ...] = ()
     running_shoes: bool = False
+    player_elevation: int | None = None
+    surfing: bool = False
     _transitions_by_source: dict[Location, tuple[WorldTransition, ...]] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -370,6 +380,13 @@ class NavigationWorld:
                 source = transition_approach_position(transition)
             if source is not None:
                 indexed.setdefault(source, []).append(transition)
+            # Most warps activate on their entry tile, but ROM-defined
+            # field-effect transitions (for example Center escalators) expose
+            # a distinct source tile.  Index those source states too so
+            # ReachWarp checks do not scan every transition for every search
+            # node.
+            for activation_source in getattr(transition, "activation_locations", ()):
+                indexed.setdefault(activation_source, []).append(transition)
         object.__setattr__(
             self,
             "_transitions_by_source",
@@ -399,7 +416,42 @@ class NavigationWorld:
                 effective_transition(t) for t in (getattr(observation, "transitions", ()) or observation.warps)
             ),
             running_shoes=getattr(observation, "running_shoes", False),
+            player_elevation=(
+                getattr(observation, "player_current_elevation", None)
+                if getattr(observation, "player_current_elevation", None) is not None
+                else getattr(observation, "player_elevation", None)
+            ),
+            surfing=getattr(observation, "surfing", False),
         )
+
+    def _elevation_allows_step(self, source: Location, destination: Location) -> bool:
+        """Apply the coarse elevation rule used by legacy pathfinding.
+
+        Emerald exposes water with ordinary walk collision. Without this
+        guard, an early-game route can select a visually adjacent pond tile
+        as though it were land. Elevation 1 -> 3 is a valid exit; 3 -> 1
+        requires an already active Surf state. Unknown elevations remain
+        permissive for synthetic or incomplete observations.
+        """
+        source_tile = self.tiles.get(source)
+        destination_tile = self.tiles.get(destination)
+        if source_tile is None or destination_tile is None:
+            return True
+        source_elevation = source_tile.elevation
+        if source_elevation is None:
+            source_elevation = self.player_elevation
+        destination_elevation = destination_tile.elevation
+        if source_elevation is None or destination_elevation is None:
+            return True
+        if source_elevation == destination_elevation:
+            return True
+        if source_elevation in (0, 15) or destination_elevation in (0, 15):
+            return True
+        if source_elevation == 1 and destination_elevation == 3:
+            return True
+        if source_elevation == 3 and destination_elevation == 1:
+            return self.surfing
+        return False
 
     def neighbors(self, location: Location) -> tuple[tuple[Direction, Location, bool], ...]:
         tile = self.tiles.get(location)
@@ -421,6 +473,7 @@ class NavigationWorld:
             if (
                 neighbour is not None
                 and not neighbour.blocked
+                and self._elevation_allows_step(location, destination)
                 and (
                     destination in transition_entries
                     or neighbour.allowed_directions is None
@@ -430,7 +483,7 @@ class NavigationWorld:
                 forced = (neighbour.forced_movement_to or {}).get(direction)
                 result.append((direction, forced[0] if forced is not None else destination, False))
         for transition in self._transitions_by_source.get(location, ()):
-            if transition.destination is not None:
+            if transition.destination is not None and self._elevation_allows_step(location, transition.destination):
                 result.append((self._warp_direction(location, transition), transition.destination, True))
         return tuple(result)
 
@@ -779,7 +832,12 @@ def transition_approach_position(transition: WorldTransition) -> Location | None
     )
 
 
-def _global_navigation_world(observation_world: NavigationWorld, graph: WorldMapGraph) -> NavigationWorld:
+def _global_navigation_world(
+    observation_world: NavigationWorld,
+    graph: WorldMapGraph,
+    *,
+    enrich_maps: tuple[MapId, ...] = (),
+) -> NavigationWorld:
     """Build the lazy static world overlay used by the exact-state search.
 
     Map metadata is materialized only for maps reachable through the coarse
@@ -791,6 +849,14 @@ def _global_navigation_world(observation_world: NavigationWorld, graph: WorldMap
         {edge.source_map for edge in graph.edges} | {edge.destination_map for edge in graph.edges},
     )
     transitions: list[WorldTransition] = list(observation_world.transitions or observation_world.warps)
+    rom_transitions: dict[MapId, tuple[WorldTransition, ...]] = {}
+    for map_id in enrich_maps:
+        try:
+            rom_transitions[map_id] = static_map_transitions(map_id)
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            # A partially available map should not make a semantic route
+            # disappear. The graph transition remains a valid fallback.
+            continue
     known_entries = {(t.kind, t.entry, t.destination) for t in transitions}
     for edge in graph.edges:
         for source, destination in zip(edge.source_coordinates, edge.destination_coordinates):
@@ -804,6 +870,17 @@ def _global_navigation_world(observation_world: NavigationWorld, graph: WorldMap
                 ),
                 kind="map_connection" if edge.kind == "connection" else "warp",
             )
+            if edge.source_map in rom_transitions and transition.kind == "warp":
+                rom_transition = next(
+                    (
+                        candidate
+                        for candidate in rom_transitions[edge.source_map]
+                        if candidate.entry == transition.entry and candidate.destination == transition.destination
+                    ),
+                    None,
+                )
+                if rom_transition is not None:
+                    transition = rom_transition
             transition = effective_transition(transition)
             if (transition.kind, transition.entry, transition.destination) not in known_entries:
                 transitions.append(transition)
@@ -823,6 +900,9 @@ def _global_navigation_world(observation_world: NavigationWorld, graph: WorldMap
         bindings=observation_world.bindings,
         facing=observation_world.facing,
         transitions=tuple(transitions),
+        running_shoes=observation_world.running_shoes,
+        player_elevation=observation_world.player_elevation,
+        surfing=observation_world.surfing,
     )
 
 
@@ -846,9 +926,16 @@ def plan_with_world_navigation(
     if (
         isinstance(navigation_goal.target, ReachWarp)
         and navigation_goal.target.warp is not None
-        and navigation_goal.target.warp.kind == "map_connection"
         and target_map != start[0]
     ):
+        # ``_observed_exit_goal`` has already selected an executable ROM
+        # transition from the current perception.  Searching the global world
+        # again for that exact door/arrow warp is both redundant and costly:
+        # every expanded state would compare its transition set against the
+        # selected transition.  More importantly, a large Emerald world can
+        # spend long enough in that comparison that the frame loop stops
+        # advancing.  Exact observed transitions are local tactical goals;
+        # reserve global search for unresolved semantic destinations.
         return plan_observed_warp_locally(world, start, navigation_goal.target), None
     if target_map is None or target_map == start[0]:
         return GoalAwareNavigator(world).plan(start, goal, algorithm=algorithm), None
@@ -880,7 +967,11 @@ def plan_with_world_navigation(
     # remains below for compatibility with callers that explicitly require a
     # selected observed warp, but ordinary semantic cross-map goals use the
     # global state search.
-    global_world = _global_navigation_world(world, graph)
+    global_world = _global_navigation_world(
+        world,
+        graph,
+        enrich_maps=tuple(route.maps[:-1]),
+    )
     if isinstance(navigation_goal.target, ReachWarp):
         global_goal = navigation_goal.target
         # The static graph's connection direction is map metadata, while the
@@ -903,14 +994,7 @@ def plan_with_world_navigation(
                 )
             ]
             transitions.append(selected)
-            global_world = NavigationWorld(
-                tiles=global_world.tiles,
-                warps=global_world.warps,
-                triggers=global_world.triggers,
-                bindings=global_world.bindings,
-                facing=global_world.facing,
-                transitions=tuple(transitions),
-            )
+            global_world = replace(global_world, transitions=tuple(transitions))
     else:
         # An unresolved interaction is intentionally a map-boundary goal.
         # Runtime observation resolves its interaction after arrival.
@@ -1324,9 +1408,11 @@ def plan_with_world_navigation(
         (
             (start[0], activation_position)
             if connection_activation and activation_position is not None
-            else (start[0], source_coordinates)
-            if directional_activation
-            else (start[0], activation_position or source_coordinates)
+            else (
+                (start[0], source_coordinates)
+                if directional_activation
+                else (start[0], activation_position or source_coordinates)
+            )
         ),
         (edge.destination_map, destination_coordinates),
         transition_kind="map_connection" if edge.kind == "connection" else edge.kind,
@@ -1357,6 +1443,23 @@ def plan_observed_warp_locally(
         raise NavigationError("observed warp destination no longer matches the goal")
     if goal.destination_map is not None and selected.destination[0] != goal.destination_map:
         raise NavigationError("observed warp map no longer matches the goal")
+    # A step-on door warp exposes both its entry tile and the adjacent tiles
+    # from which the field engine will accept the step.  ReachWarp's generic
+    # evaluator treats those activation tiles as satisfied, but the ROM still
+    # requires the player to enter the entry tile.  Keep planning until the
+    # entry tile instead of returning an empty plan (which the controller
+    # interprets as a completed goal and re-observes forever).
+    if (
+        selected.activation is WarpActivation.STEP_ON
+        and start != selected.entry
+        and start in selected.activation_locations
+    ):
+        local_plan = GoalAwareNavigator(world).plan(start, ReachLocation(selected.entry))
+        return NavigationPlan(
+            local_plan.actions,
+            selected.entry,
+            GoalAwareNavigator(world)._metrics(local_plan.actions),
+        )
     # ReachWarp's local terminal condition is deliberately the entry/source
     # state.  For directional-step warps that is not the transition itself:
     # the ROM consumes one additional directional input while standing on the
@@ -1409,7 +1512,17 @@ def plan_observed_warp_locally(
         and start == selected.entry
         and not any(action.action_type is NavigationActionType.WARP for action in local_plan.actions)
     ):
-        direction = selected.activation_direction or selected.required_facing or world.facing or Direction.South
+        direction = selected.activation_direction
+        if direction is None:
+            direction = selected.required_facing
+        # A plain STEP_ON warp has no distinct second directional input, so
+        # carry the approach/final facing into its synthetic verification
+        # action.  Explicit ROM direction metadata must still preserve North
+        # (enum value 0) correctly.
+        if direction is None:
+            direction = world.facing
+        if direction is None:
+            direction = Direction.South
         crossing = NavigationAction(
             NavigationActionType.WARP,
             direction,
@@ -1958,11 +2071,19 @@ class GoalAwareNavigator:
         interaction targets with no explicit positions keeps the heuristic
         admissible when the target's geometry is incomplete.
         """
-        if any(warp.entry[0] == location[0] for warp in self.world.warps):
-            return (0, 0, 0, 0, 0, 0)
         positions: list[Location] = []
         if isinstance(target, ReachLocation):
             positions = [target.location]
+        elif isinstance(target, ReachWarp):
+            transitions = target.warps or ((target.warp,) if target.warp is not None else self.world.transitions)
+            for transition in transitions:
+                if transition is None or transition.destination is None:
+                    continue
+                source = transition_approach_position(transition)
+                if source is None:
+                    activation_locations = getattr(transition, "activation_locations", ())
+                    source = next(iter(activation_locations), transition.entry)
+                positions.append(source)
         elif isinstance(target, (ActivateTrigger, ReachInteractionPosition, EngageTrainer)):
             for trigger in self.world.triggers:
                 matches = (
@@ -2016,17 +2137,14 @@ class GoalAwareNavigator:
             )
             return matched
         if isinstance(target, ReachWarp):
-            transitions = self.world.transitions or self.world.warps
-            allowed_transitions = target.warps or ((target.warp,) if target.warp is not None else transitions)
-            transitions = tuple(
-                warp
-                for warp in transitions
-                if any(transitions_match(warp, allowed) for allowed in allowed_transitions)
-                and (
-                    target.destination_map is None
-                    or (warp.destination is not None and warp.destination[0] == target.destination_map)
-                )
-            )
+            all_transitions = self.world.transitions or self.world.warps
+            allowed_transitions = target.warps or ((target.warp,) if target.warp is not None else all_transitions)
+            # ReachWarp is evaluated for every search node.  Restrict the
+            # candidates to transitions executable from this node before
+            # comparing identities.  The previous implementation scanned all
+            # boundary endpoints on every node; on Emerald's long connection
+            # strips that turned one local route into a frame-scale search.
+            transitions = self.world._transitions_by_source.get(location, ())
             matched = any(
                 (
                     location == transition_approach_position(warp)
@@ -2052,9 +2170,13 @@ class GoalAwareNavigator:
                     )
                 )
                 and (target.destination is None or warp.destination == target.destination)
-                and (target.destination_map is None or warp.destination[0] == target.destination_map)
+                and (
+                    target.destination_map is None
+                    or (warp.destination is not None and warp.destination[0] == target.destination_map)
+                )
                 and (target.warp is None or transitions_match(warp, target.warp))
                 and (not target.warps or any(transitions_match(warp, allowed) for allowed in target.warps))
+                and any(transitions_match(warp, allowed) for allowed in allowed_transitions)
                 for warp in transitions
             )
             return matched
@@ -2085,7 +2207,13 @@ class GoalAwareNavigator:
                 continue
             if target.warp is not None and not transitions_match(transition, target.warp):
                 continue
-            direction = transition.activation_direction or transition.required_facing or facing or Direction.South
+            direction = transition.activation_direction
+            if direction is None:
+                direction = transition.required_facing
+            if direction is None:
+                direction = facing
+            if direction is None:
+                direction = Direction.South
             return (
                 actions
                 + (
@@ -2166,14 +2294,23 @@ class GoalAwareNavigator:
                     approach = transition_approach_position(transition)
                     if approach == source and entry != source:
                         # Global map-connection successors originate at the
-                        # executable approach tile.  Reconstruct the same
+                        # executable approach tile. Reconstruct the same
                         # two-input action contract as local planning: first
                         # step onto the boundary, then cross the connection.
+                        #
+                        # The second action must be sourced at ``entry``.
+                        # ``approach`` is where the search discovers the
+                        # transition, but the first MOVE has already placed
+                        # the avatar on the boundary by the time the
+                        # crossing input is dispatched. Keeping the WARP
+                        # source at ``approach`` makes the route controller
+                        # see a divergence and replan back one tile forever
+                        # at live map connections.
                         actions.append(
                             NavigationAction(
                                 NavigationActionType.WARP,
                                 transition.required_facing,
-                                approach if connection_source_is_approach else entry,
+                                entry,
                                 destination_location,
                                 transition_kind="map_connection",
                             )

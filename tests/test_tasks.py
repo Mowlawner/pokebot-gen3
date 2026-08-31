@@ -72,6 +72,24 @@ class TestIsWaitingForInput(unittest.TestCase):
         ):
             self.assertFalse(is_field_message_waiting_for_input())
 
+    def test_emerald_printer_pause_states_are_input_waits_but_rendering_is_not(self):
+        from modules.tasks import is_waiting_for_input
+
+        for state in (1, 2, 3):
+            with (
+                patch("modules.tasks.context", types.SimpleNamespace(rom=types.SimpleNamespace(is_rs=False))),
+                patch("modules.tasks.get_global_script_context", return_value=None),
+                patch("modules.tasks.read_symbol", return_value=bytes((1, state))),
+            ):
+                self.assertTrue(is_waiting_for_input())
+
+        with (
+            patch("modules.tasks.context", types.SimpleNamespace(rom=types.SimpleNamespace(is_rs=False))),
+            patch("modules.tasks.get_global_script_context", return_value=None),
+            patch("modules.tasks.read_symbol", return_value=bytes((1, 0))),
+        ):
+            self.assertFalse(is_waiting_for_input())
+
     def test_emerald_wait_for_a_or_b_with_active_printer_is_field_dialogue(self):
         from modules.tasks import is_field_message_waiting_for_input
 
@@ -229,6 +247,7 @@ class TestIsWaitingForInput(unittest.TestCase):
             patch("modules.interaction_state.player_avatar_is_controllable", return_value=False),
             patch("modules.interaction_state.task_is_active", return_value=True),
             patch("modules.interaction_state.is_field_message_waiting_for_input", return_value=False),
+            patch("modules.interaction_state.is_field_message_task_waiting_for_input", return_value=True),
             patch(
                 "modules.interaction_state.get_global_script_context",
                 return_value=types.SimpleNamespace(native_function_name="IsFieldMessageBoxHidden"),
@@ -239,6 +258,32 @@ class TestIsWaitingForInput(unittest.TestCase):
         self.assertFalse(observation.dialogue_waiting)
         self.assertTrue(observation.field_message_lifecycle_active)
         self.assertTrue(observation.field_message_advance_ready)
+
+    def test_active_field_message_render_is_not_actionable(self):
+        import modules.interaction_state as interaction_state
+
+        interaction_state._field_message_lifecycle_active = False
+        interaction_state._field_message_advance_ready = False
+        with (
+            patch("modules.interaction_state.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.interaction_state.player_avatar_is_controllable", return_value=False),
+            patch("modules.interaction_state.task_is_active", return_value=True),
+            patch("modules.interaction_state.is_field_message_waiting_for_input", return_value=False),
+            patch("modules.interaction_state.is_field_message_task_waiting_for_input", return_value=False),
+            patch(
+                "modules.interaction_state.get_global_script_context",
+                return_value=types.SimpleNamespace(
+                    is_active=True,
+                    native_function_name="IsFieldMessageBoxHidden",
+                    script_function_name="Std_MsgboxDefault",
+                ),
+            ),
+        ):
+            observation = observe_interaction()
+
+        self.assertFalse(observation.dialogue_waiting)
+        self.assertTrue(observation.field_message_lifecycle_active)
+        self.assertFalse(observation.field_message_advance_ready)
 
     def test_active_hidden_box_is_dialogue_lifecycle_but_not_actionable(self):
         import modules.interaction_state as interaction_state

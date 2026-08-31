@@ -66,6 +66,10 @@ def _create_save_state() -> None:
         screenshot.save(file, format="PNG", pnginfo=extra_chunks)
 
     context.message = f"State saved to `{target_path[0]}`."
+    runtime = getattr(context, "nuzlocke_runtime", None)
+    commit = getattr(runtime, "commit_pending_events", None)
+    if callable(commit):
+        commit("save_state")
 
 
 def _import_flags_and_vars() -> None:

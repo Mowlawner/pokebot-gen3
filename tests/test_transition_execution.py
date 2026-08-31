@@ -128,7 +128,7 @@ class TestTransitionExecution(unittest.TestCase):
 
     def test_destination_observation_clears_pending_transition(self):
         action = transition()
-        loop, emulator, selected = self.make_loop([observation(), observation(map_id=(0, 9))], action)
+        loop, emulator, selected = self.make_loop([observation(), observation(map_id=(0, 9), valid_tile=True)], action)
         resumed = ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE))
         with patch("modules.agent_control.context.emulator", emulator), patch(
             "modules.agent_control.select_action", side_effect=(selected, resumed)
@@ -137,6 +137,26 @@ class TestTransitionExecution(unittest.TestCase):
             loop.step()
         self.assertIsNone(loop._pending_transition)
         self.assertEqual(emulator.released, ["Down"])
+
+    def test_transient_destination_coordinate_waits_without_runtime_override(self):
+        action = transition(destination=((0, 9), (5, 8)))
+        transient = observation(map_id=(0, 9), position=(19, -1))
+        arrived = observation(map_id=(0, 9), position=(5, 8), valid_tile=True)
+        loop, emulator, selected = self.make_loop([observation(), transient, arrived], action)
+        resumed = ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE))
+        with patch("modules.agent_control.context.emulator", emulator), patch(
+            "modules.agent_control.select_action", side_effect=(selected, resumed)
+        ), patch("modules.agent_control.record_runtime_transition_observation") as record:
+            loop.step()
+            settling = loop.step()
+            self.assertIsNotNone(loop._pending_transition)
+            self.assertEqual(settling[2].result_type, ActionResultType.WAITING)
+            self.assertEqual(settling[1].action.reason, "transition destination coordinate settling")
+            loop.step()
+
+        self.assertIsNone(loop._pending_transition)
+        record.assert_not_called()
+        self.assertEqual(emulator.released, ["Down", "Down"])
 
     def test_destination_releases_warp_direction_before_first_tactical_input(self):
         action = transition(destination=((0, 9), (5, 8)))
@@ -219,7 +239,7 @@ class TestTransitionExecution(unittest.TestCase):
 
     def test_map_connection_releases_direction_at_destination_without_changing_pending_behavior(self):
         action = transition("map_connection")
-        loop, emulator, selected = self.make_loop([observation(), observation(map_id=(0, 9))], action)
+        loop, emulator, selected = self.make_loop([observation(), observation(map_id=(0, 9), valid_tile=True)], action)
         with patch("modules.agent_control.context.emulator", emulator), patch(
             "modules.agent_control.select_action",
             side_effect=(selected, ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE))),

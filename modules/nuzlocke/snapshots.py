@@ -10,6 +10,7 @@ within-frame freshness limitations, but it never adds another snapshot cache.
 from __future__ import annotations
 
 from dataclasses import dataclass, field as dataclass_field
+from enum import Enum
 from typing import TYPE_CHECKING
 
 from .identity import PokemonIdentity
@@ -28,6 +29,8 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class MoveSnapshot:
+    """Immutable move data exposed by a Pokémon observation."""
+
     name: str
     pp: int
     total_pp: int
@@ -36,6 +39,8 @@ class MoveSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class PokemonSnapshot:
+    """Immutable identity, health, move, and ownership data for a Pokémon."""
+
     species: str
     nickname: str
     level: int
@@ -55,11 +60,15 @@ class PokemonSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class PartyPokemonSnapshot(PokemonSnapshot):
+    """A Pokémon snapshot augmented with its current party slot."""
+
     party_index: int
 
 
 @dataclass(frozen=True, slots=True)
 class PlayerSnapshot:
+    """Immutable player position and overworld-control observation."""
+
     name: str | None
     map_group: int | None
     map_number: int | None
@@ -71,12 +80,16 @@ class PlayerSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class ItemQuantity:
+    """An observed item name and quantity from one inventory pocket."""
+
     name: str
     quantity: int
 
 
 @dataclass(frozen=True, slots=True)
 class InventorySnapshot:
+    """Immutable view of the item pockets relevant to campaign policy."""
+
     items: tuple[ItemQuantity, ...]
     poke_balls: tuple[ItemQuantity, ...]
     key_items: tuple[ItemQuantity, ...]
@@ -84,6 +97,8 @@ class InventorySnapshot:
 
 @dataclass(frozen=True, slots=True)
 class StoragePokemonSnapshot:
+    """A normalized stored Pokémon together with its box and slot."""
+
     box: int
     slot: int
     pokemon: PokemonSnapshot
@@ -91,12 +106,16 @@ class StoragePokemonSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class StorageSnapshot:
+    """Immutable view of readable Pokémon currently held in storage."""
+
     active_box: int
     pokemon: tuple[StoragePokemonSnapshot, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class BattlePokemonSnapshot:
+    """Immutable battle-side data for one active battler."""
+
     party_index: int
     species: str
     current_hp: int
@@ -112,6 +131,8 @@ class BattlePokemonSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class BattleSnapshot:
+    """Immutable observation of the current battle boundary and battlers."""
+
     battle_type: tuple[str, ...]
     is_trainer: bool
     is_wild: bool
@@ -124,14 +145,48 @@ class BattleSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class NamedFlag:
+    """A named ROM event flag and its observed boolean value."""
+
     name: str
     value: bool
 
 
 @dataclass(frozen=True, slots=True)
 class NamedVariable:
+    """A named ROM event variable and its observed integer value."""
+
     name: str
     value: int
+
+
+class CampaignObservationLifecycle(Enum):
+    """Lifecycle of the save-backed campaign observation.
+
+    ``FRESH_START`` is a real emulator observation at the title/main menu:
+    the ROM has not loaded a save or started a new game, so bytes exposed by
+    save-block readers are not campaign facts.  It is deliberately distinct
+    from ``UNAVAILABLE`` so campaign execution can still mount the opening
+    capability without treating unavailable facts as false or true.
+    """
+
+    UNAVAILABLE = "unavailable"
+    FRESH_START = "fresh_start"
+    ACTIVE = "active"
+
+
+# These ROM callbacks can occur before ``game_has_started()`` becomes true.
+# Their save-block reads are therefore not campaign facts, but they are still
+# part of the executable new-game flow and must keep the opening capability
+# mounted.
+_FRESH_START_GAME_STATE_NAMES = frozenset(
+    {
+        "TITLE_SCREEN",
+        "MAIN_MENU",
+        "OPTIONS_MENU",
+        "NAMING_SCREEN",
+        "CHOOSE_STARTER",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,15 +197,20 @@ class CampaignObservationSnapshot:
     variables: tuple[NamedVariable, ...] = ()
     text_speed: int | None = None
     available: bool = False
+    lifecycle: CampaignObservationLifecycle = CampaignObservationLifecycle.UNAVAILABLE
 
 
 @dataclass(frozen=True, slots=True)
 class ProgressionSnapshot:
+    """Observed badge flags used by campaign progression."""
+
     badges: tuple[NamedFlag, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class NuzlockeSnapshot:
+    """Complete immutable observation passed to Nuzlocke reducers."""
+
     frame: int
     game_id: str | None
     game_state: "GameState | None"
@@ -173,12 +233,16 @@ class NuzlockeSnapshot:
 
 
 def _moves(pokemon) -> tuple[MoveSnapshot, ...]:
+    """Normalize the readable move slots of a runtime Pokémon object."""
+
     return tuple(
         MoveSnapshot(move.move.name, move.pp, move.total_pp, move.pp_ups) for move in pokemon.moves if move is not None
     )
 
 
 def _pokemon(pokemon) -> PokemonSnapshot:
+    """Normalize a party or storage Pokémon without mutating the source."""
+
     trainer = pokemon.original_trainer
     return PokemonSnapshot(
         species=pokemon.species.name,
@@ -213,6 +277,8 @@ def _storage_pokemon_is_readable(pokemon) -> bool:
 
 
 def _battle_pokemon(pokemon) -> BattlePokemonSnapshot:
+    """Normalize one runtime battle battler into an immutable snapshot."""
+
     return BattlePokemonSnapshot(
         party_index=pokemon.party_index,
         species=pokemon.species.name,
@@ -230,10 +296,14 @@ def _battle_pokemon(pokemon) -> BattlePokemonSnapshot:
 
 
 def _items(slots) -> tuple[ItemQuantity, ...]:
+    """Normalize item slots while preserving their observed quantities."""
+
     return tuple(ItemQuantity(slot.item.name, slot.quantity) for slot in slots)
 
 
 def _player() -> tuple[PlayerSnapshot, bool]:
+    """Read the player projection and whether its avatar is available."""
+
     from modules.player import (
         get_player,
         get_player_avatar,
@@ -265,6 +335,8 @@ def _player() -> tuple[PlayerSnapshot, bool]:
 
 
 def _battle(game_state: GameState) -> BattleSnapshot | None:
+    """Read battle state only while the runtime reports a battle lifecycle."""
+
     if getattr(game_state, "name", None) not in {
         "BATTLE",
         "BATTLE_STARTING",
@@ -311,6 +383,8 @@ def _battle(game_state: GameState) -> BattleSnapshot | None:
 
 
 def _storage_snapshot(storage) -> StorageSnapshot:
+    """Build or reuse the normalized snapshot for the current storage object."""
+
     global _last_storage_source, _last_storage_snapshot
 
     from modules.context import context
@@ -352,7 +426,7 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
     """Read current observable state without performing any emulator action."""
     from modules.context import context
     from modules.items import get_item_bag
-    from modules.memory import get_event_flag, get_game_state
+    from modules.memory import game_has_started, get_event_flag, get_game_state
     from modules.pokemon_party import get_party
     from modules.pokemon_storage import get_pokemon_storage
 
@@ -393,22 +467,57 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
                 "SET_WALL_CLOCK",
                 "RESCUED_BIRCH",
                 "DEFEATED_RIVAL_ROUTE103",
+                "HIDE_ROUTE_103_RIVAL",
                 "SYS_POKEMON_GET",
                 "SYS_POKEDEX_GET",
                 "RECEIVED_POKEDEX_FROM_BIRCH",
                 "VISITED_PETALBURG_CITY",
+                "DEVON_GOODS_STOLEN",
                 "RECOVERED_DEVON_GOODS",
+                "RETURNED_DEVON_GOODS",
+                "DELIVERED_DEVON_GOODS",
+                "INTERACTED_WITH_DEVON_EMPLOYEE_GOODS_STOLEN",
                 "VISITED_RUSTBORO_CITY",
                 "DEFEATED_RUSTBORO_GYM",
             )
         )
         campaign_variables = tuple(
             NamedVariable(name, get_event_var(name))
-            for name in ("LITTLEROOT_INTRO_STATE", "LITTLEROOT_RIVAL_STATE", "BIRCH_LAB_STATE")
+            for name in (
+                "LITTLEROOT_INTRO_STATE",
+                "LITTLEROOT_RIVAL_STATE",
+                "BIRCH_LAB_STATE",
+                "PETALBURG_CITY_STATE",
+                "PETALBURG_GYM_STATE",
+                "PETALBURG_WOODS_STATE",
+                "RUSTBORO_CITY_STATE",
+                "RUSTURF_TUNNEL_STATE",
+                "DEVON_CORP_3F_STATE",
+            )
         )
         text_speed = unpack_uint16(get_save_block(2, offset=0x14, size=2)) & 0x07
+        # ``get_game_state()`` is also non-None on the title and main-menu
+        # callbacks.  Those callbacks can expose an uninitialised save block
+        # (typically all 0xff after mGBA opens an empty save file), which
+        # would make every raw flag appear true.  Only treat save-backed
+        # campaign values as observations after the ROM reports that a save
+        # has been loaded or a new game has actually started.
+        save_backed = game_has_started()
+        if save_backed:
+            lifecycle = CampaignObservationLifecycle.ACTIVE
+        elif getattr(game_state, "name", None) in _FRESH_START_GAME_STATE_NAMES:
+            # mGBA exposes an all-0xff placeholder save after opening a
+            # profile with no game save.  Keep the title/menu usable by the
+            # opening executor, but never expose those bytes as facts.
+            lifecycle = CampaignObservationLifecycle.FRESH_START
+        else:
+            lifecycle = CampaignObservationLifecycle.UNAVAILABLE
         campaign_observation = CampaignObservationSnapshot(
-            campaign_flags, campaign_variables, text_speed, game_state is not None
+            campaign_flags,
+            campaign_variables,
+            text_speed,
+            save_backed,
+            lifecycle,
         )
     except (AttributeError, ImportError, KeyError, IndexError, RuntimeError, TypeError, ValueError):
         pass

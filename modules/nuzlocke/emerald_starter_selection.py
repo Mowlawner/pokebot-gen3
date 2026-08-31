@@ -16,10 +16,15 @@ HOENN_STARTER_CHOICES = ("Treecko", "Torchic", "Mudkip")
 
 
 class StarterRandomSource(Protocol):
-    def choice(self, sequence): ...
+    """Minimal random-source contract needed to select a starter."""
+
+    def choice(self, sequence):
+        """Return one item from ``sequence``."""
 
 
 class EmeraldStarterSelectionPhase(Enum):
+    """Observed phase of Emerald's starter chooser interaction."""
+
     CHOOSING = auto()
     ANIMATING = auto()
     CONFIRMING = auto()
@@ -27,6 +32,8 @@ class EmeraldStarterSelectionPhase(Enum):
 
 @dataclass(frozen=True, slots=True)
 class EmeraldStarterSelectionObservation:
+    """ROM task-backed starter cursor and input-readiness observation."""
+
     choices: tuple[str, str, str]
     selected_index: int
     phase: EmeraldStarterSelectionPhase
@@ -34,6 +41,8 @@ class EmeraldStarterSelectionObservation:
 
     @property
     def selected_species(self) -> str:
+        """Return the species currently selected by the chooser cursor."""
+
         return self.choices[self.selected_index]
 
 

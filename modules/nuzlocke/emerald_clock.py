@@ -20,7 +20,6 @@ from modules.player import get_player, get_player_avatar
 from modules.start_game import RandomSource
 from modules.tasks import get_task, task_is_active
 
-
 _CLOCK_TASKS = (
     "Task_SetClock_WaitFadeIn",
     "Task_SetClock_HandleInput",
@@ -48,6 +47,8 @@ _EMERALD_PLAYER_HOUSE_CLOCK_INTERACTIONS = {
 
 
 def _current_map_id() -> tuple[int, int] | None:
+    """Read the current map identity, returning none during transitions."""
+
     try:
         location = get_map_data_for_current_position()
     except (AttributeError, RuntimeError, ValueError, TypeError):
@@ -56,6 +57,8 @@ def _current_map_id() -> tuple[int, int] | None:
 
 
 def _opening_player_gender(player_gender: object | None = None) -> str:
+    """Resolve protagonist gender from an explicit value or ROM player data."""
+
     value = getattr(player_gender, "value", player_gender)
     if value in ("male", "female"):
         return value
@@ -86,10 +89,14 @@ def _littleroot_house_maps(
 
 
 def player_house_map(floor: int, player_gender: object | None = None) -> MapRSE:
+    """Return the player's Littleroot house map for a one-based floor."""
+
     return _littleroot_house_maps(player_gender)[floor - 1]
 
 
 def rival_house_map(floor: int, player_gender: object | None = None) -> MapRSE:
+    """Return the rival's Littleroot house map for a one-based floor."""
+
     return _littleroot_house_maps(player_gender)[floor + 1]
 
 
@@ -115,6 +122,8 @@ def clock_input_direction(
 
 
 def clock_time_mode() -> WallClockTimeMode:
+    """Return the configured wall-clock selection mode with a safe fallback."""
+
     config = getattr(context, "config", None)
     start_game = getattr(config, "start_game", None)
     configured = getattr(start_game, "clock_time_mode", WallClockTimeMode.SYSTEM_TIME)

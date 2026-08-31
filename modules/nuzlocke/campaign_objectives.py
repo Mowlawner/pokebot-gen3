@@ -26,10 +26,13 @@ from .campaign_state import CampaignState, Fact, FactStatus, RunStatus
 from .resource_policy import EncounterPolicy, ReadinessImportance, ResourceObjective
 from modules.world_navigation import WorldMapGraph, WorldNavigationError, get_world_map_graph
 from .encounter_catalog import EncounterOpportunity, encounter_opportunities
-from .emerald_campaign_registry import evaluate_emerald_fact
+from .emerald_campaign_registry import emerald_bosses, evaluate_emerald_fact
+from .snapshots import CampaignObservationLifecycle
 
 
 class ObjectiveStatus(Enum):
+    """Evaluation status used when selecting a campaign objective."""
+
     READY = "ready"
     BLOCKED = "blocked"
     UNKNOWN = "unknown"
@@ -38,6 +41,8 @@ class ObjectiveStatus(Enum):
 
 
 class RouteRelation(Enum):
+    """Relationship between an optional task route and progression route."""
+
     ON_ROUTE = "on_route"
     DETOUR = "detour"
     UNREACHABLE = "unreachable"
@@ -45,6 +50,8 @@ class RouteRelation(Enum):
 
 
 class EncounterClassification(Enum):
+    """Geometric classification of an encounter's route detour."""
+
     ON_ROUTE = "on_route"
     SMALL_DETOUR = "small_detour"
     LARGE_DETOUR = "large_detour"
@@ -53,6 +60,8 @@ class EncounterClassification(Enum):
 
 
 class EncounterRecommendation(Enum):
+    """Policy recommendation for an available encounter opportunity."""
+
     PREFER = "prefer"
     DEFER = "defer"
     UNAVAILABLE = "unavailable"
@@ -61,12 +70,16 @@ class EncounterRecommendation(Enum):
 
 @dataclass(frozen=True, slots=True)
 class EncounterEvaluationPolicy:
+    """Thresholds used to classify encounter detour costs."""
+
     small_detour_cost: int = 10
     small_detour_ratio: float = 0.25
 
 
 @dataclass(frozen=True, slots=True)
 class EncounterEvaluation:
+    """Measured route costs and recommendation for one encounter task."""
+
     task_id: str
     location: tuple[int, int]
     progression_destination: tuple[int, int] | None
@@ -82,6 +95,8 @@ class EncounterEvaluation:
 
 @dataclass(frozen=True, slots=True)
 class RouteContext:
+    """Measured relationship between a task destination and progression."""
+
     current_location: tuple[int, int]
     progression_destination: tuple[int, int] | None
     task_destination: tuple[int, int]
@@ -100,6 +115,8 @@ class CampaignPredicate:
     evaluator: Callable[[CampaignState], Fact[bool]]
 
     def evaluate(self, state: CampaignState) -> Fact[bool]:
+        """Evaluate this predicate against an already-observed campaign state."""
+
         return self.evaluator(state)
 
 
@@ -107,6 +124,10 @@ def party_fully_restored() -> CampaignPredicate:
     """Freshly observed party restoration fact used by safety objectives."""
 
     def evaluate(state: CampaignState) -> Fact[bool]:
+        """Evaluate the target level against the living observed party."""
+
+        """Report whether every observed non-egg party member is restored."""
+
         if not state.party.is_known:
             return Fact(None, state.party.status)
         members = tuple(p for p in (state.party.value or ()) if not getattr(p, "is_egg", getattr(p, "egg", False)))
@@ -123,6 +144,8 @@ def party_fully_restored() -> CampaignPredicate:
 
 
 def heal_party_objective() -> CampaignObjective:
+    """Return the transient safety objective that restores the party."""
+
     return CampaignObjective(
         "HEAL_PARTY",
         "Restore the party",
@@ -136,6 +159,8 @@ def heal_party_objective() -> CampaignObjective:
 
 @dataclass(frozen=True, slots=True)
 class CampaignObjective:
+    """Declarative campaign task with predicates, dependencies, and execution metadata."""
+
     objective_id: str
     description: str
     prerequisites: tuple[CampaignPredicate, ...]
@@ -157,6 +182,8 @@ class CampaignObjective:
 
 @dataclass(frozen=True, slots=True)
 class ObjectiveSelection:
+    """Result of resolving one campaign objective or task frontier."""
+
     objective: CampaignObjective | None
     status: ObjectiveStatus
     reason: str
@@ -205,6 +232,8 @@ def campaign_objective_producers(
 
 
 def current_area_is(area: str) -> CampaignPredicate:
+    """Build a predicate requiring the observed canonical area name."""
+
     return CampaignPredicate(
         f"current_area_is:{area}",
         f"current canonical area is {area}",
@@ -217,7 +246,11 @@ def current_area_is(area: str) -> CampaignPredicate:
 
 
 def has_item(item: str, minimum: int = 1) -> CampaignPredicate:
+    """Build a predicate requiring at least ``minimum`` copies of an item."""
+
     def evaluate(state: CampaignState) -> Fact[bool]:
+        """Compare the observed item quantity with the requested minimum."""
+
         quantity = state.item_quantity(item)
         if not quantity.is_known:
             return Fact(None, quantity.status)
@@ -231,7 +264,11 @@ def has_item(item: str, minimum: int = 1) -> CampaignPredicate:
 
 
 def battle_completed_at(location: tuple[int, int], *, trainer: bool = True) -> CampaignPredicate:
+    """Build a predicate for a successful battle at a specific map location."""
+
     def evaluate(state: CampaignState) -> Fact[bool]:
+        """Match the last completed battle against the requested boundary."""
+
         battle = state.last_completed_battle
         if not battle.is_known:
             return Fact(None, battle.status)
@@ -248,7 +285,11 @@ def battle_completed_at(location: tuple[int, int], *, trainer: bool = True) -> C
 
 
 def party_has_usable_pokemon() -> CampaignPredicate:
+    """Build a predicate requiring one living, non-fainted party member."""
+
     def evaluate(state: CampaignState) -> Fact[bool]:
+        """Evaluate party usability from current party and rules projections."""
+
         if not state.party.is_known:
             return Fact(None, state.party.status)
         dead = state.dead_pokemon
@@ -263,8 +304,48 @@ def party_has_usable_pokemon() -> CampaignPredicate:
     return CampaignPredicate("party_has_usable_pokemon", "party has a usable Pokémon", evaluate)
 
 
-def encounter_available() -> CampaignPredicate:
+def party_meets_level_target(target_level: int) -> CampaignPredicate:
+    """Require every currently living, non-egg party member to meet a level.
+
+    Party levels are current-save observations, not durable campaign events.
+    Dead Pokémon are excluded using the rules projection so a healed fainted
+    Pokémon cannot make preparation appear complete or be selected for battle.
+    """
+
+    if target_level < 1:
+        raise ValueError("level target must be positive")
+
     def evaluate(state: CampaignState) -> Fact[bool]:
+        """Evaluate the target level against the living observed party."""
+
+        if not state.party.is_known:
+            return Fact(None, state.party.status)
+        if not state.dead_pokemon.is_known:
+            return Fact(None, state.dead_pokemon.status)
+        members = tuple(
+            pokemon
+            for pokemon in state.party.value or ()
+            if not getattr(pokemon, "egg", getattr(pokemon, "is_egg", False))
+            and (
+                getattr(pokemon, "identity", None) is None
+                or pokemon.identity not in (state.dead_pokemon.value or frozenset())
+            )
+        )
+        return Fact.known(bool(members) and all(pokemon.level >= target_level for pokemon in members))
+
+    return CampaignPredicate(
+        f"party_meets_level_target:{target_level}",
+        f"all living party Pokémon are at least level {target_level}",
+        evaluate,
+    )
+
+
+def encounter_available() -> CampaignPredicate:
+    """Build a predicate for an eligible, unconsumed current-area encounter."""
+
+    def evaluate(state: CampaignState) -> Fact[bool]:
+        """Evaluate current-area encounter availability without guessing."""
+
         encounter = state.current_encounter
         if not encounter.is_known:
             return Fact(None, encounter.status)
@@ -276,6 +357,8 @@ def encounter_available() -> CampaignPredicate:
 
 
 def campaign_fact(name: str) -> CampaignPredicate:
+    """Build a predicate backed by a registered ROM-observed campaign fact."""
+
     return CampaignPredicate(
         f"campaign_fact:{name}",
         name.replace("_", " "),
@@ -332,7 +415,11 @@ def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
         CampaignObjective(
             objective_id="complete_intro_rival",
             description="Complete the introductory rival battle",
-            prerequisites=(campaign_fact("starter_obtained"),),
+            # The rival objective needs a living battle-capable party. Full
+            # restoration remains an explicit recovery objective, but a small
+            # amount of ordinary post-Birch damage must not force a Center
+            # visit before the ROM battle begins.
+            prerequisites=(campaign_fact("starter_obtained"), party_has_usable_pokemon()),
             completion=campaign_fact("intro_rival_battle_complete"),
             execution_id="intro_rival",
             tactical_target=introductory_rival_goal(),
@@ -363,46 +450,117 @@ def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
             destination=MapRSE.LITTLEROOT_TOWN.value,
         ),
         CampaignObjective(
-            objective_id="start_nuzlocke",
-            description="Begin the Nuzlocke ruleset",
-            # ``receive_pokeballs`` establishes the authoritative readiness
-            # fact used as its completion predicate.  Keep the dependency
-            # graph producer-consistent for recursive planning.
-            prerequisites=(campaign_fact("pokeballs_ready"),),
-            completion=campaign_fact("nuzlocke_started"),
-            execution_id="start_nuzlocke",
-        ),
-        CampaignObjective(
             objective_id="reach_petalburg",
-            description="Begin the post-Poké Ball journey in Petalburg City",
-            prerequisites=(campaign_fact("nuzlocke_started"),),
+            description="Reach Petalburg City after receiving the Pokédex",
+            # The Pokédex opens the ROM route west from Oldale.  Poké Balls
+            # are a campaign safety prerequisite so the first encounter
+            # opportunity is not intentionally passed while the party cannot
+            # catch it; they are not being misrepresented as a ROM map gate.
+            prerequisites=(campaign_fact("pokedex_received"), campaign_fact("pokeballs_ready")),
             completion=campaign_fact("visited_petalburg"),
             execution_id="reach_petalburg",
             destination=MapRSE.PETALBURG_CITY.value,
         ),
         CampaignObjective(
-            objective_id="recover_devon_goods",
-            description="Recover the Devon Goods during the Petalburg Woods progression",
+            objective_id="complete_petalburg_wally",
+            description="Talk to Norman and complete Wally's tutorial",
             prerequisites=(campaign_fact("visited_petalburg"),),
-            completion=campaign_fact("devon_goods_recovered"),
-            execution_id="recover_devon_goods",
+            completion=campaign_fact("petalburg_wally_scene_complete"),
+            execution_id="complete_petalburg_wally",
+            destination=MapRSE.PETALBURG_CITY_GYM.value,
+        ),
+        CampaignObjective(
+            objective_id="complete_petalburg_woods",
+            description="Complete the Petalburg Woods Devon researcher scene",
+            prerequisites=(campaign_fact("petalburg_wally_scene_complete"),),
+            completion=campaign_fact("petalburg_woods_scene_complete"),
+            execution_id="complete_petalburg_woods",
             destination=MapRSE.PETALBURG_WOODS.value,
         ),
         CampaignObjective(
             objective_id="reach_rustboro",
             description="Reach Rustboro City after the Petalburg Woods progression",
-            prerequisites=(campaign_fact("devon_goods_recovered"),),
+            prerequisites=(campaign_fact("petalburg_woods_scene_complete"),),
             completion=campaign_fact("visited_rustboro"),
             execution_id="reach_rustboro",
             destination=MapRSE.RUSTBORO_CITY.value,
         ),
         CampaignObjective(
+            objective_id="complete_rustboro_goods_stolen",
+            description="Complete the Rustboro Devon Goods theft scene",
+            prerequisites=(campaign_fact("visited_rustboro"),),
+            completion=campaign_fact("devon_goods_stolen"),
+            execution_id="complete_rustboro_goods_stolen",
+            destination=MapRSE.RUSTBORO_CITY.value,
+            task_kind="optional",
+        ),
+        CampaignObjective(
+            objective_id="report_devon_goods",
+            description="Report the stolen Devon Goods to the Devon employee",
+            prerequisites=(campaign_fact("devon_goods_stolen"),),
+            completion=campaign_fact("devon_goods_reported"),
+            execution_id="report_devon_goods",
+            destination=MapRSE.RUSTBORO_CITY.value,
+            task_kind="optional",
+        ),
+        CampaignObjective(
+            objective_id="recover_devon_goods",
+            description="Recover the Devon Goods from the Rusturf Tunnel grunt",
+            prerequisites=(campaign_fact("devon_goods_stolen"),),
+            completion=campaign_fact("devon_goods_recovered"),
+            execution_id="recover_devon_goods",
+            destination=MapRSE.RUSTURF_TUNNEL.value,
+            task_kind="optional",
+        ),
+        CampaignObjective(
+            objective_id="return_devon_goods",
+            description="Return the Devon Goods to the Rustboro employee",
+            prerequisites=(campaign_fact("devon_goods_recovered"),),
+            completion=campaign_fact("devon_goods_returned"),
+            execution_id="return_devon_goods",
+            destination=MapRSE.RUSTBORO_CITY.value,
+            task_kind="optional",
+        ),
+        CampaignObjective(
+            objective_id="meet_mr_stone",
+            description="Meet Mr. Stone in Devon Corporation",
+            prerequisites=(campaign_fact("devon_goods_returned"),),
+            completion=campaign_fact("devon_corp_3f_scene_complete"),
+            execution_id="meet_mr_stone",
+            destination=MapRSE.RUSTBORO_CITY_DEVON_CORP_3F.value,
+            task_kind="optional",
+        ),
+        CampaignObjective(
+            objective_id="prepare_roxanne",
+            description="Prepare the living party for Roxanne",
+            prerequisites=(campaign_fact("visited_rustboro"),),
+            completion=party_meets_level_target(emerald_bosses()[0].preparation_level),
+            execution_id="prepare_roxanne",
+            destination=MapRSE.ROUTE116.value,
+        ),
+        CampaignObjective(
             objective_id="defeat_roxanne",
             description="Defeat Roxanne and earn the first badge",
-            prerequisites=(campaign_fact("visited_rustboro"),),
+            # Preparation is a real executable dependency, not merely an
+            # available side task.  Reusing the same predicate ID lets the
+            # dependency planner resolve the preparation producer when the
+            # live party is below the registered target, while allowing this
+            # prerequisite to pass directly once the target is met.
+            prerequisites=(
+                party_meets_level_target(emerald_bosses()[0].preparation_level),
+                campaign_fact("visited_rustboro"),
+            ),
             completion=campaign_fact("first_badge_obtained"),
             execution_id="defeat_roxanne",
             destination=MapRSE.RUSTBORO_CITY_GYM.value,
+            resource_policy=ResourceObjective(
+                "defeat_roxanne",
+                readiness=ReadinessImportance.IMPORTANT,
+                encounters=EncounterPolicy.PRESERVE,
+                mandatory_battle=True,
+                recover_before_completion=True,
+                minimum_hp_ratio=0.75,
+            ),
         ),
     )
 
@@ -414,6 +572,8 @@ def encounter_task(
     task_id = name or f"obtain_encounter:{location[0]}:{location[1]}"
 
     def accessible(state: CampaignState) -> Fact[bool]:
+        """Report whether this location still has an eligible encounter."""
+
         if not state.raw_map.is_known or not state.encounters.is_known:
             return Fact(None, state.raw_map.status if not state.raw_map.is_known else state.encounters.status)
         encounter = state.encounter_for(location)
@@ -629,17 +789,9 @@ def available_campaign_tasks(
     return tuple(result)
 
 
-def select_available_campaign_task(
-    state: CampaignState,
-    tasks: tuple[CampaignObjective, ...] | None = None,
-    encounter_locations: tuple[tuple[int, int], ...] | None = None,
-) -> ObjectiveSelection:
-    """Select the deterministic best currently available task.
+def _select_available_campaign_tasks(available: tuple[CampaignObjective, ...]) -> ObjectiveSelection:
+    """Select the deterministic best task from one discovery result."""
 
-    Priority is intentionally simple and replaceable: required tasks precede
-    optional tasks, then explicit priority and declaration order decide ties.
-    """
-    available = available_campaign_tasks(state, tasks, encounter_locations)
     required = tuple(task for task in available if task.task_kind == "required")
     if required:
         # Required progression remains the primary task. Preferred encounter
@@ -668,6 +820,20 @@ def select_available_campaign_task(
     return ObjectiveSelection(None, ObjectiveStatus.COMPLETE, "no campaign task is currently available")
 
 
+def select_available_campaign_task(
+    state: CampaignState,
+    tasks: tuple[CampaignObjective, ...] | None = None,
+    encounter_locations: tuple[tuple[int, int], ...] | None = None,
+) -> ObjectiveSelection:
+    """Select the deterministic best currently available task.
+
+    Priority is intentionally simple and replaceable: required tasks precede
+    optional tasks, then explicit priority and declaration order decide ties.
+    """
+
+    return _select_available_campaign_tasks(available_campaign_tasks(state, tasks, encounter_locations))
+
+
 def campaign_task_diagnostics(
     state: CampaignState,
     tasks: tuple[CampaignObjective, ...] | None = None,
@@ -676,7 +842,10 @@ def campaign_task_diagnostics(
     """Return structured, read-only diagnostics for currently available tasks."""
     available = available_campaign_tasks(state, tasks, encounter_locations)
     progression, progression_reason = progression_destination(available)
-    selection = select_available_campaign_task(state, tasks, encounter_locations)
+    # Selection must use the same discovery result as the rows below.  The
+    # discovery pass performs route and encounter analysis; recomputing it
+    # here doubled that cost on every controller refresh.
+    selection = _select_available_campaign_tasks(available)
     preferred = sorted(
         (
             task
@@ -766,7 +935,11 @@ def select_campaign_objective(
         return ObjectiveSelection(None, ObjectiveStatus.FAILED, "run is not legal")
 
     ordered = initial_emerald_campaign() if objectives is None else objectives
+    # Optional story work is discoverable through ``available_campaign_tasks``
+    # but must not block the executable required path to the campaign goal.
     for objective in ordered:
+        if objective.task_kind == "optional":
+            continue
         if objective.failure is not None:
             failure = objective.failure.evaluate(state)
             if failure.status is not FactStatus.KNOWN:
@@ -819,8 +992,45 @@ def plan_campaign(
     execution concerns for the selected objective's capability.
     """
     ordered = initial_emerald_campaign() if objectives is None else objectives
+
+    # A title/main-menu observation is a valid opening boundary, not a
+    # completed or failed campaign.  Save-backed facts are intentionally
+    # unavailable there because mGBA can expose an all-0xff placeholder save;
+    # select the opening capability directly so the planner does not stall on
+    # an unavailable terminal predicate.  This is lifecycle dispatch, not a
+    # remembered phase: the next frame re-evaluates the ROM observation.
+    if (
+        getattr(state, "campaign_lifecycle", CampaignObservationLifecycle.UNAVAILABLE)
+        is CampaignObservationLifecycle.FRESH_START
+    ):
+        startup = next((item for item in ordered if item.objective_id == "set_text_speed"), None)
+        if startup is not None:
+            return ObjectiveSelection(startup, ObjectiveStatus.READY, "fresh ROM startup requires opening setup")
+
+    # ``CampaignProgressionMode`` uses this dependency-aware planner instead
+    # of the legacy tuple-order selector.  Keep the terminal Nuzlocke rule at
+    # this boundary too: a durable WhiteoutOccurred must prevent a restarted
+    # process from mounting campaign movement against an older save-state.
+    if state.run_status.status is not FactStatus.KNOWN:
+        return ObjectiveSelection(None, ObjectiveStatus.UNKNOWN, "run status is unavailable")
+    if state.run_status.value is RunStatus.LOST:
+        return ObjectiveSelection(None, ObjectiveStatus.FAILED, "run is lost")
+
+    legal = state.run_is_legal()
+    if legal.status is not FactStatus.KNOWN:
+        return ObjectiveSelection(None, ObjectiveStatus.UNKNOWN, "run legality is unavailable")
+    if not legal.value:
+        return ObjectiveSelection(None, ObjectiveStatus.FAILED, "run is not legal")
+
     target = goal or ultimate_emerald_campaign_goal()
     producers = campaign_objective_producers(ordered)
+    # Party restoration is an executable safety dependency, not a public
+    # campaign milestone.  Keep it out of ``initial_emerald_campaign`` (and
+    # therefore preserve its stable public ordering), while making the
+    # dependency-aware planner able to resolve it before the first legal
+    # encounter.
+    restoration = heal_party_objective()
+    producers.setdefault(restoration.completion.predicate_id, (restoration,))
     completion = target.completion.evaluate(state)
 
     if completion.status is not FactStatus.KNOWN:
@@ -839,6 +1049,8 @@ def plan_campaign(
     visiting: set[str] = set()
 
     def resolve(objective: CampaignObjective) -> ObjectiveSelection:
+        """Resolve one objective recursively through its prerequisite producers."""
+
         if objective.objective_id in visiting:
             return ObjectiveSelection(
                 objective,

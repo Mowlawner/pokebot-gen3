@@ -27,9 +27,7 @@ class EmeraldHealingCatalogTests(unittest.TestCase):
         self.assertIn(HealingSourceRSE.ROUTE111_REST_STOP, route111)
 
     def test_destination_resolves_to_catalog_source(self):
-        source = emerald_healing_source_for_destination(
-            (MapRSE.ROUTE111, (26, 18))
-        )
+        source = emerald_healing_source_for_destination((MapRSE.ROUTE111, (26, 18)))
         self.assertIs(source, HealingSourceRSE.ROUTE111_REST_STOP)
 
 

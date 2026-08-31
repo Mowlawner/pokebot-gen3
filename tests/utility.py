@@ -375,6 +375,11 @@ def with_frame_timeout(timeout_in_frames: int):
     return decorator
 
 
+# Resolve the GUI submodule before patching by dotted string.  ``modules`` is
+# a namespace package, so relying on unittest.mock to discover ``gui`` via
+# attribute lookup is import-order dependent (notably during CI collection).
+import modules.gui.multi_select_window
+
 ask_for_choice_patcher = mock.patch("modules.gui.multi_select_window.ask_for_choice")
 mocked_ask_for_choice = ask_for_choice_patcher.start()
 

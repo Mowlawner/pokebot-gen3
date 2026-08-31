@@ -16,6 +16,8 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class LevelCapAssessment:
+    """Observed legality result for the active Emerald boss level cap."""
+
     rule_id: CampaignRuleId
     status: FactStatus
     active_boss: EmeraldBossDefinition | None
@@ -25,6 +27,8 @@ class LevelCapAssessment:
 
     @property
     def legal(self) -> bool:
+        """Return whether the assessment is known and has no illegal members."""
+
         return self.status is FactStatus.KNOWN and not self.illegal_party_indices
 
 
@@ -72,14 +76,20 @@ class LevelCapRule:
     rule_id = CampaignRuleId.LEVEL_CAP
 
     def evaluate(self, state: "CampaignState") -> LevelCapAssessment:
+        """Assess the current party against the active boss cap."""
+
         return assess_level_cap(state.campaign_facts, state.party.value if state.party.is_known else None)
 
     def constrain(self, state: "CampaignState", candidate):
+        """Leave non-battle campaign candidates unchanged."""
+
         return candidate
 
 
 @dataclass(frozen=True, slots=True)
 class BattleEntryDecision:
+    """Conservative allow/deny result for entering a campaign battle."""
+
     allowed: bool
     reason: str
     assessment: LevelCapAssessment

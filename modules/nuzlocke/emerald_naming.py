@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum, auto
 
-from modules.keyboard import get_naming_screen_data
+from modules.keyboard import NamingScreenState, get_naming_screen_data
 from modules.memory import GameState, get_game_state, read_symbol, unpack_uint32
 from modules.console import diagnostic_print
 from modules.memory import unpack_uint16
@@ -23,6 +23,8 @@ from modules.pokemon import get_species_by_index
 
 
 class EmeraldNamingTarget(Enum):
+    """Semantic naming-screen targets recognized from Emerald's ROM data."""
+
     PLAYER_NAME = auto()
     POKEMON_NICKNAME = auto()
     CAUGHT_POKEMON_NICKNAME = auto()
@@ -33,6 +35,8 @@ class EmeraldNamingTarget(Enum):
 
 @dataclass(frozen=True, slots=True)
 class EmeraldNamingObservation:
+    """ROM-backed naming target, screen readiness, and optional Pokémon data."""
+
     target: EmeraldNamingTarget
     template_number: int | None
     screen_pointer: int | None
@@ -80,11 +84,17 @@ def observe_emerald_naming() -> EmeraldNamingObservation | None:
             personality = unpack_uint32(_read_dynamic_bytes(pointer, _MON_PERSONALITY_OFFSET, 4))
             species_name = get_species_by_index(species_id).name
             pokemon_gender = {0: "male", 254: "female", 255: None}.get(gender_value)
+        naming_screen = get_naming_screen_data()
+        keyboard_ready = bool(
+            naming_screen is not None
+            and getattr(naming_screen, "enabled", False)
+            and getattr(naming_screen, "state", None) is NamingScreenState.HandleInput
+        )
         return EmeraldNamingObservation(
             target,
             value,
             pointer,
-            get_naming_screen_data() is not None,
+            keyboard_ready,
             species_id,
             species_name,
             pokemon_gender,
@@ -99,6 +109,8 @@ def observe_emerald_naming() -> EmeraldNamingObservation | None:
 
 
 def _read_dynamic_byte(pointer: int, offset: int) -> int:
+    """Read one byte from the live naming-screen object at an exact offset."""
+
     # Kept separate so tests can assert the exact decomp-derived address.
     from modules.context import context
 
@@ -106,16 +118,22 @@ def _read_dynamic_byte(pointer: int, offset: int) -> int:
 
 
 def _read_dynamic_bytes(pointer: int, offset: int, size: int) -> bytes:
+    """Read a byte range from the live naming-screen object."""
+
     from modules.context import context
 
     return context.emulator.read_bytes(pointer + offset, size)
 
 
 def _read_field_byte(offset: int) -> int:
+    """Read one byte from the symbol-backed naming-screen structure."""
+
     return read_symbol("sNamingScreen", offset=offset, size=1)[0]
 
 
 def _read_field_bytes(offset: int, size: int) -> bytes:
+    """Read a byte range from the symbol-backed naming-screen structure."""
+
     return read_symbol("sNamingScreen", offset=offset, size=size)
 
 

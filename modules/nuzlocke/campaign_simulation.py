@@ -19,17 +19,23 @@ from .campaign_state import CampaignState
 
 @dataclass(frozen=True, slots=True)
 class CampaignCheckpoint:
+    """Named materialized campaign state used for planner diagnostics."""
+
     name: str
     state: CampaignState | None
     unavailable_reason: str | None = None
 
     @classmethod
     def unavailable(cls, name: str, reason: str) -> "CampaignCheckpoint":
+        """Create a checkpoint whose state could not be materialized."""
+
         return cls(name, None, reason)
 
 
 @dataclass(frozen=True, slots=True)
 class CampaignSimulation:
+    """Read-only selector and task report for one campaign checkpoint."""
+
     checkpoint: str
     status: str
     reason: str | None

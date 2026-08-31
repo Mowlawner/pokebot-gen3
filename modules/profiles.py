@@ -1,4 +1,6 @@
 import contextlib
+import errno
+import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -31,6 +33,94 @@ class Profile:
     rom: ROM
     path: Path
     last_played: datetime | None
+
+
+class ProfileInUseError(RuntimeError):
+    """The selected profile is already owned by another bot process."""
+
+
+class ProfileLock:
+    """Own one profile for the lifetime of an emulator process.
+
+    The lock file is intentionally retained as a harmless marker.  The OS
+    lock is held on its descriptor, so a crashed process cannot leave a stale
+    lock that prevents a later run from starting.  This protects both the
+    save-state and the durable event log, which must always describe one
+    emulator timeline.
+    """
+
+    filename = ".pokebot.lock"
+
+    def __init__(self, profile_path: str | Path):
+        self.profile_path = Path(profile_path)
+        self.path = self.profile_path / self.filename
+        self._descriptor: int | None = None
+
+    @property
+    def acquired(self) -> bool:
+        return self._descriptor is not None
+
+    def acquire(self) -> "ProfileLock":
+        if self.acquired:
+            return self
+        self.profile_path.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            self._lock_descriptor(descriptor)
+            os.ftruncate(descriptor, 0)
+            os.write(descriptor, f"pid={os.getpid()}\n".encode("ascii"))
+            os.fsync(descriptor)
+        except (BlockingIOError, OSError) as error:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            if isinstance(error, BlockingIOError) or getattr(error, "errno", None) in (errno.EACCES, errno.EAGAIN):
+                raise ProfileInUseError(
+                    f"Profile {self.profile_path.name!r} is already in use by another bot process."
+                ) from error
+            raise RuntimeError(f"Could not lock profile {self.profile_path}: {error}") from error
+        self._descriptor = descriptor
+        return self
+
+    @staticmethod
+    def _lock_descriptor(descriptor: int) -> None:
+        if os.name == "nt":
+            # msvcrt.locking locks bytes rather than descriptors. Ensure the
+            # first byte exists and position the descriptor at it.
+            import msvcrt
+
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            return
+        import fcntl
+
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def release(self) -> None:
+        descriptor, self._descriptor = self._descriptor, None
+        if descriptor is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+    def __enter__(self) -> "ProfileLock":
+        return self.acquire()
+
+    def __exit__(self, exception_type, exception, traceback) -> None:
+        self.release()
 
 
 def list_available_profiles() -> list[Profile]:

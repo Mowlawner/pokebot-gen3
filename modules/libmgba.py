@@ -219,6 +219,25 @@ class LibmgbaEmulator:
         clear_runtime_transition_observations()
         self._core.reset()
 
+    @staticmethod
+    def _commit_nuzlocke_events(boundary: str) -> None:
+        """Commit buffered Nuzlocke events after a successful save.
+
+        ``--no-save-state`` only suppresses the automatic shutdown save.  A
+        manual save state or an in-game save still reaches this boundary and
+        therefore still makes the corresponding event history durable.
+        """
+
+        runtime = getattr(context, "nuzlocke_runtime", None)
+        commit = getattr(runtime, "commit_pending_events", None)
+        if not callable(commit):
+            return
+        committed = commit(boundary)
+        diagnostic_print(
+            lambda: f"NUZLOCKE_SAVE_BOUNDARY: boundary={boundary!r} committed={committed}",
+            trace=True,
+        )
+
     def create_save_state(self, suffix: str = "") -> None:
         states_directory = self._profile.path / "states"
         if not states_directory.exists():
@@ -248,6 +267,7 @@ class LibmgbaEmulator:
                 screenshot.save(state_file, format="PNG", pnginfo=extra_chunks)
 
         console.print("Updated `current_state.ss1`!")
+        self._commit_nuzlocke_events("save_state")
 
     def shutdown(self) -> None:
         """
@@ -278,6 +298,7 @@ class LibmgbaEmulator:
                 saves_directory.mkdir()
             with open(saves_directory / time.strftime("%Y-%m-%d_%H-%M-%S.sav"), "wb") as backup_file:
                 backup_file.write(save_file.read())
+        self._commit_nuzlocke_events("game_save")
 
     def get_frame_count(self) -> int:
         """

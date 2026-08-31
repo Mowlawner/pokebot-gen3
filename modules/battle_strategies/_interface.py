@@ -68,6 +68,25 @@ class BattleStrategy:
         """
         raise NotImplementedError
 
+    def has_replacement_after_faint(self, battle_state: BattleState) -> bool:
+        """Whether this strategy has a legal Pokémon to send out now.
+
+        The ROM party menu can contain Pokémon that are technically usable by
+        the game but not usable by a strategy (for example, a Nuzlocke-dead
+        Pokémon that was healed by a Center). Keeping this predicate on the
+        strategy lets the battle handler distinguish a real replacement from
+        a party that only looks non-empty to the ROM.
+        """
+        from modules.pokemon_party import get_party
+
+        active_indices = {
+            battler.party_index for battler in battle_state.own_side.active_battlers if battler is not None
+        }
+        return any(
+            index not in active_indices and not pokemon.is_egg and pokemon.current_hp > 0
+            for index, pokemon in enumerate(get_party())
+        )
+
     def decide_turn(self, battle_state: BattleState) -> tuple["TurnAction", any]:
         """
         This is called at the start of every turn and should return a decision on what action to take.

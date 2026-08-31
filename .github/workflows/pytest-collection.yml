@@ -13,6 +13,24 @@ jobs:
         with:
           python-version: "3.12"
 
+      # sounddevice is a Python wrapper around PortAudio.  The wheel does not
+      # provide the native shared library, so importing the emulator backend
+      # fails during test collection on a clean Ubuntu runner unless the
+      # runtime library is installed explicitly.
+      - name: Install native audio runtime
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libportaudio2
+
+      - name: Install native mGBA Python bindings
+        run: |
+          curl --fail --location --silent --show-error \
+            https://github.com/hanzi/libmgba-py/releases/download/0.2.0-2/libmgba-py_0.2.0_ubuntu-lunar.zip \
+            --output /tmp/libmgba-py.zip
+          unzip -q /tmp/libmgba-py.zip -d .
+          # The extension links against libmgba.so.0.10, which is shipped in
+          # the extracted project directory rather than a system library
+          # directory. Make it visible to the dynamic linker for collection.
+          echo "LD_LIBRARY_PATH=${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}/mgba:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
       - name: Install runtime and test dependencies
         run: |
           python -m pip install --upgrade pip

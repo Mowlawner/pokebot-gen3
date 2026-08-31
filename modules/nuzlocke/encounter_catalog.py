@@ -12,6 +12,8 @@ from .campaign_state import CampaignState
 
 @dataclass(frozen=True, slots=True)
 class EncounterOpportunity:
+    """World encounter location overlaid with observed Nuzlocke state."""
+
     location: tuple[int, int]
     observed: bool
     consumed: bool

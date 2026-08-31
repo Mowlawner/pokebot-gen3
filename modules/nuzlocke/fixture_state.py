@@ -8,6 +8,7 @@ from .persistence import JsonEventStore
 from .projection import load_campaign_projection
 from .rules import load_rules
 from .snapshots import (
+    CampaignObservationLifecycle,
     CampaignObservationSnapshot,
     InventorySnapshot,
     ItemQuantity,
@@ -92,15 +93,30 @@ def load_offline_normalized_snapshot(profile: str | Path) -> NuzlockeSnapshot:
         "SET_WALL_CLOCK",
         "RESCUED_BIRCH",
         "DEFEATED_RIVAL_ROUTE103",
+        "HIDE_ROUTE_103_RIVAL",
         "SYS_POKEMON_GET",
         "SYS_POKEDEX_GET",
         "RECEIVED_POKEDEX_FROM_BIRCH",
         "VISITED_PETALBURG_CITY",
+        "DEVON_GOODS_STOLEN",
         "RECOVERED_DEVON_GOODS",
+        "RETURNED_DEVON_GOODS",
+        "DELIVERED_DEVON_GOODS",
+        "INTERACTED_WITH_DEVON_EMPLOYEE_GOODS_STOLEN",
         "VISITED_RUSTBORO_CITY",
         "DEFEATED_RUSTBORO_GYM",
     )
-    variable_names = ("LITTLEROOT_INTRO_STATE", "LITTLEROOT_RIVAL_STATE", "BIRCH_LAB_STATE")
+    variable_names = (
+        "LITTLEROOT_INTRO_STATE",
+        "LITTLEROOT_RIVAL_STATE",
+        "BIRCH_LAB_STATE",
+        "PETALBURG_CITY_STATE",
+        "PETALBURG_GYM_STATE",
+        "PETALBURG_WOODS_STATE",
+        "RUSTBORO_CITY_STATE",
+        "RUSTURF_TUNNEL_STATE",
+        "DEVON_CORP_3F_STATE",
+    )
     badges = tuple(NamedFlag(f"BADGE{i:02d}_GET", save_data.get_event_flag(f"BADGE{i:02d}_GET")) for i in range(1, 9))
     campaign_flags = tuple(NamedFlag(name, save_data.get_event_flag(name)) for name in flag_names)
     campaign_variables = tuple(NamedVariable(name, save_data.get_event_var(name)) for name in variable_names)
@@ -135,6 +151,7 @@ def load_offline_normalized_snapshot(profile: str | Path) -> NuzlockeSnapshot:
             campaign_variables,
             text_speed,
             available=True,
+            lifecycle=CampaignObservationLifecycle.ACTIVE,
         ),
     )
     context.profile = previous_profile

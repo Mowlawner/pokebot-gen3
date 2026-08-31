@@ -32,6 +32,38 @@ class TestTriggerBindings(unittest.TestCase):
         self.assertEqual(binding.script_symbol, "Route103_EventScript_Rival")
         self.assertEqual(binding.event_type, "object")
 
+    def test_first_badge_bindings_use_rom_script_identities(self):
+        devon = get_trigger_binding("devon_goods_researcher")
+        roxanne = get_trigger_binding("roxanne")
+
+        self.assertEqual(devon.map_id, MapRSE.PETALBURG_WOODS.value)
+        self.assertEqual(devon.script_symbol, "PetalburgWoods_EventScript_DevonResearcherLeft")
+        self.assertIn("PetalburgWoods_EventScript_DevonResearcherRight", devon.alternate_script_symbols)
+        self.assertEqual(roxanne.map_id, MapRSE.RUSTBORO_CITY_GYM.value)
+        self.assertEqual(roxanne.script_symbol, "RustboroCity_Gym_EventScript_Roxanne")
+
+    def test_post_wally_bindings_use_rom_script_identities(self):
+        expected = {
+            "devon_goods_researcher": (
+                MapRSE.PETALBURG_WOODS.value,
+                "PetalburgWoods_EventScript_DevonResearcherLeft",
+            ),
+            "rusturf_tunnel_goods": (
+                MapRSE.RUSTURF_TUNNEL.value,
+                "RusturfTunnel_EventScript_Grunt",
+            ),
+            "rustboro_return_devon_goods": (
+                MapRSE.RUSTBORO_CITY.value,
+                "RustboroCity_EventScript_DevonEmployee1",
+            ),
+        }
+
+        for trigger_id, (map_id, script_symbol) in expected.items():
+            binding = get_trigger_binding(trigger_id)
+            self.assertIsNotNone(binding, trigger_id)
+            self.assertEqual(binding.map_id, map_id)
+            self.assertEqual(binding.script_symbol, script_symbol)
+
     def test_real_object_event_template_script_matches_binding(self):
         object_event = _route103_object_event()
         template_map = SimpleNamespace(

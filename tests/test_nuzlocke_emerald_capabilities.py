@@ -16,17 +16,27 @@ from modules.nuzlocke.emerald_capabilities import (
     _observed_local_destination_goal,
     _semantic_target_for_objective,
 )
-from modules.goals import ActivateTrigger, SemanticTarget, SemanticTargetKind
+from modules.goals import (
+    ActivateTrigger,
+    GoalConstraints,
+    NavigationGoal,
+    SemanticTarget,
+    SemanticTargetKind,
+    TrainerMode,
+)
 from modules.map_path import Direction
 from modules.map_data import MapRSE
 from modules.overworld import (
     MapConnectionObservation,
     OverworldObservation,
+    OverworldObservationResult,
+    OverworldObservationStatus,
     TileObservation,
     TriggerObservation,
     WarpObservation,
 )
 from modules.navigation import TransitionRelevance, classify_transition_relevance
+from modules.world_navigation import WorldEdge, WorldMapGraph
 from modules.nuzlocke.emerald_confirmation import (
     EmeraldConfirmationChoice,
     EmeraldConfirmationContext,
@@ -147,6 +157,44 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
 
         perceive_overworld.assert_not_called()
 
+    def test_unavailable_overworld_result_yields_without_unwinding_navigation(self):
+        from modules.nuzlocke.emerald_capabilities import observation_driven_overworld_progression
+
+        unavailable = OverworldObservationResult(
+            OverworldObservationStatus.UNAVAILABLE,
+            reason="player_avatar_unavailable",
+        )
+        with patch(
+            "modules.nuzlocke.emerald_capabilities.perceive_overworld",
+            return_value=unavailable,
+        ) as perceive_overworld:
+            progression = observation_driven_overworld_progression()
+            next(progression)
+            next(progression)
+
+        self.assertEqual(perceive_overworld.call_count, 2)
+
+    def test_initial_overworld_observation_is_reused_for_first_navigation_step(self):
+        from modules.nuzlocke.emerald_capabilities import observation_driven_overworld_progression
+
+        world = OverworldObservation(
+            (2, 0),
+            (1, 1),
+            Direction.East,
+            True,
+            (),
+            (),
+            (),
+            (),
+        )
+        wrapped = OverworldObservationResult(OverworldObservationStatus.VALID, observation=world)
+        with patch(
+            "modules.nuzlocke.emerald_capabilities.perceive_overworld",
+            side_effect=AssertionError("the initial frame observation should be reused"),
+        ):
+            progression = observation_driven_overworld_progression(initial_observation=wrapped)
+            next(progression)
+
     def test_map_change_eviction_closes_cached_tactical_loop(self):
         from modules.nuzlocke.emerald_capabilities import observation_driven_overworld_progression
 
@@ -161,6 +209,103 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
 
         cached_loop.close.assert_called_once_with()
         self.assertNotIn("overworld", cache)
+
+    def test_transient_destination_coordinate_preserves_transition_ownership(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        source_map = (1, 1)
+        destination_map = (1, 0)
+        transition = MapConnectionObservation(
+            (source_map, (19, 0)),
+            (destination_map, (19, 59)),
+            required_facing=capabilities.Direction.North,
+        )
+        transient = OverworldObservation(destination_map, (19, -1), capabilities.Direction.North, True, (), (), (), ())
+        arrived = OverworldObservation(
+            destination_map,
+            (19, 59),
+            capabilities.Direction.North,
+            True,
+            (TileObservation((destination_map, (19, 59)), False, frozenset(capabilities.Direction)),),
+            (),
+            (),
+            (),
+        )
+        cache = {"navigation_progress": {"pending_transition": transition}}
+        with (
+            patch.object(capabilities, "perceive_overworld", side_effect=(transient, arrived)),
+            patch.object(capabilities, "GoalAwareNavigator"),
+        ):
+            progression = capabilities.observation_driven_overworld_progression(
+                semantic_target=SemanticTarget.map(destination_map), execution_cache=cache
+            )
+            next(progression)
+            self.assertIs(cache["navigation_progress"]["pending_transition"], transition)
+            next(progression)
+
+        self.assertNotIn("pending_transition", cache["navigation_progress"])
+        self.assertIs(cache["navigation_progress"]["previous_transition"], transition)
+        self.assertNotIn("settling_observations", cache["navigation_progress"])
+
+    def test_transition_settling_does_not_plan_a_fresh_exit(self):
+        from modules.nuzlocke.emerald_capabilities import observation_driven_overworld_progression
+
+        current = OverworldObservation(
+            (2, 0),
+            (1, 1),
+            Direction.East,
+            True,
+            (),
+            (),
+            (),
+            (),
+            transition_in_progress=True,
+            transition_signals=frozenset({"task:Task_MapNamePopUpWindow"}),
+        )
+        with (
+            patch("modules.nuzlocke.emerald_capabilities.perceive_overworld", return_value=current),
+            patch("modules.nuzlocke.emerald_capabilities._observed_exit_goal") as observed_exit_goal,
+        ):
+            next(observation_driven_overworld_progression())
+
+        observed_exit_goal.assert_not_called()
+
+    def test_completed_intro_rival_capability_releases_on_rom_flag(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        observation = SimpleNamespace(
+            map_id=None,
+            dialogue_lifecycle_active=False,
+            campaign_facts=(
+                ("text_speed_fast", True),
+                ("new_game_setup_complete", True),
+                ("wall_clock_set", True),
+                ("intro_rival_battle_complete", True),
+            ),
+        )
+        with patch.object(capabilities, "_emerald_observation", return_value=observation):
+            campaign = capabilities.observation_driven_emerald_campaign("complete_intro_rival")
+            with self.assertRaises(StopIteration):
+                next(campaign)
+
+    def test_missing_current_map_affordance_releases_navigation_capability(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        current = OverworldObservation(
+            (0, 18),
+            (9, 14),
+            Direction.North,
+            True,
+            (),
+            (),
+            (),
+            (),
+        )
+        target = SemanticTarget.interaction((0, 18), "Route103_EventScript_Rival")
+        with patch.object(capabilities, "perceive_overworld", return_value=current):
+            progression = capabilities.observation_driven_overworld_progression(semantic_target=target)
+            with self.assertRaises(StopIteration):
+                next(progression)
 
     def test_post_gender_name_prompt_is_a_single_transition_input(self):
         action = choose_emerald_campaign_action(
@@ -226,6 +371,34 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         world = OverworldObservation((25, 40), (4, 1), None, False, (), (), (), ())
         navigator = GoalAwareNavigator(NavigationWorld.from_overworld(world))
         self.assertIsNone(_observed_exit_goal(world, navigator))
+
+    def test_observed_exit_applies_objective_navigation_policy(self):
+        source_map = (25, 40)
+        destination = ((1, 1), (0, 0))
+        warp = WarpObservation((source_map, (2, 8)), destination)
+        world = SimpleNamespace(
+            map_id=source_map,
+            player_coordinates=(2, 7),
+            controllable=True,
+            transitions=(warp,),
+            warps=(),
+        )
+        navigator = Mock()
+        navigator.plan.return_value = SimpleNamespace(
+            metrics=SimpleNamespace(encounter_opportunities=0, total_route_cost=1, movement_actions=1)
+        )
+        policy = NavigationGoal(
+            SemanticTarget.interaction((1, 2), interaction_id="roxanne"),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+        )
+
+        selected = _observed_exit_goal(world, navigator, navigation_policy=policy)
+
+        self.assertIs(selected.warp, warp)
+        planned_goal = navigator.plan.call_args.args[1]
+        self.assertIsInstance(planned_goal, NavigationGoal)
+        self.assertIs(planned_goal.target.warp, warp)
+        self.assertEqual(planned_goal.constraints.trainer_mode, TrainerMode.AVOID)
 
     def test_transition_relevance_precedes_local_cost(self):
         from modules.map_path import Direction
@@ -373,9 +546,7 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
 
         town, house_1f, house_2f, route101 = (0, 9), (1, 2), (1, 3), (0, 16)
         house_entry = WarpObservation((town, (5, 8)), (house_1f, (2, 8)))
-        route_exit = MapConnectionObservation(
-            (town, (10, 0)), (route101, (10, 28)), required_facing=Direction.North
-        )
+        route_exit = MapConnectionObservation((town, (10, 0)), (route101, (10, 28)), required_facing=Direction.North)
         world = SimpleNamespace(
             map_id=town,
             player_coordinates=(8, 4),
@@ -495,6 +666,93 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
 
         self.assertIs(selected.warp, reverse)
 
+    def test_recent_transition_only_reverses_exact_same_destination_exit(self):
+        """Two exits to one map must not collapse into one anti-reversal edge."""
+        from modules.world_navigation import WorldRoute
+
+        route104, woods, rustboro = (0, 19), (24, 11), (0, 3)
+        previous = WarpObservation((route104, (11, 38)), (woods, (17, 38)), required_facing=Direction.South)
+        reverse = WarpObservation((woods, (17, 38)), (route104, (11, 38)), required_facing=Direction.North)
+        forward = WarpObservation((woods, (15, 5)), (route104, (11, 30)), required_facing=Direction.North)
+        world = SimpleNamespace(
+            map_id=woods,
+            player_coordinates=(17, 38),
+            controllable=True,
+            transitions=(reverse, forward),
+            warps=(),
+        )
+        navigator = Mock()
+        navigator.plan.side_effect = lambda start, goal, algorithm: SimpleNamespace(
+            metrics=SimpleNamespace(
+                encounter_opportunities=0,
+                total_route_cost=1 if goal.warp is reverse else 40,
+                movement_actions=1 if goal.warp is reverse else 40,
+            )
+        )
+
+        with (
+            patch(
+                "modules.nuzlocke.emerald_capabilities.classify_transition_relevance",
+                return_value=TransitionRelevance.RELEVANT,
+            ),
+            patch(
+                "modules.nuzlocke.emerald_capabilities.transition_world_route",
+                return_value=WorldRoute((route104, rustboro), (), 10),
+            ),
+        ):
+            selected = _observed_exit_goal(
+                world,
+                navigator,
+                SemanticTarget.map(rustboro),
+                {"previous_transition": previous},
+            )
+
+        self.assertIs(selected.warp, forward)
+
+    def test_world_route_selects_correct_exit_when_restart_loses_transition_memory(self):
+        """The static route should break same-map exit ties after restart."""
+        from modules.world_navigation import WorldRoute
+
+        route104, woods, rustboro = (0, 19), (24, 11), (0, 3)
+        reverse = WarpObservation((woods, (17, 38)), (route104, (11, 38)), required_facing=Direction.North)
+        forward = WarpObservation((woods, (14, 5)), (route104, (10, 30)), required_facing=Direction.North)
+        world = SimpleNamespace(
+            map_id=woods,
+            player_coordinates=(17, 38),
+            controllable=True,
+            transitions=(reverse, forward),
+            warps=(),
+        )
+        graph = WorldMapGraph(
+            (
+                WorldEdge(woods, route104, "warp", ((14, 5),), ((10, 30),)),
+                WorldEdge(route104, rustboro, "connection", ((0, 0),), ((0, 59),)),
+            )
+        )
+        navigator = Mock()
+        navigator.plan.side_effect = lambda start, goal, algorithm: SimpleNamespace(
+            metrics=SimpleNamespace(
+                encounter_opportunities=0,
+                total_route_cost=1 if goal.warp is reverse else 40,
+                movement_actions=1 if goal.warp is reverse else 40,
+            )
+        )
+
+        with (
+            patch("modules.world_navigation.get_world_map_graph", return_value=graph),
+            patch(
+                "modules.nuzlocke.emerald_capabilities.classify_transition_relevance",
+                return_value=TransitionRelevance.RELEVANT,
+            ),
+            patch(
+                "modules.nuzlocke.emerald_capabilities.transition_world_route",
+                return_value=WorldRoute((route104, rustboro), (), 10),
+            ),
+        ):
+            selected = _observed_exit_goal(world, navigator, SemanticTarget.map(rustboro))
+
+        self.assertIs(selected.warp, forward)
+
     def test_goal_route_quality_prefers_staircase_over_cheap_cyclic_exit(self):
         """The autonomous 1F boundary must choose forward world progress."""
         from modules.map_path import Direction
@@ -586,6 +844,70 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             selected = _observed_exit_goal(world, navigator, target)
         self.assertIs(selected.warp, locally_reachable)
 
+    def test_unreachable_progression_connection_can_use_indirect_warp(self):
+        """A disconnected map section may require an interior warp first."""
+        from modules.navigation import NavigationError
+        from modules.world_navigation import WorldEdge, WorldMapGraph, WorldRoute
+
+        source = (25, 40)
+        target_map = (25, 41)
+        detour_map = (25, 42)
+        wrong_boundary_map = (25, 43)
+        direct = MapConnectionObservation((source, (3, 0)), (target_map, (3, 9)), required_facing=Direction.North)
+        detour = WarpObservation((source, (2, 1)), (detour_map, (1, 1)))
+        wrong_boundary = MapConnectionObservation(
+            (source, (4, 1)), (wrong_boundary_map, (4, 9)), required_facing=Direction.East
+        )
+        world = OverworldObservation(
+            source,
+            (2, 2),
+            Direction.South,
+            True,
+            tuple(
+                TileObservation((source, coordinate), False, frozenset(Direction))
+                for coordinate in ((2, 2), direct.entry[1], detour.entry[1], wrong_boundary.entry[1])
+            ),
+            (detour,),
+            (),
+            (),
+            transitions=(direct, detour, wrong_boundary),
+        )
+        graph = WorldMapGraph(
+            (
+                WorldEdge(source, target_map, "connection", ((3, 0),), ((3, 9),)),
+                WorldEdge(detour_map, target_map, "connection", ((1, 1),), ((1, 9),)),
+                WorldEdge(source, wrong_boundary_map, "connection", ((4, 1),), ((4, 9),)),
+                WorldEdge(wrong_boundary_map, target_map, "connection", ((4, 9),), ((4, 0),)),
+            )
+        )
+        navigator = Mock()
+
+        def plan(_start, goal, algorithm):
+            if goal.warp is direct or goal.warps:
+                raise NavigationError("direct section is unreachable")
+            return SimpleNamespace(
+                metrics=SimpleNamespace(encounter_opportunities=0, total_route_cost=1, movement_actions=1)
+            )
+
+        navigator.plan.side_effect = plan
+        with (
+            patch("modules.world_navigation.get_world_map_graph", return_value=graph),
+            patch(
+                "modules.nuzlocke.emerald_capabilities.classify_transition_relevance",
+                return_value=TransitionRelevance.RELEVANT,
+            ),
+            patch(
+                "modules.nuzlocke.emerald_capabilities.transition_world_route",
+                side_effect=lambda warp, _target, _graph: (
+                    WorldRoute((target_map,), (), 0) if warp is direct else WorldRoute((detour_map, target_map), (), 10)
+                ),
+            ),
+        ):
+            selected = _observed_exit_goal(world, navigator, SemanticTarget.map(target_map))
+
+        self.assertIsNotNone(selected)
+        self.assertIs(selected.warp, detour)
+
     def test_semantic_target_with_no_known_relevant_exit_does_not_escape_unrelated(self):
         from modules.map_path import Direction
         from modules.overworld import OverworldObservation, TileObservation, WarpObservation
@@ -651,12 +973,8 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         from modules.world_navigation import WorldEdge, WorldMapGraph, WorldRoute
 
         oldale, route103, route101, lab = (0, 9), (0, 18), (0, 16), (0, 10)
-        reverse = MapConnectionObservation(
-            (oldale, (1, 0)), (route103, (1, 20)), required_facing=Direction.North
-        )
-        forward = MapConnectionObservation(
-            (oldale, (3, 0)), (route101, (3, 20)), required_facing=Direction.North
-        )
+        reverse = MapConnectionObservation((oldale, (1, 0)), (route103, (1, 20)), required_facing=Direction.North)
+        forward = MapConnectionObservation((oldale, (3, 0)), (route101, (3, 20)), required_facing=Direction.North)
         world = OverworldObservation(
             oldale,
             (2, 1),
@@ -893,6 +1211,57 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         self.assertIsNone(
             _observed_local_destination_goal(world, Mock(), MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value)
         )
+
+    def test_petalburg_wally_target_selects_gym_warp_over_east_route(self):
+        city = MapRSE.PETALBURG_CITY.value
+        route104 = MapRSE.ROUTE104.value
+        route102 = MapRSE.ROUTE102.value
+        gym = MapRSE.PETALBURG_CITY_GYM.value
+        west = MapConnectionObservation((city, (0, 10)), (route104, (99, 10)))
+        east = MapConnectionObservation((city, (29, 10)), (route102, (0, 10)))
+        gym_warp = WarpObservation((city, (15, 8)), (gym, (4, 108)))
+        world = OverworldObservation(
+            city,
+            (10, 10),
+            Direction.East,
+            True,
+            tuple(
+                TileObservation((city, coordinate), False, frozenset(Direction))
+                for coordinate in ((10, 10), west.entry[1], east.entry[1], gym_warp.entry[1])
+            ),
+            (gym_warp,),
+            (),
+            (),
+            transitions=(west, east, gym_warp),
+        )
+        graph = WorldMapGraph(
+            (
+                WorldEdge(city, route104, "connection", (), (), estimated_cost=10),
+                WorldEdge(city, route102, "connection", (), (), estimated_cost=10),
+                WorldEdge(city, gym, "warp", (), (), estimated_cost=10),
+                WorldEdge(route104, city, "connection", (), (), estimated_cost=10),
+                WorldEdge(route102, city, "connection", (), (), estimated_cost=10),
+            )
+        )
+        navigator = Mock()
+        navigator.plan.return_value = SimpleNamespace(
+            destination=gym_warp.entry,
+            metrics=SimpleNamespace(encounter_opportunities=0, total_route_cost=7, movement_actions=7),
+        )
+
+        with (
+            patch("modules.world_navigation.get_world_map_graph", return_value=graph),
+            patch("modules.navigation.get_world_map_graph", return_value=graph),
+        ):
+            selected = _observed_exit_goal(
+                world,
+                navigator,
+                _semantic_target_for_objective("complete_petalburg_wally"),
+            )
+
+        self.assertIsNotNone(selected)
+        self.assertIs(selected.warp, gym_warp)
+        self.assertEqual(selected.destination_map, gym)
 
     def test_receive_pokedex_waits_for_rom_owned_lab_event_after_entry(self):
         action = choose_emerald_observation_action(
@@ -1139,6 +1508,44 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
                 SemanticTarget.interaction(map_id, "Route103_EventScript_Rival"),
             ),
             ActivateTrigger("introductory_rival"),
+        )
+
+        # The live object scan and semantic binding can both describe the
+        # same ROM interaction.  Campaign identity must win over the
+        # ephemeral object trigger.
+        generic_runtime = replace(
+            trigger,
+            trigger_id="object:2:Route103_EventScript_Rival",
+            kind="object_interaction",
+        )
+        with_both = replace(world, triggers=(generic_runtime, trigger))
+        self.assertEqual(
+            _observed_interaction_goal(
+                with_both,
+                SemanticTarget.interaction(map_id, "Route103_EventScript_Rival"),
+            ),
+            ActivateTrigger("introductory_rival"),
+        )
+
+        # Static activation geometry is also the valid pre-battle fallback
+        # while the runtime object has not spawned yet.
+        static_only = replace(world, triggers=(replace(trigger, locations=frozenset()),))
+        self.assertEqual(
+            _observed_interaction_goal(
+                static_only,
+                SemanticTarget.interaction(map_id, "Route103_EventScript_Rival"),
+            ),
+            ActivateTrigger("introductory_rival"),
+        )
+
+        # Once the ROM has reported completion, that same static geometry is
+        # stale and must not reclaim the campaign objective.
+        self.assertIsNone(
+            _observed_interaction_goal(
+                static_only,
+                SemanticTarget.interaction(map_id, "Route103_EventScript_Rival"),
+                completion_observed=True,
+            )
         )
 
     def test_transition_classifier_exposes_relevance_and_blocking(self):

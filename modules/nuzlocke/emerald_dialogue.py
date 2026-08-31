@@ -110,17 +110,15 @@ def observe_dialogue(
     # stopped the draw task.  Keep this in the shared observer so callers do
     # not need a second, subtly different standard-message predicate.
     if not actionable:
-        actionable = bool(
-            state[2]
-            and state[3] == "WaitForAorBPress"
-            and state[4] == "Std_MsgboxDefault"
-            and state[5]
-        )
+        actionable = bool(state[2] and state[3] == "WaitForAorBPress" and state[4] == "Std_MsgboxDefault" and state[5])
     if actionable:
         lifecycle = True
-    if lifecycle and not state[0] and not (
-        state[3] == "WaitForAorBPress" and state[4] == "Std_MsgboxDefault" and state[5]
-    ) and not state[7]:
+    if (
+        lifecycle
+        and not state[0]
+        and not (state[3] == "WaitForAorBPress" and state[4] == "Std_MsgboxDefault" and state[5])
+        and not state[7]
+    ):
         lifecycle = False
     diagnostic_print(
         lambda: (
@@ -153,18 +151,12 @@ def advance_dialogue(
         else:
             context.emulator.press_button("A")
         diagnostic_print(
-            lambda: (
-                "EMERALD_DIALOGUE_EXECUTION: "
-                f"frame={getattr(context, 'frame', None)!r} button='A' fresh=True"
-            ),
+            lambda: ("EMERALD_DIALOGUE_EXECUTION: " f"frame={getattr(context, 'frame', None)!r} button='A' fresh=True"),
             trace=True,
         )
     else:
         diagnostic_print(
-            lambda: (
-                "EMERALD_DIALOGUE_EXECUTION: "
-                f"frame={getattr(context, 'frame', None)!r} action='WAIT'"
-            ),
+            lambda: ("EMERALD_DIALOGUE_EXECUTION: " f"frame={getattr(context, 'frame', None)!r} action='WAIT'"),
             trace=True,
         )
     yield

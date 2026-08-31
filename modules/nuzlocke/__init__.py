@@ -9,6 +9,7 @@ from .snapshots import (
     NamedFlag,
     NamedVariable,
     CampaignObservationSnapshot,
+    CampaignObservationLifecycle,
     NuzlockeSnapshot,
     PartyPokemonSnapshot,
     PlayerSnapshot,
@@ -55,8 +56,10 @@ from .emerald_campaign_registry import (
     EmeraldBossDefinition,
     EmeraldBossProgression,
     EmeraldObjectiveDefinition,
+    EmeraldCapabilityDefinition,
     active_emerald_boss,
     emerald_bosses,
+    emerald_capability_definition,
     emerald_objectives,
 )
 from .level_cap import BattleEntryDecision, LevelCapAssessment, LevelCapRule, assess_level_cap, evaluate_battle_entry
@@ -154,6 +157,7 @@ def __getattr__(name):
         }[name]
     raise AttributeError(name)
 
+
 __all__ = [
     "BattleSnapshot",
     "BattlePokemonSnapshot",
@@ -163,6 +167,7 @@ __all__ = [
     "NamedFlag",
     "NamedVariable",
     "CampaignObservationSnapshot",
+    "CampaignObservationLifecycle",
     "NuzlockeSnapshot",
     "PartyPokemonSnapshot",
     "PlayerSnapshot",
@@ -210,6 +215,8 @@ __all__ = [
     "active_emerald_boss",
     "emerald_bosses",
     "EmeraldObjectiveDefinition",
+    "EmeraldCapabilityDefinition",
+    "emerald_capability_definition",
     "emerald_objectives",
     "BattleEntryDecision",
     "LevelCapAssessment",

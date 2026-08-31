@@ -43,6 +43,8 @@ class ObservedPokemon:
 
 @dataclass(frozen=True, slots=True)
 class ObservedBattle:
+    """Immutable summary of a battle start observed in event history."""
+
     battle_type: tuple[str, ...]
     is_trainer: bool
     is_wild: bool
@@ -52,6 +54,8 @@ class ObservedBattle:
 
 @dataclass(frozen=True, slots=True)
 class ObservedEvent:
+    """Sequence and timeline metadata for one projected event."""
+
     sequence: int
     event_type: str
     session_id: str | None
@@ -60,6 +64,8 @@ class ObservedEvent:
 
 @dataclass(frozen=True, slots=True)
 class ObservedCampaignState:
+    """Immutable read-only projection of observed campaign transitions."""
+
     current_session_id: str | None = None
     last_event_sequence: int = 0
     last_observed_frame: int | None = None
@@ -82,6 +88,8 @@ class ObservedCampaignState:
 
 
 def _event_key(event: Event, session_id: str | None) -> str:
+    """Build the idempotency key used when replaying an unsequenced event."""
+
     payload = json.dumps(serialize_event(event), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(f"{session_id}\0{event.frame}\0{payload}".encode()).hexdigest()
 
@@ -100,11 +108,15 @@ class CampaignProjection:
     """
 
     def __init__(self) -> None:
+        """Create an empty ordered observation projection."""
+
         self._state = ObservedCampaignState()
         self._seen: set[str] = set()
 
     @property
     def state(self) -> ObservedCampaignState:
+        """Return the current immutable observation projection."""
+
         return self._state
 
     def apply(
@@ -115,6 +127,8 @@ class CampaignProjection:
         sequence: int | None = None,
         event_id: str | None = None,
     ) -> None:
+        """Reduce one ordered event into observed campaign state."""
+
         if not isinstance(
             event,
             (
@@ -231,6 +245,8 @@ class CampaignProjection:
         self._state = replace(state, **changes)
 
     def apply_record(self, record: dict[str, Any]) -> None:
+        """Validate and reduce one persisted event record with its metadata."""
+
         required = {"event_id", "session_id", "sequence", "frame", "type", "payload"}
         if set(record) != required:
             raise ValueError("Malformed event record")
@@ -246,6 +262,8 @@ class CampaignProjection:
 
 
 def reduce_events(events: Iterable[Event]) -> ObservedCampaignState:
+    """Reduce an in-memory event iterable into observed campaign state."""
+
     projection = CampaignProjection()
     for event in events:
         projection.apply(event)
@@ -253,6 +271,8 @@ def reduce_events(events: Iterable[Event]) -> ObservedCampaignState:
 
 
 def load_campaign_projection(event_store: JsonEventStore) -> ObservedCampaignState:
+    """Replay an event store into the immutable observation projection."""
+
     projection = CampaignProjection()
     for record in event_store.iter_records():
         projection.apply_record(record)

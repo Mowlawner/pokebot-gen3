@@ -24,6 +24,8 @@ from .identity import PokemonIdentity
 
 @dataclass(frozen=True, slots=True)
 class BattleStarted:
+    """Observation of a battle becoming fully identifiable in the ROM."""
+
     frame: int
     battle_type: tuple[str, ...]
     is_trainer: bool
@@ -32,10 +34,17 @@ class BattleStarted:
     own_pokemon_identities: tuple[PokemonIdentity, ...] = ()
     opponent_pokemon_identities: tuple[PokemonIdentity, ...] = ()
     location: tuple[int, int] | None = None
+    # ``None`` preserves compatibility with events written before the
+    # runtime began recording the campaign eligibility boundary.  New live
+    # events carry the decision made from the same frame's campaign facts so
+    # rules replay does not have to reconstruct emulator state.
+    encounter_eligible: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class BattleEnded:
+    """Observation of a battle leaving the active battle lifecycle."""
+
     frame: int
     outcome: str
     battle_type: tuple[str, ...]
@@ -63,6 +72,8 @@ class PokemonCaptured:
 
 @dataclass(frozen=True, slots=True)
 class MapChanged:
+    """Observation of a player map transition."""
+
     frame: int
     old_map: tuple[int, int] | None
     new_map: tuple[int, int] | None
@@ -70,6 +81,8 @@ class MapChanged:
 
 @dataclass(frozen=True, slots=True)
 class PartyChanged:
+    """Observation of party membership, order, or relevant member changes."""
+
     frame: int
     entered_party_indices: tuple[int, ...]
     left_party_indices: tuple[int, ...]
@@ -82,6 +95,8 @@ class PartyChanged:
 
 @dataclass(frozen=True, slots=True)
 class PokemonFainted:
+    """Observation of a party Pokémon transitioning to zero HP."""
+
     frame: int
     party_index: int
     species: str
@@ -93,6 +108,8 @@ class PokemonFainted:
 
 @dataclass(frozen=True, slots=True)
 class PokemonStorageLocation:
+    """Observed box and slot for a stable Pokémon identity."""
+
     identity: PokemonIdentity
     box: int
     slot: int
@@ -100,6 +117,8 @@ class PokemonStorageLocation:
 
 @dataclass(frozen=True, slots=True)
 class StorageChanged:
+    """Observation of Pokémon entering, leaving, or moving within storage."""
+
     frame: int
     entered: tuple[PokemonStorageLocation, ...]
     left: tuple[PokemonStorageLocation, ...]
@@ -108,11 +127,15 @@ class StorageChanged:
 
 @dataclass(frozen=True, slots=True)
 class WhiteoutOccurred:
+    """Observation that the ROM entered its whiteout game state."""
+
     frame: int
 
 
 @dataclass(frozen=True, slots=True)
 class GameStateChanged:
+    """Observation of a change in the emulator's game-state enum."""
+
     frame: int
     old_state: Any
     new_state: Any
@@ -154,6 +177,8 @@ def _identity(pokemon: PartyPokemonSnapshot) -> tuple[Any, ...]:
 
 
 def _party_state(pokemon: PartyPokemonSnapshot) -> tuple[Any, ...]:
+    """Return party fields whose changes warrant a PartyChanged event."""
+
     # HP and fainted are intentionally excluded: battle damage is not a party
     # composition change and must not produce an event every frame.
     return (
@@ -168,6 +193,8 @@ def _party_state(pokemon: PartyPokemonSnapshot) -> tuple[Any, ...]:
 
 
 def _map(snapshot: NuzlockeSnapshot) -> tuple[int, int] | None:
+    """Return a snapshot's map identity when both map components are known."""
+
     if snapshot.player.map_group is None or snapshot.player.map_number is None:
         return None
     return snapshot.player.map_group, snapshot.player.map_number
@@ -177,6 +204,8 @@ class NuzlockeEventObserver:
     """Convert a sequence of normalized snapshots into one-shot transitions."""
 
     def __init__(self) -> None:
+        """Create an observer with no prior snapshot baseline."""
+
         self._previous: NuzlockeSnapshot | None = None
         self._previous_battle: NuzlockeSnapshot | None = None
         self._previous_ready_battle: NuzlockeSnapshot | None = None
@@ -186,21 +215,61 @@ class NuzlockeEventObserver:
         self._fainted: set[tuple[Any, ...]] = set()
         self._storage_location_cache: dict[int, tuple[object, dict[PokemonIdentity, PokemonStorageLocation]]] = {}
 
+    @staticmethod
+    def _battle_is_ready(snapshot: NuzlockeSnapshot) -> bool:
+        """Return whether the battle boundary has usable ROM identity data.
+
+        During Emerald's ``BATTLE_STARTING`` transition, battler buffers can
+        already contain enough data for ``BattleSnapshot.ready`` to be true
+        while the battle type is still zeroed.  Such a frame is a baseline,
+        not a legal encounter boundary; accepting it would claim a location
+        with stale opponent identity data.
+        """
+        return bool(
+            snapshot.battle_available
+            and snapshot.battle is not None
+            and snapshot.battle.ready
+            and snapshot.battle.battle_type
+        )
+
     def observe(self, snapshot: NuzlockeSnapshot) -> tuple[Event, ...]:
+        """Compare one snapshot with the prior baseline and emit transitions."""
+
         previous = self._previous
         self._previous = snapshot
         if previous is None:
             self._remember_available(snapshot)
+            # A process can be restored from a save-state while the ROM is
+            # already in a fully materialized battle.  Treat that first
+            # complete battle observation as the start boundary; otherwise
+            # the observer can only emit BattleEnded and the campaign rules
+            # never get a chance to claim a legal encounter.  An incomplete
+            # BATTLE_STARTING snapshot still remains a baseline and will be
+            # promoted by the normal ready transition below.
+            if self._battle_is_ready(snapshot):
+                battle = snapshot.battle
+                return (
+                    BattleStarted(
+                        snapshot.frame,
+                        battle.battle_type,
+                        battle.is_trainer,
+                        battle.is_wild,
+                        battle.is_double,
+                        tuple(p.identity for p in battle.own_active if p.identity is not None),
+                        tuple(p.identity for p in battle.opponent_active if p.identity is not None),
+                        _map(snapshot),
+                    ),
+                )
             return ()
 
         events: list[Event] = []
         previous_battle = self._previous_battle
         if (
-            snapshot.battle_available
-            and snapshot.battle is not None
-            and snapshot.battle.ready
+            self._battle_is_ready(snapshot)
             and self._previous_ready_battle is None
-            and (previous_battle is None or previous_battle.battle is None or not previous_battle.battle.ready)
+            and (
+                previous_battle is None or previous_battle.battle is None or not self._battle_is_ready(previous_battle)
+            )
         ):
             battle = snapshot.battle
             events.append(
@@ -277,9 +346,11 @@ class NuzlockeEventObserver:
         return tuple(events)
 
     def _remember_available(self, snapshot: NuzlockeSnapshot) -> None:
+        """Update only the observation baselines available in this snapshot."""
+
         if snapshot.battle_available:
             self._previous_battle = snapshot
-            if snapshot.battle is not None and snapshot.battle.ready:
+            if self._battle_is_ready(snapshot):
                 self._previous_ready_battle = snapshot
             elif snapshot.battle is None:
                 self._previous_ready_battle = None
@@ -291,6 +362,8 @@ class NuzlockeEventObserver:
             self._previous_party = snapshot
 
     def _party_events(self, previous: NuzlockeSnapshot, snapshot: NuzlockeSnapshot) -> list[Event]:
+        """Derive party composition and faint transitions between snapshots."""
+
         old = previous.party
         new = snapshot.party
         old_keys = tuple(_identity(p) for p in old)
@@ -367,6 +440,8 @@ class NuzlockeEventObserver:
         return ([event] if event is not None else []) + faint_events
 
     def _storage_locations(self, value: NuzlockeSnapshot) -> dict[PokemonIdentity, PokemonStorageLocation]:
+        """Index readable storage identities, reusing the snapshot-local cache."""
+
         source = value.pc
         key = id(source)
         cached = self._storage_location_cache.get(key)
@@ -387,6 +462,8 @@ class NuzlockeEventObserver:
         return locations
 
     def _storage_events(self, previous: NuzlockeSnapshot, snapshot: NuzlockeSnapshot) -> list[Event]:
+        """Derive storage entry, exit, and movement transitions."""
+
         old, new = self._storage_locations(previous), self._storage_locations(snapshot)
         entered = tuple(new[identity] for identity in new.keys() - old.keys())
         left = tuple(old[identity] for identity in old.keys() - new.keys())

@@ -5,7 +5,7 @@ from enum import Enum, auto
 from modules.context import context
 from modules.map import observe_live_map_identity, get_map_metadata, get_map_objects
 from modules.game import get_event_var_name
-from modules.memory import get_event_flag, get_event_var_by_number, get_game_state_symbol
+from modules.memory import get_event_flag, get_event_flag_by_number, get_event_var_by_number, get_game_state_symbol
 from modules.tasks import task_is_active
 from modules.map_path import Direction, _get_map_metadata
 from modules.player import get_player_avatar, player_avatar_is_controllable
@@ -28,6 +28,71 @@ class MovementState(Enum):
 
 # Emerald's MB_COUNTER value from include/constants/metatile_behaviors.h.
 EMERALD_MB_COUNTER = 0x80
+
+
+# Readiness and campaign capability execution run back-to-back during one
+# application frame. Keep that frame's passive overworld observation available
+# to the capability so it does not rebuild the same map/object/trigger model a
+# second time before issuing its first action.
+_shared_overworld_observation_frame = None
+_shared_overworld_observation_emulator = None
+_shared_overworld_observation_avatar_reader = None
+_shared_overworld_observation = None
+
+
+def _current_emulator_frame():
+    """Return the live emulator frame used to scope passive observations."""
+
+    emulator = getattr(context, "emulator", None)
+    get_frame_count = getattr(emulator, "get_frame_count", None)
+    if not callable(get_frame_count):
+        return None
+    try:
+        frame = get_frame_count()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    # A test double without a concrete frame must not accidentally turn a
+    # process-wide observation into a cache.  The real adapter returns an
+    # int, and accepting bool here would be equally misleading.
+    return frame if isinstance(frame, int) and not isinstance(frame, bool) else None
+
+
+def invalidate_shared_overworld_observation() -> None:
+    """Discard the passive world read after an explicit runtime invalidation."""
+
+    global _shared_overworld_observation_frame, _shared_overworld_observation_emulator, _shared_overworld_observation_avatar_reader, _shared_overworld_observation
+    _shared_overworld_observation_frame = None
+    _shared_overworld_observation_emulator = None
+    _shared_overworld_observation_avatar_reader = None
+    _shared_overworld_observation = None
+
+
+def publish_shared_overworld_observation(observation) -> None:
+    """Publish a passive overworld read for another owner in this frame."""
+
+    global _shared_overworld_observation_frame, _shared_overworld_observation_emulator, _shared_overworld_observation_avatar_reader, _shared_overworld_observation
+    frame = _current_emulator_frame()
+    if frame is None:
+        return
+    _shared_overworld_observation_frame = frame
+    _shared_overworld_observation_emulator = getattr(context, "emulator", None)
+    _shared_overworld_observation_avatar_reader = get_player_avatar
+    _shared_overworld_observation = observation
+
+
+def shared_overworld_observation_for_current_frame():
+    """Return the published passive overworld read for the current frame."""
+
+    frame = _current_emulator_frame()
+    if frame is None:
+        return None
+    if (
+        frame != _shared_overworld_observation_frame
+        or getattr(context, "emulator", None) is not _shared_overworld_observation_emulator
+        or get_player_avatar is not _shared_overworld_observation_avatar_reader
+    ):
+        return None
+    return _shared_overworld_observation
 
 
 def _running_shoes_received() -> bool:
@@ -156,6 +221,14 @@ class TriggerObservation:
     # activate the trainer, distinct from the adjacent interaction positions.
     hazard_locations: frozenset[Location] = frozenset()
     hazard_kind: str | None = None
+    # Coordinate scripts are dispatched by the ROM when the player enters
+    # their tile. Object and background events, by contrast, require the
+    # interaction button. Keep this execution distinction explicit so a
+    # semantic campaign target cannot turn an automatic scene into repeated
+    # A presses. These fields are appended to preserve the legacy positional
+    # constructor order used by navigation fixtures.
+    elevation: int | None = None
+    requires_input: bool = True
 
 
 @dataclass(frozen=True)
@@ -259,6 +332,76 @@ def trainer_hazard_locations(
     return frozenset(result)
 
 
+def static_trainer_observations(
+    map_id: MapId,
+    map_metadata,
+    runtime_objects: tuple[ObjectObservation, ...] | list[ObjectObservation] = (),
+) -> tuple[ObjectObservation, ...]:
+    """Describe trainer hazards whose runtime object has not spawned yet.
+
+    Emerald can populate ``gObjectEvents`` lazily as the camera approaches an
+    object.  That is too late for avoidance: a route may already have crossed
+    the trainer's sight line by the time the object becomes visible.  The map
+    template is ROM-owned and supplies the trainer type, initial coordinate,
+    range, direction, and defeat state, so it is a safe fallback for hazards.
+
+    These observations are intentionally separate from the returned runtime
+    object list.  A template is not evidence that the object currently blocks
+    collision or that a semantic binding has a live object match.
+    """
+    runtime_ids = {object_observation.local_id for object_observation in runtime_objects}
+    result: list[ObjectObservation] = []
+    for template in getattr(map_metadata, "objects", ()):
+        try:
+            if getattr(template, "kind", "normal") != "normal":
+                continue
+            local_id = template.local_id
+            trainer_type = template.trainer_type
+            if local_id in runtime_ids or trainer_type in (None, "None", "???"):
+                continue
+            # A set template flag means the object is hidden.  If the flag
+            # cannot be read at this boundary, retain the hazard: an unknown
+            # visibility result must not silently expose the player to battle.
+            flag_id = getattr(template, "flag_id", 0) or 0
+            if flag_id:
+                try:
+                    if get_event_flag_by_number(flag_id):
+                        continue
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+                    pass
+            defeated = template.is_trainer_defeated
+            movement_type = str(getattr(template, "movement_type", ""))
+            facing = None
+            if trainer_type != "See All Directions":
+                # FACE_DOWN_AND_UP and similar movement types begin in the
+                # first listed direction; that is the object-event spawn
+                # orientation used by the ROM before its first turn.
+                direction_name = movement_type.removeprefix("FACE_").split("_")[0].title()
+                if direction_name in {"Up", "Down", "Left", "Right"}:
+                    facing = direction_name
+            result.append(
+                ObjectObservation(
+                    local_id=local_id,
+                    location=(map_id, template.local_coordinates),
+                    script=getattr(template, "script_symbol", ""),
+                    previous_location=(map_id, template.local_coordinates),
+                    facing=facing,
+                    movement_type=movement_type,
+                    trainer_type=trainer_type,
+                    trainer_range=template.trainer_range,
+                    trainer_defeated=defeated,
+                    interactable=True,
+                    elevation=getattr(template, "elevation", None),
+                )
+            )
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+            # Partial map metadata is common during a map transition.  It is
+            # better to omit one unresolved fallback than to make perception
+            # fail and lose all of the other current-frame evidence.
+            continue
+    return tuple(result)
+
+
 def evaluate_trigger_condition(trigger: TriggerObservation, current_value: int | None) -> bool | None:
     """Evaluate a normalized trigger condition without interpreting its script."""
     if trigger.condition_required_value is None:
@@ -301,6 +444,12 @@ class OverworldObservation:
     objects: tuple[ObjectObservation, ...]
     triggers: tuple[TriggerObservation, ...]
     bindings: tuple[BindingResolution, ...] = ()
+    # ``player_elevation`` mirrors Emerald's PlayerGetElevation(), which is
+    # the player object event's previous elevation and is what coordinate
+    # events use for dispatch. The other fields support transition diagnosis.
+    player_elevation: int | None = None
+    player_current_elevation: int | None = None
+    player_previous_coordinates: Coordinate | None = None
     movement_state: MovementState | None = None
     dynamic_blocked_coordinates: frozenset[Coordinate] = frozenset()
     transitions: tuple[WorldTransition, ...] = ()
@@ -310,6 +459,10 @@ class OverworldObservation:
     map_identity_source: str = "save_block"
     save_block_map_id: MapId | None = None
     live_map_candidates: tuple[MapId, ...] = ()
+    # True when the avatar is already in a water-traversal state. Navigation
+    # uses this to distinguish an ordinary land avatar from one that can
+    # legally enter elevation-1 water tiles.
+    surfing: bool = False
 
     def tile_at(self, coordinates: Coordinate) -> TileObservation | None:
         tile = next((tile for tile in self.tiles if tile.location[1] == coordinates), None)
@@ -389,6 +542,34 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
             elif "Door" in tile_type or "Exterior Door" in tile_type:
                 mechanism = TransitionMechanism.DOOR_WARP
                 activation_mode = TransitionActivationMode.FIELD_EFFECT
+                # Exterior door tiles are collision-blocked ROM warp entries.
+                # The field engine activates them from the adjacent walkable
+                # tile, so the entry coordinate is not an executable source
+                # state for navigation.  Keep the source geometry explicit;
+                # this is especially important for recovery, whose catalog
+                # destination is the Center door itself.
+                direction_vectors = {
+                    Direction.North: (0, -1),
+                    Direction.East: (1, 0),
+                    Direction.South: (0, 1),
+                    Direction.West: (-1, 0),
+                }
+                static_object_locations = {
+                    object_template.local_coordinates for object_template in getattr(map_data, "objects", ())
+                }
+                door_sources = []
+                for direction, (dx, dy) in direction_vectors.items():
+                    source = (x - dx, y - dy)
+                    source_tile = by_coordinate.get(source)
+                    if (
+                        source_tile is not None
+                        and any(source_tile.accessible_from_direction)
+                        and source not in static_object_locations
+                    ):
+                        door_sources.append(((map_id, source), direction))
+                activation_locations = frozenset(source for source, _ in door_sources)
+                if len(door_sources) == 1:
+                    activation_direction = door_sources[0][1]
             if tile_type in ("Escalator Up", "Escalator Down"):
                 mechanism = TransitionMechanism.ESCALATOR_WARP
                 activation_mode = TransitionActivationMode.FIELD_EFFECT
@@ -523,11 +704,13 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
                         locations=frozenset({location}),
                         activation_locations=frozenset({location}),
                         kind=event.type,
+                        elevation=event.elevation,
                         script_symbol=event.script_symbol if event.type == "script" else None,
                         condition_variable=get_event_var_name(event.trigger_var_number),
                         condition_variable_number=event.trigger_var_number,
                         condition_required_value=event.trigger_value,
                         affordance_id=event.script_symbol,
+                        requires_input=False,
                     )
                 )
         for index, event in enumerate(map_data.bg_events):
@@ -610,8 +793,43 @@ def prewarm_static_map_observation(map_id: MapId) -> tuple[TileObservation, ...]
     return static.tiles
 
 
+def static_map_transitions(map_id: MapId) -> tuple[WorldTransition, ...]:
+    """Return ROM-backed transitions for a lazily materialized map.
+
+    Global navigation normally needs only the map graph.  Goals that end at a
+    field-effect warp, however, must retain the executable activation geometry
+    from the source map even when that map is reached later in the route.
+    """
+    prewarm_static_map_observation(map_id)
+    return _static_map_observations[map_id].transitions
+
+
 @traced("overworld_perception")
 def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
+    """Read the current overworld once per emulator frame.
+
+    Several owners can observe the same frame: readiness, the semantic
+    campaign dispatcher, and the tactical controller.  The underlying read
+    scans map metadata, runtime objects, and trigger bindings, so repeating it
+    before the emulator advances can consume the entire 60 Hz budget.  A
+    frame-scoped cache keeps those owners on one immutable passive snapshot.
+    Explicit invalidation and a changed/reset frame counter still force a
+    fresh read.
+    """
+
+    cached = shared_overworld_observation_for_current_frame()
+    if cached is not None:
+        trace = getattr(context, "stutter_trace", None)
+        if trace is not None:
+            trace.mark("overworld_perception_cache_hit", True)
+        return cached
+
+    observation = _perceive_overworld_uncached()
+    publish_shared_overworld_observation(observation)
+    return observation
+
+
+def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservationResult:
     """Read the current map and avatar without changing emulator state.
 
     Collision and directional access come from the existing PathMap metadata;
@@ -709,6 +927,11 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
     # hint and wait for destination confirmation instead of invalidating the
     # route that caused the transition.
     transition_signals: set[str] = set()
+    controls_available = False
+    try:
+        controls_available = player_avatar_is_controllable()
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        pass
     try:
         callback = get_game_state_symbol().upper()
         if "LOADMAP" in callback or callback in {"CB2_CHANGEMAP", "CB2_LOADMAP"}:
@@ -722,13 +945,25 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
         "Task_ArrowWarp",
         "Task_MapConnection",
         "Task_TransitionToMap",
+        # The popup is created as part of map entry and hides itself on the
+        # first accepted field input.  Until then, treat the destination as
+        # settling so campaign navigation does not plan from a half-installed
+        # map boundary.
+        "Task_MapNamePopUpWindow",
     ):
         try:
+            # Emerald's map-name banner can remain installed while the player
+            # is already controllable (notably after the Route 104/Woods
+            # boundary). It is presentation state, not a movement handoff;
+            # treating it as a hard transition leaves the campaign waiting
+            # forever without ever selecting the next exit.
+            if task_name == "Task_MapNamePopUpWindow" and controls_available:
+                continue
             if task_is_active(task_name):
                 transition_signals.add(f"task:{task_name}")
         except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
             pass
-    if not player_avatar_is_controllable():
+    if not controls_available:
         transition_signals.add("player_controls_locked")
     if getattr(getattr(avatar, "tile_transition_state", None), "name", "NOT_MOVING") != "NOT_MOVING":
         transition_signals.add("avatar_tile_transition")
@@ -771,7 +1006,12 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
         )
 
     objects = trace.call("runtime_object_scan", scan_runtime_objects) if trace is not None else scan_runtime_objects()
-    object_locations = {object_observation.location[1] for object_observation in objects}
+    # Keep runtime occupancy authoritative.  Static trainer templates below
+    # contribute hazards only; they must not block a tile or claim a live
+    # trigger binding before Emerald has spawned the object event.
+    runtime_objects = objects
+    static_trainers = static_trainer_observations(map_id, map_data, runtime_objects)
+    object_locations = {object_observation.location[1] for object_observation in runtime_objects}
 
     # Conditions belong to the live observation, not the static cache.
     live_triggers: list[TriggerObservation] = []
@@ -828,6 +1068,28 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
             )
         )
 
+    # Object events can be absent from gObjectEvents until the camera nears
+    # them.  Publish their ROM-derived sight lines immediately so a trainer-
+    # avoiding route does not commit to an unsafe approach before that load.
+    for trainer in static_trainers:
+        triggers.append(
+            TriggerObservation(
+                trigger_id=f"static_object:{trainer.local_id}:{trainer.script}",
+                locations=frozenset({trainer.location}),
+                kind="trainer_hazard",
+                affordance_id=trainer.trainer_id,
+                hazard_locations=trainer_hazard_locations(
+                    trainer,
+                    tiles,
+                    tuple(runtime_objects) + static_trainers,
+                ),
+                hazard_kind="trainer",
+                # A template fallback is not a live interaction affordance.
+                # It exists solely to constrain route selection.
+                requires_input=False,
+            )
+        )
+
     timing("perception_active_runtime_objects", runtime_start)
     if trace is not None:
         trace.duration("overworld_runtime_object_scan_duration_ms", trace_runtime_start)
@@ -841,7 +1103,7 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
         return tuple(
             resolve_trigger_binding(
                 binding,
-                objects,
+                runtime_objects,
                 (map_width, map_height),
                 static_objects=getattr(map_data, "objects", ()) if map_id == binding.map_id else (),
             )
@@ -922,13 +1184,16 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
         map_id=map_id,
         player_coordinates=player_coordinates,
         facing=_direction(avatar.facing_direction),
-        controllable=player_avatar_is_controllable(),
+        controllable=controls_available,
         tiles=static.tiles,
         warps=tuple(warps),
         transitions=static.transitions,
         objects=objects,
         triggers=tuple(triggers),
         bindings=bindings,
+        player_elevation=getattr(avatar, "elevation", None),
+        player_current_elevation=getattr(avatar, "current_elevation", None),
+        player_previous_coordinates=getattr(avatar, "previous_coordinates", None),
         movement_state=movement_state,
         dynamic_blocked_coordinates=dynamic_blocked_coordinates,
         transition_in_progress=bool(transition_signals),
@@ -937,4 +1202,5 @@ def perceive_overworld() -> OverworldObservation | OverworldObservationResult:
         map_identity_source=live_map.source if live_map.map_id is not None else "save_block",
         save_block_map_id=save_block_map_id,
         live_map_candidates=live_map.candidates,
+        surfing=bool(getattr(avatar, "is_in_water", False)),
     )

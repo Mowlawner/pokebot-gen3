@@ -17,11 +17,15 @@ from modules.semantic_choices import ChoiceConsequence, ConsequenceKnowledge, Di
 
 
 class EmeraldConfirmationChoice(Enum):
+    """Rows available in Emerald's standard yes/no confirmation menu."""
+
     YES = auto()
     NO = auto()
 
 
 class EmeraldConfirmationContext(Enum):
+    """Semantic prompt owners recognized from task and script observations."""
+
     PLAYER_NAME = auto()
     POKEMON_NICKNAME = auto()
     GO_SEE_RIVAL = auto()
@@ -30,6 +34,8 @@ class EmeraldConfirmationContext(Enum):
 
 @dataclass(frozen=True, slots=True)
 class EmeraldConfirmationObservation:
+    """ROM-backed yes/no prompt state and its known consequences."""
+
     active: bool
     selected: EmeraldConfirmationChoice | None
     input_ready: bool
@@ -43,6 +49,8 @@ class EmeraldConfirmationObservation:
 
     @property
     def dialogue_choice(self) -> DialogueChoice:
+        """Adapt this confirmation observation to the shared choice model."""
+
         return DialogueChoice(
             question_text=self.question_text,
             options=self.options,
@@ -67,6 +75,8 @@ _GO_SEE_RIVAL_SCRIPT = "LittlerootTown_ProfessorBirchsLab_EventScript_GoSeeRival
 
 
 def _active_confirmation_task() -> str | None:
+    """Find the active ROM task that owns a recognized confirmation menu."""
+
     try:
         for task in get_tasks() or ():
             name = task.symbol

@@ -1,7 +1,9 @@
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 
-from modules.goals import Goal
+from modules.goals import Goal, ReachLocation
+from modules.navigation import IntermediateRouteAnalysis, RouteAnalysis
 from modules.nuzlocke.campaign_controller import CampaignController, CampaignControllerStatus
 from modules.nuzlocke.campaign_execution import CampaignExecutionResult, CampaignExecutionStatus
 from modules.nuzlocke.campaign_objectives import CampaignObjective, ObjectiveSelection, ObjectiveStatus
@@ -17,6 +19,22 @@ from modules.nuzlocke.readiness_diagnostics import (
 
 def readiness(decision=ReadinessDecision.RECOVER, game_state="OVERWORLD"):
     trainer_availability = Availability.UNAVAILABLE if decision is ReadinessDecision.UNKNOWN else Availability.KNOWN
+    route_analysis = None
+    if decision is ReadinessDecision.RECOVER and game_state == "OVERWORLD":
+        route_analysis = RouteAnalysis(
+            Goal(),
+            "normal-route",
+            40,
+            (
+                IntermediateRouteAnalysis(
+                    ReachLocation(("OLDale", (5, 6))),
+                    48,
+                    8,
+                    True,
+                    first_route=SimpleNamespace(metrics=SimpleNamespace(total_route_cost=8)),
+                ),
+            ),
+        )
     return ProgressionReadinessDiagnostic(
         "reach_generic",
         "ready",
@@ -43,6 +61,7 @@ def readiness(decision=ReadinessDecision.RECOVER, game_state="OVERWORLD"):
             if decision is ReadinessDecision.UNKNOWN
             else ReadinessReason.CRITICAL_PARTY_HP
         ),
+        route_analysis=route_analysis,
     )
 
 
@@ -204,6 +223,27 @@ class CampaignRecoveryIntegrationTests(unittest.TestCase):
         self.assertEqual(result.execution_phase, "CAMPAIGN")
         self.assertIn("OVERWORLD_UNAVAILABLE", result.reason)
         self.assertEqual(starts, [])
+
+    def test_controller_lets_campaign_plan_evaluate_raw_readiness(self):
+        objective = CampaignObjective("reach_generic", "generic", (), SimpleNamespace(evaluate=lambda _: None))
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "ready")
+        execution = CampaignExecutionResult(objective, CampaignExecutionStatus.READY, "ready", tactical_goal=Goal())
+        recovery_starts = []
+        observed = replace(readiness(), readiness_decision=None, readiness_reason=None)
+
+        controller = CampaignController(
+            lambda: object(),
+            selector=lambda _: selection,
+            adapter=lambda _: execution,
+            readiness_provider=lambda *_: observed,
+            recovery_factory=lambda _: iter((recovery_starts.append("planned"),)),
+        )
+
+        result = controller.step()
+
+        self.assertEqual(result.execution_phase, "RECOVERY")
+        self.assertEqual(recovery_starts, ["planned"])
+        self.assertEqual(controller.state.plan.readiness_decision, ReadinessDecision.RECOVER)
 
 
 if __name__ == "__main__":

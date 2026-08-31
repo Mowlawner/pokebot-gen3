@@ -4,6 +4,7 @@ from modules.context import context
 from modules.console import diagnostic_print
 from modules.game import set_rom
 from modules.libmgba import LibmgbaEmulator
+from modules.profiles import ProfileLock
 
 if TYPE_CHECKING:
     from pokebot import StartupSettings
@@ -19,28 +20,40 @@ class PokebotHeadless:
         if startup_settings.profile is None:
             raise RuntimeError("Headless mode cannot be started without selecting a profile.")
 
-        context.profile = startup_settings.profile
-        diagnostic_print(
-            lambda: f"Profile selected: {startup_settings.profile.path} (source: {startup_settings.profile_source})"
-        )
-        context.config.load(startup_settings.profile.path, strict=False)
-        set_rom(startup_settings.profile.rom)
-        context.emulator = LibmgbaEmulator(
-            startup_settings.profile,
-            self._on_frame,
-            save_state_on_shutdown=not startup_settings.no_save_state,
-        )
-        context.audio = not startup_settings.no_audio
-        context.video = not startup_settings.no_video
-        context.emulation_speed = startup_settings.emulation_speed
-        context.debug = startup_settings.debug
-        context.debug_trace = startup_settings.debug_trace
-        context.debug_profile = startup_settings.debug_profile
-        context.debug_stutter_trace = startup_settings.stutter_trace
-        context.stutter_trace_threshold_ms = startup_settings.stutter_threshold_ms
-        context.bot_mode = startup_settings.bot_mode
+        profile_lock = ProfileLock(startup_settings.profile.path)
+        profile_lock.acquire()
+        try:
+            context.profile = startup_settings.profile
+            diagnostic_print(
+                lambda: f"Profile selected: {startup_settings.profile.path} (source: {startup_settings.profile_source})"
+            )
+            context.config.load(startup_settings.profile.path, strict=False)
+            set_rom(startup_settings.profile.rom)
+            context.emulator = LibmgbaEmulator(
+                startup_settings.profile,
+                self._on_frame,
+                save_state_on_shutdown=not startup_settings.no_save_state,
+            )
+            context.audio = not startup_settings.no_audio
+            context.video = not startup_settings.no_video
+            context.emulation_speed = startup_settings.emulation_speed
+            context.debug = startup_settings.debug
+            context.debug_trace = startup_settings.debug_trace
+            context.debug_profile = startup_settings.debug_profile
+            context.debug_stutter_trace = startup_settings.stutter_trace
+            context.stutter_trace_threshold_ms = startup_settings.stutter_threshold_ms
+            context.bot_mode = startup_settings.bot_mode
 
-        self._main_loop()
+            try:
+                self._main_loop()
+            except KeyboardInterrupt:
+                # Headless runs have no window-close event to invoke the normal
+                # emulator shutdown path. Treat Ctrl-C as that same clean exit
+                # so process-restart validation never resumes from a stale state.
+                if context.emulator is not None:
+                    context.emulator.shutdown()
+        finally:
+            profile_lock.release()
 
     def on_settings_updated(self) -> None:
         pass

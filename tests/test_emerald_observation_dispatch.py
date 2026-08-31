@@ -116,6 +116,7 @@ class EmeraldObservationDispatchTests(unittest.TestCase):
             affordance_id="WallClockScript",
             script_symbol="WallClockScript",
             condition_active=True,
+            locations=frozenset({((1, 3), (3, 4))}),
             activation_locations=frozenset({((1, 3), (3, 4))}),
         )
         overworld = SimpleNamespace(map_id=(1, 3), triggers=(trigger,))

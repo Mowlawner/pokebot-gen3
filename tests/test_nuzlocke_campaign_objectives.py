@@ -10,6 +10,8 @@ from modules.nuzlocke.campaign_objectives import (
     current_area_is,
     has_item,
     initial_emerald_campaign,
+    party_meets_level_target,
+    party_fully_restored,
     select_campaign_objective,
     available_campaign_tasks,
     select_available_campaign_task,
@@ -157,6 +159,31 @@ class CampaignObjectiveTests(unittest.TestCase):
         selection = select_available_campaign_task(self.state(), (optional, required))
         self.assertEqual(selection.objective.objective_id, "required")
 
+    def test_level_target_completion_uses_all_living_non_egg_party_members(self):
+        state = self.state()
+        predicate = party_meets_level_target(14)
+        self.assertFalse(predicate.evaluate(state).value)
+
+        ready_party = tuple(replace(pokemon, level=14) for pokemon in state.party.value)
+        self.assertTrue(predicate.evaluate(replace(state, party=Fact.known(ready_party))).value)
+
+    def test_level_target_completion_excludes_dead_members_but_requires_a_living_member(self):
+        state = self.state()
+        living = replace(state.party.value[0], level=14, party_index=1)
+        dead = replace(state.party.value[0], level=1, party_index=0)
+        state = replace(
+            state,
+            party=Fact.known((dead, living)),
+            dead_pokemon=Fact.known(frozenset({self.identity})),
+        )
+        # Both fixtures share the same identity, so the dead projection must
+        # exclude both if identity is the only available discriminator.
+        self.assertFalse(party_meets_level_target(14).evaluate(state).value)
+
+        distinct_living = replace(living, identity=PokemonIdentity(11, 21, 31))
+        state = replace(state, party=Fact.known((dead, distinct_living)))
+        self.assertTrue(party_meets_level_target(14).evaluate(state).value)
+
     def test_route_context_distinguishes_aligned_and_detour_encounters(self):
         current = MapRSE.LITTLEROOT_TOWN.value
         progression = MapRSE.PETALBURG_CITY.value
@@ -260,6 +287,7 @@ class CampaignObjectiveTests(unittest.TestCase):
                         False,
                         False,
                         False,
+                        False,
                     )
                 )
             )
@@ -305,8 +333,29 @@ class CampaignObjectiveTests(unittest.TestCase):
             "devon_goods_recovered",
             "visited_rustboro",
             "first_badge_obtained",
+            "petalburg_wally_scene_complete",
+            "petalburg_woods_scene_complete",
+            "devon_goods_returned",
+            "devon_goods_delivered",
+            "devon_goods_reported",
+            "devon_goods_stolen",
+            "rustboro_city_state",
+            "rusturf_tunnel_state",
+            "devon_corp_3f_state",
+            "devon_corp_3f_scene_complete",
+            "roxanne_available",
         )
-        return CampaignFacts(*(Fact.known(values.get(name, False)) for name in names))
+        return CampaignFacts(
+            *(
+                Fact.known(
+                    values.get(
+                        name,
+                        values.get("pokedex_received", False) if name == "nuzlocke_started" else False,
+                    )
+                )
+                for name in names
+            )
+        )
 
     @staticmethod
     def objective(objective_id, completion, prerequisites=(), failure=None):
@@ -359,6 +408,47 @@ class CampaignObjectiveTests(unittest.TestCase):
         rival = producers["campaign_fact:intro_rival_battle_complete"]
         self.assertEqual(tuple(item.objective_id for item in rival), ("complete_intro_rival",))
 
+    def test_pokedex_receipt_is_the_campaign_nuzlocke_boundary(self):
+        state = self.state(
+            campaign_facts=self.facts(
+                pokedex_received=True,
+                pokeballs_available=True,
+                pokeballs_ready=True,
+            )
+        )
+
+        self.assertTrue(state.campaign_facts.nuzlocke_started.value)
+        planned = plan_campaign(state, goal=ultimate_emerald_campaign_goal())
+        self.assertEqual(planned.status, ObjectiveStatus.READY)
+        self.assertEqual(planned.objective.objective_id, "reach_petalburg")
+
+    def test_introductory_rival_accepts_a_usable_partially_damaged_party(self):
+        objective = next(item for item in initial_emerald_campaign() if item.objective_id == "complete_intro_rival")
+        state = self.state(
+            campaign_facts=self.facts(
+                text_speed_fast=True,
+                new_game_setup_complete=True,
+                wall_clock_set=True,
+                rival_met=True,
+                birch_rescued=True,
+                starter_obtained=True,
+            ),
+        )
+        damaged_party = replace(state.party.value[0], current_hp=19)
+        state = replace(state, party=Fact.known((damaged_party,)))
+
+        planned = plan_campaign(
+            state,
+            goal=CampaignGoal(
+                "intro_rival",
+                "complete the introductory rival battle",
+                objective.completion,
+            ),
+        )
+
+        self.assertEqual(planned.status, ObjectiveStatus.READY)
+        self.assertEqual(planned.objective.objective_id, "complete_intro_rival")
+
     def test_planner_resolves_false_prerequisite_to_existing_producer(self):
         prerequisite = self.predicate("ready", False)
         producer = replace(
@@ -379,6 +469,16 @@ class CampaignObjectiveTests(unittest.TestCase):
         planned = plan_campaign(self.state(campaign_facts=facts), initial_emerald_campaign()[:1], goal=goal)
         self.assertEqual(planned.status, ObjectiveStatus.UNKNOWN)
         self.assertIsNone(planned.objective)
+
+    def test_dependency_planner_rejects_lost_run_before_mounting_campaign_work(self):
+        goal = ultimate_emerald_campaign_goal()
+        planned = plan_campaign(
+            self.state(run_status=RunStatus.LOST, area="RUSTBORO_CITY", balls=5),
+            goal=goal,
+        )
+        self.assertEqual(planned.status, ObjectiveStatus.FAILED)
+        self.assertIsNone(planned.objective)
+        self.assertEqual(planned.reason, "run is lost")
 
     def test_ultimate_goal_is_explicitly_represented_by_current_slice_endpoint(self):
         goal = ultimate_emerald_campaign_goal()
@@ -574,7 +674,7 @@ class CampaignObjectiveTests(unittest.TestCase):
         self.assertEqual(selection.status, ObjectiveStatus.READY)
         self.assertEqual(selection.objective.objective_id, "receive_pokedex")
 
-    def test_newly_acquired_pokeballs_select_start_nuzlocke(self):
+    def test_newly_acquired_pokeballs_select_petalburg_progression(self):
         state = self.state(
             balls=5,
             campaign_facts=self.facts(
@@ -592,7 +692,7 @@ class CampaignObjectiveTests(unittest.TestCase):
         )
         selection = select_campaign_objective(state)
         self.assertEqual(selection.status, ObjectiveStatus.READY)
-        self.assertEqual(selection.objective.objective_id, "start_nuzlocke")
+        self.assertEqual(selection.objective.objective_id, "reach_petalburg")
 
     def test_pokeballs_available_without_ready_blocks_nuzlocke(self):
         # Test that pokeballs_available=True but pokeballs_ready=False blocks nuzlocke
@@ -629,19 +729,37 @@ class CampaignObjectiveTests(unittest.TestCase):
                 "complete_intro_rival",
                 "receive_pokedex",
                 "receive_pokeballs",
-                "start_nuzlocke",
                 "reach_petalburg",
-                "recover_devon_goods",
+                "complete_petalburg_wally",
+                "complete_petalburg_woods",
                 "reach_rustboro",
+                "complete_rustboro_goods_stolen",
+                "report_devon_goods",
+                "recover_devon_goods",
+                "return_devon_goods",
+                "meet_mr_stone",
+                "prepare_roxanne",
                 "defeat_roxanne",
             ),
         )
 
-    def test_post_pokeball_fixture_selects_petalburg_progression(self):
-        from modules.nuzlocke.fixture_state import load_campaign_state_from_fixture
-
-        state = load_campaign_state_from_fixture(
-            __import__("pathlib").Path(__file__).parents[1] / "profiles" / "test_begin_nuzlocke"
+    def test_post_pokeball_state_selects_petalburg_progression(self):
+        # Keep this selector test independent of ignored, mutable emulator
+        # profiles. The ROM-backed fixture is covered by live validation.
+        state = self.state(
+            campaign_facts=self.facts(
+                text_speed_fast=True,
+                new_game_setup_complete=True,
+                wall_clock_set=True,
+                rival_met=True,
+                birch_rescued=True,
+                starter_obtained=True,
+                intro_rival_battle_complete=True,
+                pokedex_received=True,
+                pokeballs_available=True,
+                pokeballs_ready=True,
+                nuzlocke_started=True,
+            )
         )
         selection = select_available_campaign_task(state)
         self.assertEqual(selection.status, ObjectiveStatus.READY)
@@ -666,15 +784,88 @@ class CampaignObjectiveTests(unittest.TestCase):
         state = self.state(campaign_facts=self.facts(**complete))
         self.assertEqual(select_available_campaign_task(state).objective.objective_id, "reach_petalburg")
         state = self.state(campaign_facts=self.facts(**complete, visited_petalburg=True))
-        self.assertEqual(select_available_campaign_task(state).objective.objective_id, "recover_devon_goods")
-        state = self.state(campaign_facts=self.facts(**complete, visited_petalburg=True, devon_goods_recovered=True))
+        self.assertEqual(select_available_campaign_task(state).objective.objective_id, "complete_petalburg_wally")
+        state = self.state(
+            campaign_facts=self.facts(**complete, visited_petalburg=True, petalburg_wally_scene_complete=True)
+        )
+        self.assertEqual(select_available_campaign_task(state).objective.objective_id, "complete_petalburg_woods")
+        state = self.state(
+            campaign_facts=self.facts(
+                **complete,
+                visited_petalburg=True,
+                petalburg_wally_scene_complete=True,
+                petalburg_woods_scene_complete=True,
+            )
+        )
         self.assertEqual(select_available_campaign_task(state).objective.objective_id, "reach_rustboro")
         state = self.state(
             campaign_facts=self.facts(
-                **complete, visited_petalburg=True, devon_goods_recovered=True, visited_rustboro=True
+                **complete,
+                visited_petalburg=True,
+                petalburg_wally_scene_complete=True,
+                petalburg_woods_scene_complete=True,
+                devon_goods_recovered=True,
             )
         )
-        self.assertEqual(select_available_campaign_task(state).objective.objective_id, "defeat_roxanne")
+        self.assertEqual(select_available_campaign_task(state).objective.objective_id, "reach_rustboro")
+        state = self.state(
+            campaign_facts=self.facts(
+                **complete,
+                visited_petalburg=True,
+                petalburg_wally_scene_complete=True,
+                petalburg_woods_scene_complete=True,
+                devon_goods_recovered=True,
+                visited_rustboro=True,
+            )
+        )
+        self.assertEqual(select_available_campaign_task(state).objective.objective_id, "prepare_roxanne")
+
+    def test_first_badge_fixture_advances_from_new_run_to_authoritative_gym_flag(self):
+        """Exercise the complete declarative slice through DEFEATED_RUSTBORO_GYM."""
+        stages = [((), "set_text_speed")]
+        completed: list[str] = []
+        for fact, next_objective in (
+            ("text_speed_fast", "complete_new_game_setup"),
+            ("new_game_setup_complete", "set_wall_clock"),
+            ("wall_clock_set", "meet_rival"),
+            ("rival_met", "rescue_birch"),
+            ("birch_rescued", "obtain_starter"),
+            ("starter_obtained", "complete_intro_rival"),
+            ("intro_rival_battle_complete", "receive_pokedex"),
+            ("pokedex_received", "receive_pokeballs"),
+        ):
+            completed.append(fact)
+            stages.append((tuple(completed), next_objective))
+        completed.extend(("pokeballs_available", "pokeballs_ready"))
+        for fact, next_objective in (
+            ("pokeballs_ready", "reach_petalburg"),
+            ("visited_petalburg", "complete_petalburg_wally"),
+            ("petalburg_wally_scene_complete", "complete_petalburg_woods"),
+            ("petalburg_woods_scene_complete", "reach_rustboro"),
+            ("visited_rustboro", "prepare_roxanne"),
+            ("prepare_roxanne", "defeat_roxanne"),
+            ("first_badge_obtained", None),
+        ):
+            completed.append(fact)
+            stages.append((tuple(completed), next_objective))
+
+        for completed, expected_id in stages:
+            state = self.state(
+                balls=5 if "pokeballs_available" in completed else 0,
+                campaign_facts=self.facts(**{name: True for name in completed}),
+            )
+            if "prepare_roxanne" in completed:
+                state = replace(
+                    state,
+                    party=Fact.known(tuple(replace(pokemon, level=14) for pokemon in state.party.value)),
+                )
+            selection = plan_campaign(state, goal=ultimate_emerald_campaign_goal())
+            if expected_id is None:
+                self.assertEqual(selection.status, ObjectiveStatus.COMPLETE)
+                self.assertIsNone(selection.objective)
+            else:
+                self.assertEqual(selection.status, ObjectiveStatus.READY, expected_id)
+                self.assertEqual(selection.objective.objective_id, expected_id)
 
     def test_empty_definition_and_all_complete(self):
         empty = select_campaign_objective(self.state(), ())

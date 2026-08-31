@@ -2,7 +2,16 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from modules.modes.campaign import CampaignProgressionMode
+from modules.modes.campaign import CampaignProgressionMode, _overworld_position_is_coherent
+from modules.map_data import MapRSE, PokemonCenter
+from modules.goals import ReachLocation
+from modules.nuzlocke.resource_policy import (
+    PartyResource,
+    ResourceObservationStatus,
+    RouteRecovery,
+    ResourceSnapshot,
+)
+from modules.overworld import OverworldObservationResult, OverworldObservationStatus
 from modules.nuzlocke.campaign_controller import CampaignController
 from modules.nuzlocke.campaign_execution import CampaignExecutionResult, CampaignExecutionStatus
 from modules.nuzlocke.campaign_objectives import (
@@ -10,11 +19,148 @@ from modules.nuzlocke.campaign_objectives import (
     CampaignPredicate,
     ObjectiveSelection,
     ObjectiveStatus,
+    plan_campaign,
 )
-from modules.nuzlocke.campaign_state import Fact
+from modules.nuzlocke.campaign_state import Fact, RunStatus
+from modules.memory import GameState
+from modules.nuzlocke.readiness_diagnostics import Availability
 
 
 class CampaignOrchestrationTests(unittest.TestCase):
+    def test_readiness_rejects_destination_header_with_out_of_bounds_avatar_coordinate(self):
+        class FakeOverworld:
+            player_coordinates = (19, -1)
+
+            @staticmethod
+            def tile_at(coordinates):
+                return None if coordinates == (19, -1) else object()
+
+        self.assertFalse(_overworld_position_is_coherent(FakeOverworld()))
+
+    def test_readiness_accepts_a_coherent_avatar_coordinate(self):
+        class FakeOverworld:
+            player_coordinates = (19, 59)
+
+            @staticmethod
+            def tile_at(coordinates):
+                return object() if coordinates == (19, 59) else None
+
+        self.assertTrue(_overworld_position_is_coherent(FakeOverworld()))
+
+    def test_readiness_recovery_analysis_is_bounded_to_local_or_selected_source(self):
+        current = (MapRSE.RUSTBORO_CITY, (19, 59))
+        local = CampaignProgressionMode._recovery_candidate_goals(
+            current,
+            RouteRecovery(center_available=True, center_location=(MapRSE.RUSTBORO_CITY, (16, 38))),
+            is_rse=True,
+        )
+        self.assertEqual(local, (ReachLocation((MapRSE.RUSTBORO_CITY, (16, 38))),))
+
+        with patch(
+            "modules.modes.campaign.emerald_healing_sources_for_map",
+            return_value=(),
+        ), patch(
+            "modules.modes.campaign.pokemon_center_candidates",
+            return_value=(PokemonCenter.RustboroCity,),
+        ):
+            selected = CampaignProgressionMode._recovery_candidate_goals(
+                (MapRSE.ROUTE104, (1, 1)),
+                RouteRecovery(center_available=True, center_location=(MapRSE.RUSTBORO_CITY, (16, 38))),
+                is_rse=True,
+            )
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].location, (MapRSE.RUSTBORO_CITY, (16, 38)))
+
+    def test_readiness_does_not_analyze_recovery_during_unavailable_overworld(self):
+        mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
+        mode._readiness_evaluated = False
+        snapshot = SimpleNamespace(
+            frame=1,
+            game_state=None,
+            party=(),
+            party_available=False,
+            player_available=False,
+        )
+        resources = ResourceSnapshot(
+            observation_status=ResourceObservationStatus.VALID,
+        )
+        objective = SimpleNamespace(
+            objective_id="test_objective",
+            resource_policy=SimpleNamespace(minimum_hp_ratio=0.5),
+        )
+        with patch(
+            "modules.modes.campaign.perceive_overworld",
+            return_value=OverworldObservationResult(
+                OverworldObservationStatus.UNAVAILABLE,
+                reason="player_avatar_unavailable",
+            ),
+        ), patch("modules.modes.campaign.get_nuzlocke_snapshot", return_value=snapshot), patch(
+            "modules.modes.campaign.get_game_state", return_value=None
+        ), patch(
+            "modules.modes.campaign.observe_resource_snapshot", return_value=resources
+        ), patch(
+            "modules.modes.campaign.observe_route_recovery"
+        ) as observe_recovery, patch(
+            "modules.modes.campaign.build_progression_readiness_diagnostic", return_value=object()
+        ):
+            mode._readiness_input(objective, None)
+
+        observe_recovery.assert_not_called()
+
+    def test_readiness_does_not_analyze_recovery_for_transient_empty_snapshot_party(self):
+        mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
+        mode._readiness_evaluated = False
+        snapshot = SimpleNamespace(
+            frame=1,
+            game_state=SimpleNamespace(name="OVERWORLD"),
+            party=(),
+            party_available=False,
+            player_available=True,
+            player=SimpleNamespace(map_group=0, map_number=18, coordinates=(10, 3)),
+        )
+        resources = ResourceSnapshot(
+            (PartyResource(20, 23),),
+            observation_status=ResourceObservationStatus.VALID,
+        )
+        overworld = SimpleNamespace(
+            map_id=(0, 18),
+            player_coordinates=(10, 3),
+            controllable=True,
+            transition_in_progress=False,
+            objects=(),
+        )
+        objective = SimpleNamespace(
+            objective_id="receive_pokedex",
+            destination=(0, 7),
+            resource_policy=SimpleNamespace(minimum_hp_ratio=0.5),
+        )
+        with patch(
+            "modules.modes.campaign.perceive_overworld",
+            return_value=overworld,
+        ), patch(
+            "modules.modes.campaign.publish_shared_overworld_observation"
+        ), patch("modules.modes.campaign.get_nuzlocke_snapshot", return_value=snapshot), patch(
+            "modules.modes.campaign.get_game_state", return_value=GameState.OVERWORLD
+        ), patch(
+            "modules.modes.campaign.observe_interaction",
+            return_value=SimpleNamespace(
+                interaction_phase=SimpleNamespace(),
+                script_active=False,
+                dialogue_waiting=False,
+                field_message_lifecycle_active=False,
+                native_function=None,
+            ),
+        ), patch(
+            "modules.modes.campaign.observe_resource_snapshot", return_value=resources
+        ), patch(
+            "modules.modes.campaign.observe_route_recovery"
+        ) as observe_recovery:
+            diagnostic = mode._readiness_input(objective, None)
+
+        observe_recovery.assert_not_called()
+        assert diagnostic.party_availability is Availability.KNOWN
+        assert diagnostic.lowest_hp_ratio == 20 / 23
+
     def test_controller_is_constructed_during_mode_initialization(self):
         with patch("modules.modes.campaign.CampaignController") as controller_factory:
             mode = CampaignProgressionMode()
@@ -92,13 +238,32 @@ class CampaignOrchestrationTests(unittest.TestCase):
             readiness_provider=lambda *_: object(),
         )
         with patch(
-            "modules.nuzlocke.campaign_controller.evaluate_progression_readiness",
+            "modules.nuzlocke.campaign_controller.build_campaign_plan",
             side_effect=AssertionError("startup capability must not require overworld readiness"),
         ):
             state = controller.step()
 
         self.assertEqual(state.status.value, "ready")
         self.assertEqual(advanced, ["first startup executor step"])
+
+    def test_lost_run_does_not_mount_campaign_tactical_loop(self):
+        state = SimpleNamespace(run_status=Fact.known(RunStatus.LOST))
+
+        controller = CampaignController(
+            lambda: state,
+            selector=plan_campaign,
+            adapter=lambda selection: CampaignExecutionResult(
+                selection.objective,
+                CampaignExecutionStatus.FAILED,
+                selection.reason,
+            ),
+        )
+
+        result = controller.step()
+
+        self.assertEqual(result.status.value, "failed")
+        self.assertEqual(result.reason, "run is lost")
+        self.assertIsNone(controller.current_objective_id)
 
 
 if __name__ == "__main__":

@@ -221,7 +221,12 @@ def is_waiting_for_input() -> bool:
         text_printer_state = text_printer_data[1]
         # ``and`` otherwise returns the integer printer-active flag when it is
         # zero.  Keep this helper's documented bool contract at the boundary.
-        return bool(text_printer_is_active and text_printer_state in (2, 3))
+        # Emerald keeps the printer active while it is stopped at either a
+        # ``\\p`` pause (state 1) or a page clear/scroll prompt (states 2/3).
+        # The field-message draw task owns all three states and the script
+        # resumes only after an A/B edge.  State 0 is ordinary character
+        # rendering and must remain non-actionable.
+        return bool(text_printer_is_active and text_printer_state in (1, 2, 3))
 
 
 def is_field_message_waiting_for_input(field_message_lifecycle_active: bool = False) -> bool:
@@ -256,9 +261,10 @@ def is_field_message_task_waiting_for_input() -> bool:
     """Whether Emerald's draw task and printer are at the input boundary.
 
     ``IsFieldMessageBoxHidden`` can remain the script native for one or more
-    frames after the printer reaches its clear/wait state.  Task state 2 plus
-    printer states Clear/ScrollStart is the ROM-level distinction from an
-    ordinary character-rendering wait.
+    frames while the printer is paused, before the script reaches its
+    ``WaitForAorBPress`` handoff.  Task state 2 plus printer states Wait,
+    Clear, or ScrollStart is the ROM-level distinction from ordinary
+    character rendering.
     """
     try:
         if context.rom.is_rs or not task_is_active("Task_DrawFieldMessage"):
@@ -268,7 +274,8 @@ def is_field_message_task_waiting_for_input() -> bool:
         return (
             task is not None
             and task.data_value(0) == 2
-            and not printer.active
+            and printer.active
+            and printer.raw_state in ("Wait", "Clear", "ScrollStart")
         )
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
         return False

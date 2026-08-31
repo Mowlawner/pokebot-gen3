@@ -6,22 +6,28 @@ executes navigation, battle, item, or healing actions.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable
+from typing import Any, Iterable
 
 
 class ReadinessImportance(Enum):
+    """How strongly an objective's resource condition should be enforced."""
+
     NONE = "none"
     NORMAL = "normal"
     IMPORTANT = "important"
 
 
 class EncounterPolicy(Enum):
+    """Resource posture to use while resolving optional wild encounters."""
+
     NORMAL = "normal"
     PRESERVE = "preserve"
     GRIND = "grind"
 
 
 class ResourceDecision(Enum):
+    """Pure policy result describing the next resource-related action."""
+
     CONTINUE = "continue"
     PRESERVE_RESOURCES = "preserve_resources"
     PREFER_RUN = "prefer_run"
@@ -31,6 +37,8 @@ class ResourceDecision(Enum):
 
 
 class ResourceObservationStatus(Enum):
+    """Validity state for a resource observation."""
+
     VALID = "valid"
     UNAVAILABLE = "unavailable"
     MALFORMED = "malformed"
@@ -38,6 +46,8 @@ class ResourceObservationStatus(Enum):
 
 @dataclass(frozen=True, slots=True)
 class PartyResource:
+    """Observed health and status information for one party member."""
+
     current_hp: int
     max_hp: int
     status: str | None = None
@@ -45,11 +55,15 @@ class PartyResource:
 
     @property
     def hp_ratio(self) -> float:
+        """Return current HP as a safe ratio of maximum HP."""
+
         return self.current_hp / self.max_hp if self.max_hp > 0 else 0.0
 
 
 @dataclass(frozen=True, slots=True)
 class HealingResource:
+    """A healing item with its observed quantity, strength, and location."""
+
     name: str
     quantity: int
     heal_amount: int
@@ -59,6 +73,8 @@ class HealingResource:
 
 @dataclass(frozen=True, slots=True)
 class ResourceSnapshot:
+    """Immutable party, item, and observation-quality inputs to resource policy."""
+
     party: tuple[PartyResource, ...] = ()
     bag_healing_items: tuple[HealingResource, ...] = ()
     pc_healing_items: tuple[HealingResource, ...] = ()
@@ -72,21 +88,34 @@ class ResourceSnapshot:
 
     @property
     def usable_party(self) -> tuple[PartyResource, ...]:
+        """Return non-fainted party members with positive HP."""
+
         return tuple(p for p in self.party if not p.fainted and p.current_hp > 0)
 
     @property
     def worst_hp_ratio(self) -> float:
+        """Return the lowest HP ratio among usable party members."""
+
         usable = self.usable_party
         return min((p.hp_ratio for p in usable), default=0.0)
 
     @property
     def total_missing_hp(self) -> int:
+        """Return total missing HP across usable party members."""
+
         return sum(max(0, p.max_hp - p.current_hp) for p in self.usable_party)
 
 
 @dataclass(frozen=True, slots=True)
 class RouteRecovery:
+    """Known route affordances for reaching a healing source or PC."""
+
     center_available: bool = False
+    # The concrete outdoor destination selected by route recovery.  Keeping
+    # this alongside the distance prevents readiness analysis from reopening
+    # the entire global healing catalog just to compare one already-selected
+    # recovery route.
+    center_location: object | None = None
     distance_to_center: int | None = None
     center_on_route: bool = False
     safe_to_reach_center: bool = True
@@ -101,10 +130,16 @@ class RouteRecovery:
     # example the player's mother or a rest stop).  Keep the historical
     # Center fields for compatibility, but expose the broader capability.
     healing_source_available: bool = False
+    # An executable route may be retained from the same observation that
+    # measured the recovery distance. CampaignPlan can adopt it directly so
+    # recovery does not run a second synchronous pathfinding search.
+    route: Any | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ResourceObjective:
+    """Objective-specific resource and encounter policy metadata."""
+
     objective_id: str
     readiness: ReadinessImportance = ReadinessImportance.NONE
     encounters: EncounterPolicy = EncounterPolicy.NORMAL
@@ -116,6 +151,8 @@ class ResourceObjective:
 
 
 def _useful_item(snapshot: ResourceSnapshot, route: RouteRecovery) -> HealingResource | None:
+    """Choose the strongest bag item that can cover current missing HP."""
+
     candidates = [item for item in snapshot.bag_healing_items if item.quantity > 0 and item.heal_amount > 0]
     candidates = [item for item in candidates if item.heal_amount >= snapshot.total_missing_hp]
     if not candidates:
@@ -195,4 +232,6 @@ def assess_campaign_resources(
 def assess_wild_encounter(
     objective: ResourceObjective, snapshot: ResourceSnapshot, route: RouteRecovery
 ) -> ResourceDecision:
+    """Assess resource policy at an optional wild-encounter boundary."""
+
     return assess_campaign_resources(objective, snapshot, route, wild_encounter=True)

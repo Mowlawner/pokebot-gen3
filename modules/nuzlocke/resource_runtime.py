@@ -1,5 +1,6 @@
 """Runtime adapters for the pure campaign resource policy."""
 
+from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
@@ -15,17 +16,35 @@ from modules.agent_control import (
     select_action,
 )
 from modules.interaction_state import InteractionPhase
-from modules.goals import ActivateTrigger, EncounterMode, Goal, NavigationGoal, ReachInteractionPosition, ReachLocation
+from modules.goals import (
+    ActivateTrigger,
+    EncounterMode,
+    EngageTrainer,
+    Goal,
+    GoalConstraints,
+    NavigationGoal,
+    ReachInteractionPosition,
+    ReachLocation,
+    ReachWarp,
+    TrainerMode,
+)
 from modules.map_data import MapFRLG, PokemonCenter
-from modules.map import get_map_metadata
+from modules.map import get_map_all_tiles, get_map_data, get_map_metadata
 from modules.modes.util.higher_level_actions import heal_in_pokemon_center
 from modules.modes.util.items import use_item_from_bag
 from modules.modes.util.map import find_closest_pokemon_center
 from modules.modes.util.walking import wait_for_player_avatar_to_be_controllable
 from modules.map_path import calculate_path, PathFindingError, Direction
 from modules.player import get_player_location
-from modules.navigation import NavigationWorld, plan_with_world_navigation
-from modules.overworld import OverworldObservationResult, perceive_overworld
+from modules.navigation import (
+    NavigationAction,
+    NavigationActionType,
+    NavigationError,
+    NavigationPlan,
+    NavigationWorld,
+    plan_with_world_navigation,
+)
+from modules.overworld import MovementState, OverworldObservationResult, perceive_overworld
 from modules.world_navigation import get_world_map_graph
 from modules.modes.util.pc_interaction import PCAction, interact_with_pc
 from modules.modes._interface import BotModeError
@@ -33,6 +52,7 @@ from modules.pokemon_party import get_party
 from modules.console import diagnostic_print
 from .campaign_status import recovery_status
 from modules.goals import SemanticTarget
+from .identity import PokemonIdentity
 from .emerald_healing_catalog import (
     emerald_healing_source_for_destination,
     emerald_healing_sources,
@@ -71,8 +91,7 @@ def _pulse_toward_entry(observation, destination) -> bool:
         press_button_fresh(direction.button_name)
     diagnostic_print(
         lambda: (
-            "CAMPAIGN_RECOVERY_ENTRY_WARP_FALLBACK: "
-            f"from={current!r} toward={target!r} direction={direction.name!r}"
+            "CAMPAIGN_RECOVERY_ENTRY_WARP_FALLBACK: " f"from={current!r} toward={target!r} direction={direction.name!r}"
         ),
         trace=True,
         prefix="CAMPAIGN_RECOVERY_ENTRY_WARP_FALLBACK",
@@ -83,6 +102,54 @@ def _pulse_toward_entry(observation, destination) -> bool:
 def _map_id_value(map_id):
     """Normalize map enums to the tuple emitted by overworld perception."""
     return getattr(map_id, "value", map_id)
+
+
+def _recovery_navigation_goal(destination, source=None):
+    """Return the executable goal for a cataloged healing destination."""
+    source = source or emerald_healing_source_for_destination(destination)
+    interior_map = getattr(source, "interior_map", None)
+    if interior_map is None:
+        # Preserve compatibility for non-Emerald providers that expose only a
+        # standable destination coordinate.
+        return ReachLocation(destination)
+    return ReachWarp(destination_map=_map_id_value(interior_map))
+
+
+def _navigation_plan_from_legacy_path(start, waypoints) -> NavigationPlan | None:
+    """Adapt an already-computed legacy path for the tactical navigator.
+
+    ``calculate_path`` predates the goal-aware navigator and returns waypoints
+    rather than ``NavigationAction`` objects. Recovery only needs to retain
+    the route it just measured, so re-searching the same path merely to change
+    representations would recreate the frame-time stall this adapter avoids.
+    Invalid/mock waypoint collections remain deliberately unsupported and
+    fall back to normal planning.
+    """
+    if not isinstance(start, tuple) or len(start) != 2 or not isinstance(waypoints, (tuple, list)):
+        return None
+    current = start
+    actions = []
+    for waypoint in waypoints:
+        map_id = getattr(waypoint, "map", None)
+        coordinates = getattr(waypoint, "coordinates", None)
+        direction = getattr(waypoint, "direction", None)
+        if map_id is None or not isinstance(coordinates, tuple) or len(coordinates) != 2 or direction is None:
+            return None
+        destination = (map_id, coordinates)
+        is_warp = bool(getattr(waypoint, "is_warp", False)) or destination[0] != current[0]
+        actions.append(
+            NavigationAction(
+                NavigationActionType.WARP if is_warp else NavigationActionType.MOVE,
+                direction,
+                current,
+                destination,
+                transition_kind="warp" if is_warp else None,
+            )
+        )
+        current = destination
+    if not actions:
+        return None
+    return NavigationPlan(tuple(actions), current)
 
 
 def _prewarm_interior_map_identity(interior_map_id) -> None:
@@ -111,12 +178,16 @@ _MAP_IDENTITY_RESOLUTION_TIMEOUT = 300
 
 
 class HealingSourceType(Enum):
+    """Kinds of full-party healing affordances recognized at runtime."""
+
     FULL_PARTY_PROVIDER = "full_party_provider"
     POKEMON_CENTER_NURSE = "pokemon_center_nurse"
 
 
 @dataclass(frozen=True, slots=True)
 class HealingSource:
+    """Observed healing affordance with navigation and interaction metadata."""
+
     source_id: str
     source_type: HealingSourceType
     location: object
@@ -152,6 +223,8 @@ _FULL_PARTY_HEALING_SCRIPT_NAMES = frozenset(
 
 
 def _healing_source_type(identity: str) -> HealingSourceType | None:
+    """Classify an observed interaction script as a healing source."""
+
     if identity.endswith("_PokemonCenter_1F_EventScript_Nurse"):
         return HealingSourceType.POKEMON_CENTER_NURSE
     if identity in _FULL_PARTY_HEALING_SCRIPT_NAMES:
@@ -258,7 +331,10 @@ def _resolve_recovery_interaction() -> Iterator[object]:
             prefix="RECOVERY_INTERACTION_PREFLIGHT",
         )
         previous_signature = signature
-        if decision.action.action_type is AgentActionType.ADVANCE_DIALOGUE:
+        if decision.action.action_type in (
+            AgentActionType.ADVANCE_DIALOGUE,
+            AgentActionType.ACCELERATE_DIALOGUE_RENDER,
+        ):
             result = executor.execute(decision.action, observation)
             diagnostic_print(
                 lambda: (
@@ -299,6 +375,8 @@ def _resolve_recovery_interaction() -> Iterator[object]:
 
 
 def observe_resource_snapshot() -> ResourceSnapshot:
+    """Read party and healing-item resources with explicit error provenance."""
+
     trace = getattr(context, "stutter_trace", None)
     started = trace.now() if trace is not None else 0
     party = get_party()
@@ -369,6 +447,8 @@ def observe_resource_snapshot() -> ResourceSnapshot:
 
 
 def party_is_restored() -> bool:
+    """Return whether every observed non-egg party member is fully restored."""
+
     party = get_party()
     return bool(party) and all(
         p.current_hp == p.total_hp and p.status_condition.value == "none" for p in party if not p.is_egg
@@ -404,9 +484,8 @@ def execute_heal_party() -> Iterator[object]:
             source = destination_source
         if source.interaction_trigger_id is None:
             destination = source.location
-            yield from AgentControlLoop(
-                lambda: observe_agent(goal=ReachLocation(destination)), goal=ReachLocation(destination)
-            ).run()
+            navigation_goal = _recovery_navigation_goal(destination)
+            yield from AgentControlLoop(lambda: observe_agent(goal=navigation_goal), goal=navigation_goal).run()
             destination_source = None
             source = None
             while source is None:
@@ -422,25 +501,466 @@ def execute_heal_party() -> Iterator[object]:
         return
 
 
-def execute_planned_recovery(destination, planned_source=None) -> Iterator[object]:
+def _preparation_training_location(training_map) -> tuple[tuple, tuple[tuple[int, int], ...]]:
+    """Find ROM-authoritative encounter tiles on the selected training map.
+
+    Encounter availability alone does not imply that a tile is reachable from
+    the map's current entry.  Return the complete candidate set so the live
+    observed world can choose a reachable tile after the map transition.
+    """
+    map_id = _map_id_value(training_map)
+    map_data = get_map_data(map_id, (0, 0))
+    candidates = tuple(sorted(tile.local_position for tile in get_map_all_tiles(map_data) if tile.has_encounters))
+    if not candidates:
+        raise BotModeError(f"no land encounter tile is available on training map {map_id!r}")
+    return map_id, candidates
+
+
+_PREPARATION_NAVIGATION_RETRY_LIMIT = 12
+
+
+def _reachable_local_positions(world, start, training_map):
+    """Return the current map component reachable from ``start``.
+
+    Preparation used to run a full weighted path search once per grass tile.
+    Route 116 exposes enough encounter tiles for that repeated search to
+    monopolize an application frame.  A plain ReachLocation goal has no
+    route preference or interaction-facing requirement, so its candidate
+    membership is exactly the walkable component produced by the observed
+    world neighbors.  Keep non-``NavigationWorld`` values permissive for
+    lightweight callers and existing test doubles.
+    """
+    if not isinstance(world, NavigationWorld):
+        return None
+    if not isinstance(start, tuple) or len(start) != 2 or start[0] != training_map:
+        return frozenset()
+    pending = deque((start,))
+    reachable = {start[1]}
+    while pending:
+        current = pending.popleft()
+        for _direction, destination, _is_warp in world.neighbors(current):
+            if destination[0] != training_map or destination[1] in reachable:
+                continue
+            reachable.add(destination[1])
+            pending.append(destination)
+    return frozenset(reachable)
+
+
+def _preparation_navigation_goal(
+    overworld,
+    training_map,
+    training_candidates: tuple[tuple[int, int], ...],
+    *,
+    allow_wild: bool = True,
+):
+    """Select a reachable grass target, or a trainer that blocks the route.
+
+    A battle can return the avatar several tiles away from the target that
+    was planned before the battle.  Dynamic trainer occupancy can also split
+    the currently observed map into components.  Reusing the old fixed
+    target in either case turns a recoverable battle into a failed
+    preparation capability.  Build one fresh local world and use it both to
+    choose a new grass tile and, when necessary, to deliberately clear a
+    reachable trainer blocking the remaining grass component.
+    """
+    start = (overworld.map_id, overworld.player_coordinates)
+    world = NavigationWorld.from_overworld(overworld)
+    last_error = None
+    candidates = sorted(
+        training_candidates,
+        key=lambda position: (
+            abs(position[0] - start[1][0]) + abs(position[1] - start[1][1]),
+            position[0],
+            position[1],
+        ),
+    )
+    if allow_wild:
+        reachable_positions = _reachable_local_positions(world, start, training_map)
+        if reachable_positions is not None:
+            for coordinates in candidates:
+                if coordinates not in reachable_positions:
+                    continue
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_PREPARATION_CANDIDATE_SELECTED: "
+                        f"map={training_map!r} start={start!r} coordinates={coordinates!r} "
+                        f"reachable_candidates={sum(candidate in reachable_positions for candidate in candidates)}"
+                    ),
+                    trace=True,
+                )
+                return ReachLocation((training_map, coordinates)), None
+        else:
+            for coordinates in candidates:
+                try:
+                    plan_with_world_navigation(world, start, ReachLocation((training_map, coordinates)))
+                except (
+                    AttributeError,
+                    IndexError,
+                    KeyError,
+                    NavigationError,
+                    PathFindingError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as error:
+                    last_error = error
+                    diagnostic_print(
+                        lambda: (
+                            "CAMPAIGN_PREPARATION_CANDIDATE_REJECTED: "
+                            f"map={training_map!r} coordinates={coordinates!r} "
+                            f"start={start!r} error_type={type(error).__name__!r} error={error!r}"
+                        ),
+                        trace=True,
+                    )
+                    continue
+                return ReachLocation((training_map, coordinates)), None
+    else:
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_PREPARATION_WILD_DISABLED: "
+                f"map={training_map!r} start={start!r} reason='area encounter already resolved'"
+            ),
+            trace=True,
+        )
+
+    trainers = sorted(
+        (
+            obj
+            for obj in getattr(overworld, "objects", ())
+            if getattr(obj, "trainer_id", None) is not None and getattr(obj, "trainer_defeated", None) is False
+        ),
+        key=lambda obj: (
+            abs(obj.location[1][0] - start[1][0]) + abs(obj.location[1][1] - start[1][1]),
+            obj.trainer_id,
+        ),
+    )
+    for trainer in trainers:
+        trainer_goal = NavigationGoal(
+            EngageTrainer(trainer.trainer_id),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.ENGAGE),
+            encounter_mode=EncounterMode.IGNORE,
+        )
+        try:
+            plan_with_world_navigation(world, start, trainer_goal)
+        except (
+            AttributeError,
+            IndexError,
+            KeyError,
+            NavigationError,
+            PathFindingError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            last_error = error
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_PREPARATION_TRAINER_REJECTED: "
+                    f"map={training_map!r} trainer={trainer.trainer_id!r} "
+                    f"start={start!r} error_type={type(error).__name__!r} error={error!r}"
+                ),
+                trace=True,
+            )
+            continue
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_PREPARATION_TRAINER_SELECTED: "
+                f"map={training_map!r} start={start!r} trainer={trainer.trainer_id!r}"
+            ),
+            trace=True,
+        )
+        return trainer_goal, None
+
+    return None, last_error
+
+
+def _preparation_encounter_resolved(training_map) -> bool:
+    """Return whether the selected area's first encounter is no longer open.
+
+    Preparation may use wild grass only until the first encounter reaches a
+    terminal outcome.  Once it is captured, lost, or causes a faint, further
+    grass battles would be a one-encounter violation.  Read this from the
+    rules projection rather than from the event-store cache or the current
+    party so the live policy and replay use the same authority.
+    """
+    runtime = getattr(context, "nuzlocke_runtime", None)
+    projection = getattr(runtime, "rules_projection", None)
+    state = getattr(projection, "state", None)
+    if state is None:
+        return False
+    location = _map_id_value(training_map)
+    encounter = next(
+        (
+            item
+            for item in getattr(state, "encounters", ())
+            if getattr(item, "eligible", True) and item.location == location
+        ),
+        None,
+    )
+    return encounter is not None and getattr(encounter, "status", None) not in {"none", "pending", "unknown"}
+
+
+def execute_campaign_preparation(training_map, *, target_level: int) -> Iterator[object]:
+    """Train the current living party to a bounded target before a boss.
+
+    The target is checked from the live party on every loop boundary. The
+    Center loop owns healing and encounter-area movement, while the campaign
+    mode supplies the Nuzlocke-aware battle strategy at battle entry.
+    """
+    if target_level < 1:
+        raise ValueError("preparation target must be positive")
+
+    from modules.battle_strategies.nuzlocke_level_balancing import (
+        NuzlockeLevelBalancingBattleStrategy,
+    )
+    from modules.modes.util.pokecenter_loop import PokecenterLoopController
+
+    loop = None
+
+    def target_reached() -> bool:
+        """Check the live living-party levels and relay battle boundaries."""
+
+        party = get_party()
+        if loop is not None and any(not pokemon.is_egg for pokemon in party):
+            # PokecenterLoopController receives its battle-end notification
+            # through the mode/listener boundary. Preparation owns a nested
+            # controller, so relay that boundary before evaluating whether a
+            # heal or another encounter is needed.
+            loop.on_battle_ended()
+        runtime = getattr(context, "nuzlocke_runtime", None)
+        dead = frozenset(
+            getattr(getattr(getattr(runtime, "rules_projection", None), "state", None), "dead_pokemon", ()) or ()
+        )
+        living = tuple(
+            pokemon
+            for pokemon in party
+            if not pokemon.is_egg
+            and (
+                runtime is None
+                or ((identity := PokemonIdentity.from_pokemon(pokemon)) is not None and identity not in dead)
+            )
+        )
+        return bool(living) and all(pokemon.level >= target_level for pokemon in living)
+
+    if target_reached():
+        return
+
+    training_map, training_candidates = _preparation_training_location(training_map)
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_PREPARATION_CANDIDATES: "
+            f"map={training_map!r} count={len(training_candidates)} "
+            f"first={training_candidates[:10]!r}"
+        ),
+        trace=True,
+    )
+    map_goal = NavigationGoal(SemanticTarget.map(training_map), encounter_mode=EncounterMode.AVOID)
+    yield from AgentControlLoop(
+        lambda: observe_agent(goal=map_goal),
+        goal=map_goal,
+    ).run()
+
+    # The map-level route intentionally stops at the observed entry tile. Pick
+    # a grass tile from the settled, live topology rather than assuming the
+    # first ROM encounter tile is in the entry-connected component.
+    navigation_attempts = 0
+    while True:
+        observation = observe_agent()
+        overworld = getattr(observation, "overworld", None)
+        start = (
+            (overworld.map_id, overworld.player_coordinates)
+            if overworld is not None and getattr(overworld, "player_coordinates", None) is not None
+            else None
+        )
+        if start is None or start[0] != training_map:
+            raise BotModeError("training map transition did not settle on the selected map")
+        if target_reached():
+            return
+        encounter_resolved = _preparation_encounter_resolved(training_map)
+        navigation_goal, last_error = _preparation_navigation_goal(
+            overworld,
+            training_map,
+            training_candidates,
+            allow_wild=not encounter_resolved,
+        )
+        if navigation_goal is None:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_PREPARATION_CANDIDATE_FAILURE: "
+                    f"map={training_map!r} start={start!r} count={len(training_candidates)} "
+                    f"last_error={last_error!r}"
+                ),
+                trace=True,
+            )
+            raise BotModeError(
+                f"no reachable encounter tile or clearing trainer is available on training map {training_map!r}: {last_error}"
+            )
+
+        navigation_attempts += 1
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_PREPARATION_NAVIGATION_SELECTED: "
+                f"map={training_map!r} start={start!r} goal={navigation_goal!r} "
+                f"attempt={navigation_attempts}"
+            ),
+            trace=True,
+        )
+        try:
+            yield from AgentControlLoop(
+                lambda: observe_agent(goal=navigation_goal),
+                goal=navigation_goal,
+            ).run()
+        except NavigationError as error:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_PREPARATION_NAVIGATION_RETRY: "
+                    f"map={training_map!r} start={start!r} goal={navigation_goal!r} "
+                    f"attempt={navigation_attempts} error_type={type(error).__name__!r} error={error!r}"
+                ),
+                trace=True,
+            )
+            if navigation_attempts >= _PREPARATION_NAVIGATION_RETRY_LIMIT:
+                raise BotModeError(
+                    f"preparation navigation did not stabilize on training map {training_map!r}: {error}"
+                ) from error
+            continue
+        if isinstance(navigation_goal, NavigationGoal) and isinstance(navigation_goal.target, EngageTrainer):
+            # Clearing a trainer is an intermediate preparation step.  Keep
+            # selecting from the live topology: if the area's encounter has
+            # already been resolved this remains trainer-only, while a
+            # trainer that merely blocked access can be followed by grass.
+            continue
+        break
+
+    training_location = navigation_goal.location
+    if training_location is not None:
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_PREPARATION_CANDIDATE_SELECTED: "
+                f"map={training_map!r} training_location={training_location!r}"
+            ),
+            trace=True,
+        )
+
+    loop = PokecenterLoopController(
+        recovery_handler=lambda center: execute_planned_recovery(center.value),
+    )
+    loop.battle_strategy = NuzlockeLevelBalancingBattleStrategy
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_PREPARATION_TRAINING_LOOP: "
+            f"map={training_map!r} training_location={training_location!r} target_level={target_level}"
+        ),
+        trace=True,
+    )
+    loop.verify_on_start()
+    target_was_reached = False
+
+    def stop_training() -> bool:
+        """Stop wild training at the target or a terminal area encounter."""
+
+        nonlocal target_was_reached
+        # Stop at the first terminal encounter boundary.  The outer
+        # preparation loop will then select a trainer goal, keeping all later
+        # training battles outside the consumed wild-encounter path.
+        target_was_reached = target_reached()
+        return target_was_reached or _preparation_encounter_resolved(training_map)
+
+    yield from loop.run(stop_condition=stop_training)
+
+    if target_was_reached:
+        return
+    if not _preparation_encounter_resolved(training_map):
+        # Preserve the existing recovery/whiteout termination behavior.  The
+        # trainer handoff is only valid when the loop stopped at a terminal
+        # encounter boundary; an interrupted loop must not invent a new route.
+        return
+
+    # The wild loop deliberately ends after the area's encounter is resolved.
+    # Continue through the same observed trainer-first selection path rather
+    # than returning to grass.  This also handles an encounter that was
+    # resolved by a prior invocation of this capability.
+    while not target_reached():
+        observation = observe_agent()
+        overworld = getattr(observation, "overworld", None)
+        start = (
+            (overworld.map_id, overworld.player_coordinates)
+            if overworld is not None and getattr(overworld, "player_coordinates", None) is not None
+            else None
+        )
+        if start is None or start[0] != training_map:
+            raise BotModeError("preparation trainer handoff did not settle on the selected map")
+        trainer_goal, last_error = _preparation_navigation_goal(
+            overworld,
+            training_map,
+            training_candidates,
+            allow_wild=False,
+        )
+        if trainer_goal is None:
+            raise BotModeError(
+                f"no reachable trainer is available for safe preparation on training map {training_map!r}: {last_error}"
+            )
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_PREPARATION_TRAINER_CONTINUATION: "
+                f"map={training_map!r} start={start!r} goal={trainer_goal!r}"
+            ),
+            trace=True,
+        )
+        yield from AgentControlLoop(
+            lambda: observe_agent(goal=trainer_goal),
+            goal=trainer_goal,
+        ).run()
+
+
+def execute_planned_recovery(destination, planned_source=None, planned_route=None) -> Iterator[object]:
     """Execute recovery at the Center selected by campaign planning.
 
     The route destination is intentionally passed in from the plan.  The
     interaction affordance is still discovered from a fresh interior
-    observation, but execution never reselects a different Center.
+    observation, but execution never reselects a different Center.  When a
+    planner-composed route is supplied, it is adopted directly for the
+    outdoor leg instead of being recomputed by the tactical navigator.
     """
     if party_is_restored():
         return
+    center = next((candidate for candidate in PokemonCenter if candidate.value == destination), None)
+    catalog_source = planned_source or emerald_healing_source_for_destination(destination)
+    interior_map = getattr(catalog_source, "interior_map", None)
+    if interior_map is None:
+        raise RuntimeError(f"No healing-location interior is defined for {destination!r}")
+    # Catalog Center destinations name the exterior door tile, which is a
+    # blocked warp entry in the ROM rather than a standable location.  Ask the
+    # world navigator to execute the exact door warp so it can stop on the
+    # adjacent activation tile and issue the required directional input.
+    navigation_goal = ReachWarp(destination_map=interior_map.value if hasattr(interior_map, "value") else interior_map)
     context.campaign_status = recovery_status(
         SemanticTarget.at(destination),
         "Navigate to healing source",
     )
-    yield from AgentControlLoop(
-        lambda: observe_agent(goal=ReachLocation(destination)),
-        goal=ReachLocation(destination),
-    ).run()
-    center = next((candidate for candidate in PokemonCenter if candidate.value == destination), None)
-    catalog_source = planned_source or emerald_healing_source_for_destination(destination)
+    if planned_route is not None:
+        # A legacy recovery route includes the final door warp and therefore
+        # terminates on the Center's interior map. A planner-composed
+        # ReachLocation route, by contrast, ends on the selected exterior
+        # destination and retains the historical goal contract.
+        planned_goal = ReachLocation(destination)
+        planned_destination = getattr(planned_route, "destination", None)
+        if (
+            isinstance(planned_destination, tuple)
+            and len(planned_destination) == 2
+            and planned_destination[0] != destination[0]
+        ):
+            planned_goal = navigation_goal
+        yield from AgentControlLoop(
+            lambda: observe_agent(goal=planned_goal),
+            goal=planned_goal,
+            navigation_plan=planned_route,
+        ).run()
+    else:
+        yield from AgentControlLoop(
+            lambda: observe_agent(goal=navigation_goal),
+            goal=navigation_goal,
+        ).run()
     if center is not None:
         yield from _wait_for_center_interior(center)
     elif catalog_source is not None:
@@ -463,6 +983,7 @@ def execute_planned_recovery(destination, planned_source=None) -> Iterator[objec
         SemanticTarget.map(interior_map),
         "Navigate to nurse" if center is not None else "Navigate to healing source",
     )
+    executor = AgentActionExecutor()
     while True:
         # This loop's only completion condition is a physical map change.
         # Observe the map on every frame, including the transient CHANGE_MAP
@@ -484,8 +1005,11 @@ def execute_planned_recovery(destination, planned_source=None) -> Iterator[objec
                     getattr(observation.overworld, "map_id", interior_map),
                     source.interaction_trigger_id or source.source_id,
                 ),
-                "Navigate to nurse" if getattr(source, "source_type", None) is HealingSourceType.POKEMON_CENTER_NURSE
-                else "Navigate to healing source",
+                (
+                    "Navigate to nurse"
+                    if getattr(source, "source_type", None) is HealingSourceType.POKEMON_CENTER_NURSE
+                    else "Navigate to healing source"
+                ),
             )
             # The nurse is separated from the player by the Center counter.
             # Reaching the Center map is not the same as reaching an
@@ -524,8 +1048,11 @@ def execute_planned_recovery(destination, planned_source=None) -> Iterator[objec
                     getattr(observation.overworld, "map_id", interior_map),
                     source.interaction_trigger_id or source.source_id,
                 ),
-                "Interact with nurse" if getattr(source, "source_type", None) is HealingSourceType.POKEMON_CENTER_NURSE
-                else "Interact with healing source",
+                (
+                    "Interact with nurse"
+                    if getattr(source, "source_type", None) is HealingSourceType.POKEMON_CENTER_NURSE
+                    else "Interact with healing source"
+                ),
             )
             yield from _execute_healing_source_interaction(source)
             if not party_is_restored():
@@ -540,8 +1067,10 @@ def execute_planned_recovery(destination, planned_source=None) -> Iterator[objec
             return
         if observation.interaction_type.name == "DIALOGUE" or not observation.interaction.controllable:
             decision = select_action(observation)
-            AgentActionExecutor().execute(decision.action, observation)
+            executor.execute(decision.action, observation)
         yield
+
+
 def _execute_healing_source_interaction(source: HealingSource) -> Iterator[object]:
     """Interact with a reached semantic healing source through shared control.
 
@@ -556,6 +1085,7 @@ def _execute_healing_source_interaction(source: HealingSource) -> Iterator[objec
     last_party_restored = False
     dialogue_input_in_flight: tuple[object, ...] | None = None
     dialogue_input_waits = 0
+    stable_standing_observations = 0
     # Script activation is asynchronous: the overworld can remain apparently
     # controllable for several observations after the A input is accepted.
     # Keep ownership during that transition, but retain a bounded failure
@@ -639,6 +1169,33 @@ def _execute_healing_source_interaction(source: HealingSource) -> Iterator[objec
             yield
             continue
         if not interaction_started:
+            # A navigation goal can become geometrically complete on the same
+            # observation that the avatar is still finishing its last step.
+            # Pressing A in that frame is lost (or, worse, consumed by the
+            # next field interaction).  Require two consecutive authoritative
+            # standing observations before starting a healing interaction.
+            # Synthetic observations used by unit callers may omit movement
+            # state; retain their existing behavior in that case.
+            movement_state = getattr(observation.overworld, "movement_state", None)
+            if observation.overworld is not None and movement_state is not None:
+                controllable = getattr(observation.overworld, "controllable", False)
+                if movement_state is not MovementState.STANDING or not controllable:
+                    stable_standing_observations = 0
+                    diagnostic_print(
+                        lambda: (
+                            "HEALING_SOURCE_INTERACTION_WAIT: "
+                            f"source={source.source_id!r} movement="
+                            f"{getattr(movement_state, 'name', None)!r} controllable={controllable!r}"
+                        ),
+                        trace=True,
+                        prefix="HEALING_SOURCE_INTERACTION_WAIT",
+                    )
+                    yield
+                    continue
+                stable_standing_observations += 1
+                if stable_standing_observations < 2:
+                    yield
+                    continue
             diagnostic_print(lambda: f"HEALING_SOURCE_INTERACTION_BEGIN: source={source.source_id!r}", trace=True)
             executor.execute(
                 AgentAction(
@@ -706,8 +1263,11 @@ def observe_route_recovery() -> RouteRecovery:
             if trace is not None:
                 trace.duration("campaign_route_recovery_observation_duration_ms", started)
             return result
+        route = None
         try:
-            distance = len(calculate_path(location, center_location))
+            legacy_path = calculate_path(location, center_location)
+            distance = len(legacy_path)
+            route = _navigation_plan_from_legacy_path(location, legacy_path)
         except PathFindingError:
             # The legacy pathfinder deliberately cannot cross map warps. Use
             # the same world planner that executes campaign navigation for
@@ -715,10 +1275,10 @@ def observe_route_recovery() -> RouteRecovery:
             overworld = perceive_overworld()
             if isinstance(overworld, OverworldObservationResult):
                 raise
-            plan, route = plan_with_world_navigation(
+            plan, _ = plan_with_world_navigation(
                 NavigationWorld.from_overworld(overworld),
                 location,
-                ReachLocation(center_location),
+                _recovery_navigation_goal(center_location),
                 get_world_map_graph(),
             )
             if plan.metrics is None or plan.destination is None:
@@ -726,7 +1286,13 @@ def observe_route_recovery() -> RouteRecovery:
             distance = plan.metrics.total_route_cost
             if distance is None:
                 raise PathFindingError("world recovery route has no cost")
-        result = RouteRecovery(center_available=True, distance_to_center=distance, safe_to_reach_center=True)
+        result = RouteRecovery(
+            center_available=True,
+            center_location=center_location,
+            distance_to_center=distance,
+            safe_to_reach_center=True,
+            route=route,
+        )
         if trace is not None:
             trace.duration("campaign_route_recovery_observation_duration_ms", started)
         return result
@@ -736,8 +1302,7 @@ def observe_route_recovery() -> RouteRecovery:
             (
                 source
                 for source in emerald_healing_sources()
-                if source.outdoor_location[0] == location[0]
-                or source.interior_map == location[0]
+                if source.outdoor_location[0] == location[0] or source.interior_map == location[0]
             ),
             None,
         )
@@ -782,7 +1347,8 @@ def recover_at_nearest_center(current_location=None, selected_center=None) -> It
 def _navigate_recovery_to_center(center) -> Iterator[object]:
     """Reach a selected Center through the normal observation-driven loop."""
     location = (center.value[0], center.value[1])
-    loop = AgentControlLoop(lambda: observe_agent(goal=ReachLocation(location)), goal=ReachLocation(location)).run()
+    navigation_goal = _recovery_navigation_goal(location)
+    loop = AgentControlLoop(lambda: observe_agent(goal=navigation_goal), goal=navigation_goal).run()
     yield from loop
 
 
@@ -878,9 +1444,7 @@ def _wait_for_center_interior(center) -> Iterator[object]:
                 isinstance(position[1], tuple)
                 and len(position[1]) == 2
                 and position[1] != center.value[1]
-                and abs(position[1][0] - center.value[1][0])
-                + abs(position[1][1] - center.value[1][1])
-                == 1
+                and abs(position[1][0] - center.value[1][0]) + abs(position[1][1] - center.value[1][1]) == 1
             )
             if adjacent_to_entry:
                 _pulse_toward_entry(observation, center.value)
@@ -943,6 +1507,8 @@ def _wait_for_healing_interior(source) -> Iterator[object]:
 
 
 def use_best_bag_healing_item() -> Iterator[object]:
+    """Use the strongest available healing item from the bag."""
+
     snapshot = observe_resource_snapshot()
     usable = [item for item in snapshot.bag_healing_items if item.quantity > 0]
     if not usable:
@@ -1012,4 +1578,6 @@ class CampaignCapability:
     delegate: object = execute_existing_tactical_goal
 
     def __call__(self) -> Iterator[object]:
+        """Run the capability delegate against its configured tactical goal."""
+
         yield from self.delegate(self.tactical_goal)
