@@ -35,6 +35,8 @@ EMERALD_MB_COUNTER = 0x80
 # to the capability so it does not rebuild the same map/object/trigger model a
 # second time before issuing its first action.
 _shared_overworld_observation_frame = None
+_shared_overworld_observation_emulator = None
+_shared_overworld_observation_avatar_reader = None
 _shared_overworld_observation = None
 
 
@@ -58,19 +60,23 @@ def _current_emulator_frame():
 def invalidate_shared_overworld_observation() -> None:
     """Discard the passive world read after an explicit runtime invalidation."""
 
-    global _shared_overworld_observation_frame, _shared_overworld_observation
+    global _shared_overworld_observation_frame, _shared_overworld_observation_emulator, _shared_overworld_observation_avatar_reader, _shared_overworld_observation
     _shared_overworld_observation_frame = None
+    _shared_overworld_observation_emulator = None
+    _shared_overworld_observation_avatar_reader = None
     _shared_overworld_observation = None
 
 
 def publish_shared_overworld_observation(observation) -> None:
     """Publish a passive overworld read for another owner in this frame."""
 
-    global _shared_overworld_observation_frame, _shared_overworld_observation
+    global _shared_overworld_observation_frame, _shared_overworld_observation_emulator, _shared_overworld_observation_avatar_reader, _shared_overworld_observation
     frame = _current_emulator_frame()
     if frame is None:
         return
     _shared_overworld_observation_frame = frame
+    _shared_overworld_observation_emulator = getattr(context, "emulator", None)
+    _shared_overworld_observation_avatar_reader = get_player_avatar
     _shared_overworld_observation = observation
 
 
@@ -80,7 +86,11 @@ def shared_overworld_observation_for_current_frame():
     frame = _current_emulator_frame()
     if frame is None:
         return None
-    if frame != _shared_overworld_observation_frame:
+    if (
+        frame != _shared_overworld_observation_frame
+        or getattr(context, "emulator", None) is not _shared_overworld_observation_emulator
+        or get_player_avatar is not _shared_overworld_observation_avatar_reader
+    ):
         return None
     return _shared_overworld_observation
 

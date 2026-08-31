@@ -225,6 +225,41 @@ state.
 Exit criteria: the bot can prepare for and safely execute the first gym using
 only current observations and registered campaign facts.
 
+#### Encounter-seeking and strategic team building
+
+The campaign must treat legal wild encounters as first-class, optional
+objectives rather than only as a battle-listener decision.  Encounter planning
+must:
+
+1. Discover reachable encounter areas with a pending legal encounter under
+   the current story, movement, resource, and Nuzlocke state.
+2. Compare taking an encounter now with deferring it until a later capability
+   (for example Surf) exposes a more useful encounter, while accounting for
+   route cost, risk, and the chance that the area will not be revisited.
+3. When an encounter is accepted, provide navigation with an executable
+   encounter-producing goal.  Reaching a map is insufficient: the bot must
+   reach valid encounter terrain, generate the battle, and resolve the legal
+   encounter before resuming its parent story or preparation objective.
+4. Score encounter areas against the active team-building objective.  For
+   example, after choosing Torchic, the planner may prefer Route 102 or
+   Petalburg Woods because their encounter tables contain possible Grass
+   types useful against Roxanne.  A desired species is never guaranteed; the
+   first legal encounter consumes the area according to configured rules.
+
+Introduce a ROM-backed `EncounterCandidate` model containing canonical area,
+encounter method, species pool, current/future availability, executable route,
+resource requirements, strategic value, and deferral alternatives.  Keep ROM
+observations authoritative for encounter tables and map reachability; keep
+Nuzlocke projections authoritative for whether an area is pending or consumed;
+and keep ranking/deferral decisions pure and configurable.
+
+The initial implementation should support land encounters and expand to Surf,
+fishing, Rock Smash, static, gift, forced, Safari, and roamer encounters as
+separate methods.  Add coverage for pending-area discovery, unreachable areas,
+on-route versus detour selection, future Surf alternatives, executable
+encounter generation, and strategic area selection with a non-guaranteed
+species result.
+
 ### P2 — Complete the Emerald campaign registry
 
 1. Register all Emerald gyms, caps, leaders, rival battles, and villain
