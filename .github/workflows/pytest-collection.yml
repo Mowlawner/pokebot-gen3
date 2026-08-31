@@ -26,6 +26,10 @@ jobs:
             https://github.com/hanzi/libmgba-py/releases/download/0.2.0-2/libmgba-py_0.2.0_ubuntu-lunar.zip \
             --output /tmp/libmgba-py.zip
           unzip -q /tmp/libmgba-py.zip -d .
+          # The extension links against libmgba.so.0.10, which is shipped in
+          # the extracted project directory rather than a system library
+          # directory. Make it visible to the dynamic linker for collection.
+          echo "LD_LIBRARY_PATH=${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}/mgba:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
 
       - name: Install runtime and test dependencies
         run: |
