@@ -25,12 +25,16 @@ def discover_trainer_ids(observation) -> tuple[str, ...]:
 
 
 class PreparationStrategy(str, Enum):
+    """Ordering strategy for wild and trainer preparation work."""
+
     WILD_FIRST = "wild_first"
     TRAINERS_FIRST = "trainers_first"
     BALANCED = "balanced"
 
 
 class RiskTolerance(str, Enum):
+    """Allowed risk posture for a preparation decision."""
+
     CONSERVATIVE = "conservative"
     NORMAL = "normal"
     AGGRESSIVE = "aggressive"
@@ -38,6 +42,8 @@ class RiskTolerance(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class PreparationInput:
+    """Pure inputs used to choose a bounded preparation plan."""
+
     boss: EmeraldBossDefinition | None
     party_levels: tuple[int, ...]
     party_hp_ratios: tuple[float, ...] = ()
@@ -51,6 +57,8 @@ class PreparationInput:
 
 @dataclass(frozen=True, slots=True)
 class PreparationDecision:
+    """Pure preparation result with optional navigation target metadata."""
+
     status: FactStatus
     strategy: PreparationStrategy | None
     boss_id: str | None
@@ -65,9 +73,13 @@ class PreparationDecision:
 
     @property
     def required(self) -> bool:
+        """Return whether preparation has an actionable target."""
+
         return self.status is FactStatus.KNOWN and self.strategy is not None and self.target_level is not None
 
     def navigation_goal(self) -> NavigationGoal | None:
+        """Translate an actionable preparation result into navigation."""
+
         if not self.required:
             return None
         if self.strategy is PreparationStrategy.TRAINERS_FIRST and self.trainer_id is not None:

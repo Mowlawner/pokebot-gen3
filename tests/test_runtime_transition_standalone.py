@@ -4,12 +4,17 @@ import unittest
 
 from modules.goals import SemanticTarget
 from modules.navigation import (
+    GoalAwareNavigator,
+    NavigationActionType,
+    NavigationWorld,
+    NavigableTile,
     clear_runtime_transition_observations,
     effective_transition,
     record_runtime_transition_observation,
     runtime_transition_observation,
 )
-from modules.overworld import WarpObservation, MapConnectionObservation
+from modules.goals import ReachWarp
+from modules.overworld import WarpActivation, WarpObservation, MapConnectionObservation
 from modules.map_path import Direction
 
 
@@ -59,6 +64,48 @@ class RuntimeTransitionTests(unittest.TestCase):
         self.assertEqual(effective_transition(transition).destination, observed)
         clear_runtime_transition_observations()
         self.assertEqual(effective_transition(transition).destination, transition.destination)
+
+    def test_override_preserves_arrow_warp_activation_metadata(self):
+        transition = WarpObservation(
+            ((1, 1), (4, 5)),
+            ((2, 1), (8, 9)),
+            required_facing=Direction.North,
+            activation_direction=Direction.North,
+            activation=WarpActivation.DIRECTIONAL_STEP,
+        )
+        observed = ((3, 1), (2, 2))
+        record_runtime_transition_observation(transition.entry, transition.kind, transition.destination, observed)
+
+        reconciled = effective_transition(transition)
+
+        self.assertIsInstance(reconciled, WarpObservation)
+        self.assertEqual(reconciled.destination, observed)
+        self.assertEqual(reconciled.required_facing, Direction.North)
+        self.assertEqual(reconciled.activation, WarpActivation.DIRECTIONAL_STEP)
+
+    def test_reconciled_arrow_warp_still_dispatches_required_direction(self):
+        transition = WarpObservation(
+            ((1, 1), (4, 5)),
+            ((2, 1), (8, 9)),
+            activation_direction=Direction.North,
+            activation=WarpActivation.DIRECTIONAL_STEP,
+        )
+        observed = transition.destination
+        record_runtime_transition_observation(transition.entry, transition.kind, transition.destination, observed)
+        reconciled = effective_transition(transition)
+        world = NavigationWorld(
+            {transition.entry: NavigableTile(transition.entry)},
+            transitions=(reconciled,),
+            facing=Direction.South,
+        )
+
+        plan = GoalAwareNavigator(world).plan(
+            transition.entry,
+            ReachWarp(destination_map=observed[0], destination=observed, warp=transition),
+        )
+
+        self.assertEqual(plan.actions[-1].action_type, NavigationActionType.WARP)
+        self.assertEqual(plan.actions[-1].direction, Direction.North)
 
     def test_unresolved_interaction_remains_semantic_target(self):
         target = SemanticTarget.interaction((101, 1), "Route101_EventScript_BirchsBag")

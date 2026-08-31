@@ -9,7 +9,7 @@ alias for existing users/tests.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 import random
 from typing import Callable, Iterator
@@ -17,7 +17,15 @@ from typing import Callable, Iterator
 from modules.context import context
 from modules.console import diagnostic_print
 from modules.agent_control import AgentControlLoop, ActionResultType, observe_agent
-from modules.goals import ActivateTrigger, ReachLocation, ReachWarp, SemanticTarget, SemanticTargetKind
+from modules.goals import (
+    ActivateTrigger,
+    NavigationGoal,
+    ReachLocation,
+    ReachInteractionPosition,
+    ReachWarp,
+    SemanticTarget,
+    SemanticTargetKind,
+)
 from modules.navigation import (
     GoalAwareNavigator,
     NavigationError,
@@ -32,7 +40,14 @@ from modules.keyboard import type_in_naming_screen
 from modules.map import get_map_metadata
 from modules.map_data import MapRSE
 from modules.memory import GameState, get_event_flag, get_event_var, get_game_state, get_save_block, unpack_uint16
-from modules.overworld import perceive_overworld, WorldTransition
+from modules.overworld import (
+    OverworldObservationResult,
+    OverworldObservationStatus,
+    perceive_overworld,
+    shared_overworld_observation_for_current_frame,
+    WorldTransition,
+)
+from modules.interaction_state import InteractionType, classify_interaction, observe_interaction
 from modules.player import player_avatar_is_controllable, player_avatar_is_rom_owned_movement
 from modules.player import get_player
 from modules.start_game import resolve_start_game_initialization
@@ -68,6 +83,7 @@ from .emerald_confirmation import (
     EmeraldConfirmationObservation,
     observe_emerald_confirmation,
 )
+from .emerald_campaign_registry import emerald_capability_definition
 from .emerald_dialogue import advance_dialogue, dialogue_state_snapshot, observe_dialogue
 
 
@@ -78,6 +94,8 @@ _advance_scripted_input = advance_dialogue
 
 
 class EmeraldOpeningCapability:
+    """Compatibility container exposing the shared dialogue observer hook."""
+
     _dialogue_state_snapshot = staticmethod(dialogue_state_snapshot)
 
 
@@ -86,6 +104,23 @@ def _uses_shared_runtime_context() -> bool:
     from modules.context import context as shared_context
 
     return context is shared_context
+
+
+def _normalize_overworld_observation(value):
+    """Return a usable overworld observation from the perception boundary.
+
+    ``perceive_overworld`` can return a diagnostic result while the avatar or
+    map is being installed.  That result is not an overworld world object and
+    must never reach navigation, where accessing ``controllable`` would tear
+    down the mounted campaign capability.  Keep accepting lightweight test
+    doubles and older direct observations for compatibility.
+    """
+
+    if not isinstance(value, OverworldObservationResult):
+        return value
+    if value.status is not OverworldObservationStatus.VALID:
+        return None
+    return value.observation
 
 
 def _compatibility_opening_state(player_gender: object | None = None) -> OpeningSequenceState:
@@ -154,6 +189,8 @@ _GO_SEE_RIVAL_SCRIPT = "LittlerootTown_ProfessorBirchsLab_EventScript_GoSeeRival
 
 
 class EmeraldCampaignAction(Enum):
+    """Bounded actions available to the observation-driven Emerald executor."""
+
     WAIT = auto()
     ADVANCE_TITLE = auto()
     ENTER_OPTIONS = auto()
@@ -423,6 +460,7 @@ def _observed_exit_goal(
     navigator: GoalAwareNavigator,
     semantic_target: SemanticTarget | None = None,
     navigation_progress: dict | None = None,
+    navigation_policy: NavigationGoal | None = None,
 ) -> ReachWarp | None:
     """Choose a tactical exit from the currently observed map.
 
@@ -454,11 +492,15 @@ def _observed_exit_goal(
     # calls.  A warp already under the player or very close is likely the
     # intended one.
     def distance(warp):
+        """Rank a cross-map exit by local Manhattan distance to the player."""
+
         return abs(warp.entry[1][0] - world.player_coordinates[0]) + abs(warp.entry[1][1] - world.player_coordinates[1])
 
     graph = None
     route_graph = None
     planned_next_maps: frozenset | None = None
+    planned_next_edges: tuple = ()
+    route_aligned: frozenset = frozenset()
     if semantic_target is not None and semantic_target.target_map is not None:
         # Use the world route as a direction-of-travel constraint, not merely
         # as a score for each observed exit.  Without this, a reverse edge can
@@ -470,9 +512,8 @@ def _observed_exit_goal(
             route_graph = get_world_map_graph()
             world_route = route_graph.route(world.map_id, semantic_target.target_map)
             if world_route.edges:
-                planned_next_maps = frozenset(
-                    edge.destination_map for edge in world_route.edges if edge.source_map == world.map_id
-                )
+                planned_next_edges = tuple(edge for edge in world_route.edges if edge.source_map == world.map_id)
+                planned_next_maps = frozenset(edge.destination_map for edge in planned_next_edges)
         except (AttributeError, RuntimeError, TypeError, ValueError):
             route_graph = None
     relevance = {
@@ -558,6 +599,14 @@ def _observed_exit_goal(
             and transition.destination is not None
             and semantic_target.target_map == transition.destination[0]
         )
+        # A map can expose a direct progression connection whose boundary is
+        # not reachable from the current connected component.  Emerald's
+        # Route 104 is one such map: the Rustboro boundary is north of the
+        # Petalburg Woods detour, while the player can be standing at the
+        # Woods' south exit.  Keep the direct connection as the first pass,
+        # but retain relevant indirect transitions for a second pass if every
+        # direct candidate is locally unreachable.
+        indirect_relevant = tuple(transition for transition in relevant if transition not in progression)
         if progression:
             relevant = progression
         if relevant:
@@ -568,6 +617,12 @@ def _observed_exit_goal(
             return None
 
     candidates = sorted(exits, key=distance)
+
+    def tactical_goal(target):
+        """Apply objective-owned navigation policy to a live tactical target."""
+        if navigation_policy is None:
+            return target
+        return replace(navigation_policy, target=target)
     if planned_next_maps:
         progressing = tuple(
             transition
@@ -576,6 +631,22 @@ def _observed_exit_goal(
         )
         if progressing:
             candidates = progressing
+    if planned_next_edges:
+        # A map can have multiple transitions to the same next map. Prefer
+        # the concrete edge chosen by the world route, especially after a
+        # restart when the in-memory previous-transition guard is absent.
+        # Petalburg Woods has south and north exits that both return to Route
+        # 104, but only the north exit advances toward Rustboro.
+        route_aligned = frozenset(
+            transition
+            for transition in candidates
+            if any(
+                transition.destination is not None
+                and transition.destination[0] == edge.destination_map
+                and transition.entry[1] in edge.source_coordinates
+                for edge in planned_next_edges
+            )
+        )
 
     def connection_key(transition):
         """Identify the ROM connection strip represented by aligned entries."""
@@ -664,6 +735,36 @@ def _observed_exit_goal(
             connection_groups[key].append(transition)
     ranked: list[tuple[tuple, object]] = []
     previous_transition = None if navigation_progress is None else navigation_progress.get("previous_transition")
+
+    def is_immediate_reverse(warp) -> bool:
+        """Return whether an exit exactly reverses the previous transition."""
+
+        if previous_transition is None or warp.destination is None:
+            return False
+        # New execution state retains the complete observed transition. This
+        # matters when two exits return to the same map (Petalburg Woods has
+        # both a south and a north Route 104 exit): only the exact inverse of
+        # the entry transition is an immediate reversal.
+        previous_entry = getattr(previous_transition, "entry", None)
+        previous_destination = getattr(previous_transition, "destination", None)
+        if previous_entry is not None and previous_destination is not None:
+            return (
+                warp.entry == previous_destination
+                and warp.destination == previous_entry
+                and not (
+                    semantic_target is not None
+                    and semantic_target.target_map == previous_entry[0]
+                )
+            )
+        # Preserve compatibility with older callers/tests that provide only
+        # the source and destination map IDs.
+        return (
+            len(previous_transition) >= 2
+            and warp.entry[0] == previous_transition[1]
+            and warp.destination[0] == previous_transition[0]
+            and not (semantic_target is not None and semantic_target.target_map == previous_transition[0])
+        )
+
     # Evaluate every observed candidate that could advance the semantic goal.
     # The world route is a quality discriminator; local path cost remains the
     # tie-breaker among equally good downstream routes.
@@ -688,9 +789,23 @@ def _observed_exit_goal(
                 trace=True,
             )
             # Use A* for faster heuristic-guided search.
-            plan = navigator.plan((world.map_id, world.player_coordinates), target, algorithm="astar")
+            plan = navigator.plan(
+                (world.map_id, world.player_coordinates),
+                tactical_goal(target),
+                algorithm="astar",
+            )
             diagnostic_print(lambda: ("CAMPAIGN_PLAN_TRACE: phase=exit_candidate_end " f"plan={plan!r}"), trace=True)
-        except NavigationError:
+        except NavigationError as error:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_PLAN_TRACE: phase=exit_candidate_error "
+                    f"frame={getattr(context, 'frame', None)!r} error={str(error)!r} "
+                    f"tiles={len(navigator.world.tiles)} "
+                    f"start_neighbors={navigator.world.neighbors((world.map_id, world.player_coordinates))!r} "
+                    f"transitions={len(navigator.world.transitions or navigator.world.warps)}"
+                ),
+                trace=True,
+            )
             continue
         # Navigation providers are allowed to decline a candidate without a
         # plan.  Treat that the same as an unreachable local exit rather than
@@ -714,15 +829,11 @@ def _observed_exit_goal(
         downstream_cost = downstream.estimated_cost if downstream not in (None, False) else 0
         local_cost = metrics.total_route_cost if metrics else float("inf")
         total_route_cost = downstream_cost + local_cost
-        immediate_reverse = (
-            previous_transition is not None
-            and warp.entry[0] == previous_transition[1]
-            and warp.destination[0] == previous_transition[0]
-            and not (semantic_target is not None and semantic_target.target_map == previous_transition[0])
-        )
+        immediate_reverse = is_immediate_reverse(warp)
         ranked.append(
             (
                 (
+                    0 if warp in route_aligned else 1,
                     total_route_cost,
                     downstream_cost,
                     metrics.encounter_opportunities if metrics else float("inf"),
@@ -744,12 +855,12 @@ def _observed_exit_goal(
                     "destination": transition.destination,
                     "local_reachability": any(candidate[1] is transition for candidate in ranked),
                     "local_movement_cost": next(
-                        (candidate[0][3] for candidate in ranked if candidate[1] is transition), None
+                        (candidate[0][4] for candidate in ranked if candidate[1] is transition), None
                     ),
                     "downstream_world_route_cost": (
                         downstream_routes[transition].estimated_cost if transition in downstream_routes else None
                     ),
-                    "total_cost": next((candidate[0][0] for candidate in ranked if candidate[1] is transition), None),
+                    "total_cost": next((candidate[0][1] for candidate in ranked if candidate[1] is transition), None),
                     "relevance": relevance[transition].name,
                     "survives_filtering": transition in candidates,
                     "selected": False,
@@ -758,6 +869,47 @@ def _observed_exit_goal(
             ),
         )
     if not ranked:
+        if semantic_target is not None and indirect_relevant:
+            observed_transitions = tuple(getattr(world, "transitions", ()) or world.warps)
+            fallback_transitions = tuple(
+                transition for transition in observed_transitions if transition in indirect_relevant
+            )
+            # If the direct target boundary is stranded in the current local
+            # component, an interior warp is the intended way to reach the
+            # next component.  Keep other boundary connections as a fallback
+            # only when no relevant interior warp was observed; otherwise a
+            # cheap but wrong town connection can win before the detour (for
+            # example, Route 104's Petalburg Woods south entrance versus its
+            # reachable Petalburg boundary).
+            indirect_warps = tuple(
+                transition for transition in fallback_transitions if transition.kind != "map_connection"
+            )
+            if indirect_warps:
+                fallback_transitions = indirect_warps
+            if fallback_transitions:
+                fallback_world = replace(
+                    world,
+                    transitions=fallback_transitions,
+                    warps=tuple(transition for transition in world.warps if transition in fallback_transitions),
+                )
+                fallback = _observed_exit_goal(
+                    fallback_world,
+                    navigator,
+                    semantic_target,
+                    navigation_progress,
+                    navigation_policy,
+                )
+                if fallback is not None:
+                    diagnostic_print(
+                        lambda: (
+                            "CAMPAIGN_NAVIGATION_TRACE: indirect_progression_fallback "
+                            f"frame={getattr(context, 'frame', None)!r} "
+                            f"map={world.map_id!r} target={semantic_target.target_map!r} "
+                            f"transitions={len(fallback_transitions)}"
+                        ),
+                        trace=True,
+                    )
+                    return fallback
         # Preserve targetless escape behavior. With a semantic target, a
         # locally blocked relevant transition is explicit rather than an
         # excuse to choose an unrelated exit.
@@ -790,6 +942,9 @@ def observation_driven_overworld_progression(
     semantic_target: SemanticTarget | None = None,
     execution_cache: dict | None = None,
     objective_id: str | None = None,
+    navigation_policy: NavigationGoal | None = None,
+    completion_observed: bool | None = None,
+    initial_observation=None,
 ) -> Iterator[object]:
     """Advance through observed overworld affordances one input at a time.
 
@@ -804,6 +959,24 @@ def observation_driven_overworld_progression(
     # This is execution state, not campaign history: dropping the capability
     # drops the cache as well.
     execution_cache = execution_cache if execution_cache is not None else {}
+    initial_observation = _normalize_overworld_observation(initial_observation)
+    use_initial_observation = initial_observation is not None
+
+    def navigation_observation(goal):
+        """Observe interaction state while reusing this frame's world read."""
+
+        nonlocal use_initial_observation
+        if use_initial_observation:
+            use_initial_observation = False
+            return observe_agent(
+                goal=goal,
+                overworld_observation=initial_observation,
+            )
+        return observe_agent(
+            goal=goal,
+            overworld_observation=execution_cache.get("current_overworld"),
+        )
+
     while True:
         # Navigation is subordinate to all semantic UI actions.  The caller
         # supplies the current-frame interrupt predicate so a route generator
@@ -812,23 +985,73 @@ def observation_driven_overworld_progression(
         if interrupt is not None and interrupt():
             yield
             continue
-        try:
-            current = perceive_overworld()
-        except (AttributeError, RuntimeError, TypeError, ValueError):
-            current = None
+        if use_initial_observation:
+            current = initial_observation
+            use_initial_observation = False
+        else:
+            try:
+                current = _normalize_overworld_observation(perceive_overworld())
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                current = None
 
-        if interrupt is not None and interrupt():
-            yield
-            continue
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_NAVIGATION_OBSERVATION: "
+                f"frame={getattr(context, 'frame', None)!r} "
+                f"type={type(current).__name__!r} "
+                f"map={getattr(current, 'map_id', None)!r} "
+                f"position={getattr(current, 'player_coordinates', None)!r} "
+                f"controllable={getattr(current, 'controllable', None)!r} "
+                f"transition={getattr(current, 'transition_in_progress', None)!r}"
+            ),
+            trace=True,
+        )
+
+        execution_cache["current_overworld"] = current
         progress = execution_cache.setdefault("navigation_progress", {})
         pending_transition = progress.get("pending_transition")
         if pending_transition is not None and current is not None:
-            if current.map_id == pending_transition[1] and current.map_id != pending_transition[0]:
+            pending_entry = getattr(pending_transition, "entry", None)
+            pending_destination = getattr(pending_transition, "destination", None)
+            if pending_entry is not None and pending_destination is not None:
+                destination = pending_destination
+                if (
+                    destination is not None
+                    and current.map_id == destination[0]
+                    and current.map_id != pending_entry[0]
+                ):
+                    # mGBA can expose the destination map header before the
+                    # avatar has a valid coordinate in that map. Boundary
+                    # coordinates such as (19, -1) are a transition settling
+                    # observation, not evidence that the selected connection
+                    # was wrong. Preserve capability-level transition
+                    # ownership until a static destination tile is visible;
+                    # otherwise cache eviction below drops the tactical loop
+                    # before it can confirm the destination.
+                    tile_at = getattr(current, "tile_at", None)
+                    if callable(tile_at) and tile_at(current.player_coordinates) is None:
+                        settling_observations = progress.get("settling_observations", 0) + 1
+                        progress["settling_observations"] = settling_observations
+                        diagnostic_print(
+                            lambda: (
+                                "CAMPAIGN_NAVIGATION_WAIT: destination_coordinate_settling "
+                                f"frame={getattr(context, 'frame', None)!r} "
+                                f"observed={(current.map_id, current.player_coordinates)!r} "
+                                f"expected={destination!r} observation={settling_observations}"
+                            ),
+                            trace=True,
+                        )
+                        yield
+                        continue
+                    progress["previous_transition"] = pending_transition
+                    progress.pop("pending_transition", None)
+                    progress.pop("settling_observations", None)
+            elif current.map_id == pending_transition[1] and current.map_id != pending_transition[0]:
                 progress["previous_transition"] = pending_transition
                 progress.pop("pending_transition", None)
         # A tactical plan is deliberately local to this observation.  The
         # next frame gets a new navigator and cannot inherit route ownership.
-        if current is None or not current.controllable:
+        if current is None or not getattr(current, "controllable", False):
             yield
             continue
         navigator = GoalAwareNavigator(NavigationWorld.from_overworld(current))
@@ -863,10 +1086,88 @@ def observation_driven_overworld_progression(
                     execution_cache.pop("overworld", None)
             yield
             continue
-        interaction_goal = _observed_interaction_goal(current, semantic_target)
+        # A destination map can expose a valid avatar and map header before
+        # the ROM has finished its map-entry handoff.  In particular,
+        # Task_MapNamePopUpWindow is installed on entry and can coexist with a
+        # stale pre-transition observation.  Wait for that boundary to clear
+        # before selecting a fresh exit; an existing tactical loop above still
+        # owns and settles its transition.
+        if getattr(current, "transition_in_progress", False):
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_NAVIGATION_WAIT: "
+                    f"frame={getattr(context, 'frame', None)!r} "
+                    f"map={current.map_id!r} position={current.player_coordinates!r} "
+                    f"signals={getattr(current, 'transition_signals', ())!r}"
+                ),
+                trace=True,
+            )
+            yield
+            continue
+        interaction_goal = _observed_interaction_goal(
+            current,
+            semantic_target,
+            completion_observed=completion_observed,
+        )
         if interaction_goal is not None:
             _publish_navigation_intent(semantic_target, "INTERACT")
-            loop = AgentControlLoop(lambda: observe_agent(goal=interaction_goal), goal=interaction_goal).run()
+            interaction_tactical_goal = (
+                replace(navigation_policy, target=interaction_goal)
+                if navigation_policy is not None
+                else interaction_goal
+            )
+            loop = AgentControlLoop(
+                lambda: navigation_observation(interaction_tactical_goal),
+                goal=interaction_tactical_goal,
+            ).run()
+            execution_cache["overworld"] = (cache_key, loop)
+            try:
+                next(loop)
+            except StopIteration:
+                execution_cache.pop("overworld", None)
+                yield
+                continue
+            yield
+            continue
+        petalburg_wally_gate_goal = _observed_petalburg_wally_gate_goal(current, semantic_target)
+        if petalburg_wally_gate_goal is not None:
+            _publish_navigation_intent(semantic_target, "INTERACT ROM GYM GATE")
+            gate_tactical_goal = (
+                replace(navigation_policy, target=petalburg_wally_gate_goal)
+                if navigation_policy is not None
+                else petalburg_wally_gate_goal
+            )
+            loop = AgentControlLoop(
+                lambda: navigation_observation(gate_tactical_goal),
+                goal=gate_tactical_goal,
+            ).run()
+            execution_cache["overworld"] = (cache_key, loop)
+            try:
+                next(loop)
+            except StopIteration:
+                execution_cache.pop("overworld", None)
+                yield
+                continue
+            yield
+            continue
+        # A map connection can be geometrically valid while its approach tile
+        # is occupied by a ROM-spawned gatekeeper.  In that case the gatekeeper
+        # is the executable next step (for example, the Petalburg opening
+        # scene), not a reason to choose another exit such as the east route.
+        # Resolve this before selecting a generic exit so a blocked campaign
+        # route cannot oscillate against the NPC.
+        boundary_interaction_goal = _observed_boundary_interaction_goal(current, semantic_target)
+        if boundary_interaction_goal is not None:
+            _publish_navigation_intent(semantic_target, "INTERACT BLOCKING GATE")
+            boundary_tactical_goal = (
+                replace(navigation_policy, target=boundary_interaction_goal)
+                if navigation_policy is not None
+                else boundary_interaction_goal
+            )
+            loop = AgentControlLoop(
+                lambda: navigation_observation(boundary_tactical_goal),
+                goal=boundary_tactical_goal,
+            ).run()
             execution_cache["overworld"] = (cache_key, loop)
             try:
                 next(loop)
@@ -888,7 +1189,7 @@ def observation_driven_overworld_progression(
             )
             if goal is not None:
                 _publish_navigation_intent(semantic_target, "LOCAL LAB WARP")
-                loop = AgentControlLoop(lambda: observe_agent(goal=goal), goal=goal).run()
+                loop = AgentControlLoop(lambda: navigation_observation(goal), goal=goal).run()
                 execution_cache["overworld"] = (cache_key, loop)
                 try:
                     next(loop)
@@ -898,13 +1199,28 @@ def observation_driven_overworld_progression(
                     continue
                 yield
                 continue
-        if semantic_target is not None and semantic_target.target_map == current.map_id:
+        if (
+            semantic_target is not None
+            and semantic_target.kind is SemanticTargetKind.INTERACTION
+            and semantic_target.target_map == current.map_id
+        ):
             # A current-map interaction target is meaningful only when its
             # affordance is currently observed. Do not fall back to a generic
-            # map escape route.
-            yield
-            continue
-        goal = _observed_exit_goal(current, navigator, semantic_target, progress)
+            # map escape route or retain a no-op generator forever. Returning
+            # hands control back to CampaignController, which can re-read the
+            # ROM completion flags and either advance or mount a fresh
+            # observation boundary when the object is merely still spawning.
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_NAVIGATION_BOUNDARY: "
+                    f"frame={getattr(context, 'frame', None)!r} map={current.map_id!r} "
+                    f"interaction={semantic_target.interaction_id!r} "
+                    "reason='semantic_affordance_not_observed'"
+                ),
+                trace=True,
+            )
+            return
+        goal = _observed_exit_goal(current, navigator, semantic_target, progress, navigation_policy)
         if goal is None:
             _publish_navigation_intent(semantic_target, "no viable local transition")
             yield
@@ -916,8 +1232,13 @@ def observation_driven_overworld_progression(
         )
         progress = execution_cache.setdefault("navigation_progress", {})
         if goal.warp is not None and goal.destination is not None:
-            progress["pending_transition"] = (goal.warp.entry[0], goal.destination[0])
-        loop = AgentControlLoop(lambda: observe_agent(goal=goal), goal=goal).run()
+            progress["pending_transition"] = goal.warp
+        tactical_goal = (
+            replace(navigation_policy, target=goal)
+            if navigation_policy is not None
+            else goal
+        )
+        loop = AgentControlLoop(lambda: navigation_observation(tactical_goal), goal=tactical_goal).run()
         execution_cache["overworld"] = (cache_key, loop)
         try:
             next(loop)
@@ -973,16 +1294,75 @@ def _observed_local_destination_goal(
 def _observed_interaction_goal(
     world: OverworldObservation,
     semantic_target: SemanticTarget | None,
-) -> ActivateTrigger | None:
-    """Resolve a current-map semantic interaction to its observed affordance."""
+    completion_observed: bool | None = None,
+) -> ActivateTrigger | ReachInteractionPosition | None:
+    """Resolve a current-map semantic interaction to its observed affordance.
+
+    Static activation geometry is valid before a runtime object has spawned;
+    ``locations`` only reports the object's current runtime position and may
+    therefore be empty for a legitimate pre-battle interaction.  Callers that
+    own a ROM-backed completion fact can explicitly close the affordance when
+    that fact is true, which prevents stale static geometry from reopening a
+    completed objective.
+    """
     if semantic_target is None or semantic_target.target_map != world.map_id:
         return None
     interaction_id = semantic_target.interaction_id
     if interaction_id is None:
         return None
+    if completion_observed is True:
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_NAVIGATION_BOUNDARY: "
+                f"frame={getattr(context, 'frame', None)!r} "
+                f"interaction={interaction_id!r} reason='authoritative_completion_observed'"
+            ),
+            trace=True,
+        )
+        return None
+    matching_triggers = []
     for trigger in world.triggers:
         identities = (trigger.trigger_id, trigger.affordance_id, trigger.script_symbol)
         matches = interaction_id in identities
+        if interaction_id == "devon_goods_researcher":
+            # Petalburg Woods exposes this scene as one of two coordinate
+            # scripts (left/right) rather than as a stable object binding.
+            # The alias is campaign-owned; the concrete trigger remains the
+            # currently observed coordinate event.
+            matches = matches or any(
+                isinstance(identity, str)
+                and identity
+                in {
+                    "PetalburgWoods_EventScript_DevonResearcherLeft",
+                    "PetalburgWoods_EventScript_DevonResearcherRight",
+                }
+                for identity in identities
+            )
+        if interaction_id == "rustboro_goods_stolen":
+            matches = matches or any(
+                isinstance(identity, str)
+                and identity
+                in {
+                    "RustboroCity_EventScript_StolenGoodsTrigger0",
+                    "RustboroCity_EventScript_StolenGoodsTrigger1",
+                    "RustboroCity_EventScript_StolenGoodsTrigger2",
+                    "RustboroCity_EventScript_StolenGoodsTrigger3",
+                    "RustboroCity_EventScript_StolenGoodsTrigger4",
+                }
+                for identity in identities
+            )
+        if interaction_id == "rustboro_goods_report":
+            matches = matches or any(
+                isinstance(identity, str)
+                and identity
+                in {
+                    "RustboroCity_EventScript_HelpGetGoodsTrigger0",
+                    "RustboroCity_EventScript_HelpGetGoodsTrigger1",
+                    "RustboroCity_EventScript_HelpGetGoodsTrigger2",
+                    "RustboroCity_EventScript_HelpGetGoodsTrigger3",
+                }
+                for identity in identities
+            )
         if interaction_id == "wall_clock":
             # Keep the campaign target stable while accepting each gender/map
             # specific ROM script at the observation boundary.
@@ -990,8 +1370,90 @@ def _observed_interaction_goal(
                 isinstance(identity, str) and identity.endswith("_EventScript_WallClock")
                 for identity in identities
             )
-        if matches and trigger.condition_active is not False and trigger.activation_locations:
-            return ActivateTrigger(trigger.trigger_id)
+        if (
+            matches
+            and trigger.condition_active is not False
+            and trigger.activation_locations
+        ):
+            matching_triggers.append(trigger)
+    if not matching_triggers:
+        return None
+
+    # A runtime object often publishes both a generic object affordance and a
+    # campaign-owned semantic binding for the same ROM script.  Preserve the
+    # semantic identity when both are available; otherwise the tactical goal
+    # can change from ``introductory_rival`` to an ephemeral object ID between
+    # observations and lose its campaign handoff.
+    trigger = next(
+        (
+            candidate
+            for candidate in matching_triggers
+            if str(getattr(candidate, "kind", "")).startswith("semantic_")
+        ),
+        matching_triggers[0],
+    )
+    # Coordinate scripts fire on tile entry; object interactions need an
+    # A-button edge.  Preserve that ROM distinction all the way to the
+    # tactical goal so an automatic story scene is never started by repeated
+    # interaction input.
+    return (
+        ActivateTrigger(trigger.trigger_id)
+        if getattr(trigger, "requires_input", True)
+        else ReachInteractionPosition(trigger.trigger_id)
+    )
+
+
+_PETALBURG_WALLY_GATE_SCRIPT_SUFFIXES = (
+    "_EventScript_ShowGymToPlayer",
+    "_EventScript_ShowGymToPlayer0",
+    "_EventScript_ShowGymToPlayer1",
+    "_EventScript_ShowGymToPlayer2",
+    "_EventScript_ShowGymToPlayer3",
+)
+
+
+def _observed_petalburg_wally_gate_goal(
+    world: OverworldObservation,
+    semantic_target: SemanticTarget | None,
+) -> ActivateTrigger | None:
+    """Keep Petalburg's ROM-owned gym gate ahead of generic exits.
+
+    Emerald dispatches the Petalburg gym introduction from four coordinate
+    scripts, rather than from the Gym Boy object as a normal interaction. If
+    the player is standing on one of those active trigger tiles, selecting a
+    map connection (especially Route 102 to the east) is incorrect: the ROM
+    scene owns the next step and will move the player into the gym.
+    """
+    if (
+        semantic_target is None
+        or semantic_target.target_map != MapRSE.PETALBURG_CITY_GYM.value
+        or semantic_target.interaction_id != "PetalburgCity_Gym_EventScript_Norman"
+        or world.map_id != MapRSE.PETALBURG_CITY.value
+    ):
+        return None
+    player_location = (world.map_id, world.player_coordinates)
+    for trigger in world.triggers:
+        script_symbol = getattr(trigger, "script_symbol", None) or getattr(trigger, "affordance_id", None)
+        if not isinstance(script_symbol, str) or not script_symbol.endswith(_PETALBURG_WALLY_GATE_SCRIPT_SUFFIXES):
+            continue
+        # A coordinate script is executable only when its ROM condition was
+        # positively observed.  ``None`` means the event variable could not
+        # be read this frame; treating that as active can steal ownership from
+        # a valid map exit during a partial observation.
+        if trigger.condition_active is not True or player_location not in trigger.activation_locations:
+            continue
+        if getattr(trigger, "currently_actionable", None) is False:
+            continue
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_NAVIGATION_TRACE: petalburg_wally_gate_trigger_required "
+                f"frame={getattr(context, 'frame', None)!r} map={world.map_id!r} "
+                f"player={world.player_coordinates!r} trigger={trigger.trigger_id!r} "
+                f"script={script_symbol!r}"
+            ),
+            trace=True,
+        )
+        return ActivateTrigger(trigger.trigger_id)
     return None
 
 
@@ -1011,8 +1473,8 @@ def _observed_boundary_interaction_goal(
     target_connections = tuple(
         transition
         for transition in (getattr(world, "transitions", ()) or world.warps)
-        if transition.kind == "map_connection"
-        and transition.destination is not None
+        if getattr(transition, "kind", None) == "map_connection"
+        and getattr(transition, "destination", None) is not None
         and transition.destination[0] == semantic_target.target_map
     )
     approach_tiles = {
@@ -1046,6 +1508,8 @@ def _observed_boundary_interaction_goal(
 
 
 def _start_game_values() -> tuple[str, str]:
+    """Read configured player name and gender values with safe defaults."""
+
     config = getattr(context, "config", None)
     start_game = getattr(config, "start_game", None)
     return (
@@ -1065,6 +1529,8 @@ def _configured_name(target: EmeraldNamingTarget) -> str | None:
 
 
 def _resolve_player_campaign_initialization(rng: RandomSource | None = None) -> StartGameInitialization:
+    """Resolve one session-stable player initialization choice."""
+
     name_config, gender_config = _start_game_values()
     if rng is None:
         # Use a session-stable RNG so that re-mounting the capability for
@@ -1076,6 +1542,8 @@ def _resolve_player_campaign_initialization(rng: RandomSource | None = None) -> 
 
 
 def _resolve_player_campaign_name(rng: RandomSource | None = None) -> str | None:
+    """Resolve the configured player name using the observed protagonist gender."""
+
     configured, configured_gender = _start_game_values()
     if not isinstance(configured, str):
         return None
@@ -1106,6 +1574,8 @@ def _naming_input(name: str) -> None:
 
 
 def _active_gender_task() -> str | None:
+    """Return the active task from Emerald's gender/name setup sequence."""
+
     try:
         names = {task.symbol for task in (get_tasks() or [])}
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
@@ -1157,6 +1627,8 @@ def _advance_name_prompt() -> Iterator[object]:
 
 
 def _campaign_observation(field_message_lifecycle_active: bool = False) -> EmeraldCampaignObservation:
+    """Assemble the compatibility observation from current ROM affordances."""
+
     from .campaign_controller import runtime_campaign_state
 
     state = runtime_campaign_state()
@@ -1233,6 +1705,7 @@ def _emerald_observation(
     """
     legacy = _campaign_observation(field_message_lifecycle_active)
     live_context = _uses_shared_runtime_context()
+    trace = getattr(context, "stutter_trace", None)
     if live_context:
         try:
             starter_selection = observe_emerald_starter_selection()
@@ -1249,8 +1722,28 @@ def _emerald_observation(
         overworld = None
     else:
         try:
-            overworld = perceive_overworld()
-        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+            raw_overworld = shared_overworld_observation_for_current_frame()
+            if raw_overworld is None:
+                raw_overworld = perceive_overworld()
+            elif trace is not None:
+                trace.mark("campaign_overworld_observation_cache_hit", True)
+            if isinstance(raw_overworld, OverworldObservationResult) and trace is not None:
+                trace.mark("campaign_overworld_observation_status", raw_overworld.status.value)
+                trace.mark("campaign_overworld_observation_reason", raw_overworld.reason)
+            overworld = _normalize_overworld_observation(raw_overworld)
+        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError) as error:
+            if trace is not None:
+                trace.mark("campaign_overworld_observation_error_type", type(error).__name__)
+                trace.mark("campaign_overworld_observation_error", repr(error))
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_OVERWORLD_OBSERVATION_EXCEPTION: "
+                    f"frame={getattr(context, 'frame', None)!r} "
+                    f"objective={objective_id!r} "
+                    f"exception_type={type(error).__name__!r} exception={error!r}"
+                ),
+                trace=True,
+            )
             overworld = None
     if live_context:
         try:
@@ -1348,6 +1841,17 @@ def _emerald_observation(
         # dispatcher cannot accidentally ignore the live observation.
         ("wall_clock_set", _safe_event_flag("SET_WALL_CLOCK")),
     )
+    if objective_id == "complete_intro_rival":
+        defeated_rival = _safe_event_flag("DEFEATED_RIVAL_ROUTE103")
+        hidden_rival = _safe_event_flag("HIDE_ROUTE_103_RIVAL")
+        rival_complete = (
+            True
+            if defeated_rival is True or hidden_rival is True
+            else False
+            if defeated_rival is False and hidden_rival is False
+            else None
+        )
+        facts += (("intro_rival_battle_complete", rival_complete),)
     clock_interaction = None
     if live_context:
         try:
@@ -1379,7 +1883,6 @@ def _emerald_observation(
         trace=True,
     )
     _publish_campaign_status(objective_id, semantic_target, legacy, overworld)
-    trace = getattr(context, "stutter_trace", None)
     if trace is not None and callable(getattr(trace, "mark", None)):
         # These are targeted replay fields, not per-frame console output.
         # They make scripted-interaction stalls diagnosable without turning
@@ -1395,6 +1898,16 @@ def _emerald_observation(
         trace.mark("startup_tasks", startup_tasks)
         trace.mark("confirmation", repr(legacy.confirmation_observation))
         try:
+            defeated_rival = _safe_event_flag("DEFEATED_RIVAL_ROUTE103")
+            hidden_rival = _safe_event_flag("HIDE_ROUTE_103_RIVAL")
+            trace.mark("defeated_rival_route103", defeated_rival)
+            trace.mark("hide_route_103_rival", hidden_rival)
+            trace.mark(
+                "intro_rival_battle_complete",
+                True if defeated_rival is True or hidden_rival is True
+                else False if defeated_rival is False and hidden_rival is False
+                else None,
+            )
             trace.mark("littleroot_intro_state", get_event_var("LITTLEROOT_INTRO_STATE"))
             trace.mark("littleroot_rival_state", get_event_var("LITTLEROOT_RIVAL_STATE"))
         except (AttributeError, RuntimeError, ValueError, TypeError, IndexError, KeyError):
@@ -1435,6 +1948,13 @@ def _semantic_target_for_objective(objective_id: str | None) -> SemanticTarget |
         lambda: ("CAMPAIGN_SEMANTIC_TARGET_CALL: " f"capability_id={id(objective_id)!r} objective_id={objective_id!r}"),
         trace=True,
     )
+    registered = emerald_capability_definition(objective_id) if objective_id is not None else None
+    if registered is not None and registered.semantic_target is not None:
+        result = registered.semantic_target
+        diagnostic_print(
+            lambda: f"CAMPAIGN_SEMANTIC_TARGET_RESULT: objective_id={objective_id!r} target={result!r}", trace=True
+        )
+        return result
     if objective_id == "rescue_birch":
         result = SemanticTarget.interaction(MapRSE.ROUTE101.value, interaction_id=_BIRCH_BAG_INTERACTION_ID)
         diagnostic_print(
@@ -1544,7 +2064,15 @@ def _publish_campaign_status(
         "complete_intro_rival": "Complete Introductory Rival Battle",
         "receive_pokedex": "Receive Pokédex",
         "receive_pokeballs": "Receive Poké Balls",
-        "start_nuzlocke": "Begin Nuzlocke",
+        "reach_petalburg": "Reach Petalburg City",
+        "complete_petalburg_wally": "Complete Wally's Tutorial",
+        "complete_petalburg_woods": "Complete Petalburg Woods Scene",
+        "reach_rustboro": "Reach Rustboro City",
+        "complete_rustboro_goods_stolen": "Complete Rustboro Goods Theft Scene",
+        "report_devon_goods": "Report the Stolen Devon Goods",
+        "recover_devon_goods": "Recover the Devon Goods",
+        "return_devon_goods": "Return the Devon Goods",
+        "meet_mr_stone": "Meet Mr. Stone",
     }
     label = descriptions.get(objective_id, objective_id) if objective_id is not None else None
     if label is None:
@@ -1571,6 +2099,8 @@ def _publish_navigation_intent(target: SemanticTarget | None, intent: str) -> No
 
 
 def _safe_event_flag(name: str) -> bool | None:
+    """Read a ROM event flag without turning a transient read error into false."""
+
     try:
         return bool(get_event_flag(name))
     except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
@@ -1657,11 +2187,19 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
     last_stable_map_id = None
 
     def higher_priority_actionable() -> bool:
-        # Re-observe through the same normalized pipeline.  Avoid recursion by
-        # checking only actions that outrank overworld movement.
+        """Check whether a non-movement action currently owns the frame."""
+
+        # Navigation only needs the interaction classifier here. Rebuilding
+        # the full Emerald observation would repeat map metadata, runtime
+        # object, and trigger perception twice around every navigation step.
         try:
-            current = _emerald_observation(field_message_lifecycle_active, objective_id)
-            return choose_emerald_observation_action(current) is not EmeraldCampaignAction.ADVANCE_OBSERVED_OVERWORLD
+            return classify_interaction(observe_interaction()) in {
+                InteractionType.DIALOGUE,
+                InteractionType.CHOICE,
+                InteractionType.MENU,
+                InteractionType.BATTLE,
+                InteractionType.SPECIAL_INTERACTION,
+            }
         except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
             return False
 
@@ -1691,6 +2229,8 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
         resolved_starter = resolve_emerald_starter(configured, rng)
     if objective_id == "set_wall_clock":
         clock_target_time = _emerald_clock_time(_clock_time_mode(), rng=rng)
+    registered_capability = emerald_capability_definition(objective_id) if objective_id is not None else None
+    navigation_policy = getattr(registered_capability, "readiness_goal", None)
     while True:
         observation = _emerald_observation(field_message_lifecycle_active, objective_id)
         # A field-message lifecycle belongs to the map/script that created
@@ -1707,6 +2247,24 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
         if observation.map_id is not None:
             last_stable_map_id = observation.map_id
         field_message_lifecycle_active = observation.dialogue_lifecycle_active
+        if (
+            objective_id == "complete_intro_rival"
+            and dict(observation.campaign_facts).get("intro_rival_battle_complete") is True
+        ):
+            # The ROM has closed the objective. Release this capability
+            # immediately so CampaignController can select the next frontier
+            # even if the final object-removal frame still carries the old
+            # Route 103 semantic target.
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_CAPABILITY_BOUNDARY: "
+                    f"frame={getattr(context, 'frame', None)!r} "
+                    "objective='complete_intro_rival' "
+                    "reason='authoritative_completion_observed'"
+                ),
+                trace=True,
+            )
+            return
         action = choose_emerald_observation_action(observation)
         diagnostic_print(
             lambda: (
@@ -2184,14 +2742,28 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
             # re-evaluated by CampaignController on the next frame.
             # The target is read again from the same current observation that
             # selected this action; no route is retained across frames.
-            next(
-                observation_driven_overworld_progression(
-                    higher_priority_actionable,
-                    observation.semantic_target,
-                    tactical_execution_cache,
-                    objective_id,
+            try:
+                next(
+                    observation_driven_overworld_progression(
+                        higher_priority_actionable,
+                        observation.semantic_target,
+                        tactical_execution_cache,
+                        objective_id,
+                        navigation_policy,
+                        (
+                            dict(observation.campaign_facts).get("intro_rival_battle_complete")
+                            if objective_id == "complete_intro_rival"
+                            else None
+                        ),
+                        observation.overworld,
+                    )
                 )
-            )
+            except StopIteration:
+                # A current-map semantic target with no observed affordance
+                # is a capability boundary, not a successful input step.
+                # Let the controller re-observe ROM facts before deciding
+                # whether the objective advanced or needs a fresh mount.
+                return
             yield
             continue
         else:

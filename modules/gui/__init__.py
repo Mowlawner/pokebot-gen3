@@ -18,6 +18,7 @@ from modules.gui.emulator_screen import EmulatorScreen
 from modules.gui.load_state_window import LoadStateWindow
 from modules.gui.select_profile_screen import SelectProfileScreen
 from modules.libmgba import LibmgbaEmulator, input_map
+from modules.profiles import ProfileLock
 from modules.sprites import choose_random_sprite, crop_sprite_square
 from modules.version import pokebot_name, pokebot_version
 
@@ -44,6 +45,7 @@ class PokebotGui:
         self._main_loop = main_loop
         self._on_exit = on_exit
         self._startup_settings: "StartupSettings | None" = None
+        self._profile_lock: ProfileLock | None = None
         self.inputs_enabled = True
         self.is_headless = False
 
@@ -105,6 +107,10 @@ class PokebotGui:
             context.emulator.shutdown()
             context.emulator = None
 
+        if self._profile_lock is not None:
+            self._profile_lock.release()
+            self._profile_lock = None
+
         self._on_exit()
 
         os._exit(0)
@@ -139,14 +145,22 @@ class PokebotGui:
         self._reset_screen()
         source = "CLI" if self._startup_settings and self._startup_settings.profile is profile else "GUI"
         diagnostic_print(lambda: f"Profile selected: {profile.path} (source: {source})")
+        profile_lock = ProfileLock(profile.path)
+        profile_lock.acquire()
+        self._profile_lock = profile_lock
         context.profile = profile
-        context.config.load(profile.path, strict=False)
-        set_rom(profile.rom)
-        context.emulator = LibmgbaEmulator(
-            profile,
-            self._emulator_screen.update,
-            save_state_on_shutdown=not self._startup_settings.no_save_state if self._startup_settings else True,
-        )
+        try:
+            context.config.load(profile.path, strict=False)
+            set_rom(profile.rom)
+            context.emulator = LibmgbaEmulator(
+                profile,
+                self._emulator_screen.update,
+                save_state_on_shutdown=not self._startup_settings.no_save_state if self._startup_settings else True,
+            )
+        except Exception:
+            profile_lock.release()
+            self._profile_lock = None
+            raise
 
         if self._startup_settings:
             context.audio = not self._startup_settings.no_audio

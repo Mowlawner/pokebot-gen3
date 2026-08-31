@@ -15,10 +15,13 @@ from modules.goals import ActivateTrigger, EngageTrainer, Goal, NavigationGoal, 
 from modules.map_data import MapRSE
 
 from .campaign_objectives import CampaignObjective, ObjectiveSelection, ObjectiveStatus
+from .emerald_campaign_registry import emerald_capability_definition
 
 
 @dataclass(frozen=True)
 class _EmeraldCampaignDelegate:
+    """Lazy delegate that mounts the ROM-specific Emerald capability."""
+
     objective_id: str
 
     def __call__(self, _objective: Goal) -> Iterator[object]:
@@ -29,6 +32,8 @@ class _EmeraldCampaignDelegate:
 
 
 class CampaignExecutionStatus(Enum):
+    """Translation status returned before any tactical execution begins."""
+
     READY = "ready"
     BLOCKED = "blocked"
     UNKNOWN = "unknown"
@@ -157,6 +162,32 @@ class CampaignExecutionAdapter:
                 goal,
             )
 
+        if objective.objective_id == "prepare_roxanne":
+            capability_definition = emerald_capability_definition(objective.objective_id)
+            if (
+                capability_definition is None
+                or capability_definition.semantic_target is None
+                or capability_definition.preparation_level is None
+            ):
+                return CampaignExecutionResult(
+                    objective,
+                    CampaignExecutionStatus.UNSUPPORTED,
+                    "prepare_roxanne has no registered Emerald preparation capability",
+                    objective.execution_id,
+                )
+            from .resource_runtime import execute_campaign_preparation
+
+            return CampaignExecutionResult(
+                objective,
+                CampaignExecutionStatus.READY,
+                "mounted bounded Emerald preparation capability",
+                objective.execution_id,
+                capability=lambda: execute_campaign_preparation(
+                    capability_definition.semantic_target.target_map,
+                    target_level=capability_definition.preparation_level,
+                ),
+            )
+
         # Preparation decisions supply an explicit trainer target and policy;
         # keep the adapter generic so the live controller can mount the normal
         # navigation loop without ROM-specific battle code here.
@@ -171,16 +202,8 @@ class CampaignExecutionAdapter:
                 objective.tactical_target,
             )
 
-        if objective.objective_id in {
-            "set_text_speed",
-            "complete_new_game_setup",
-            "set_wall_clock",
-            "meet_rival",
-            "rescue_birch",
-            "obtain_starter",
-            "receive_pokedex",
-            "reach_petalburg",
-        }:
+        capability_definition = emerald_capability_definition(objective.objective_id)
+        if capability_definition is not None:
             # Keep the selector ROM-neutral and import emulator code only when
             # a live Emerald objective is actually mounted.
             from .emerald_capabilities import emerald_campaign_capability
@@ -188,9 +211,10 @@ class CampaignExecutionAdapter:
             return CampaignExecutionResult(
                 objective,
                 CampaignExecutionStatus.READY,
-                f"mounted observation-driven Emerald executor for {objective.objective_id}",
+                f"mounted {capability_definition.capability_id} for {objective.objective_id}",
                 objective.execution_id,
-                capability=lambda: emerald_campaign_capability(objective.objective_id),
+                capability=lambda: emerald_campaign_capability(capability_definition.objective_id),
+                tactical_goal=capability_definition.readiness_goal,
             )
 
         if objective.objective_id in {"confirm_early_pokeballs", "receive_pokeballs"}:

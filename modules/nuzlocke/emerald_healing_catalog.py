@@ -126,22 +126,32 @@ class HealingSourceRSE(Enum):
 
     @property
     def source_id(self) -> str:
+        """Return the stable identifier used by healing execution."""
+
         return self.value[0]
 
     @property
     def outdoor_location(self):
+        """Return the outdoor map and coordinates leading to this source."""
+
         return self.value[1]
 
     @property
     def interior_map(self) -> MapRSE:
+        """Return the interior map containing the healing interaction."""
+
         return self.value[2]
 
     @property
     def script_symbol(self) -> str:
+        """Return the ROM script symbol for this healing interaction."""
+
         return self.value[3]
 
 
 def emerald_healing_sources() -> tuple[HealingSourceRSE, ...]:
+    """Return every cataloged Emerald full-party healing source."""
+
     return tuple(HealingSourceRSE)
 
 
@@ -151,4 +161,6 @@ def emerald_healing_sources_for_map(map_id) -> tuple[HealingSourceRSE, ...]:
 
 
 def emerald_healing_source_for_destination(destination) -> HealingSourceRSE | None:
+    """Return the source whose outdoor destination exactly matches ``destination``."""
+
     return next((source for source in HealingSourceRSE if source.outdoor_location == destination), None)

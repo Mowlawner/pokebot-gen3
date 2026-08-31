@@ -57,6 +57,37 @@ TRIGGER_BINDINGS: tuple[TriggerBinding, ...] = (
             "LittlerootTown_ProfessorBirchsLab_EventScript_MayGivePokeBalls",
         ),
     ),
+    TriggerBinding(
+        trigger_id="devon_goods_researcher",
+        map_id=MapRSE.PETALBURG_WOODS.value,
+        # The decompilation has left/right script variants for the same
+        # researcher scene.  Script identity is authoritative; local ID is
+        # intentionally omitted because the scene's object template can vary
+        # with the player's approach side.
+        script_symbol="PetalburgWoods_EventScript_DevonResearcherLeft",
+        alternate_script_symbols=("PetalburgWoods_EventScript_DevonResearcherRight",),
+    ),
+    TriggerBinding(
+        trigger_id="petalburg_norman",
+        map_id=MapRSE.PETALBURG_CITY_GYM.value,
+        script_symbol="PetalburgCity_Gym_EventScript_Norman",
+        local_id=1,
+    ),
+    TriggerBinding(
+        trigger_id="rusturf_tunnel_goods",
+        map_id=MapRSE.RUSTURF_TUNNEL.value,
+        script_symbol="RusturfTunnel_EventScript_Grunt",
+    ),
+    TriggerBinding(
+        trigger_id="rustboro_return_devon_goods",
+        map_id=MapRSE.RUSTBORO_CITY.value,
+        script_symbol="RustboroCity_EventScript_DevonEmployee1",
+    ),
+    TriggerBinding(
+        trigger_id="roxanne",
+        map_id=MapRSE.RUSTBORO_CITY_GYM.value,
+        script_symbol="RustboroCity_Gym_EventScript_Roxanne",
+    ),
 )
 
 

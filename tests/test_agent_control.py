@@ -20,7 +20,7 @@ from modules.agent_control import (
     select_action,
     observe_agent,
 )
-from modules.goals import GoalConstraints, NavigationGoal, ReachLocation, ReachWarp
+from modules.goals import GoalConstraints, NavigationGoal, ReachLocation, ReachWarp, SemanticTarget
 from modules.interaction_state import InteractionObservation, InteractionPhase
 from modules.map_path import Direction
 from modules.memory import GameState
@@ -67,6 +67,8 @@ def observation(
     controllable=True,
     field_message_lifecycle_active=False,
     field_message_advance_ready=False,
+    field_message_render_rescue_available=False,
+    interaction_phase=None,
 ):
     return AgentObservation(
         InteractionObservation(
@@ -78,10 +80,15 @@ def observation(
             controllable=controllable,
             field_message_lifecycle_active=field_message_lifecycle_active,
             field_message_advance_ready=field_message_advance_ready,
+            field_message_render_rescue_available=field_message_render_rescue_available,
             interaction_phase=(
-                InteractionPhase.FIELD_MESSAGE_INPUT_WAIT
-                if dialogue_waiting or field_message_advance_ready
-                else InteractionPhase.NONE
+                interaction_phase
+                if interaction_phase is not None
+                else (
+                    InteractionPhase.FIELD_MESSAGE_INPUT_WAIT
+                    if dialogue_waiting or field_message_advance_ready
+                    else InteractionPhase.NONE
+                )
             ),
         ),
         overworld=world,
@@ -90,6 +97,52 @@ def observation(
 
 
 class AgentActionSelectionTests(TestCase):
+    def test_semantic_map_goal_completes_when_already_on_target_map(self):
+        world = overworld({(0, 0)}, start=(0, 0))
+        goal = NavigationGoal(SemanticTarget.map(MAP))
+
+        decision = select_action(observation(GameState.OVERWORLD, world=world, goal=goal))
+
+        self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(decision.goal_evaluation.status, GoalStatus.COMPLETE)
+        self.assertEqual(decision.goal_evaluation.reason, "goal position reached")
+
+    def test_reach_warp_completes_when_destination_map_is_already_observed(self):
+        destination_map = ("destination", 0)
+        world = OverworldObservation(
+            map_id=destination_map,
+            player_coordinates=(0, 0),
+            facing=Direction.South,
+            controllable=True,
+            tiles=(TileObservation((destination_map, (0, 0)), False, frozenset(Direction)),),
+            warps=(),
+            objects=(),
+            triggers=(),
+        )
+        goal = ReachWarp(destination_map=destination_map)
+
+        decision = select_action(observation(GameState.OVERWORLD, world=world, goal=goal))
+
+        self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(decision.goal_evaluation.status, GoalStatus.COMPLETE)
+        self.assertEqual(decision.goal_evaluation.reason, "destination map reached")
+
+    def test_invalid_destination_map_coordinate_waits_for_transition_to_settle(self):
+        world = overworld({(0, 0)}, start=(0, -1))
+        decision = select_action(
+            observation(
+                GameState.OVERWORLD,
+                world=world,
+                goal=ReachLocation((MAP, (0, 0))),
+            )
+        )
+
+        self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(
+            decision.action.reason,
+            "avatar coordinate is not present in current overworld topology; waiting for transition to settle",
+        )
+
     def test_script_owned_controllable_overworld_waits_instead_of_reinteracting(self):
         world = overworld({(0, 0)}, controllable=True)
         observed = observation(
@@ -134,7 +187,7 @@ class AgentActionSelectionTests(TestCase):
         self.assertEqual(decision.action.navigation.action_type, NavigationActionType.MOVE)
         self.assertEqual(decision.action.direction, Direction.East)
         self.assertIn(
-            "global route unavailable; using observed local transition", decision.goal_evaluation.world_diagnostics
+            "observed transition planned locally; global route not consulted", decision.goal_evaluation.world_diagnostics
         )
 
     def test_arrival_at_directional_observed_warp_emits_activation_input(self):
@@ -343,6 +396,93 @@ class AgentActionSelectionTests(TestCase):
         )
         self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
 
+    def test_automatic_coordinate_trigger_waits_for_rom_scene_instead_of_pressing_a(self):
+        from modules.goals import ActivateTrigger
+
+        trigger = TriggerObservation(
+            "coord:0:152:0",
+            frozenset({(MAP, (0, 0))}),
+            activation_locations=frozenset({(MAP, (0, 0))}),
+            requires_input=False,
+        )
+        world = overworld({(0, 0)}, triggers=(trigger,))
+        decision = select_action(
+            observation(GameState.OVERWORLD, world=world, goal=ActivateTrigger("coord:0:152:0"))
+        )
+
+        self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(decision.action.reason, "automatic coordinate trigger fires on tile entry")
+
+    def test_completed_automatic_trigger_is_complete_when_rom_condition_turns_off(self):
+        from modules.goals import ActivateTrigger
+
+        trigger = TriggerObservation(
+            "coord:0:152:0",
+            frozenset({(MAP, (0, 0))}),
+            activation_locations=frozenset({(MAP, (0, 0))}),
+            condition_active=False,
+            requires_input=False,
+        )
+        decision = select_action(
+            observation(
+                GameState.OVERWORLD,
+                world=overworld({(0, 0)}, triggers=(trigger,)),
+                goal=ActivateTrigger("coord:0:152:0"),
+            )
+        )
+
+        self.assertEqual(decision.goal_evaluation.status, GoalStatus.COMPLETE)
+        self.assertIn("ROM scene already completed", decision.goal_evaluation.reason)
+
+    def test_cached_automatic_trigger_is_invalidated_after_rom_condition_turns_off(self):
+        from modules.goals import ActivateTrigger
+
+        goal = ActivateTrigger("coord:0:152:0")
+        trigger = TriggerObservation(
+            "coord:0:152:0",
+            frozenset({(MAP, (0, 0))}),
+            activation_locations=frozenset({(MAP, (0, 0))}),
+            condition_active=False,
+            requires_input=False,
+        )
+        world = overworld({(0, 0)}, triggers=(trigger,))
+        loop = AgentControlLoop(lambda: None, goal=goal)
+        loop._cached_goal = goal
+        loop._cached_evaluation = GoalEvaluation(GoalStatus.REACHABLE)
+
+        with patch.object(agent_control.context, "emulator", Mock()):
+            decision = loop._cached_decision(observation(GameState.OVERWORLD, world=world, goal=goal))
+
+        self.assertIsNone(decision)
+        self.assertIsNone(loop._cached_evaluation)
+        self.assertIsNone(loop._cached_goal)
+
+    def test_cached_static_object_target_interacts_without_runtime_spawn(self):
+        from modules.goals import ActivateTrigger
+
+        goal = ActivateTrigger("rival")
+        trigger = TriggerObservation(
+            "rival",
+            frozenset(),
+            activation_locations=frozenset({(MAP, (0, 0))}),
+            kind="semantic_object",
+        )
+        world = overworld({(0, 0)}, triggers=(trigger,))
+        observed = observation(GameState.OVERWORLD, world=world, goal=goal)
+        loop = AgentControlLoop(lambda: observed, goal=goal)
+        loop._cached_goal = goal
+        loop._cached_evaluation = GoalEvaluation(
+            GoalStatus.REACHABLE,
+            plan=NavigationPlan((), (MAP, (0, 0))),
+        )
+        loop._cached_world_signature = loop._world_signature(observed)
+
+        decision = loop._cached_decision(observed)
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.action.action_type, AgentActionType.INTERACT)
+        self.assertEqual(decision.action.option, "rival")
+
     def test_uncontrollable_field_dialogue_transition_advances_once(self):
         from modules.goals import ActivateTrigger
 
@@ -382,6 +522,125 @@ class AgentActionSelectionTests(TestCase):
             result = AgentActionExecutor().execute(AgentAction(AgentActionType.ADVANCE_DIALOGUE), dialogue)
         self.assertEqual(result.result_type, ActionResultType.EXECUTED)
         emulator.press_button.assert_called_once_with("A")
+
+    def test_render_rescue_uses_a_fresh_b_pulse(self):
+        class FreshEmulator:
+            press_button_fresh = Mock()
+            hold_button = Mock()
+
+        emulator = FreshEmulator()
+        rendering = observation(
+            GameState.OVERWORLD,
+            field_message_lifecycle_active=True,
+            field_message_render_rescue_available=True,
+            interaction_phase=InteractionPhase.FIELD_MESSAGE_RENDER_WAIT,
+        )
+        action = AgentAction(AgentActionType.ACCELERATE_DIALOGUE_RENDER)
+        with patch("modules.agent_control.context.emulator", emulator):
+            result = AgentActionExecutor().execute(action, rendering)
+
+        self.assertEqual(result.result_type, ActionResultType.EXECUTED)
+        emulator.press_button_fresh.assert_called_once_with("B")
+        emulator.hold_button.assert_called_once_with("B")
+
+    def test_render_rescue_releases_held_b_before_dialogue_input(self):
+        class FreshEmulator:
+            press_button_fresh = Mock()
+            hold_button = Mock()
+            release_button = Mock()
+            is_button_held = Mock(return_value=False)
+
+        emulator = FreshEmulator()
+        rendering = observation(
+            GameState.OVERWORLD,
+            field_message_lifecycle_active=True,
+            field_message_render_rescue_available=True,
+            interaction_phase=InteractionPhase.FIELD_MESSAGE_RENDER_WAIT,
+        )
+        ready = replace(
+            rendering,
+            interaction=replace(
+                rendering.interaction,
+                field_message_render_rescue_available=False,
+                interaction_phase=InteractionPhase.FIELD_MESSAGE_INPUT_WAIT,
+            ),
+        )
+        executor = AgentActionExecutor()
+        with patch("modules.agent_control.context.emulator", emulator):
+            executor.execute(AgentAction(AgentActionType.ACCELERATE_DIALOGUE_RENDER), rendering)
+            executor.execute(AgentAction(AgentActionType.ADVANCE_DIALOGUE), ready)
+
+        emulator.release_button.assert_called_once_with("B")
+        self.assertEqual(emulator.press_button_fresh.call_args_list, [call("B"), call("A")])
+
+    def test_render_rescue_sends_one_fresh_b_then_holds_until_release(self):
+        class StatefulEmulator:
+            def __init__(self):
+                self.held = set()
+                self.fresh_presses = []
+                self.holds = []
+                self.releases = []
+
+            def press_button_fresh(self, button):
+                self.fresh_presses.append(button)
+
+            def hold_button(self, button):
+                self.holds.append(button)
+                self.held.add(button)
+
+            def is_button_held(self, button):
+                return button in self.held
+
+            def release_button(self, button):
+                self.releases.append(button)
+                self.held.discard(button)
+
+        emulator = StatefulEmulator()
+        rendering = observation(
+            GameState.OVERWORLD,
+            field_message_lifecycle_active=True,
+            field_message_render_rescue_available=True,
+            interaction_phase=InteractionPhase.FIELD_MESSAGE_RENDER_WAIT,
+        )
+        ready = replace(
+            rendering,
+            interaction=replace(
+                rendering.interaction,
+                field_message_render_rescue_available=False,
+                interaction_phase=InteractionPhase.FIELD_MESSAGE_INPUT_WAIT,
+            ),
+        )
+        executor = AgentActionExecutor()
+        with patch("modules.agent_control.context.emulator", emulator):
+            executor.execute(AgentAction(AgentActionType.ACCELERATE_DIALOGUE_RENDER), rendering)
+            executor.execute(AgentAction(AgentActionType.ACCELERATE_DIALOGUE_RENDER), rendering)
+            executor.execute(AgentAction(AgentActionType.ADVANCE_DIALOGUE), ready)
+
+        self.assertEqual(emulator.fresh_presses, ["B", "A"])
+        self.assertEqual(emulator.holds, ["B", "B"])
+        self.assertEqual(emulator.releases, ["B"])
+
+    def test_render_rescue_rejects_stale_or_wrong_phase_observations(self):
+        emulator = Mock()
+        rendering = observation(
+            GameState.OVERWORLD,
+            field_message_lifecycle_active=True,
+            field_message_render_rescue_available=True,
+            interaction_phase=InteractionPhase.FIELD_MESSAGE_RENDER_WAIT,
+        )
+        action = AgentAction(AgentActionType.ACCELERATE_DIALOGUE_RENDER)
+        not_rendering = replace(
+            rendering,
+            interaction=replace(
+                rendering.interaction,
+                interaction_phase=InteractionPhase.FIELD_MESSAGE_INPUT_WAIT,
+            ),
+        )
+        with patch("modules.agent_control.context.emulator", emulator):
+            result = AgentActionExecutor().execute(action, not_rendering)
+
+        self.assertEqual(result.result_type, ActionResultType.WAITING)
+        emulator.press_button.assert_not_called()
 
     def test_safe_batch_groups_straight_and_turning_moves(self):
         world = overworld({(x, y) for x, y in ((0, 0), (1, 0), (2, 0), (2, 1))})
@@ -460,6 +719,37 @@ class AgentActionSelectionTests(TestCase):
             self.assertTrue(loop._advance_movement_batch())
         emulator.hold_button.assert_called_once_with("Right")
 
+    def test_running_batch_holds_direction_and_run_button_each_frame(self):
+        from modules.agent_control import _MovementBatch
+
+        loop = AgentControlLoop(lambda: None)
+        loop._movement_batch = _MovementBatch(
+            (
+                NavigationAction(
+                    NavigationActionType.MOVE,
+                    Direction.East,
+                    (MAP, (0, 0)),
+                    (MAP, (1, 0)),
+                    run=True,
+                ),
+            )
+        )
+        avatar = SimpleNamespace(
+            map_group_and_number=MAP,
+            local_coordinates=(0, 0),
+            facing_direction="Right",
+        )
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator), patch(
+            "modules.agent_control.get_game_state", return_value=GameState.OVERWORLD
+        ), patch("modules.agent_control.is_field_message_waiting_for_input", return_value=False), patch(
+            "modules.agent_control.get_player_avatar", return_value=avatar
+        ):
+            self.assertTrue(loop._advance_movement_batch())
+
+        self.assertEqual(emulator.hold_button.call_args_list, [call("Right"), call("B")])
+        emulator.press_direction.assert_not_called()
+
     def test_fast_path_turns_without_debug_diagnostics(self):
         loop, avatar = self._movement_batch_loop()
         avatar.facing_direction = "Up"
@@ -527,6 +817,17 @@ class AgentActionSelectionTests(TestCase):
             result = observe_agent()
         self.assertIs(result.overworld, settled_interior)
         perceive.assert_called_once_with()
+
+    def test_observe_agent_reuses_supplied_overworld_observation(self):
+        settled_overworld = overworld({(0, 0)})
+        interaction = InteractionObservation(GameState.OVERWORLD, controllable=True)
+        with patch("modules.agent_control._force_universal_reobserve", return_value=False), patch(
+            "modules.agent_control.observe_interaction", return_value=interaction
+        ), patch("modules.agent_control.perceive_overworld") as perceive:
+            result = observe_agent(overworld_observation=settled_overworld)
+
+        self.assertIs(result.overworld, settled_overworld)
+        perceive.assert_not_called()
 
     def test_required_overworld_observes_map_during_change_map_callback(self):
         settled_interior = overworld({(0, 0)})
@@ -624,8 +925,15 @@ class AgentActionSelectionTests(TestCase):
     def test_dialogue_produces_advance_action_only_when_ready(self):
         ready = observation(GameState.OVERWORLD, dialogue_waiting=True)
         not_ready = observation(GameState.OVERWORLD, dialogue_waiting=False)
+        rendering = observation(
+            GameState.OVERWORLD,
+            field_message_lifecycle_active=True,
+            field_message_render_rescue_available=True,
+            interaction_phase=InteractionPhase.FIELD_MESSAGE_RENDER_WAIT,
+        )
         self.assertEqual(available_actions(ready)[0].action_type, AgentActionType.ADVANCE_DIALOGUE)
         self.assertEqual(available_actions(not_ready)[0].action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(available_actions(rendering)[0].action_type, AgentActionType.ACCELERATE_DIALOGUE_RENDER)
 
     def test_choice_exposes_each_selectable_option(self):
         actions = available_actions(observation(GameState.OVERWORLD, choices=("YES", "NO")))

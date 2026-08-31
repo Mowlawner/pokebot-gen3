@@ -86,6 +86,13 @@ class StateCache:
         self._battle_state: StateCacheItem["BattleState | None"] = StateCacheItem(None)
 
     def reset(self) -> None:
+        # The overworld snapshot is kept in its adapter module rather than in
+        # this cache to avoid a circular import.  Resetting the runtime cache
+        # is also a hard emulator-session boundary, so never retain a passive
+        # observation across it.
+        from modules.overworld import invalidate_shared_overworld_observation
+
+        invalidate_shared_overworld_observation()
         self._party = StateCacheItem(None)
         self._opponent = StateCacheItem(None)
         self._fishing_attempt = StateCacheItem(None)
@@ -112,6 +119,9 @@ class StateCache:
         retaining the values is useful for fallback code, but the next
         observation must reread the ROM-owned runtime structures.
         """
+        from modules.overworld import invalidate_shared_overworld_observation
+
+        invalidate_shared_overworld_observation()
         for item in (
             self._player,
             self._player_avatar,

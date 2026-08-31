@@ -15,7 +15,7 @@ from modules.nuzlocke.emerald_naming import (
 
 
 class EmeraldNamingObservationTests(unittest.TestCase):
-    def observe(self, template, *, species=277, gender=0, personality=1234):
+    def observe(self, template, *, species=277, gender=0, personality=1234, naming_screen=None):
         base = 0x02010000
         addresses = []
 
@@ -34,11 +34,53 @@ class EmeraldNamingObservationTests(unittest.TestCase):
             patch("modules.nuzlocke.emerald_naming.get_game_state", return_value=GameState.NAMING_SCREEN),
             patch("modules.nuzlocke.emerald_naming.read_symbol", return_value=(0x02010000).to_bytes(4, "little")),
             patch("modules.context.context", types.SimpleNamespace(emulator=emulator)),
-            patch("modules.nuzlocke.emerald_naming.get_naming_screen_data", return_value=object()),
+            patch(
+                "modules.nuzlocke.emerald_naming.get_naming_screen_data",
+                return_value=naming_screen if naming_screen is not None else object(),
+            ),
         ):
             observation = observe_emerald_naming()
         self.assertIn(base + 0x1E2C, addresses)
         return observation
+
+    def test_keyboard_ready_requires_the_rom_input_state(self):
+        from modules.keyboard import KeyboardPageType, NamingScreen, NamingScreenState
+
+        with_page_swap = self.observe(
+            0,
+            naming_screen=NamingScreen(
+                enabled=True,
+                state=NamingScreenState.PageSwap,
+                current_input="",
+                keyboard_page=KeyboardPageType.Uppercase,
+                cursor_position=(0, 0),
+            ),
+        )
+        self.assertFalse(with_page_swap.keyboard_ready)
+
+        disabled_screen = self.observe(
+            0,
+            naming_screen=NamingScreen(
+                enabled=False,
+                state=NamingScreenState.HandleInput,
+                current_input="",
+                keyboard_page=KeyboardPageType.Uppercase,
+                cursor_position=(0, 0),
+            ),
+        )
+        self.assertFalse(disabled_screen.keyboard_ready)
+
+        ready = self.observe(
+            0,
+            naming_screen=NamingScreen(
+                enabled=True,
+                state=NamingScreenState.HandleInput,
+                current_input="",
+                keyboard_page=KeyboardPageType.Uppercase,
+                cursor_position=(0, 0),
+            ),
+        )
+        self.assertTrue(ready.keyboard_ready)
 
     def test_player_template_is_player_name(self):
         self.assertEqual(self.observe(0).target, EmeraldNamingTarget.PLAYER_NAME)

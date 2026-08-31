@@ -45,13 +45,19 @@ class CampaignRulesConfig:
 
     @classmethod
     def from_names(cls, names: tuple[str, ...] | list[str]) -> "CampaignRulesConfig":
+        """Build configuration from serialized rule identifier names."""
+
         return cls(frozenset(CampaignRuleId(name) for name in names))
 
     @classmethod
     def unrestricted(cls) -> "CampaignRulesConfig":
+        """Build configuration with every optional campaign rule disabled."""
+
         return cls(frozenset())
 
     def is_enabled(self, rule: CampaignRuleId) -> bool:
+        """Return whether the supplied rule is enabled for this run."""
+
         return rule in self.enabled_rules
 
 

@@ -16,11 +16,12 @@ from modules.battle_state import (
 from modules.battle_observation import observe_current_battle
 from modules.battle_strategies import BattleStrategy
 from modules.context import context
+from modules.console import diagnostic_print
 from modules.debug import debug
 from modules.items import Item, get_item_by_index
 from modules.keyboard import handle_naming_screen
 from modules.memory import get_game_state, GameState, read_symbol, unpack_uint16
-from modules.menuing import scroll_to_party_menu_index
+from modules.menuing import get_current_party_menu_index, scroll_to_party_menu_index
 from modules.player import get_player
 from modules.plugins import plugin_should_nickname_pokemon
 from modules.pokemon import StatusCondition
@@ -82,7 +83,6 @@ def handle_battle(
         elif (
             (instruction == "BattleScript_HandleFaintedMon" or task_is_active("Task_HandleChooseMonInput"))
             and get_battle_state().own_side.is_fainted
-            and len(get_party().non_fainted_pokemon) > 0
         ):
             yield from handle_fainted_pokemon(strategy)
         elif instruction in (
@@ -188,6 +188,30 @@ def handle_fainted_pokemon(strategy: BattleStrategy):
         #     yield
         return
 
+    # Emerald still owns the battle until it has shown the whiteout flow when
+    # the last party member faints.  There is no replacement to select in
+    # this case, so sending the normal party-selection input would leave the
+    # handler pressing B forever (the choose-mon task ignores it).  Advance
+    # the ROM's native transition and let WhiteoutListener take ownership once
+    # GameState.WHITEOUT is exposed.
+    has_replacement = getattr(strategy, "has_replacement_after_faint", None)
+    if callable(has_replacement):
+        replacement_available = bool(has_replacement(battle_state))
+    else:
+        replacement_available = bool(get_party().non_fainted_pokemon)
+    diagnostic_print(
+        lambda: (
+            "BATTLE_FAINT_REPLACEMENT: "
+            f"strategy={type(strategy).__name__!r} available={replacement_available!r} "
+            f"party={[(pokemon.name, pokemon.current_hp, pokemon.is_egg) for pokemon in get_party()]!r} "
+            f"active={[battler.party_index for battler in battle_state.own_side.active_battlers]!r}"
+        ),
+        trace=True,
+    )
+    if not replacement_available:
+        yield from _advance_after_party_wipe()
+        return
+
     if not battle_state.is_trainer_battle:
         if strategy.should_flee_after_faint(battle_state):
             if context.bot_mode != "Manual":
@@ -207,6 +231,7 @@ def handle_fainted_pokemon(strategy: BattleStrategy):
                     return
 
     new_lead_index = strategy.choose_new_lead_after_faint(battle_state)
+    regular_new_lead_index = new_lead_index
 
     # If `choose_new_lead_after_faint()` has been called while NOT being in the party selection screen,
     # `get_party()` still contains the 'original' (overworld) party order. Thus, we have to map the new
@@ -255,9 +280,58 @@ def handle_fainted_pokemon(strategy: BattleStrategy):
     if index_needs_mapping:
         new_lead_index = battle_state.map_battle_party_index(new_lead_index)
 
+    # A save-state can preserve a battle's party-order buffer from an earlier
+    # menu boundary.  Emerald has already reordered the visible party by the
+    # time the menu task is active, so use the selected Pokémon's identity as
+    # the final source of truth for the visible menu slot when available.
+    try:
+        visible_party_index = get_party().get_index_for_pokemon(new_lead)
+    except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+        visible_party_index = None
+    if visible_party_index is not None and visible_party_index != new_lead_index:
+        diagnostic_print(
+            lambda: (
+                "BATTLE_FAINT_SELECTION_RECONCILED: "
+                f"mapped_index={new_lead_index} visible_index={visible_party_index}"
+            ),
+            trace=True,
+        )
+        new_lead_index = visible_party_index
+
+    diagnostic_print(
+        lambda: (
+            "BATTLE_FAINT_SELECTION: "
+            f"regular_index={regular_new_lead_index} menu_index={new_lead_index} "
+            f"battle_order={getattr(battle_state, '_battler_party_order', None)!r} "
+            f"party={[(pokemon.name, pokemon.current_hp, pokemon.is_egg) for pokemon in get_party()]!r} "
+            f"cursor={get_current_party_menu_index()!r}"
+        ),
+        trace=True,
+    )
+
     yield from scroll_to_party_menu_index(new_lead_index)
     while get_game_state() == GameState.PARTY_MENU:
         context.emulator.press_button("A")
+        yield
+
+
+@debug.track
+def _advance_after_party_wipe() -> Generator[None, None, None]:
+    """Advance a trainer battle after the player has no replacement Pokémon.
+
+    ``Task_HandleChooseMonInput`` is also used for the final-party branch, but
+    that task does not accept the ordinary cancel input.  A positive input is
+    what lets the Emerald battle engine continue into its whiteout script;
+    outside that task, battle text/teardown is advanced with B as usual.
+    """
+
+    while battle_is_active():
+        if get_game_state() == GameState.WHITEOUT:
+            return
+        if task_is_active("Task_HandleChooseMonInput") or task_is_active("Task_HandleSelectionMenuInput"):
+            context.emulator.press_button("A")
+        else:
+            context.emulator.press_button("B")
         yield
 
 

@@ -21,11 +21,15 @@ from modules.tasks import get_task
 
 
 class EmeraldMenuKind(Enum):
+    """Kinds of title-screen menus recognized by the observer."""
+
     MAIN_MENU = auto()
     OPTIONS_MENU = auto()
 
 
 class EmeraldMainMenuItem(Enum):
+    """Semantic items exposed by Emerald's main menu."""
+
     CONTINUE = auto()
     NEW_GAME = auto()
     OPTIONS = auto()
@@ -34,6 +38,8 @@ class EmeraldMainMenuItem(Enum):
 
 
 class EmeraldOptionsItem(Enum):
+    """Semantic rows exposed by Emerald's options menu."""
+
     TEXT_SPEED = auto()
     BATTLE_SCENE = auto()
     BATTLE_STYLE = auto()
@@ -45,6 +51,8 @@ class EmeraldOptionsItem(Enum):
 
 @dataclass(frozen=True, slots=True)
 class EmeraldMenuObservation:
+    """ROM task-backed menu cursor and input-readiness observation."""
+
     menu_kind: EmeraldMenuKind
     cursor_index: int | None
     selected_item: EmeraldMainMenuItem | EmeraldOptionsItem | None
@@ -72,6 +80,8 @@ _OPTIONS_MENU_TASKS = (
 
 
 def _first_task(names: tuple[str, ...]):
+    """Return the first active task from an ordered task-name probe."""
+
     for name in names:
         task = get_task(name)
         if task is not None:
@@ -80,6 +90,8 @@ def _first_task(names: tuple[str, ...]):
 
 
 def _main_item(menu_type: int | None, cursor: int | None) -> EmeraldMainMenuItem | None:
+    """Map Emerald's raw menu type and cursor to a semantic item."""
+
     if menu_type is None or cursor is None:
         return None
     items = {

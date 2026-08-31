@@ -144,6 +144,21 @@ class PlayerAvatar:
         return self._object_event.current_coords
 
     @property
+    def previous_coordinates(self) -> tuple[int, int]:
+        """Coordinates used by Emerald's destination/step event resolver."""
+        return self._object_event.previous_coords
+
+    @property
+    def elevation(self) -> int:
+        """Elevation used by Emerald's ``PlayerGetElevation`` helper."""
+        return self._object_event.previous_elevation
+
+    @property
+    def current_elevation(self) -> int:
+        """The player object event's current elevation, for diagnostics."""
+        return self._object_event.current_elevation
+
+    @property
     def flags(self) -> AvatarFlags:
         return AvatarFlags(self._player_avatar_data[0])
 
@@ -176,6 +191,9 @@ class PlayerAvatar:
         return {
             "map_group_and_number": self.map_group_and_number,
             "local_coordinates": self.local_coordinates,
+            "previous_coordinates": self.previous_coordinates,
+            "elevation": self.elevation,
+            "current_elevation": self.current_elevation,
             "running_state": self.running_state.name,
             "tile_transition_state": self.tile_transition_state.name,
             "acro_bike_state": self.acro_bike_state.name,

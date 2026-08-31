@@ -75,7 +75,12 @@ def main_loop() -> None:
         plugin_profile_loaded(context.profile)
 
         context.stats = StatsDatabase(context.profile)
-        nuzlocke_event_store = JsonEventStore(context.profile.path / "nuzlocke_events.json")
+        nuzlocke_event_store = JsonEventStore(
+            context.profile.path / "nuzlocke_events.json",
+            # Do not touch a profile merely because the bot was launched.
+            # The first event-log write belongs to a successful save boundary.
+            create_on_open=False,
+        )
 
         if context.config.http.http_server.enable:
             from modules.web.http import start_http_server
@@ -87,7 +92,14 @@ def main_loop() -> None:
 
         context.bot_listeners = get_bot_listeners(context.rom)
         campaign_rules = CampaignRulesConfig.from_names(context.config.nuzlocke_rules.enabled_rules)
-        context.nuzlocke_runtime = NuzlockeRuntime(event_sink=nuzlocke_event_store, rule_config=campaign_rules)
+        context.nuzlocke_runtime = NuzlockeRuntime(
+            event_sink=nuzlocke_event_store,
+            rule_config=campaign_rules,
+            event_store=nuzlocke_event_store,
+            # Durable campaign history advances with an explicit successful
+            # save boundary, not with every observed battle transition.
+            defer_event_persistence=True,
+        )
         trace_output = context.profile.path / "stutter_trace.jsonl" if context.debug_stutter_trace else None
         context.stutter_trace = StutterTrace(
             enabled=context.debug_stutter_trace,
@@ -262,7 +274,12 @@ def main_loop() -> None:
             if previous_frame_info is not None and previous_frame_info.frame_count > frame_info.frame_count:
                 state_cache.reset()
                 context.bot_listeners = get_bot_listeners(context.rom)
-                context.nuzlocke_runtime = NuzlockeRuntime(event_sink=nuzlocke_event_store, rule_config=campaign_rules)
+                context.nuzlocke_runtime = NuzlockeRuntime(
+                    event_sink=nuzlocke_event_store,
+                    rule_config=campaign_rules,
+                    event_store=nuzlocke_event_store,
+                    defer_event_persistence=True,
+                )
             if profiling_enabled():
                 profile_timing("main_frame_setup", frame_setup_start)
             frame_setup_elapsed = profile_now() - frame_setup_start if profiling_enabled() else 0
@@ -363,9 +380,9 @@ def main_loop() -> None:
                         if is_starter_flow_controller:
                             diagnostic_print(
                                 lambda: (
-                                    "STARTER_FLOW: main_loop after next(controller) "
-                                    f"controller={active_controller_qualname!r} "
-                                    f"stack={[controller.__qualname__ for controller in context.controller_stack]!r}"
+                                "STARTER_FLOW: main_loop after next(controller) "
+                                f"controller={active_controller_qualname!r} "
+                                f"stack={[controller.__qualname__ for controller in context.controller_stack]!r}"
                                 ),
                                 trace=True,
                             )

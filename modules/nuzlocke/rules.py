@@ -36,6 +36,8 @@ UNKNOWN = "unknown"
 
 @dataclass(frozen=True, slots=True)
 class LocationEncounter:
+    """Reduced first-encounter state for one map location."""
+
     location: tuple[int, int]
     status: str = NO_ENCOUNTER
     pokemon_identity: PokemonIdentity | None = None
@@ -45,6 +47,8 @@ class LocationEncounter:
 
 @dataclass(frozen=True, slots=True)
 class RuleViolation:
+    """A rule breach observed at a location and frame."""
+
     reason: str
     location: tuple[int, int] | None
     frame: int
@@ -61,6 +65,8 @@ class RuleAssessment:
 
 @dataclass(frozen=True, slots=True)
 class NuzlockeCampaignState:
+    """Immutable legality state produced by the enabled Nuzlocke rules."""
+
     encounters: tuple[LocationEncounter, ...] = ()
     dead_pokemon: tuple[PokemonIdentity, ...] = ()
     unknown_faints: tuple[PokemonFainted, ...] = ()
@@ -70,18 +76,26 @@ class NuzlockeCampaignState:
 
     @property
     def legal(self) -> bool:
+        """Return whether no rule violation has been reduced so far."""
+
         return not self.violations
 
     @property
     def first_encounters(self) -> tuple[LocationEncounter, ...]:
+        """Return encounters eligible for the run's first-encounter rule."""
+
         return tuple(e for e in self.encounters if e.eligible)
 
     @property
     def unresolved_encounters(self) -> tuple[LocationEncounter, ...]:
+        """Return eligible encounters whose outcomes are not settled."""
+
         return tuple(e for e in self.first_encounters if e.status in (PENDING, UNKNOWN))
 
     @property
     def alive_pokemon(self) -> tuple[PokemonIdentity, ...]:
+        """Return captured first-encounter Pokémon not marked dead."""
+
         return tuple(
             e.pokemon_identity
             for e in self.first_encounters
@@ -90,6 +104,8 @@ class NuzlockeCampaignState:
 
     @property
     def caught_first_encounters(self) -> tuple[PokemonIdentity, ...]:
+        """Return identities captured from eligible first encounters."""
+
         return tuple(
             e.pokemon_identity for e in self.first_encounters if e.status == CAPTURED and e.pokemon_identity is not None
         )
@@ -112,6 +128,8 @@ class FaintingRule:
         encounter_eligible: bool,
         active_wild: dict[tuple[int, int], tuple[PokemonIdentity, ...]],
     ) -> NuzlockeCampaignState:
+        """Reduce faint and whiteout events into permanent run state."""
+
         if isinstance(event, PokemonFainted):
             if event.identity is None:
                 return replace(state, unknown_faints=state.unknown_faints + (event,))
@@ -122,6 +140,8 @@ class FaintingRule:
         return state
 
     def evaluate(self, state: NuzlockeCampaignState) -> RuleAssessment:
+        """Assess whether the reduced run has suffered a whiteout."""
+
         return RuleAssessment(
             self.rule_id,
             not state.run_lost,
@@ -129,6 +149,8 @@ class FaintingRule:
         )
 
     def constrain(self, state: NuzlockeCampaignState, candidate):
+        """Leave candidate selection unchanged for this observation rule."""
+
         return candidate
 
 
@@ -145,6 +167,8 @@ class OneEncounterPerAreaRule:
         encounter_eligible: bool,
         active_wild: dict[tuple[int, int], tuple[PokemonIdentity, ...]],
     ) -> NuzlockeCampaignState:
+        """Reduce eligible wild battles into first-encounter outcomes."""
+
         if isinstance(event, BattleStarted):
             if not (encounter_eligible and event.is_wild and not event.is_trainer and event.location is not None):
                 return state
@@ -156,21 +180,27 @@ class OneEncounterPerAreaRule:
                     state, encounters=state.encounters + (LocationEncounter(location, PENDING, identity, event.frame),)
                 )
             elif existing.status not in (PENDING, UNKNOWN):
-                violation = RuleViolation(
-                    "wild encounter after location's first encounter was resolved", location, event.frame
-                )
                 identity = event.opponent_pokemon_identities[0] if len(event.opponent_pokemon_identities) == 1 else None
+                # A repeat wild battle is still legal to fight.  The
+                # one-encounter rule constrains capture eligibility, not the
+                # player's ability to battle or escape incidental encounters.
+                # Keep an explicit ineligible history record so later
+                # capture handling cannot mistake it for a first encounter.
                 state = replace(
                     state,
                     encounters=state.encounters + (LocationEncounter(location, UNKNOWN, identity, event.frame, False),),
-                    violations=state.violations + (violation,),
                 )
             active_wild[location] = event.opponent_pokemon_identities
         elif isinstance(event, PokemonCaptured):
             locations = ((event.location, ()),) if event.location is not None else tuple(active_wild.items())
             for location, opponent_ids in locations:
                 if not opponent_ids or event.identity in opponent_ids:
-                    return self._resolve(state, location, CAPTURED, event.identity)
+                    current = next((item for item in state.encounters if item.location == location), None)
+                    # Capture events from an incidental repeat must not
+                    # mutate the already-resolved first encounter.  Only a
+                    # pending eligible battle owns a capture outcome.
+                    if current is not None and current.status == PENDING:
+                        return self._resolve(state, location, CAPTURED, event.identity)
         elif isinstance(event, BattleEnded) and event.is_wild and not event.is_trainer and event.location is not None:
             current = next((e for e in state.encounters if e.location == event.location), None)
             if current is not None and current.status == PENDING:
@@ -185,16 +215,22 @@ class OneEncounterPerAreaRule:
         return state
 
     def evaluate(self, state: NuzlockeCampaignState) -> RuleAssessment:
+        """Assess whether the encounter history contains a repeat encounter."""
+
         reasons = tuple(violation.reason for violation in state.violations)
         return RuleAssessment(self.rule_id, not reasons, reasons)
 
     def constrain(self, state: NuzlockeCampaignState, candidate):
+        """Leave candidate selection unchanged for this observation rule."""
+
         return candidate
 
     @staticmethod
     def _resolve(
         state: NuzlockeCampaignState, location: tuple[int, int], status: str, identity: PokemonIdentity | None
     ) -> NuzlockeCampaignState:
+        """Return state with the eligible encounter at ``location`` resolved."""
+
         return replace(
             state,
             encounters=tuple(
@@ -217,6 +253,8 @@ class NuzlockeRulesProjection:
         encounters_active: bool = True,
         rule_config: CampaignRulesConfig | None = None,
     ) -> None:
+        """Create a reducer with the configured rule set and encounter gate."""
+
         self._state = NuzlockeCampaignState()
         self._seen: set[tuple[Any, ...]] = set()
         self._active_wild: dict[tuple[int, int], tuple[PokemonIdentity, ...]] = {}
@@ -233,6 +271,8 @@ class NuzlockeRulesProjection:
 
     @property
     def rule_assessments(self) -> tuple[RuleAssessment, ...]:
+        """Return each enabled rule's current pure assessment."""
+
         return tuple(rule.evaluate(self._state) for rule in self._rules)
 
     def set_encounters_active(self, active: bool) -> None:
@@ -241,6 +281,8 @@ class NuzlockeRulesProjection:
 
     @property
     def state(self) -> NuzlockeCampaignState:
+        """Return the current immutable reduced state."""
+
         return self._state
 
     def apply(
@@ -251,6 +293,8 @@ class NuzlockeRulesProjection:
         event_id: str | None = None,
         encounter_eligible: bool | None = None,
     ) -> None:
+        """Apply one ordered event, ignoring only an already-seen event key."""
+
         if not isinstance(
             event,
             (
@@ -277,6 +321,11 @@ class NuzlockeRulesProjection:
         self._seen.add(key)
         state = self._state
         eligible_now = self._encounters_active if encounter_eligible is None else encounter_eligible
+        if isinstance(event, BattleStarted) and event.encounter_eligible is not None:
+            # A persisted BattleStarted owns the eligibility decision made at
+            # its observation boundary.  This takes precedence over the
+            # caller's current runtime state during replay.
+            eligible_now = event.encounter_eligible
         for rule in self._rules:
             state = rule.apply(
                 state,
@@ -285,8 +334,17 @@ class NuzlockeRulesProjection:
                 active_wild=self._active_wild,
             )
         self._state = replace(state, last_event_sequence=actual)
+        if isinstance(event, NuzlockeStarted):
+            # Older persisted BattleStarted records predate the explicit
+            # encounter_eligible field.  The durable campaign boundary is
+            # enough to restore the historical rule activation point for
+            # those records; newer records still use their own frame-local
+            # eligibility decision above.
+            self._encounters_active = True
 
     def apply_record(self, record: dict[str, Any]) -> None:
+        """Validate and apply one persisted event-store record."""
+
         required = {"event_id", "session_id", "sequence", "frame", "type", "payload"}
         if set(record) != required:
             raise ValueError("Malformed event record")
@@ -297,6 +355,8 @@ class NuzlockeRulesProjection:
 
 
 def reduce_rules(events: Iterable[Event]) -> NuzlockeCampaignState:
+    """Reduce an in-memory event iterable into Nuzlocke campaign state."""
+
     projection = NuzlockeRulesProjection()
     for event in events:
         projection.apply(event)
@@ -304,6 +364,8 @@ def reduce_rules(events: Iterable[Event]) -> NuzlockeCampaignState:
 
 
 def load_rules(event_store: JsonEventStore) -> NuzlockeCampaignState:
+    """Replay all records from an event store through the rules projection."""
+
     projection = NuzlockeRulesProjection()
     for record in event_store.iter_records():
         projection.apply_record(record)

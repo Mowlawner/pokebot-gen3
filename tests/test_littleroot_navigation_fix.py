@@ -33,12 +33,10 @@ class TestLittlerootNavigationFix(unittest.TestCase):
             ),
         ), patch("modules.map.context", self.context):
             # Create a mock map location for (6,9) in Littleroot
-            # _tile_behaviour should be 1 for grass
             mock_loc = MapLocation(b"header", 0, 9, (6, 9))
-            mock_loc._tile_behaviour = 1
-
-            # Since ROM is not FRLG, it uses _tile_behaviour & 1
-            # But get_wild_encounters_for_map is mocked
+            # Emerald Tall Grass is tile type 2 / behavior 2.
+            mock_loc.__dict__["_metatile_attributes"] = (2, 0, 0)
+            mock_loc.__dict__["_tile_behaviour"] = 2
 
             self.assertFalse(mock_loc.has_encounters)
 
@@ -62,9 +60,56 @@ class TestLittlerootNavigationFix(unittest.TestCase):
             "modules.map.context", self.context
         ):
             mock_loc = MapLocation(b"header", 0, 1, (6, 9))
-            mock_loc._tile_behaviour = 1
+            # Route grass is tile type 2 even though its behavior value is 2.
+            mock_loc.__dict__["_metatile_attributes"] = (2, 0, 0)
+            mock_loc.__dict__["_tile_behaviour"] = 2
 
             self.assertTrue(mock_loc.has_encounters)
+
+    def test_emerald_tall_grass_behavior_two_is_encounterable(self):
+        mock_encounters = WildEncounterList(
+            land_encounter_rate=10,
+            surf_encounter_rate=0,
+            rock_smash_encounter_rate=0,
+            fishing_encounter_rate=0,
+            land_encounters=[MagicMock(spec=WildEncounter)],
+            surf_encounters=[],
+            rock_smash_encounters=[],
+            old_rod_encounters=[],
+            good_rod_encounters=[],
+            super_rod_encounters=[],
+        )
+        with patch("modules.map.get_wild_encounters_for_map", return_value=mock_encounters), patch(
+            "modules.map.context", self.context
+        ):
+            mock_loc = MapLocation(b"header", 0, 18, (14, 11))
+            mock_loc.__dict__["_metatile_attributes"] = (2, 0, 0)
+            mock_loc.__dict__["_tile_behaviour"] = 2
+
+            self.assertTrue(mock_loc.has_encounters)
+
+    def test_emerald_jump_south_behavior_fifty_nine_is_not_encounterable(self):
+        mock_encounters = WildEncounterList(
+            land_encounter_rate=10,
+            surf_encounter_rate=0,
+            rock_smash_encounter_rate=0,
+            fishing_encounter_rate=0,
+            land_encounters=[MagicMock(spec=WildEncounter)],
+            surf_encounters=[],
+            rock_smash_encounters=[],
+            old_rod_encounters=[],
+            good_rod_encounters=[],
+            super_rod_encounters=[],
+        )
+        with patch("modules.map.get_wild_encounters_for_map", return_value=mock_encounters), patch(
+            "modules.map.context", self.context
+        ):
+            mock_loc = MapLocation(b"header", 0, 18, (10, 12))
+            # Jump South is a normal-looking tile type with behavior 59.
+            mock_loc.__dict__["_metatile_attributes"] = (0, 0, 0)
+            mock_loc.__dict__["_tile_behaviour"] = 59
+
+            self.assertFalse(mock_loc.has_encounters)
 
 
 if __name__ == "__main__":

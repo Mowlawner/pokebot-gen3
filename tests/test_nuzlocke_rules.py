@@ -49,11 +49,16 @@ class TestNuzlockeRules(unittest.TestCase):
         self.assertEqual(state.encounters[0].status, CAPTURED)
         self.assertEqual(state.encounters[0].pokemon_identity, captured)
 
-    def test_subsequent_wild_encounter_is_ineligible_and_illegal(self):
-        state = reduce_rules((self.start(), self.end(), self.start(3)))
-        self.assertFalse(state.legal)
-        self.assertIn("first encounter", state.violations[0].reason)
+    def test_subsequent_wild_encounter_is_ineligible_but_legal_to_fight(self):
+        captured = PokemonIdentity(99, 20, 30)
+        state = reduce_rules(
+            (self.start(), PokemonCaptured(2, captured, self.a), self.end(), self.start(3),
+             PokemonCaptured(4, self.wild, self.a))
+        )
+        self.assertTrue(state.legal)
+        self.assertEqual(state.violations, ())
         self.assertFalse(state.encounters[-1].eligible)
+        self.assertEqual(state.encounters[0].pokemon_identity, captured)
 
     def test_trainer_battle_does_not_consume_encounter(self):
         state = reduce_rules((self.start(trainer=True, wild=False), self.end(trainer=True, wild=False)))

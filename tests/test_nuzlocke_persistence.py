@@ -5,7 +5,8 @@ from enum import Enum
 from pathlib import Path
 from unittest.mock import patch
 
-from modules.nuzlocke.events import MapChanged
+from modules.nuzlocke.events import MapChanged, PokemonStorageLocation, StorageChanged
+from modules.nuzlocke.identity import PokemonIdentity
 from modules.nuzlocke.persistence import (
     EventStoreCorruptionError,
     JsonEventStore,
@@ -15,7 +16,12 @@ from modules.nuzlocke.persistence import (
 import modules.nuzlocke.persistence as persistence
 from modules.nuzlocke.runtime import NuzlockeRuntime
 from modules.nuzlocke.snapshots import (
+    BattleSnapshot,
+    CampaignObservationSnapshot,
     InventorySnapshot,
+    ItemQuantity,
+    NamedFlag,
+    NamedVariable,
     NuzlockeSnapshot,
     PlayerSnapshot,
     ProgressionSnapshot,
@@ -25,6 +31,7 @@ from modules.nuzlocke.snapshots import (
 
 class State(Enum):
     OVERWORLD = 1
+    BATTLE = 2
 
 
 def snapshot(frame, map_number=2):
@@ -41,7 +48,37 @@ def snapshot(frame, map_number=2):
     )
 
 
+def complete_campaign_observation(*, pokedex_received: bool = True) -> CampaignObservationSnapshot:
+    return CampaignObservationSnapshot(
+        flags=(
+            NamedFlag("SET_WALL_CLOCK", True),
+            NamedFlag("RESCUED_BIRCH", True),
+            NamedFlag("DEFEATED_RIVAL_ROUTE103", True),
+            NamedFlag("SYS_POKEMON_GET", True),
+            NamedFlag("SYS_POKEDEX_GET", pokedex_received),
+            NamedFlag("RECEIVED_POKEDEX_FROM_BIRCH", pokedex_received),
+        ),
+        variables=(
+            NamedVariable("LITTLEROOT_INTRO_STATE", 7),
+            NamedVariable("LITTLEROOT_RIVAL_STATE", 4),
+            NamedVariable("BIRCH_LAB_STATE", 5),
+        ),
+        text_speed=2,
+        available=True,
+    )
+
+
 class TestNuzlockePersistence(unittest.TestCase):
+    def test_lazy_store_does_not_create_profile_file_until_append(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            store = JsonEventStore(path, create_on_open=False)
+
+            self.assertFalse(path.exists())
+            store.append(MapChanged(1, (1, 2), (1, 3)))
+            self.assertTrue(path.exists())
+            self.assertEqual(store.last_sequence(), 1)
+
     def test_bom_prefixed_line_store_is_loaded_without_resetting_history(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.json"
@@ -190,6 +227,50 @@ class TestNuzlockePersistence(unittest.TestCase):
             self.assertEqual([record["frame"] for record in records], [1, 2])
             self.assertNotEqual(first_session, records[1]["session_id"])
 
+    def test_deferred_runtime_does_not_write_provenance_until_save_boundary(self):
+        from dataclasses import replace
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            store = JsonEventStore(path, create_on_open=False)
+            runtime = NuzlockeRuntime(
+                event_sink=store,
+                event_store=store,
+                defer_event_persistence=True,
+            )
+            inventory = InventorySnapshot((), (ItemQuantity("Poké Ball", 1),), ())
+            runtime.update(
+                replace(
+                    snapshot(1),
+                    inventory=inventory,
+                    campaign_observation=complete_campaign_observation(),
+                )
+            )
+
+            self.assertFalse(path.exists())
+            self.assertFalse(path.with_name(path.name + ".provenance").exists())
+
+            runtime.update(
+                NuzlockeSnapshot(
+                    2,
+                    "test",
+                    State.BATTLE,
+                    PlayerSnapshot("May", 1, 2, "MAP", (1, 1), "Down", True),
+                    (),
+                    inventory,
+                    BattleSnapshot(("WILD",), False, True, False, (), (), "InProgress"),
+                    StorageSnapshot(0, ()),
+                    ProgressionSnapshot(()),
+                    campaign_observation=complete_campaign_observation(pokedex_received=True),
+                )
+            )
+            self.assertFalse(path.exists())
+            self.assertEqual(runtime.pending_durable_event_count, 1)
+
+            runtime.commit_pending_events("manual_save_state")
+            self.assertTrue(path.exists())
+            self.assertTrue(path.with_name(path.name + ".provenance").exists())
+
     def test_schema_and_corruption_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.json"
@@ -217,6 +298,19 @@ class TestNuzlockePersistence(unittest.TestCase):
     def test_explicit_serialization_round_trip(self):
         event = MapChanged(7, (1, 2), None)
         self.assertEqual(deserialize_event(serialize_event(event)), event)
+
+    def test_nested_storage_locations_round_trip_through_durable_store(self):
+        first = PokemonStorageLocation(PokemonIdentity(1, 2, 3), 0, 4)
+        second = PokemonStorageLocation(PokemonIdentity(1, 2, 3), 0, 5)
+        event = StorageChanged(7, (first,), (), ((first, second),))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            store = JsonEventStore(path, session_id="session-a")
+            self.assertTrue(store.append(event))
+            reloaded = JsonEventStore(path)
+
+        self.assertEqual(reloaded.iter_events(), (event,))
 
     def test_runtime_reset_creates_new_session(self):
         runtime = NuzlockeRuntime()

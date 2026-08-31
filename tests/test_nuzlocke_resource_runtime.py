@@ -1,7 +1,8 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from modules.goals import ActivateTrigger
+from modules.goals import ActivateTrigger, NavigationGoal, ReachLocation, ReachWarp
 from modules.nuzlocke.resource_policy import PartyResource, ResourceDecision, ResourceSnapshot, RouteRecovery
 from modules.nuzlocke.resource_runtime import (
     CampaignCapability,
@@ -9,6 +10,9 @@ from modules.nuzlocke.resource_runtime import (
     HealingSourceType,
     discover_healing_source,
     execute_campaign_recovery,
+    execute_campaign_preparation,
+    execute_heal_party,
+    _preparation_navigation_goal,
 )
 from modules.nuzlocke.resource_runtime import _execute_healing_source_interaction
 from modules.nuzlocke.resource_runtime import _resolve_recovery_interaction
@@ -20,9 +24,264 @@ from modules.agent_control import AgentObservation
 from modules.interaction_state import InteractionObservation
 from modules.memory import GameState
 from modules.map_data import MapRSE, PokemonCenter
+from modules.modes.util.pokecenter_loop import PokecenterLoopController
+from modules.overworld import MovementState
 
 
 class CampaignCapabilityTests(unittest.TestCase):
+    def test_preparation_center_loop_uses_observation_driven_recovery_handler(self):
+        recovery_calls = []
+
+        def recovery_handler(center):
+            recovery_calls.append(center)
+            yield "door-aware-recovery"
+
+        def stop_condition():
+            return bool(recovery_calls)
+
+        encounter_spot = SimpleNamespace(local_position=(3, 3))
+        with patch(
+            "modules.modes.util.pokecenter_loop.get_map_data_for_current_position",
+            return_value=encounter_spot,
+        ), patch(
+            "modules.modes.util.pokecenter_loop.find_closest_pokemon_center",
+            return_value=PokemonCenter.OldaleTown,
+        ), patch(
+            "modules.modes.util.pokecenter_loop.navigate_to",
+            return_value=iter(()),
+        ), patch(
+            "modules.modes.util.pokecenter_loop.get_map_enum",
+            return_value=MapRSE.ROUTE101,
+        ), patch(
+            "modules.modes.util.pokecenter_loop.apply_white_flute_if_available",
+            return_value=iter(()),
+        ), patch(
+            "modules.modes.util.pokecenter_loop.spin",
+            side_effect=lambda *, stop_condition: iter(()),
+        ), patch(
+            "modules.modes.util.pokecenter_loop.heal_in_pokemon_center",
+            side_effect=AssertionError("legacy blocked-door recovery was used"),
+        ):
+            controller = PokecenterLoopController(recovery_handler=recovery_handler)
+            self.assertEqual(list(controller.run(stop_condition=stop_condition)), ["door-aware-recovery"])
+
+        self.assertEqual(recovery_calls, [PokemonCenter.OldaleTown])
+
+    def test_preparation_stops_without_navigation_when_target_is_already_met(self):
+        party = (SimpleNamespace(is_egg=False, level=14),)
+        with patch("modules.nuzlocke.resource_runtime.get_party", return_value=party), patch(
+            "modules.nuzlocke.resource_runtime._preparation_training_location"
+        ) as training_location:
+            self.assertEqual(list(execute_campaign_preparation((0, 18), target_level=14)), [])
+
+        training_location.assert_not_called()
+
+    def test_preparation_relays_battle_end_to_pokecenter_loop_before_stopping(self):
+        party = (SimpleNamespace(is_egg=False, level=1),)
+
+        class FakeNavigationLoop:
+            def run(self):
+                return iter(())
+
+        class FakePokecenterLoop:
+            def __init__(self, **_kwargs):
+                from unittest.mock import Mock
+
+                self.on_battle_ended = Mock()
+                self.verify_on_start = Mock()
+                self.battle_strategy = None
+
+            def run(self, *, stop_condition):
+                stop_condition()
+                return iter(())
+
+        pokecenter_loop = FakePokecenterLoop()
+        with patch("modules.nuzlocke.resource_runtime.get_party", return_value=party), patch(
+            "modules.nuzlocke.resource_runtime._preparation_training_location",
+            return_value=((0, 18), ((1, 1),)),
+        ), patch(
+            "modules.nuzlocke.resource_runtime.AgentControlLoop", return_value=FakeNavigationLoop()
+        ), patch(
+            "modules.nuzlocke.resource_runtime.observe_agent",
+            return_value=SimpleNamespace(
+                overworld=SimpleNamespace(map_id=(0, 18), player_coordinates=(1, 1))
+            ),
+        ), patch(
+            "modules.nuzlocke.resource_runtime.NavigationWorld.from_overworld",
+            return_value=object(),
+        ), patch(
+            "modules.nuzlocke.resource_runtime.plan_with_world_navigation",
+            return_value=(object(), None),
+        ), patch(
+            "modules.modes.util.pokecenter_loop.PokecenterLoopController", return_value=pokecenter_loop
+        ):
+            self.assertEqual(list(execute_campaign_preparation((0, 18), target_level=14)), [])
+
+        pokecenter_loop.verify_on_start.assert_called_once_with()
+        pokecenter_loop.on_battle_ended.assert_called_once_with()
+
+    def test_preparation_can_select_a_reachable_trainer_when_grass_is_blocked(self):
+        from modules.goals import EngageTrainer, ReachLocation, TrainerMode
+        from modules.navigation import NavigationError
+        from modules.overworld import ObjectObservation
+
+        training_map = (0, 18)
+        trainer = ObjectObservation(
+            local_id=3,
+            location=(training_map, (5, 5)),
+            trainer_type="Normal",
+            trainer_range=3,
+            trainer_defeated=False,
+        )
+        overworld = SimpleNamespace(
+            map_id=training_map,
+            player_coordinates=(1, 1),
+            objects=(trainer,),
+        )
+
+        def plan(_world, _start, goal):
+            if isinstance(goal, ReachLocation):
+                raise NavigationError("grass component is blocked")
+            self.assertIsInstance(goal.target, EngageTrainer)
+            return object(), None
+
+        with patch(
+            "modules.nuzlocke.resource_runtime.NavigationWorld.from_overworld",
+            return_value=object(),
+        ), patch("modules.nuzlocke.resource_runtime.plan_with_world_navigation", side_effect=plan):
+            selected, error = _preparation_navigation_goal(overworld, training_map, ((8, 8),))
+
+        self.assertIsNone(error)
+        self.assertIsInstance(selected, NavigationGoal)
+        self.assertIsInstance(selected.target, EngageTrainer)
+        self.assertEqual(selected.target.trainer_id, trainer.trainer_id)
+        self.assertEqual(selected.constraints.trainer_mode, TrainerMode.ENGAGE)
+
+    def test_preparation_requires_trainers_after_area_encounter_is_resolved(self):
+        from modules.goals import EngageTrainer, NavigationGoal
+        from modules.overworld import ObjectObservation
+
+        training_map = (0, 18)
+        trainer = ObjectObservation(
+            local_id=3,
+            location=(training_map, (5, 5)),
+            trainer_type="Normal",
+            trainer_range=3,
+            trainer_defeated=False,
+        )
+        party = [SimpleNamespace(is_egg=False, level=1)]
+        runtime = SimpleNamespace(
+            rules_projection=SimpleNamespace(
+                state=SimpleNamespace(
+                    encounters=(SimpleNamespace(location=training_map, status="captured", eligible=True),)
+                )
+            )
+        )
+        observations = iter(
+            (
+                SimpleNamespace(
+                    overworld=SimpleNamespace(
+                        map_id=training_map,
+                        player_coordinates=(1, 1),
+                        objects=(trainer,),
+                    )
+                ),
+                SimpleNamespace(
+                    overworld=SimpleNamespace(
+                        map_id=training_map,
+                        player_coordinates=(5, 4),
+                        objects=(trainer,),
+                    )
+                ),
+            )
+        )
+
+        class FakeNavigationLoop:
+            def __init__(self, goal):
+                self.goal = goal
+
+            def run(self):
+                if isinstance(self.goal, NavigationGoal) and isinstance(self.goal.target, EngageTrainer):
+                    party[0].level = 14
+                return iter(())
+
+        with patch("modules.nuzlocke.resource_runtime.context", SimpleNamespace(nuzlocke_runtime=runtime)), patch(
+            "modules.nuzlocke.resource_runtime.get_party", return_value=party
+        ), patch(
+            "modules.nuzlocke.resource_runtime.PokemonIdentity.from_pokemon", return_value=object()
+        ), patch(
+            "modules.nuzlocke.resource_runtime._preparation_training_location",
+            return_value=(training_map, ((8, 8),)),
+        ), patch(
+            "modules.nuzlocke.resource_runtime.AgentControlLoop",
+            side_effect=lambda _factory, goal: FakeNavigationLoop(goal),
+        ), patch(
+            "modules.nuzlocke.resource_runtime.observe_agent", side_effect=observations
+        ), patch(
+            "modules.nuzlocke.resource_runtime.NavigationWorld.from_overworld", return_value=object()
+        ), patch(
+            "modules.nuzlocke.resource_runtime.plan_with_world_navigation", return_value=(object(), None)
+        ), patch(
+            "modules.modes.util.pokecenter_loop.PokecenterLoopController",
+            side_effect=AssertionError("consumed encounter must not re-enter grass loop"),
+        ):
+            self.assertEqual(list(execute_campaign_preparation(training_map, target_level=14)), [])
+
+    def test_preparation_reobserves_after_navigation_failure(self):
+        from modules.navigation import NavigationError
+
+        party = (SimpleNamespace(is_egg=False, level=1),)
+
+        class FakeNavigationLoop:
+            def __init__(self, failure=False):
+                self.failure = failure
+
+            def run(self):
+                if self.failure:
+                    def failed():
+                        raise NavigationError("battle displaced the avatar")
+                        yield
+
+                    return failed()
+                return iter(())
+
+        class FakePokecenterLoop:
+            def __init__(self, **_kwargs):
+                self.battle_strategy = None
+
+            def on_battle_ended(self):
+                return None
+
+            def verify_on_start(self):
+                return None
+
+            def run(self, *, stop_condition):
+                stop_condition()
+                return iter(())
+
+        observations = [
+            SimpleNamespace(overworld=SimpleNamespace(map_id=(0, 18), player_coordinates=(1, 1))),
+            SimpleNamespace(overworld=SimpleNamespace(map_id=(0, 18), player_coordinates=(2, 2))),
+        ]
+        loops = iter((FakeNavigationLoop(failure=False), FakeNavigationLoop(failure=True), FakeNavigationLoop()))
+        with patch("modules.nuzlocke.resource_runtime.get_party", return_value=party), patch(
+            "modules.nuzlocke.resource_runtime._preparation_training_location",
+            return_value=((0, 18), ((3, 3),)),
+        ), patch(
+            "modules.nuzlocke.resource_runtime.AgentControlLoop", side_effect=lambda *_args, **_kwargs: next(loops)
+        ), patch(
+            "modules.nuzlocke.resource_runtime.observe_agent", side_effect=observations
+        ) as observe, patch(
+            "modules.nuzlocke.resource_runtime.NavigationWorld.from_overworld", return_value=object()
+        ), patch(
+            "modules.nuzlocke.resource_runtime.plan_with_world_navigation", return_value=(object(), None)
+        ), patch(
+            "modules.modes.util.pokecenter_loop.PokecenterLoopController", return_value=FakePokecenterLoop()
+        ):
+            self.assertEqual(list(execute_campaign_preparation((0, 18), target_level=14)), [])
+
+        self.assertEqual(observe.call_count, 2)
+
     def test_planned_recovery_navigates_to_observed_nurse_before_interacting(self):
         nurse = type(
             "Nurse",
@@ -58,11 +317,107 @@ class CampaignCapabilityTests(unittest.TestCase):
             "modules.nuzlocke.resource_runtime.discover_healing_source", return_value=nurse
         ), patch(
             "modules.nuzlocke.resource_runtime._execute_healing_source_interaction", return_value=iter(())
+        ), patch(
+            "modules.nuzlocke.resource_runtime._wait_for_center_interior", return_value=iter(())
         ):
-            list(execute_planned_recovery(("OldaleTown", (6, 16))))
+            list(execute_planned_recovery(PokemonCenter.OldaleTown.value))
 
         self.assertEqual(len(navigation_goals), 2)
+        self.assertIsInstance(navigation_goals[0], ReachWarp)
+        self.assertEqual(navigation_goals[0].destination_map, MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value)
         self.assertEqual(navigation_goals[1].trigger_id, "object:nurse")
+
+    def test_planned_recovery_adopts_planner_route_for_outdoor_leg(self):
+        planned_route = object()
+        nurse = type(
+            "Nurse",
+            (),
+            {"source_id": "nurse", "interaction_trigger_id": "object:nurse"},
+        )()
+        interior = SimpleNamespace(
+            overworld=SimpleNamespace(map_id=MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value),
+            interaction_type=SimpleNamespace(name="OVERWORLD"),
+            interaction=SimpleNamespace(controllable=True),
+        )
+        loop_calls = []
+
+        class FakeLoop:
+            def __init__(self, *args, **kwargs):
+                loop_calls.append((args, kwargs))
+
+            def run(self):
+                return iter(())
+
+        with patch("modules.nuzlocke.resource_runtime.party_is_restored", side_effect=[False, True]), patch(
+            "modules.nuzlocke.resource_runtime.AgentControlLoop", side_effect=FakeLoop
+        ), patch(
+            "modules.nuzlocke.resource_runtime._wait_for_center_interior", return_value=iter(())
+        ), patch(
+            "modules.nuzlocke.resource_runtime.observe_agent", return_value=interior
+        ), patch(
+            "modules.nuzlocke.resource_runtime.discover_healing_source", return_value=nurse
+        ), patch(
+            "modules.nuzlocke.resource_runtime._execute_healing_source_interaction", return_value=iter(())
+        ):
+            list(execute_planned_recovery(PokemonCenter.OldaleTown.value, planned_route=planned_route))
+
+        self.assertEqual(len(loop_calls), 2)
+        self.assertIs(loop_calls[0][1]["navigation_plan"], planned_route)
+        self.assertIsInstance(loop_calls[0][1]["goal"], ReachLocation)
+        self.assertNotIn("navigation_plan", loop_calls[1][1])
+
+    def test_heal_party_uses_cataloged_door_warp_for_center_destination(self):
+        outdoor = SimpleNamespace(
+            overworld=SimpleNamespace(map_id=MapRSE.OLDALE_TOWN.value, player_coordinates=(6, 17)),
+            interaction_type=SimpleNamespace(name="OVERWORLD"),
+            interaction=SimpleNamespace(controllable=True),
+        )
+        interior = SimpleNamespace(
+            overworld=SimpleNamespace(
+                map_id=MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value,
+                player_coordinates=(7, 8),
+            ),
+            interaction_type=SimpleNamespace(name="OVERWORLD"),
+            interaction=SimpleNamespace(controllable=True),
+        )
+        destination_source = HealingSource(
+            "nearest_full_party_source",
+            HealingSourceType.FULL_PARTY_PROVIDER,
+            PokemonCenter.OldaleTown.value,
+            PokemonCenter.OldaleTown,
+            interaction_trigger_id=None,
+        )
+        nurse = HealingSource(
+            "nurse",
+            HealingSourceType.POKEMON_CENTER_NURSE,
+            ((2, 2), (7, 2)),
+            "object:nurse",
+            interaction_trigger_id="object:nurse",
+        )
+        goals = []
+
+        class FakeLoop:
+            def __init__(self, *, goal):
+                goals.append(goal)
+
+            def run(self):
+                return iter(())
+
+        with patch("modules.nuzlocke.resource_runtime.party_is_restored", return_value=False), patch(
+            "modules.nuzlocke.resource_runtime.observe_agent", side_effect=[outdoor, interior]
+        ), patch(
+            "modules.nuzlocke.resource_runtime.discover_healing_source",
+            side_effect=[None, destination_source, nurse],
+        ), patch(
+            "modules.nuzlocke.resource_runtime.AgentControlLoop",
+            side_effect=lambda _factory, goal: FakeLoop(goal=goal),
+        ), patch(
+            "modules.nuzlocke.resource_runtime._execute_healing_source_interaction", return_value=iter(())
+        ):
+            list(execute_heal_party())
+
+        self.assertIsInstance(goals[0], ReachWarp)
+        self.assertEqual(goals[0].destination_map, MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value)
 
     def test_observed_center_nurse_becomes_healing_affordance(self):
         trigger = type(
@@ -160,6 +515,43 @@ class CampaignCapabilityTests(unittest.TestCase):
             "modules.nuzlocke.resource_runtime.AgentActionExecutor", return_value=executor
         ):
             list(_execute_healing_source_interaction(source))
+
+    def test_healing_source_waits_for_stable_standing_before_interacting(self):
+        source = HealingSource("nurse", HealingSourceType.POKEMON_CENTER_NURSE, None, None)
+        moving_world = type(
+            "World",
+            (),
+            {"map_id": "center", "movement_state": MovementState.MOVING, "controllable": True},
+        )()
+        standing_world = type(
+            "World",
+            (),
+            {"map_id": "center", "movement_state": MovementState.STANDING, "controllable": True},
+        )()
+        moving = AgentObservation(
+            InteractionObservation(GameState.OVERWORLD, controllable=True),
+            overworld=moving_world,
+        )
+        standing = AgentObservation(
+            InteractionObservation(GameState.OVERWORLD, controllable=True),
+            overworld=standing_world,
+        )
+        finished = AgentObservation(
+            InteractionObservation(GameState.OVERWORLD, controllable=True),
+            overworld=standing_world,
+        )
+        actions = []
+        executor = type("Executor", (), {"execute": lambda self, action, observed: actions.append(action)})()
+        with patch(
+            "modules.nuzlocke.resource_runtime.party_is_restored",
+            side_effect=[False, False, False, True],
+        ), patch(
+            "modules.nuzlocke.resource_runtime.observe_agent",
+            side_effect=[moving, standing, standing, finished],
+        ), patch("modules.nuzlocke.resource_runtime.AgentActionExecutor", return_value=executor):
+            list(_execute_healing_source_interaction(source))
+
+        self.assertEqual([action.action_type for action in actions], [AgentActionType.INTERACT])
 
     def test_script_owned_controllable_interaction_remains_owned(self):
         source = HealingSource("source", HealingSourceType.POKEMON_CENTER_NURSE, None, None)

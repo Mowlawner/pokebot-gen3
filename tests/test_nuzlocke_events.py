@@ -253,6 +253,29 @@ class TestNuzlockeEvents(unittest.TestCase):
             (),
         )
 
+    def test_initial_ready_battle_is_a_start_boundary_after_restore(self):
+        from modules.nuzlocke.events import BattleStarted, NuzlockeEventObserver
+
+        observer = NuzlockeEventObserver()
+        events = observer.observe(self.snapshot(state=State.BATTLE, battle=self.battle()))
+        self.assertEqual(sum(isinstance(event, BattleStarted) for event in events), 1)
+        self.assertEqual(
+            observer.observe(self.snapshot(frame=2, state=State.BATTLE, battle=self.battle())),
+            (),
+        )
+
+    def test_zero_type_starting_frame_waits_for_real_battle_boundary(self):
+        from modules.nuzlocke.events import BattleStarted, NuzlockeEventObserver
+
+        observer = NuzlockeEventObserver()
+        starting = self.battle().__class__((), False, True, False, (), (), "InProgress", True)
+        self.assertEqual(
+            observer.observe(self.snapshot(state=State.BATTLE, battle=starting)),
+            (),
+        )
+        events = observer.observe(self.snapshot(frame=2, state=State.BATTLE, battle=self.battle()))
+        self.assertEqual(sum(isinstance(event, BattleStarted) for event in events), 1)
+
     def test_partial_battle_teardown_does_not_end_battle_early(self):
         from modules.nuzlocke.events import (
             BattleEnded,

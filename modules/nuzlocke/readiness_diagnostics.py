@@ -8,7 +8,7 @@ from dataclasses import dataclass, asdict, replace
 from enum import Enum
 from typing import Any
 
-from .resource_policy import PartyResource, ResourceSnapshot, RouteRecovery
+from .resource_policy import PartyResource, ResourceObservationStatus, ResourceSnapshot, RouteRecovery
 from .snapshots import NuzlockeSnapshot
 from modules.console import diagnostic_print
 from typing import TYPE_CHECKING
@@ -18,6 +18,8 @@ if TYPE_CHECKING:
 
 
 class Availability(Enum):
+    """Availability state for one readiness observation component."""
+
     KNOWN = "known"
     UNAVAILABLE = "unavailable"
     NOT_APPLICABLE = "not_applicable"
@@ -25,12 +27,16 @@ class Availability(Enum):
 
 
 class ReadinessDecision(Enum):
+    """Pure first-stage decision for continuing or recovering."""
+
     CONTINUE = "CONTINUE"
     RECOVER = "RECOVER"
     UNKNOWN = "UNKNOWN"
 
 
 class ReadinessReason(Enum):
+    """Diagnostic reason associated with a readiness decision."""
+
     PARTY_INFORMATION_UNKNOWN = "PARTY_INFORMATION_UNKNOWN"
     NO_USABLE_POKEMON = "NO_USABLE_POKEMON"
     CRITICAL_PARTY_HP = "CRITICAL_PARTY_HP"
@@ -48,6 +54,8 @@ class ReadinessReason(Enum):
 
 @dataclass(frozen=True, slots=True)
 class PartyReadinessMember:
+    """Observed health and usability facts for one party member."""
+
     party_index: int
     species: str
     current_hp: int
@@ -60,6 +68,8 @@ class PartyReadinessMember:
 
 @dataclass(frozen=True, slots=True)
 class TrainerHazardObservation:
+    """Observed trainer threat and route relationship for readiness analysis."""
+
     object_id: int
     trainer_type: str | None
     trainer_range: int | None
@@ -72,6 +82,8 @@ class TrainerHazardObservation:
 
 @dataclass(frozen=True, slots=True)
 class ProgressionReadinessDiagnostic:
+    """Immutable evidence bundle used by the progression readiness policy."""
+
     objective_id: str | None
     objective_status: str | None
     destination: Any
@@ -101,18 +113,26 @@ class ProgressionReadinessDiagnostic:
 
     @property
     def party_count(self) -> int | None:
+        """Return the observed party size when party data is available."""
+
         return len(self.party) if self.party_availability is Availability.KNOWN else None
 
     @property
     def usable_count(self) -> int | None:
+        """Return the number of observed usable party members."""
+
         return sum(member.usable for member in self.party) if self.party_availability is Availability.KNOWN else None
 
     @property
     def fainted_count(self) -> int | None:
+        """Return the number of observed fainted party members."""
+
         return sum(member.fainted for member in self.party) if self.party_availability is Availability.KNOWN else None
 
     @property
     def lowest_hp_ratio(self) -> float | None:
+        """Return the lowest HP ratio among usable observed members."""
+
         # Fainted party members are already represented by ``fainted_count``
         # and must not make the usable party appear critically injured.  A
         # fainted member has an HP ratio of zero, but cannot be healed or used
@@ -153,12 +173,16 @@ class ProgressionReadinessDiagnostic:
 
 @dataclass(frozen=True, slots=True)
 class ReadinessResult:
+    """Pure readiness decision paired with its diagnostic reason."""
+
     decision: ReadinessDecision
     reason: ReadinessReason
 
 
 @dataclass(frozen=True, slots=True)
 class ReadinessScheduleState:
+    """Observable counters and cache state for readiness scheduling."""
+
     status: str
     age_ticks: int | None
     refresh_count: int
@@ -170,6 +194,8 @@ class ReadinessObservationScheduler:
     """Small bounded scheduler for expensive readiness observations."""
 
     def __init__(self, provider, cheap_context, *, max_age_ticks: int = 15):
+        """Create a bounded scheduler around expensive readiness observations."""
+
         self._provider = provider
         self._cheap_context = cheap_context
         self._max_age_ticks = max_age_ticks
@@ -181,12 +207,16 @@ class ReadinessObservationScheduler:
         self._invalidation_reason = "initial"
 
     def invalidate(self, reason: str) -> None:
+        """Discard cached readiness and record why it became invalid."""
+
         self._cached = None
         self._cached_key = None
         self._age = None
         self._invalidation_reason = reason
 
     def observe(self, objective, goal):
+        """Reuse or refresh readiness based on a cheap context key and age."""
+
         self._tick_count += 1
         cheap = self._cheap_context()
         key = (getattr(objective, "objective_id", None), repr(goal), cheap)
@@ -226,6 +256,8 @@ class ReadinessObservationScheduler:
 
     @property
     def state(self) -> ReadinessScheduleState:
+        """Return immutable scheduler counters and freshness state."""
+
         return ReadinessScheduleState(
             (
                 "fresh"
@@ -251,6 +283,8 @@ class CampaignReadinessPolicy:
     opportunistic_detour_threshold: int = 50
 
     def evaluate(self, readiness: ProgressionReadinessDiagnostic) -> ReadinessResult:
+        """Choose continue, recover, or unknown from observed readiness facts."""
+
         evaluation_id = id(readiness)
         recovery = getattr(readiness, "recovery", None)
         lowest_hp_ratio = getattr(readiness, "lowest_hp_ratio", None)
@@ -319,6 +353,8 @@ class CampaignReadinessPolicy:
             return ReadinessResult(ReadinessDecision.CONTINUE, ReadinessReason.PARTY_HEALTHY)
 
     def _opportunistic_recovery_available(self, readiness: ProgressionReadinessDiagnostic) -> bool:
+        """Return whether a safe nearby healing route meets policy thresholds."""
+
         if readiness.lowest_hp_ratio is None or readiness.lowest_hp_ratio > self.opportunistic_hp_ratio:
             return False
         analysis = readiness.route_analysis
@@ -351,6 +387,8 @@ class CampaignReadinessPolicy:
 
     @staticmethod
     def _recovery_result(readiness: ProgressionReadinessDiagnostic, reason: ReadinessReason) -> ReadinessResult:
+        """Convert recovery capability availability into a policy result."""
+
         if getattr(readiness, "recovery_availability", Availability.UNKNOWN) is Availability.KNOWN:
             return ReadinessResult(ReadinessDecision.RECOVER, reason)
         if getattr(readiness, "recovery_availability", Availability.UNKNOWN) is Availability.UNAVAILABLE:
@@ -371,6 +409,8 @@ def _has_imminent_trainer(readiness: ProgressionReadinessDiagnostic) -> bool:
 
 
 def _party(snapshot: NuzlockeSnapshot) -> tuple[PartyReadinessMember, ...]:
+    """Normalize party observations for readiness reporting."""
+
     if not snapshot.party_available:
         return ()
     return tuple(
@@ -385,6 +425,24 @@ def _party(snapshot: NuzlockeSnapshot) -> tuple[PartyReadinessMember, ...]:
             p.status,
         )
         for p in snapshot.party
+    )
+
+
+def _party_from_resource_snapshot(resource_snapshot: ResourceSnapshot) -> tuple[PartyReadinessMember, ...]:
+    """Build readiness members from a valid resource-party fallback."""
+
+    return tuple(
+        PartyReadinessMember(
+            index,
+            "UNKNOWN",
+            member.current_hp,
+            member.max_hp,
+            member.hp_ratio,
+            member.fainted,
+            not member.fainted and member.current_hp > 0,
+            member.status or "none",
+        )
+        for index, member in enumerate(resource_snapshot.party)
     )
 
 
@@ -409,7 +467,20 @@ def build_progression_readiness_diagnostic(
     """Build a point-in-time diagnostic without applying a survival policy."""
     members = _party(snapshot)
     party_availability = Availability.KNOWN if snapshot.party_available else Availability.UNAVAILABLE
-    usable = None if not snapshot.party_available else any(p.usable for p in members)
+    # The normalized campaign snapshot and the resource reader use separate
+    # ROM access paths. At a battle/script boundary the former can be
+    # temporarily unavailable while the latter still has a complete party.
+    # Preserve that known party rather than converting it into a false
+    # no-usable-Pokémon signal.
+    if (
+        (not snapshot.party_available or not snapshot.party)
+        and resource_snapshot is not None
+        and resource_snapshot.observation_status is ResourceObservationStatus.VALID
+        and resource_snapshot.party
+    ):
+        members = _party_from_resource_snapshot(resource_snapshot)
+        party_availability = Availability.KNOWN
+    usable = None if party_availability is not Availability.KNOWN else any(p.usable for p in members)
     healing = (
         None
         if resource_snapshot is None

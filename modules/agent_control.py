@@ -22,12 +22,14 @@ from modules.goals import (
     ReachInteractionPosition,
     ReachLocation,
     ReachWarp,
+    SemanticTarget,
 )
 from modules.interaction_state import (
     InteractionObservation,
     InteractionPhase,
     InteractionType,
     classify_interaction,
+    is_emerald_field_message_rendering,
     observe_interaction,
 )
 from modules.map_path import Direction
@@ -107,6 +109,7 @@ def _force_universal_reobserve() -> bool:
 
 class AgentActionType(Enum):
     ADVANCE_DIALOGUE = auto()
+    ACCELERATE_DIALOGUE_RENDER = auto()
     CHOOSE_DIALOGUE_OPTION = auto()
     MOVE = auto()
     INTERACT = auto()
@@ -195,6 +198,7 @@ def observe_agent(
     menu_options: tuple[str, ...] = (),
     special_interaction: str | None = None,
     require_overworld: bool = False,
+    overworld_observation: OverworldObservation | None = None,
 ) -> AgentObservation:
     """Create one live observation.
 
@@ -220,6 +224,7 @@ def observe_agent(
             special_interaction=special_interaction,
             force_overworld_reobserve=force_overworld_reobserve,
             require_overworld=require_overworld,
+            overworld_observation=overworld_observation,
         )
         diagnostic_print(
             lambda: (
@@ -245,6 +250,7 @@ def _observe_agent_instrumented(
     special_interaction: str | None = None,
     force_overworld_reobserve: bool = False,
     require_overworld: bool = False,
+    overworld_observation: OverworldObservation | None = None,
 ) -> AgentObservation:
     interaction_start = now()
     interaction = observe_interaction(
@@ -270,7 +276,12 @@ def _observe_agent_instrumented(
     should_perceive_overworld = require_overworld or interaction_type is InteractionType.OVERWORLD or (
         force_overworld_reobserve and transient_map_state
     )
-    overworld = perceive_overworld() if should_perceive_overworld else None
+    if overworld_observation is not None:
+        overworld = overworld_observation
+    elif should_perceive_overworld:
+        overworld = perceive_overworld()
+    else:
+        overworld = None
     timing("agent_overworld_perception", perception_start)
     count("agent_overworld_perceptions")
     if trace is not None:
@@ -343,6 +354,13 @@ class ActionDecision:
 
 
 def _dialogue_actions(observation: AgentObservation) -> tuple[AgentAction, ...]:
+    if observation.interaction.field_message_render_rescue_available:
+        return (
+            AgentAction(
+                AgentActionType.ACCELERATE_DIALOGUE_RENDER,
+                reason="fresh-B render rescue with held B",
+            ),
+        )
     if observation.interaction.interaction_phase is InteractionPhase.FIELD_MESSAGE_INPUT_WAIT:
         return (AgentAction(AgentActionType.ADVANCE_DIALOGUE, reason="dialogue is waiting for input"),)
     return (AgentAction(AgentActionType.WAIT_REOBSERVE, reason="dialogue is not ready"),)
@@ -394,6 +412,35 @@ def _goal_target(goal: Goal | None) -> Goal | None:
     return goal.target if isinstance(goal, NavigationGoal) else goal
 
 
+def _observed_trigger(observation: AgentObservation, trigger_id: str):
+    """Return the live affordance for a trigger goal, when it is observed."""
+    if observation.overworld is None:
+        return None
+    return next(
+        (item for item in observation.overworld.triggers if item.trigger_id == trigger_id),
+        None,
+    )
+
+
+def _trigger_condition_completed(observation: AgentObservation, trigger_id: str) -> bool:
+    """Treat a ROM-gated trigger becoming inactive as completion.
+
+    Coordinate scripts are dispatched by tile entry and usually turn their
+    event variable off as their final step.  The trigger can therefore remain
+    geometrically present after the scene has completed.  ``False`` is
+    meaningful here; ``None`` still means that live condition state was not
+    observed and must not be interpreted as completion.
+    """
+    trigger = _observed_trigger(observation, trigger_id)
+    return trigger is not None and trigger.condition_active is False
+
+
+def _trigger_requires_input(observation: AgentObservation, trigger_id: str) -> bool:
+    """Return whether an observed trigger needs an interaction-button edge."""
+    trigger = _observed_trigger(observation, trigger_id)
+    return trigger is None or getattr(trigger, "requires_input", True)
+
+
 def available_actions(observation: AgentObservation) -> tuple[AgentAction, ...]:
     """Return legal actions using a handler dedicated to the interaction state."""
 
@@ -422,6 +469,15 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
         return GoalEvaluation(GoalStatus.NOT_APPLICABLE, reason="no goal supplied")
     if observation.overworld is None or observation.interaction_type is not InteractionType.OVERWORLD:
         return GoalEvaluation(GoalStatus.NOT_APPLICABLE, reason="goal requires an overworld observation")
+
+    goal_target = _goal_target(observation.goal)
+    if isinstance(goal_target, ActivateTrigger) and _trigger_condition_completed(
+        observation, goal_target.trigger_id
+    ):
+        return GoalEvaluation(
+            GoalStatus.COMPLETE,
+            reason="trigger condition is inactive; ROM scene already completed",
+        )
 
     # Diagnostics only: this deliberately does not gate, score, or alter the
     # navigation decision.  Keep the snapshot at the same overworld decision
@@ -461,6 +517,31 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
     timing("goal_world_construction", world_start)
     count("goal_world_constructions")
     start = (observation.overworld.map_id, observation.overworld.player_coordinates)
+    if isinstance(goal_target, ReachWarp):
+        destination_map = goal_target.destination_map
+        if destination_map is None and goal_target.destination is not None:
+            destination_map = goal_target.destination[0]
+        if destination_map == observation.overworld.map_id:
+            # Recovery mounts a ReachWarp until the post-warp handoff is
+            # observed. Once the destination map is visible, the transition
+            # goal is complete even if the old warp record is still present
+            # in the freshly observed world.
+            return GoalEvaluation(
+                GoalStatus.COMPLETE,
+                reason="destination map reached",
+            )
+    # A map warp can expose the destination header before the avatar has a
+    # valid local coordinate.  Treat that as a settling observation rather
+    # than asking the world planner to search from a node that is absent from
+    # the observed topology.  This matters especially to recovery, whose
+    # ReachLocation loop is mounted immediately after a campaign warp.
+    if start not in world.tiles:
+        return GoalEvaluation(
+            GoalStatus.UNREACHABLE,
+            reason="avatar coordinate is not present in current overworld topology; waiting for transition to settle",
+            diagnostics=navigation_diagnostics(world, start, observation.goal),
+            world_diagnostics=("avatar coordinate is outside the observed map topology",),
+        )
     diagnostics_enabled = bool(context.debug and getattr(context, "debug_trace", False))
     binding_diagnostics = ()
     world_diagnostics = ()
@@ -507,6 +588,13 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
             trace=True,
         )
         target_map = goal_target_map(world, observation.goal)
+        if (
+            isinstance(observation.goal, ReachWarp)
+            and observation.goal.warp is not None
+            and target_map != start[0]
+            and world_route is None
+        ):
+            world_diagnostics = ("observed transition planned locally; global route not consulted",)
         if diagnostics_enabled and world_route is not None and target_map is not None:
             world_diagnostics = (
                 f"current_map={start[0]!r} target_map={target_map!r}",
@@ -552,7 +640,7 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
         trace_world_start.duration("navigation_planning_duration_ms", trace_planning_start)
     count("goal_planning_attempts")
 
-    if isinstance(observation.goal, (ReachLocation, ReachWarp, ReachInteractionPosition)) and not plan.actions:
+    if isinstance(goal_target, (SemanticTarget, ReachLocation, ReachWarp, ReachInteractionPosition)) and not plan.actions:
         if isinstance(observation.goal, ReachWarp) and observation.goal.warp is not None:
             # A ReachLocation handoff may leave us standing on a step-on warp
             # entry.  Do not interpret that source tile as having crossed the
@@ -576,7 +664,6 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
             binding_diagnostics=binding_diagnostics,
             world_diagnostics=world_diagnostics,
         )
-    goal_target = _goal_target(observation.goal)
     if isinstance(goal_target, EngageTrainer):
         trainer = next((obj for obj in observation.overworld.objects if obj.trainer_id == goal_target.trainer_id), None)
         if trainer is not None and trainer.trainer_defeated is True:
@@ -587,28 +674,12 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
                 world_diagnostics=(f"trainer_id={goal_target.trainer_id!r}", "trainer_defeated=True"),
             )
     if isinstance(goal_target, ActivateTrigger):
-        resolution = next(
-            (
-                binding
-                for binding in observation.overworld.bindings
-                if binding.binding.trigger_id == goal_target.trigger_id
-            ),
-            None,
-        )
         activated = observation.interaction.metadata.get("activated_trigger_ids", ())
         if goal_target.trigger_id in activated:
             return GoalEvaluation(
                 GoalStatus.COMPLETE,
                 plan=plan,
                 reason="trigger is already activated",
-                binding_diagnostics=binding_diagnostics,
-                world_diagnostics=world_diagnostics,
-            )
-        if resolution is not None and not resolution.runtime_match:
-            return GoalEvaluation(
-                GoalStatus.REACHABLE,
-                plan=plan,
-                reason="static target reached; waiting for runtime object",
                 binding_diagnostics=binding_diagnostics,
                 world_diagnostics=world_diagnostics,
             )
@@ -664,25 +735,12 @@ def _select_action_instrumented(observation: AgentObservation) -> ActionDecision
         and evaluation.plan is not None
         and not evaluation.plan.actions
     ):
-        resolution = next(
-            (
-                binding
-                for binding in observation.overworld.bindings
-                if binding.binding.trigger_id == _goal_target(observation.goal).trigger_id
-            ),
-            None,
-        )
-        runtime_available = (
-            resolution.runtime_match
-            if resolution is not None
-            else any(
-                trigger.trigger_id == _goal_target(observation.goal).trigger_id and trigger.activation_locations
-                for trigger in observation.overworld.triggers
-            )
-        )
-        if not runtime_available:
+        if not _trigger_requires_input(observation, _goal_target(observation.goal).trigger_id):
             return ActionDecision(
-                AgentAction(AgentActionType.WAIT_REOBSERVE, reason="static target reached; waiting for runtime object"),
+                AgentAction(
+                    AgentActionType.WAIT_REOBSERVE,
+                    reason="automatic coordinate trigger fires on tile entry",
+                ),
                 evaluation,
             )
         return ActionDecision(
@@ -770,6 +828,15 @@ class AgentActionExecutor:
     ):
         self._choose_option = choose_option
         self._navigate_menu = navigate_menu
+        self._field_message_render_b_held = False
+
+    def _release_field_message_render_b(self) -> None:
+        if not self._field_message_render_b_held:
+            return
+        release_button = getattr(context.emulator, "release_button", None)
+        if callable(release_button):
+            release_button("B")
+        self._field_message_render_b_held = False
 
     @profiled("agent_action_execution", "actions_executed")
     def execute(self, action: AgentAction, observation: AgentObservation) -> ActionResult:
@@ -786,12 +853,29 @@ class AgentActionExecutor:
                 f"map={observation.overworld.map_id if observation.overworld else None!r} "
                 f"coordinates={observation.overworld.player_coordinates if observation.overworld else None!r} "
                 f"facing={observation.overworld.facing if observation.overworld else None!r} "
+                f"player_elevation={getattr(observation.overworld, 'player_elevation', None) if observation.overworld else None!r} "
+                f"player_current_elevation={getattr(observation.overworld, 'player_current_elevation', None) if observation.overworld else None!r} "
+                f"player_previous_coordinates={getattr(observation.overworld, 'player_previous_coordinates', None) if observation.overworld else None!r} "
                 f"action={action.action_type.name!r} option={action.option!r} "
                 f"direction={getattr(action.direction, 'name', None)!r} navigation={action.navigation!r} "
                 f"goal={observation.goal!r} interaction={observation.interaction!r}"
             ),
             trace=True,
         )
+        if action.action_type is not AgentActionType.ACCELERATE_DIALOGUE_RENDER:
+            # The render workaround holds B so the printer keeps its
+            # speed-up flag active. Release it before any later dialogue,
+            # choice, or overworld action can observe the handoff.
+            render_b_was_owned = self._field_message_render_b_held
+            self._release_field_message_render_b()
+            if not render_b_was_owned and observation.interaction.field_message_lifecycle_active:
+                release_button = getattr(context.emulator, "release_button", None)
+                if callable(release_button):
+                    # A recovery path may construct a short-lived executor
+                    # for each observation. In that case the ownership bit
+                    # is gone, but the emulator can still be holding the B
+                    # installed by the preceding render action.
+                    release_button("B")
         if action.action_type is AgentActionType.WAIT_REOBSERVE:
             return ActionResult(ActionResultType.WAITING, action, action.reason)
         if action.action_type is AgentActionType.DELEGATE_BATTLE:
@@ -808,7 +892,39 @@ class AgentActionExecutor:
         ):
             return ActionResult(ActionResultType.UNSUPPORTED, action, "no emulator is attached")
 
-        if action.action_type is AgentActionType.ADVANCE_DIALOGUE:
+        if action.action_type is AgentActionType.ACCELERATE_DIALOGUE_RENDER:
+            if (
+                observation.interaction.interaction_phase is not InteractionPhase.FIELD_MESSAGE_RENDER_WAIT
+                or not observation.interaction.field_message_render_rescue_available
+            ):
+                return ActionResult(ActionResultType.WAITING, action, "field message render rescue is not available")
+            is_button_held = getattr(context.emulator, "is_button_held", None)
+            b_is_held = callable(is_button_held) and is_button_held("B") is True
+            hold_button = getattr(context.emulator, "hold_button", None)
+            operation = "hold_button(B)"
+            if not b_is_held:
+                press_button_fresh = getattr(type(context.emulator), "press_button_fresh", None)
+                if callable(press_button_fresh):
+                    context.emulator.press_button_fresh("B")
+                else:
+                    context.emulator.press_button("B")
+                operation = "press_button_fresh(B)+hold_button(B)"
+            if callable(hold_button):
+                # One fresh edge enables Emerald's print-speed-up path; the
+                # held B keeps it active until the printer reaches its ROM
+                # backed input boundary. This remains safe for overworld
+                # interaction because B is released before the next action.
+                hold_button("B")
+                self._field_message_render_b_held = True
+            diagnostic_print(
+                lambda: (
+                    "AGENT_DIALOGUE_RENDER_RESCUE: action=ACCELERATE_DIALOGUE_RENDER "
+                    f"pulses={observation.interaction.metadata.get('field_message_render_rescue_pulses')!r} "
+                    f"operation={operation}"
+                ),
+                trace=True,
+            )
+        elif action.action_type is AgentActionType.ADVANCE_DIALOGUE:
             if observation.interaction.interaction_phase is not InteractionPhase.FIELD_MESSAGE_INPUT_WAIT:
                 return ActionResult(ActionResultType.WAITING, action, "dialogue is not ready")
             diagnostic_print(
@@ -897,11 +1013,17 @@ class AgentControlLoop:
         executor: AgentActionExecutor | None = None,
         *,
         goal: Goal | None = None,
+        navigation_plan: NavigationPlan | None = None,
         logger: Callable[[str], None] | None = None,
     ):
         self._observe = observe
         self._executor = executor or AgentActionExecutor()
         self._goal = goal
+        # CampaignPlan may already have paid the cost of composing a route
+        # through a recovery source.  Keep that route as an execution input;
+        # the first stable observation seeds the normal route/checkpoint
+        # machinery without running a second planner search.
+        self._initial_navigation_plan = navigation_plan
         self._custom_logger = logger is not None
         self._logger = logger or (lambda message: diagnostic_print(message, trace=True))
         self._last_interaction_type: InteractionType | None = None
@@ -946,6 +1068,28 @@ class AgentControlLoop:
         self._interaction_start_waits = 0
         self._last_observed_location: Location | None = None
         self._previous_observed_location: Location | None = None
+
+    def _seed_navigation_plan(self, observation: AgentObservation) -> None:
+        """Install a planner-supplied route once its origin is observable."""
+
+        plan = self._initial_navigation_plan
+        if plan is None or self._cached_evaluation is not None or observation.overworld is None:
+            return
+        self._cached_evaluation = GoalEvaluation(
+            GoalStatus.REACHABLE,
+            plan,
+            reason="campaign planner supplied route",
+        )
+        self._cached_actions = plan.actions
+        self._cached_action_index = 0
+        self._route_plan = RoutePlan.from_navigation_plan(plan, target=self._goal)
+        self._cached_goal = self._goal
+        self._cached_world_signature = self._world_signature(observation)
+        self._initial_navigation_plan = None
+        self._report(
+            f"ROUTE_PLAN_ADOPTED route_id={self._route_plan.route_id} "
+            f"actions={len(self._route_plan.actions)} source='campaign_planner'"
+        )
 
     def _implicit_transition_boundary(self, observation: AgentObservation) -> bool:
         """Recognize a transition exposed between controller observations."""
@@ -1070,6 +1214,10 @@ class AgentControlLoop:
                 count("cached_route_fast_path_fallback_frames")
                 self._cancel_movement_batch("non_overworld_state")
                 return False
+            if is_emerald_field_message_rendering():
+                count("cached_route_fast_path_fallback_frames")
+                self._cancel_movement_batch("dialogue_rendering")
+                return False
             if is_field_message_waiting_for_input():
                 count("cached_route_fast_path_fallback_frames")
                 self._cancel_movement_batch("dialogue_started")
@@ -1136,14 +1284,23 @@ class AgentControlLoop:
                 else:
                     context.emulator.press_button(action.direction.button_name)
             else:
-                if action.run:
+                # This method is called once per emulator frame.  A repeated
+                # press_direction() is an input edge and is intentionally
+                # suppressed by LibmgbaEmulator when the same direction was
+                # present on the previous frame.  Cached running routes must
+                # hold their inputs instead, otherwise the first step works
+                # and every following frame is neutral input.
+                hold_button = getattr(context.emulator, "hold_button", None)
+                if callable(hold_button):
+                    hold_button(action.direction.button_name)
+                    if action.run:
+                        hold_button("B")
+                else:
                     press_direction = getattr(context.emulator, "press_direction", None)
                     if callable(press_direction):
-                        press_direction(action.direction.button_name, run=True)
+                        press_direction(action.direction.button_name, run=bool(action.run))
                     else:
-                        context.emulator.hold_button(action.direction.button_name)
-                else:
-                    context.emulator.hold_button(action.direction.button_name)
+                        context.emulator.press_button(action.direction.button_name)
             fast_path_completed = True
             count("cached_route_fast_path_frames")
             # These counters intentionally remain zero on the fast path.  They
@@ -1327,7 +1484,9 @@ class AgentControlLoop:
                     trigger.activation_locations,
                     trigger.navigation_locations,
                     trigger.activation_requirements,
+                    trigger.elevation,
                     trigger.target_map,
+                    trigger.requires_input,
                 )
                 for trigger in world.triggers
             ),
@@ -1426,6 +1585,17 @@ class AgentControlLoop:
         if self._cached_evaluation is None or self._cached_goal != self._goal:
             return None
 
+        goal_target = _goal_target(self._goal)
+        if isinstance(goal_target, ActivateTrigger) and _trigger_condition_completed(
+            observation, goal_target.trigger_id
+        ):
+            # The ROM has completed an automatic scene while the old tactical
+            # route is still mounted.  Drop that route so the next selection
+            # observes the completed goal and lets campaign policy choose the
+            # next objective.
+            self._invalidate_plan("automatic trigger condition completed")
+            return None
+
         count("cached_plan_validations")
         count("cached_plan_hits")
 
@@ -1482,23 +1652,10 @@ class AgentControlLoop:
                         # issue A on geometric adjacency alone.
                         self._invalidate_plan("interaction_precondition_not_ready")
                         return None
-                    resolution = next(
-                        (
-                            binding
-                            for binding in observation.overworld.bindings
-                            if binding.binding.trigger_id == _goal_target(self._goal).trigger_id
-                        ),
-                        None,
-                    )
-                    runtime_available = (
-                        resolution.runtime_match
-                        if resolution is not None
-                        else any(
-                            trigger.trigger_id == _goal_target(self._goal).trigger_id and trigger.activation_locations
-                            for trigger in observation.overworld.triggers
-                        )
-                    )
-                    if isinstance(_goal_target(self._goal), ReachInteractionPosition):
+                    if (
+                        isinstance(_goal_target(self._goal), ReachInteractionPosition)
+                        and _trigger_requires_input(observation, _goal_target(self._goal).trigger_id)
+                    ):
                         return ActionDecision(
                             AgentAction(
                                 AgentActionType.INTERACT,
@@ -1507,11 +1664,19 @@ class AgentControlLoop:
                             ),
                             self._cached_evaluation,
                         )
-                    if not runtime_available:
+                    if isinstance(_goal_target(self._goal), ReachInteractionPosition):
                         return ActionDecision(
                             AgentAction(
                                 AgentActionType.WAIT_REOBSERVE,
-                                reason="static target reached; waiting for runtime object",
+                                reason="automatic coordinate trigger fires on tile entry",
+                            ),
+                            self._cached_evaluation,
+                        )
+                    if not _trigger_requires_input(observation, _goal_target(self._goal).trigger_id):
+                        return ActionDecision(
+                            AgentAction(
+                                AgentActionType.WAIT_REOBSERVE,
+                                reason="automatic coordinate trigger fires on tile entry",
                             ),
                             self._cached_evaluation,
                         )
@@ -1711,6 +1876,31 @@ class AgentControlLoop:
             destination_map = pending.destination[0] if pending.destination is not None else None
             if destination_map is not None and observation.overworld.map_id == destination_map:
                 if pending.destination is not None and observed != pending.destination:
+                    # A map connection can briefly expose the destination map
+                    # while the avatar still has a boundary coordinate (for
+                    # example, y == -1).  That coordinate is not a failed
+                    # prediction: the destination map has changed, but its
+                    # static tile model is not coherent yet.  Keep the
+                    # transition authoritative and wait for a real tile
+                    # before recording runtime transition evidence or
+                    # invalidating the route.
+                    if observation.overworld.tile_at(observed[1]) is None:
+                        pending.settling_observations += 1
+                        if pending.settling_observations <= self._pending_transition_watchdog_limit:
+                            if pending.settling_observations == 1:
+                                self._release_transition_input(pending)
+                            self._report(
+                                f"TRANSITION: destination_coordinate_settling "
+                                f"observation={pending.settling_observations} "
+                                f"observed={observed!r} expected={pending.destination!r}"
+                            )
+                            wait_action = AgentAction(
+                                AgentActionType.WAIT_REOBSERVE,
+                                reason="transition destination coordinate settling",
+                            )
+                            wait_decision = ActionDecision(wait_action)
+                            wait_result = self._executor.execute(wait_action, observation)
+                            return observation, wait_decision, wait_result
                     if observation.overworld.movement_state is MovementState.MOVING:
                         pending.settling_observations += 1
                         if pending.settling_observations <= 8:
@@ -1977,6 +2167,7 @@ class AgentControlLoop:
             )
 
         navigation_start = now()
+        self._seed_navigation_plan(observation)
         decision = self._cached_decision(observation)
         if decision is None:
             decision = select_action(observation)

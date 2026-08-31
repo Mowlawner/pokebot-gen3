@@ -8,7 +8,7 @@ from modules.nuzlocke.readiness_diagnostics import (
     build_progression_readiness_diagnostic,
     evaluate_progression_readiness,
 )
-from modules.nuzlocke.resource_policy import RouteRecovery
+from modules.nuzlocke.resource_policy import PartyResource, ResourceObservationStatus, ResourceSnapshot, RouteRecovery
 from modules.navigation import IntermediateRouteAnalysis, RouteAnalysis
 from modules.goals import ReachLocation
 
@@ -62,6 +62,24 @@ def test_unavailable_party_is_reported_as_unavailable():
     diagnostic = build_progression_readiness_diagnostic(snapshot((), available=False))
     assert diagnostic.party == ()
     assert diagnostic.has_usable_pokemon is None
+
+
+def test_valid_resource_party_fills_transient_snapshot_gap():
+    diagnostic = build_progression_readiness_diagnostic(
+        snapshot((), available=False),
+        resource_snapshot=ResourceSnapshot(
+            (PartyResource(20, 23),),
+            observation_status=ResourceObservationStatus.VALID,
+        ),
+        overworld=SimpleNamespace(map_id=(1, 2), player_coordinates=(3, 4), objects=()),
+        overworld_availability=Availability.KNOWN,
+        recovery_availability=Availability.KNOWN,
+    )
+
+    assert diagnostic.party_availability is Availability.KNOWN
+    assert diagnostic.party_count == 1
+    assert diagnostic.lowest_hp_ratio == 20 / 23
+    assert CampaignReadinessPolicy().evaluate(diagnostic).decision is ReadinessDecision.CONTINUE
 
 
 def test_trainer_hazard_and_distance_relationships_are_observational():

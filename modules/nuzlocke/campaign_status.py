@@ -20,10 +20,14 @@ class CampaignStatus:
 
     @classmethod
     def complete_status(cls) -> "CampaignStatus":
+        """Create the terminal GUI status for a completed campaign slice."""
+
         return cls(None, None, "Campaign complete", complete=True)
 
 
 def _target_text(target: SemanticTarget | None) -> str:
+    """Render a semantic target compactly for human-readable status output."""
+
     if target is None:
         return "NONE"
     if target.kind is SemanticTargetKind.INTERACTION:
@@ -39,6 +43,8 @@ def _target_text(target: SemanticTarget | None) -> str:
 
 
 def format_campaign_status(status: CampaignStatus | None) -> str:
+    """Format the current semantic campaign status for the GUI."""
+
     if status is None:
         return "Objective: NONE\nTarget: NONE\nIntent: No semantic objective"
     if status.complete:

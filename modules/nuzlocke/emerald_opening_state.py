@@ -9,6 +9,8 @@ from enum import Enum, auto
 
 
 class OpeningSequenceState(Enum):
+    """Compatibility labels retained for callers of the legacy opening mode."""
+
     TITLE = auto()
     MAIN_MENU = auto()
     PLAYER_NAMING = auto()

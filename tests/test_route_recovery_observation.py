@@ -3,7 +3,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from modules.map_data import MapRSE, PokemonCenter
-from modules.map_path import PathFindingError
+from modules.map_path import Direction, PathFindingError, Waypoint
+from modules.navigation import NavigationActionType, NavigationPlan
 from modules.nuzlocke.resource_policy import RouteRecovery
 from modules.nuzlocke.resource_runtime import observe_route_recovery
 
@@ -21,6 +22,18 @@ class RouteRecoveryObservationTests(unittest.TestCase):
         self.assertEqual(result.distance_to_center, 1)
         self.assertTrue(result.center_available)
         self.assertTrue(result.observation_available)
+
+    def test_valid_location_retains_legacy_path_as_executable_route(self):
+        location = (MapRSE.ROUTE101, (3, 4))
+        waypoint = Waypoint(Direction.East, MapRSE.ROUTE101, (4, 4), False, False)
+        with patch("modules.nuzlocke.resource_runtime.get_player_location", return_value=location), patch(
+            "modules.nuzlocke.resource_runtime.find_closest_pokemon_center", return_value=PokemonCenter.OldaleTown
+        ), patch("modules.nuzlocke.resource_runtime.calculate_path", return_value=[waypoint]):
+            result = observe_route_recovery()
+        self.assertIsInstance(result.route, NavigationPlan)
+        self.assertEqual(result.route.actions[0].action_type, NavigationActionType.MOVE)
+        self.assertEqual(result.route.actions[0].source, location)
+        self.assertEqual(result.route.actions[0].destination, (MapRSE.ROUTE101, (4, 4)))
 
     def test_unavailable_player_location_is_explicit_and_safe(self):
         with patch("modules.nuzlocke.resource_runtime.get_player_location", return_value=None):

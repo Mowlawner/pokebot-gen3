@@ -12,10 +12,12 @@ from modules.overworld import (
     trainer_hazard_locations,
     TriggerObservation,
     evaluate_trigger_condition,
+    invalidate_shared_overworld_observation,
     prewarm_static_map_observation,
     perceive_overworld,
     OverworldObservationResult,
     OverworldObservationStatus,
+    static_trainer_observations,
 )
 
 
@@ -60,6 +62,50 @@ class TestOverworldPerception(unittest.TestCase):
         blocker = ObjectObservation(2, (map_id, (3, 0)))
         self.assertEqual(trainer_hazard_locations(trainer, tiles, (blocker,)), frozenset({(map_id, (2, 0))}))
         self.assertEqual(trainer_hazard_locations(replace(trainer, trainer_defeated=True), tiles), frozenset())
+
+    def test_static_trainer_fallback_covers_unspawned_runtime_object(self):
+        map_id = (11, 3)
+        template = SimpleNamespace(
+            kind="normal",
+            local_id=3,
+            local_coordinates=(2, 9),
+            trainer_type="Normal",
+            trainer_range=3,
+            is_trainer_defeated=False,
+            flag_id=0,
+            movement_type="FACE_LEFT",
+            script_symbol="RustboroCity_Gym_EventScript_Tommy",
+            elevation=3,
+        )
+        fallback = static_trainer_observations(map_id, SimpleNamespace(objects=(template,)), ())
+        self.assertEqual(len(fallback), 1)
+        self.assertEqual(fallback[0].trainer_id, "trainer:(11, 3):3")
+        tiles = tuple(
+            TileObservation((map_id, (x, 9)), False, frozenset(Direction), elevation=3) for x in range(5)
+        )
+        self.assertEqual(
+            trainer_hazard_locations(fallback[0], tiles),
+            frozenset({(map_id, (1, 9)), (map_id, (0, 9))}),
+        )
+
+    def test_static_trainer_fallback_does_not_duplicate_runtime_object(self):
+        map_id = (11, 3)
+        template = SimpleNamespace(
+            kind="normal",
+            local_id=3,
+            local_coordinates=(2, 9),
+            trainer_type="Normal",
+            trainer_range=3,
+            is_trainer_defeated=False,
+            flag_id=0,
+            movement_type="FACE_LEFT",
+            script_symbol="RustboroCity_Gym_EventScript_Tommy",
+        )
+        runtime = ObjectObservation(3, (map_id, (2, 9)), trainer_type="Normal")
+        self.assertEqual(
+            static_trainer_observations(map_id, SimpleNamespace(objects=(template,)), (runtime,)),
+            (),
+        )
 
     def test_missing_avatar_is_explicitly_unavailable(self):
         with patch("modules.overworld.get_player_avatar", return_value=None):
@@ -201,6 +247,50 @@ class TestOverworldPerception(unittest.TestCase):
         ]
         self.assertTrue(any(t.kind == "map_connection" for t in static.transitions))
 
+    def test_exterior_door_warp_exposes_adjacent_activation_tile(self):
+        map_id = (94, 1)
+        destination = (95, 2)
+        door = (1, 1)
+        activation = (1, 2)
+
+        def tile(coordinate):
+            accessible = [True] * 4 if coordinate == activation else [False] * 4
+            return SimpleNamespace(
+                local_coordinates=coordinate,
+                accessible_from_direction=accessible,
+                warps_to=(destination, (0, 0), Direction.North) if coordinate == door else None,
+                traversal_cost=1,
+                tile_type="Exterior Door" if coordinate == door else "",
+            )
+
+        warp_data = SimpleNamespace(
+            local_coordinates=door,
+            destination_location=SimpleNamespace(
+                map_group=destination[0], map_number=destination[1], local_position=(0, 0)
+            ),
+        )
+        path_map = SimpleNamespace(
+            tiles=[tile((x, y)) for y in range(3) for x in range(3)]
+        )
+        map_data = SimpleNamespace(
+            map_size=(3, 3),
+            warps=(warp_data,),
+            connections=(),
+            objects=(),
+            coord_events=(),
+            bg_events=(),
+        )
+        with patch("modules.overworld._get_map_metadata", return_value=path_map), patch(
+            "modules.overworld.get_map_metadata", return_value=map_data
+        ):
+            prewarm_static_map_observation(map_id)
+
+        static = __import__("modules.overworld", fromlist=["_static_map_observations"])._static_map_observations[map_id]
+        warp = static.warps[0]
+        self.assertEqual(warp.activation_locations, frozenset({(map_id, activation)}))
+        self.assertEqual(warp.activation_direction, Direction.North)
+        self.assertNotIn((map_id, door), warp.activation_locations)
+
     def test_reuses_static_tiles_when_only_avatar_state_changes(self):
         map_id = (91, 7)
         map_data = MapMetadata(
@@ -244,6 +334,109 @@ class TestOverworldPerception(unittest.TestCase):
         self.assertEqual(first.tiles[1].traversal_cost, 2)
         self.assertIs(first.tiles[1], second.tiles[1])
         self.assertEqual(first.player_coordinates, (0, 0))
+        self.assertEqual(second.player_coordinates, (1, 0))
+
+    def test_reuses_complete_passive_observation_within_emulator_frame(self):
+        map_id = (123, 45)
+        map_data = MapMetadata(
+            map_id,
+            b"header",
+            (2).to_bytes(4, "little") + (1).to_bytes(4, "little"),
+            b"events",
+            (),
+            (),
+            (),
+            (),
+            (),
+        )
+        path_tiles = [
+            SimpleNamespace(
+                local_coordinates=(x, 0),
+                accessible_from_direction=[True] * 4,
+                warps_to=None,
+                traversal_cost=1,
+            )
+            for x in range(2)
+        ]
+        avatar = SimpleNamespace(
+            map_group_and_number=map_id,
+            local_coordinates=(0, 0),
+            facing_direction="Down",
+        )
+        frame = [10]
+        emulator = SimpleNamespace(get_frame_count=lambda: frame[0])
+        live_map = SimpleNamespace(map_id=map_id, source="test", candidates=(), header_fingerprint=None)
+        with (
+            patch("modules.overworld.context", SimpleNamespace(emulator=emulator, rom=None)),
+            patch("modules.overworld.get_player_avatar", return_value=avatar),
+            patch("modules.overworld.observe_live_map_identity", return_value=live_map),
+            patch("modules.overworld._get_map_metadata", return_value=SimpleNamespace(tiles=path_tiles)),
+            patch("modules.overworld.get_map_metadata", return_value=map_data),
+            patch("modules.overworld.get_map_objects", return_value=[]) as get_map_objects,
+            patch("modules.overworld.player_avatar_is_controllable", return_value=True),
+            patch("modules.overworld.task_is_active", return_value=False),
+            patch("modules.overworld.get_game_state_symbol", return_value="CB2_OVERWORLD"),
+        ):
+            invalidate_shared_overworld_observation()
+            first = perceive_overworld()
+            avatar.local_coordinates = (1, 0)
+            second = perceive_overworld()
+
+            self.assertIs(first, second)
+            self.assertEqual(second.player_coordinates, (0, 0))
+            self.assertEqual(get_map_objects.call_count, 1)
+
+            frame[0] += 1
+            third = perceive_overworld()
+
+        self.assertIsNot(second, third)
+        self.assertEqual(third.player_coordinates, (1, 0))
+        self.assertEqual(get_map_objects.call_count, 2)
+
+    def test_explicit_overworld_invalidation_forces_same_frame_reread(self):
+        map_id = (124, 45)
+        map_data = MapMetadata(
+            map_id,
+            b"header",
+            (1).to_bytes(4, "little") + (1).to_bytes(4, "little"),
+            b"events",
+            (),
+            (),
+            (),
+            (),
+            (),
+        )
+        path_tile = SimpleNamespace(
+            local_coordinates=(0, 0),
+            accessible_from_direction=[True] * 4,
+            warps_to=None,
+            traversal_cost=1,
+        )
+        avatar = SimpleNamespace(
+            map_group_and_number=map_id,
+            local_coordinates=(0, 0),
+            facing_direction="Down",
+        )
+        emulator = SimpleNamespace(get_frame_count=lambda: 11)
+        live_map = SimpleNamespace(map_id=map_id, source="test", candidates=(), header_fingerprint=None)
+        with (
+            patch("modules.overworld.context", SimpleNamespace(emulator=emulator, rom=None)),
+            patch("modules.overworld.get_player_avatar", return_value=avatar),
+            patch("modules.overworld.observe_live_map_identity", return_value=live_map),
+            patch("modules.overworld._get_map_metadata", return_value=SimpleNamespace(tiles=[path_tile])),
+            patch("modules.overworld.get_map_metadata", return_value=map_data),
+            patch("modules.overworld.get_map_objects", return_value=[]),
+            patch("modules.overworld.player_avatar_is_controllable", return_value=True),
+            patch("modules.overworld.task_is_active", return_value=False),
+            patch("modules.overworld.get_game_state_symbol", return_value="CB2_OVERWORLD"),
+        ):
+            invalidate_shared_overworld_observation()
+            first = perceive_overworld()
+            avatar.local_coordinates = (1, 0)
+            invalidate_shared_overworld_observation()
+            second = perceive_overworld()
+
+        self.assertIsNot(first, second)
         self.assertEqual(second.player_coordinates, (1, 0))
 
     def test_processes_real_object_event_without_kind_or_script_attributes(self):

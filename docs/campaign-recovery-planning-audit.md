@@ -1,6 +1,6 @@
 # Campaign Recovery Planning Audit
 
-Date: 2026-08-29
+Date: 2026-08-30
 
 ## Executive summary
 
@@ -31,24 +31,197 @@ take control at arbitrary frame boundaries. A complete planned waypoint would
 still move that decision into campaign planning and leave dialogue/action
 ownership with the normal execution layers.
 
+## P0 closeout status
+
+The implementation pass closed the deterministic seams needed for P0, but not
+the final live exit criteria:
+
+- Runtime startup and emulator-reset hydration now replay durable campaign and
+  rules history. Battle-start encounter eligibility is persisted at the
+  observation boundary, and unit tests cover hydration, legacy activation,
+  deferred save-boundary commits, ephemeral sequence rebasing, and reset
+  preservation. Live runtime writes are intentionally deferred until an
+  in-game save, manual save state, or enabled automatic shutdown save state.
+  `--no-save-state` suppresses only the automatic shutdown boundary.
+- Emerald capability ownership now comes from the ROM registry for Devon
+  Goods, Rustboro, and Roxanne. Devon's left/right decompilation script
+  symbols and Roxanne's gym script symbol are bound explicitly. Objective
+  planning tests progress through `DEFEATED_RUSTBORO_GYM`. The optional Devon
+  Goods chain is not a literal Roxanne prerequisite; Roxanne availability is
+  the Rustboro-visited/not-yet-defeated ROM fact, while gym execution also
+  requires the registered party preparation level.
+- The fresh no-save live contract remains verified through Petalburg City. A
+  raw-state live trace now proves the Petalburg gate owns the blocked tile,
+  `ShowGymToPlayer` runs, Wally's tutorial battle runs, and
+  `ReturnFromWallyTutorial` completes before the campaign mounts
+  `recover_devon_goods`. The Devon Goods completion and first badge have not
+  yet been verified live.
+- The full default test suite currently passes 1,088 tests, with 38
+  emulator-tier tests skipped by default. The focused campaign/persistence
+  tier passes 396 tests with 5 emulator-tier tests skipped.
+- Process restart/resume has deterministic unit coverage but still needs a
+  ROM-backed demonstration. The repaired ignored `test_begin_nuzlocke` profile
+  now has 18 contiguous events, matching provenance, with `NuzlockeStarted` at
+  sequence 18. The earlier corruption note is stale; event-store corruption
+  detection remains strict.
+
+P0 should therefore remain open. The Petalburg script boundary is no longer
+the blocker, and preparation now has a unit-tested trainer-only handoff after
+an area's first encounter resolves. A disposable replay from
+`test_return_to_lab_after_rival_fight` completed the Pokémon Center nurse flow:
+the render-boundary rescue issued a fresh B pulse, released the held B before
+the actionable A, and returned to overworld movement. The reported final-box
+stall is not reproduced from the current checkpoint.
+
+The Route 103 investigation also found no avoidable route detour: the selected
+rival activation positions require 11 encounterable grass moves, versus 12
+for the other observed candidates. The two opening Growl actions are an
+intentional `EmeraldIntroRivalBattleStrategy` policy and now have focused
+coverage. A controlled 1x replay in this environment reported sound
+initialization failure and then settled at roughly 20.6 ms per frame (about
+48.5 FPS) from the beginning; the emulator core and controller work were each
+below 1 ms. This identifies the sleep-based no-audio limiter as the likely
+explanation for the apparent 80% speed, rather than a Route 103 speed setting.
+A working audio device or a more precise fallback limiter is the appropriate
+performance follow-up.
+
+The immediate closeout phase is therefore a focused ROM-boundary pass: finish
+the Devon-to-Rustboro-to-Roxanne path, produce the authoritative first-badge
+fact, capture that path as a fixture, and then prove restart/resume against the
+fixture. Retained Rustboro checkpoints currently stall inside mGBA's
+`run_frame` before the first runtime update, so they cannot serve as live
+evidence. The planned recovery-envelope work described below is the next
+architectural phase after that evidence is green.
+
+## ROM-truth and state-ownership audit
+
+The `test_ng` contract exposed a separate correctness issue from recovery:
+the profile is intentionally metadata-only so its first run starts at a fresh
+ROM title screen. mGBA still needs a save-data backend and creates a
+placeholder `current_save.sav`; in the observed case that file was 128 KiB of
+`0xff`, not a valid in-game save. Reading event flags from that buffer made
+`first_badge_obtained` appear true and produced the GUI's `Campaign complete`
+status.
+
+The fix establishes an explicit lifecycle boundary in
+`CampaignObservationSnapshot`:
+
+- `FRESH_START` is emitted only for an observed title/main-menu lifecycle
+  before a save is loaded or a new game has started. Save-backed flags and
+  variables remain unavailable, even if their raw placeholder bytes decode as
+  true or `0xffff`.
+- `ACTIVE` permits save-backed campaign facts and provenance reconciliation.
+- `UNAVAILABLE` means that the lifecycle or read itself could not be
+  established.
+
+The planner has one corresponding exception: a `FRESH_START` observation may
+mount the opening setup capability (`set_text_speed`) so startup can proceed.
+It cannot satisfy the terminal goal. This is an observation boundary, not a
+remembered phase or synthetic campaign milestone.
+
+The intended campaign model is a recursive list of goals/tasks, not a fixed
+linear state machine. A goal describes an observable game condition and its
+producer capability; the resolver recursively expands unmet prerequisites and
+returns the currently available required and optional work. Most conditions
+should be read from the ROM's flags, variables, map, party, inventory, and
+other live structures. Durable projections are appropriate only for facts the
+ROM does not preserve, such as encounter ownership, captures, faint history,
+and whiteouts. Execution state may remember a mounted generator or an
+in-progress interaction, but it must never become campaign completion state.
+
+Petalburg is the concrete example that the placeholder graph currently hides:
+
+- Pokédex receipt changes the ROM gate that lets the player leave Oldale
+  westward toward Petalburg; simply reaching Petalburg is not itself the
+  meaningful objective.
+- Norman's Wally tutorial must occur in Petalburg. Its ROM flag/variable
+  update is the prerequisite that opens the Petalburg Woods progression toward
+  Rustboro.
+- The goal resolver should therefore select the currently available gate or
+  scene task, then delegate movement, dialogue, interaction, and battle work
+  to their respective executors until the ROM reports the resulting fact.
+
+| State or machinery | Authority and purpose | Audit result |
+| --- | --- | --- |
+| `get_event_flag()` / `get_event_var()` and `CampaignFacts` | Current ROM/save-backed story state; `first_badge_obtained` comes directly from `DEFEATED_RUSTBORO_GYM` | Keep as campaign authority; reject uninitialized reads |
+| Recursive goal/task resolver and capability registry | Resolve available work from current facts and recursively expand unmet prerequisites | Make this the primary campaign interface; do not replace it with a selected-goal state machine |
+| `CampaignController` objective, tactical loop, recovery phase, and debounce fields | Process-local ownership needed to resume a capability across frames | Legitimate execution state; never use as completion evidence |
+| `CampaignProjection` / `NuzlockeRulesProjection` | Replayable encounter, capture, faint, whiteout, and battle history | Legitimate durable Nuzlocke history; not a substitute for current ROM story facts |
+| `nuzlocke_started`, `NuzlockeStarted`, and the removed `start_nuzlocke` objective | Current campaign fact: ROM-derived Pokédex receipt. Legacy event: bot-written but replay-compatible rules/audit metadata | Keep the event readable for migration; keep it outside campaign gating and derive current activation from the ROM |
+| Provenance sidecar high-water facts and party identity | Save identity/history compatibility check across profile replacement | Validation only; fresh-start observations cannot create or advance it, and it must not complete objectives |
+| `EmeraldOpeningMode` / `OpeningSequenceState` | Legacy scripted opening flow and compatibility diagnostics | Retire; do not extend or use it as the campaign architecture |
+
+`modules/modes/opening.py` is therefore not currently the source of the
+`test_ng` false completion, but it is still legacy scripted machinery that
+must not be expanded. Its `phase` is rebased from ROM observations and is not
+the intended source of campaign progress. The machinery that caused the
+reported completion was the combination of an all-`0xff` placeholder save and
+treating those reads as available campaign facts. The durable
+event/provenance files are a separate profile-side effect: they may survive a
+run even when the game itself was never saved. A strict fresh-run check should
+use `--no-save-state` and a clean event/provenance sidecar, or the repository
+should add an explicit read-only/non-persistent profile mode rather than
+inferring that policy from a profile name.
+
+The current runtime already uses the live `pokedex_received` fact to activate
+the one-encounter-per-area rule. The synthetic `start_nuzlocke` objective and
+controller boundary handoff have been removed. `reach_petalburg` remains as a
+ROM-observed traversal objective, while the actual Wally, Woods, Devon Goods,
+Rustboro, and Roxanne boundaries are represented as recursively resolved
+objectives. Legacy `NuzlockeStarted` records remain readable for migration and
+rules projection, but cannot activate the current save's campaign.
+
+### Completed cleanup boundary
+
+The following items are the concrete removal/migration list from this audit:
+
+1. Remove `start_nuzlocke` from the placeholder campaign list. Retain
+   `reach_petalburg` as an observed traversal objective and add the actual
+   Norman/Wally, Woods, Devon Goods, Rustboro, and Roxanne ROM-state goals to
+   the recursive registry.
+2. Remove the `CampaignController.refresh()` special case that invokes
+   `runtime_campaign_boundary()`, and remove that campaign-boundary write from
+   the progression path.
+3. Derive `nuzlocke_started` from the current ROM's Pokédex receipt. If
+   `NuzlockeStarted` is retained for migration or explicit ruleset metadata,
+   it must not be a campaign objective, a completion fact, a substitute for
+   Pokédex receipt, or the source of encounter eligibility when the ROM says
+   the Pokédex has not been received.
+4. Make encounter activation a Nuzlocke-rules policy: the implemented default
+   is Pokédex receipt. An explicit alternative new-game boundary, including
+   the policy for encounters before Poké Balls are obtainable, remains later
+   Nuzlocke-semantics work.
+5. Migrate old logs by preserving the legacy event for replay/audit, while
+   deriving current campaign progression and default encounter activation
+   from the current ROM observation. A stale legacy event must neither open a
+   ROM-gated route nor make a fresh `test_ng` run active.
+
+This cleanup is intentionally kept separate from the fresh-save fix: the
+objective graph now consumes observation-only campaign facts, while the event
+schema remains backward-compatible for old stores. The fresh-save fix and the
+current graph cleanup are complete; first-badge live validation and the full
+recovery ownership migration remain open.
+
 ## Current architecture and observed failure
 
 The current flow is approximately:
 
 ```text
-select static campaign objective
-    -> adapt objective to tactical goal
-        -> run readiness provider every controller refresh
-            -> evaluate HP and route availability
-                -> build a transient CampaignPlan on RECOVER
-                    -> mount the separate recovery generator
+observe ROM-backed facts + durable rule/history projections
+    -> recursively resolve the goal/task frontier and available work
+        -> select a task by campaign/rules policy
+            -> delegate movement, interaction, dialogue, or battle execution
+                -> re-observe ROM/projections for completion
+                    -> add recovery as a transient execution waypoint when needed
 ```
 
 The relevant implementation points are:
 
-- `modules/nuzlocke/campaign_objectives.py`: static objective model and
-  deterministic selector. `select_campaign_objective()` selects the first
-  incomplete objective; it does not add dynamic recovery work.
+- `modules/nuzlocke/campaign_objectives.py`: declarative goal/objective model,
+  producer index, available-task discovery, and the recursive
+  `plan_campaign()` resolver. The older ordered `select_campaign_objective()`
+  path and fixed tuple ordering remain compatibility scaffolding; the
+  executable campaign path uses recursive producer resolution.
 - `modules/nuzlocke/campaign_planner.py`: now provides `CampaignPlan` and
   `RecoveryStop`; `build_campaign_plan()` converts a readiness recovery result
   and its reachable route analysis into one transient stop.

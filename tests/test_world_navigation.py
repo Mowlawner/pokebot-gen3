@@ -37,6 +37,7 @@ from modules.navigation import (
     classify_transition_relevance,
     transition_world_route,
     TransitionRelevance,
+    NavigationError,
 )
 from modules.overworld import (
     MapConnectionObservation,
@@ -688,12 +689,41 @@ class TestWeightedNavigation(unittest.TestCase):
         self.assertTrue(world.tiles[location].blocked)
         self.assertEqual(world.tiles[location].traversal_cost, 2)
 
-    def test_static_target_reached_waits_for_runtime_spawn(self):
+    def test_land_navigation_does_not_treat_elevation_one_water_as_walkable(self):
+        land = (self.MAP, (0, 0))
+        water = (self.MAP, (1, 0))
+        world = NavigationWorld(
+            tiles={
+                land: NavigableTile(land, allowed_directions=frozenset(Direction), elevation=3),
+                water: NavigableTile(water, allowed_directions=frozenset(Direction), elevation=1),
+            },
+            facing=Direction.East,
+        )
+
+        self.assertEqual(world.neighbors(land), ())
+        with self.assertRaisesRegex(NavigationError, "No legal route"):
+            GoalAwareNavigator(world).plan(land, ReachLocation(water))
+
+    def test_existing_surf_state_can_enter_elevation_one_water(self):
+        land = (self.MAP, (0, 0))
+        water = (self.MAP, (1, 0))
+        world = NavigationWorld(
+            tiles={
+                land: NavigableTile(land, allowed_directions=frozenset(Direction), elevation=3),
+                water: NavigableTile(water, allowed_directions=frozenset(Direction), elevation=1),
+            },
+            facing=Direction.East,
+            surfing=True,
+        )
+
+        self.assertEqual(world.neighbors(land)[0][:2], (Direction.East, water))
+
+    def test_static_target_reached_interacts_without_runtime_spawn(self):
         map_id = (0, 18)
         location = (map_id, (0, 0))
         binding = TriggerBinding("rival", map_id, "RivalScript", local_id=2)
         observation = AgentObservation(
-            InteractionObservation(GameState.OVERWORLD),
+            InteractionObservation(GameState.OVERWORLD, controllable=True),
             overworld=OverworldObservation(
                 map_id=map_id,
                 player_coordinates=(0, 0),
@@ -706,7 +736,7 @@ class TestWeightedNavigation(unittest.TestCase):
                     TriggerObservation(
                         "rival",
                         frozenset(),
-                        frozenset(),
+                        frozenset({location}),
                         "semantic_object",
                         map_id,
                         frozenset({location}),
@@ -728,8 +758,8 @@ class TestWeightedNavigation(unittest.TestCase):
         selected = select_action(observation)
 
         self.assertEqual(decision.status, GoalStatus.REACHABLE)
-        self.assertEqual(selected.action.action_type, AgentActionType.WAIT_REOBSERVE)
-        self.assertNotEqual(selected.action.action_type, AgentActionType.INTERACT)
+        self.assertEqual(selected.action.action_type, AgentActionType.INTERACT)
+        self.assertEqual(selected.action.option, "rival")
 
     def test_warp_action_is_the_step_onto_a_normal_warp_tile(self):
         source_map = (0, 0)
@@ -1087,8 +1117,7 @@ class TestWeightedNavigation(unittest.TestCase):
         transition = plan.actions[-1]
         self.assertEqual(transition.action_type, NavigationActionType.WARP)
         self.assertEqual(transition.source, entry)
-        self.assertEqual(transition.direction, Direction.South)
-        self.assertEqual(transition.direction, Direction.South)
+        self.assertEqual(transition.direction, Direction.North)
 
     def test_arrow_warp_steps_onto_tile_then_uses_required_facing(self):
         source_map = (0, 0)

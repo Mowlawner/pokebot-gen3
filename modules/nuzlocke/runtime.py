@@ -19,6 +19,7 @@ from .campaign_state import Fact, derive_campaign_facts
 from .projection import CampaignProjection
 from .rules import NuzlockeRulesProjection
 from .rule_config import CampaignRulesConfig, CampaignRuleId
+from .persistence import JsonEventStore
 from modules.console import diagnostic_print
 
 if TYPE_CHECKING:
@@ -35,7 +36,19 @@ class NuzlockeRuntime:
         diagnostic_sink: EventSink | None = None,
         session_id: str | None = None,
         rule_config: CampaignRulesConfig | None = None,
+        event_store: JsonEventStore | None = None,
+        defer_event_persistence: bool = False,
     ) -> None:
+        """Create a snapshot-driven runtime with optional durable event sinks.
+
+        ``defer_event_persistence`` keeps durable events in memory until the
+        caller reports a successful save boundary.  The projections still
+        consume every event immediately; only the external sink is deferred.
+        This lets the emulator save and the event history advance together,
+        while preserving immediate sink delivery for lightweight embedders and
+        existing callers by default.
+        """
+
         self._snapshot_provider = snapshot_provider
         self._event_sink = event_sink
         self._diagnostic_sink = diagnostic_sink
@@ -49,18 +62,202 @@ class NuzlockeRuntime:
         self._campaign_projection = CampaignProjection()
         self._rules_projection = NuzlockeRulesProjection(encounters_active=False, rule_config=self._rule_config)
         self._event_statistics = EventStatistics()
+        self._event_store = event_store
+        self._defer_event_persistence = defer_event_persistence
+        self._pending_durable_events: list[tuple[Event, str]] = []
+        self._campaign_history_checked = event_store is None
+        self._campaign_history_compatible = True
+        # Do not replay durable history until a complete ROM-backed campaign
+        # observation has established that the event store belongs to the
+        # loaded save.  In particular, constructing the runtime must not let a
+        # stale NuzlockeStarted/projection state influence the first campaign
+        # selection.
+        self._campaign_history_hydrated = event_store is None
+        self._latest_snapshot: NuzlockeSnapshot | None = None
+        self._latest_campaign_facts = None
+
+    def _hydrate(self, event_store: JsonEventStore | None) -> None:
+        """Replay durable history into the projections before live updates."""
+        if event_store is None:
+            return
+        for record in event_store.iter_records():
+            self._campaign_projection.apply_record(record)
+            self._rules_projection.apply_record(record)
+        self._event_sequence = event_store.last_sequence()
+        self._campaign_history_hydrated = True
 
     @property
     def observed_projection(self) -> CampaignProjection:
+        """Return the read-only projection of observed campaign transitions."""
+
         return self._campaign_projection
 
     @property
     def rules_projection(self) -> NuzlockeRulesProjection:
+        """Return the current reduced Nuzlocke legality projection."""
+
         return self._rules_projection
 
     @property
     def rule_config(self) -> CampaignRulesConfig:
+        """Return the immutable rule configuration used by this runtime."""
+
         return self._rule_config
+
+    @property
+    def campaign_history_compatible(self) -> bool:
+        """Whether durable history was accepted for the current ROM save."""
+        return self._campaign_history_compatible
+
+    @property
+    def campaign_history_ready(self) -> bool:
+        """Whether the current ROM has authorized projection hydration.
+
+        A runtime backed by an event store starts unready and becomes ready
+        only after the first complete campaign observation has either accepted
+        or quarantined that store.  This lets campaign consumers distinguish a
+        fresh, empty projection from a projection that has not yet been
+        reconciled with the loaded save.
+        """
+        return self._campaign_history_checked and self._campaign_history_hydrated
+
+    @property
+    def latest_snapshot(self) -> NuzlockeSnapshot | None:
+        """Return the snapshot materialized by the most recent update.
+
+        The frame loop updates the runtime before campaign planning.  Exposing
+        that immutable observation lets planners and readiness diagnostics
+        share the same ROM read instead of independently rereading save blocks
+        while an emulator frame is still being assembled.
+        """
+        return self._latest_snapshot
+
+    @staticmethod
+    def _campaign_provenance_observation(snapshot: NuzlockeSnapshot, facts) -> dict:
+        """Build the save-backed provenance view used to scope event history."""
+
+        identity = None
+        for pokemon in sorted(snapshot.party, key=lambda item: item.party_index):
+            if pokemon.identity is not None:
+                identity = [
+                    pokemon.identity.personality_value,
+                    pokemon.identity.original_trainer_id,
+                    pokemon.identity.original_trainer_secret_id,
+                ]
+                break
+        return {
+            "game_id": snapshot.game_id,
+            "lifecycle": snapshot.campaign_observation.lifecycle.value,
+            "facts": {
+                name: getattr(facts, name).value
+                for name in (
+                    "new_game_setup_complete",
+                    "wall_clock_set",
+                    "rival_met",
+                    "birch_rescued",
+                    "starter_obtained",
+                    "intro_rival_battle_complete",
+                    "pokedex_received",
+                    "pokeballs_available",
+                    "pokeballs_ready",
+                    "visited_petalburg",
+                    "petalburg_wally_scene_complete",
+                    "petalburg_woods_scene_complete",
+                    "devon_goods_stolen",
+                    "devon_goods_reported",
+                    "devon_goods_recovered",
+                    "devon_goods_returned",
+                    "devon_goods_delivered",
+                    "devon_corp_3f_scene_complete",
+                    "visited_rustboro",
+                    "first_badge_obtained",
+                )
+                if getattr(facts, name).is_known
+            },
+            "stable_identity": identity,
+        }
+
+    @staticmethod
+    def _campaign_observation_is_complete(facts) -> bool:
+        """Return whether the ROM facts are sufficient to scope history.
+
+        ``CampaignObservationSnapshot.available`` means that the observation
+        read path completed, but it does not by itself prove that every
+        named field was present.  Provenance reconciliation must be able to
+        observe both sides of each opening milestone; otherwise an absent
+        field could make stale high-water history appear compatible.
+        """
+        return all(
+            getattr(facts, name).is_known
+            for name in (
+                "new_game_setup_complete",
+                "wall_clock_set",
+                "rival_met",
+                "birch_rescued",
+                "starter_obtained",
+                "intro_rival_battle_complete",
+                "pokedex_received",
+            )
+        )
+
+    def _check_campaign_history(self, snapshot: NuzlockeSnapshot, facts) -> bool:
+        """Authorize durable history only after checking the loaded ROM save."""
+        if self._event_store is None:
+            return True
+        if self._campaign_history_checked:
+            # Keep the sidecar's monotonic high-water facts current after the
+            # initial compatibility decision, but never let a transiently
+            # older map/script observation quarantine an already-active run.
+            if snapshot.campaign_observation.available:
+                observation = self._campaign_provenance_observation(snapshot, facts)
+                self._event_store.campaign_history_compatible(
+                    observation,
+                    enforce=False,
+                    persist=not self._defer_event_persistence,
+                )
+            return True
+        # During boot, campaign RAM can be temporarily unavailable. Defer the
+        # decision until the first complete observation rather than treating
+        # an incomplete frame as a new run.
+        if not snapshot.campaign_observation.available or not self._campaign_observation_is_complete(facts):
+            return False
+        observation = self._campaign_provenance_observation(snapshot, facts)
+        # Enforce compatibility only at the first complete observation of a
+        # runtime timeline.  Later complete observations still advance the
+        # provenance high-water mark, but must not quarantine the active run
+        # when a map-local/script boundary briefly exposes an older value.
+        # A real emulator reset creates a new runtime below and therefore
+        # performs the strict check again against the newly loaded save.
+        compatible = self._event_store.campaign_history_compatible(
+            observation,
+            enforce=True,
+            persist=not self._defer_event_persistence,
+        )
+        self._campaign_history_checked = True
+        self._campaign_history_compatible = compatible
+        if compatible:
+            self._hydrate(self._event_store)
+            return True
+
+        archived = self._event_store.quarantine()
+        self._observer = NuzlockeEventObserver()
+        self._campaign_projection = CampaignProjection()
+        self._rules_projection = NuzlockeRulesProjection(
+            encounters_active=False,
+            rule_config=self._rule_config,
+        )
+        self._events.clear()
+        self._event_sequence = 0
+        diagnostic_print(
+            lambda: (
+                "NUZLOCKE_HISTORY_QUARANTINED: "
+                f"event_store={self._event_store.path!s} archived={archived!s} "
+                "reason='loaded ROM save contradicts durable campaign provenance'"
+            ),
+            trace=True,
+        )
+        self._campaign_history_hydrated = True
+        return True
 
     def capture_target_for(
         self,
@@ -136,19 +333,43 @@ class NuzlockeRuntime:
         trace = getattr(trace, "stutter_trace", None)
         observe_started = trace.now() if trace is not None else 0
         current = self._snapshot_provider() if snapshot is None else snapshot
+        self._latest_snapshot = current
         if trace is not None:
             trace.duration("nuzlocke_observer_duration_ms", observe_started)
         if self._last_frame is not None and current.frame < self._last_frame:
+            # A save-state load starts a new emulator timeline, but it does
+            # not erase the campaign's durable history.  Recreate only the
+            # frame observer and hydrate projections from the event store so
+            # encounter/death/campaign facts remain available after reset.
             self._observer = NuzlockeEventObserver()
             self._campaign_projection = CampaignProjection()
             self._rules_projection = NuzlockeRulesProjection(encounters_active=False, rule_config=self._rule_config)
             self._events.clear()
             self._session_id = str(uuid4())
             self._event_sequence = 0
+            self._campaign_history_checked = False
+            self._campaign_history_compatible = True
+            self._campaign_history_hydrated = self._event_store is None
+            # Events produced after the last durable boundary belong to the
+            # discarded emulator timeline and must not be committed after a
+            # save-state load/reset.
+            self._pending_durable_events.clear()
+            self._latest_snapshot = None
+            self._latest_campaign_facts = None
 
         self._last_frame = current.frame
         inventory_fact = Fact.known(current.inventory) if current.inventory_available else Fact.unavailable()
         campaign_facts = derive_campaign_facts(current, inventory_fact, Fact.unavailable())
+        self._latest_campaign_facts = campaign_facts
+        if not self._check_campaign_history(current, campaign_facts):
+            diagnostic_print(
+                lambda: (
+                    "NUZLOCKE_HISTORY_WAITING: "
+                    "campaign observation is incomplete; durable history and live events remain hidden"
+                ),
+                trace=True,
+            )
+            return ()
         # Pokédex receipt is the Emerald campaign fact that activates the
         # Nuzlocke encounter rule.  Inventory remains a capture/readiness
         # concern and must not affect whether a location is consumed.
@@ -162,12 +383,32 @@ class NuzlockeRuntime:
         if trace is not None:
             trace.duration("nuzlocke_observer_duration_ms", observer_started)
         for event in events:
+            if isinstance(event, BattleStarted) and event.encounter_eligible is None:
+                # Enrich the observer event before it reaches either the
+                # projections or the durable sink.  The eligibility decision
+                # is a fact of the battle-start frame, not a replay-time
+                # inference from a later snapshot.
+                event_encounter_eligible = encounter_eligible
+                if event_encounter_eligible and event.is_wild and not event.is_trainer and event.location is not None:
+                    # The global Pokédex boundary enables encounter rules,
+                    # but it does not make a second encounter in an already
+                    # resolved area eligible.  Repeat battles remain valid
+                    # battles to fight; only their capture target is barred.
+                    event_encounter_eligible = (
+                        self._rules_projection.state.encounter_for(event.location).status == "none"
+                    )
+                from dataclasses import replace
+
+                event = replace(event, encounter_eligible=event_encounter_eligible)
+                encounter_eligible_for_event = event_encounter_eligible
+            else:
+                encounter_eligible_for_event = encounter_eligible
             self._event_sequence += 1
             self._campaign_projection.apply(event, session_id=self._session_id, sequence=self._event_sequence)
             self._rules_projection.apply(
                 event,
                 sequence=self._event_sequence,
-                encounter_eligible=encounter_eligible,
+                encounter_eligible=encounter_eligible_for_event,
             )
             if isinstance(event, BattleStarted):
                 encounter = next(
@@ -192,7 +433,7 @@ class NuzlockeRuntime:
             persistence_class = classify_event(event)
             self._event_statistics.record(event, persistence_class)
             if persistence_class is PersistenceClass.DURABLE and self._event_sink is not None:
-                self._event_sink(event, self._session_id)
+                self._persist_or_defer(event)
             elif persistence_class is PersistenceClass.DIAGNOSTIC and self._diagnostic_sink is not None:
                 self._diagnostic_sink(event, self._session_id)
             for subscriber in tuple(self._subscribers):
@@ -214,6 +455,8 @@ class NuzlockeRuntime:
         self._subscribers.append(consumer)
 
         def unsubscribe() -> None:
+            """Remove the consumer if it is still subscribed."""
+
             if consumer in self._subscribers:
                 self._subscribers.remove(consumer)
 
@@ -234,9 +477,63 @@ class NuzlockeRuntime:
         self._campaign_projection.apply(event, session_id=self._session_id, sequence=self._event_sequence)
         self._rules_projection.apply(event, sequence=self._event_sequence)
         if self._event_sink is not None:
-            self._event_sink(event, self._session_id)
+            self._persist_or_defer(event)
         self._event_statistics.record(event, PersistenceClass.DURABLE)
         for subscriber in tuple(self._subscribers):
             subscriber(event)
         self._events.append(event)
         return event
+
+    def _persist_or_defer(self, event: Event) -> None:
+        """Deliver a durable event now, or hold it for a save boundary."""
+
+        if self._defer_event_persistence:
+            self._pending_durable_events.append((event, self._session_id))
+            return
+        self._event_sink(event, self._session_id)
+
+    @property
+    def pending_durable_event_count(self) -> int:
+        """Return the number of durable events awaiting a save boundary."""
+
+        return len(self._pending_durable_events)
+
+    def commit_pending_events(self, boundary: str = "save") -> int:
+        """Persist events observed since the previous successful save.
+
+        The event sink is called in observer order.  Events are removed only
+        after the sink accepts them, so a failed write leaves the uncommitted
+        suffix available for a later explicit save boundary.
+        """
+
+        if not self._defer_event_persistence or self._event_sink is None:
+            return 0
+        committed = 0
+        while self._pending_durable_events:
+            event, session_id = self._pending_durable_events[0]
+            self._event_sink(event, session_id)
+            self._pending_durable_events.pop(0)
+            committed += 1
+        if self._event_store is not None and self._latest_snapshot is not None and self._latest_campaign_facts is not None:
+            # Provenance is intentionally committed at the same boundary as
+            # the event batch.  Without this, milestone observations would
+            # create profile writes on ordinary frames even when event
+            # persistence is deferred.
+            observation = self._campaign_provenance_observation(
+                self._latest_snapshot,
+                self._latest_campaign_facts,
+            )
+            self._event_store.campaign_history_compatible(
+                observation,
+                enforce=False,
+                persist=True,
+            )
+        diagnostic_print(
+            lambda: (
+                "NUZLOCKE_EVENT_COMMIT: "
+                f"boundary={boundary!r} committed={committed} "
+                f"runtime_id={id(self)!r} session_id={self._session_id!r}"
+            ),
+            trace=True,
+        )
+        return committed

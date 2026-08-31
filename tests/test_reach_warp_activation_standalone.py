@@ -1,11 +1,19 @@
 """Synthetic regression tests for executable ReachWarp transitions."""
 
 import unittest
+from unittest.mock import patch
 
 from modules.goals import ReachWarp, SemanticTarget
 from modules.map_path import Direction
-from modules.navigation import GoalAwareNavigator, NavigationActionType, NavigationWorld, NavigableTile
+from modules.navigation import (
+    GoalAwareNavigator,
+    NavigationActionType,
+    NavigationWorld,
+    NavigableTile,
+    _global_navigation_world,
+)
 from modules.overworld import MapConnectionObservation, WarpActivation, WarpObservation
+from modules.world_navigation import WorldEdge, WorldMapGraph
 
 
 def tiles(*locations):
@@ -51,6 +59,55 @@ class ReachWarpActivationTests(unittest.TestCase):
             (source, (1, 0)), ReachWarp(destination_map=destination, destination=warp.destination, warp=warp)
         )
         self.assertEqual(plan.actions[-1].direction, Direction.South)
+
+    def test_door_warp_uses_adjacent_activation_source_instead_of_entry_tile(self):
+        source, destination = (10, 1), (11, 1)
+        door = WarpObservation(
+            (source, (6, 16)),
+            (destination, (0, 0)),
+            activation_locations=frozenset({(source, (6, 17))}),
+            activation_direction=Direction.North,
+        )
+        world = NavigationWorld(tiles((source, (6, 17))), transitions=(door,), facing=Direction.North)
+        plan = GoalAwareNavigator(world).plan(
+            (source, (6, 17)), ReachWarp(destination_map=destination, destination=door.destination, warp=door)
+        )
+
+        self.assertEqual(plan.actions[-1].action_type, NavigationActionType.WARP)
+        self.assertEqual(plan.actions[-1].source, (source, (6, 17)))
+        self.assertEqual(plan.actions[-1].direction, Direction.North)
+        self.assertNotIn((source, (6, 16)), [action.destination for action in plan.actions])
+
+    def test_global_warp_overlay_preserves_rom_door_activation_geometry(self):
+        source, destination = (12, 1), (13, 1)
+        door = WarpObservation(
+            (source, (6, 16)),
+            (destination, (0, 0)),
+            activation_locations=frozenset({(source, (6, 17))}),
+            activation_direction=Direction.North,
+        )
+        graph = WorldMapGraph(
+            (
+                WorldEdge(
+                    source,
+                    destination,
+                    "warp",
+                    ((6, 16),),
+                    ((0, 0),),
+                ),
+            )
+        )
+        observed = NavigationWorld(tiles((source, (6, 17))), facing=Direction.North)
+        with patch("modules.navigation.static_map_transitions", return_value=(door,)):
+            global_world = _global_navigation_world(observed, graph, enrich_maps=(source,))
+
+        enriched = global_world.transitions[0]
+        self.assertEqual(enriched.activation_locations, door.activation_locations)
+        plan = GoalAwareNavigator(global_world).plan(
+            (source, (6, 17)), ReachWarp(destination_map=destination, destination=door.destination, warp=enriched)
+        )
+        self.assertEqual(plan.actions[-1].source, (source, (6, 17)))
+        self.assertEqual(plan.actions[-1].direction, Direction.North)
 
     def test_map_connection_uses_approach_as_warp_source(self):
         source, destination = (5, 1), (6, 1)

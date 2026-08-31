@@ -30,6 +30,7 @@ from modules.pokemon import (
 from modules.pokemon_party import get_current_repel_level, get_party, Pokemon
 from modules.state_cache import state_cache
 from modules.profiler import count as profile_count, now as profile_now, profiled, timing as profile_timing
+from modules.terrain import TALL_GRASS_TILE_TYPES
 
 if TYPE_CHECKING:
     from modules.battle_state import EncounterType
@@ -945,13 +946,13 @@ class MapLocation:
         if context.rom.is_frlg:
             return bool(self._metatile_attributes[0] & 0x0700_0000)
 
-        # RSE encounter availability is determined by the land encounter table
-        # for the map.  Avoid forcing a metatile-layout read here: navigation
-        # often has a valid observed behavior and encounter table while the
-        # layout bytes are unavailable during a transition or in a synthetic
-        # observation.
-        is_land = bool(self._tile_behaviour & 1)
-        if is_land:
+        # RSE's metatile behavior bits are movement/interaction flags, not a
+        # reliable encounter-terrain discriminator.  In particular, Emerald
+        # uses behavior 2 for Tall Grass and behavior 59 for Jump South; the
+        # old ``behavior & 1`` test inverted both of those cases.  Use the
+        # ROM tile type, which is also the source used by navigation's terrain
+        # cost, and then require a land encounter table for this map.
+        if self.tile_type in TALL_GRASS_TILE_TYPES:
             encounters = get_wild_encounters_for_map(self.map_group, self.map_number)
             return encounters is not None and len(encounters.land_encounters) > 0
         return False

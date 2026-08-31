@@ -4,18 +4,23 @@
 
 Build an autonomous, observation-driven Pokémon Generation 3 Nuzlocke bot.
 The bot must be able to start or resume a run, observe the emulator, maintain
-authoritative campaign and Nuzlocke state, choose legal actions, navigate the
-world, manage resources, complete battles, recover from transitions and
-failures, and verify completion without human intervention.
+authoritative campaign and Nuzlocke state, recursively resolve available goals,
+choose legal actions, navigate the world, manage resources, complete battles,
+recover from transitions and failures, and verify completion without human
+intervention.
 
 The current repository is an observation-driven Emerald opening and early
 progression pilot. Its live-validated fresh-run path starts without save data
-and reaches Petalburg City. The declarative campaign graph also describes the
-next Petalburg Woods, Rustboro, and first-badge objectives, but those remain
-outside the currently executable live slice. The campaign rules, immutable
-observations, event projection, level-cap gateway, resource policy, and
-adaptive navigation work are valuable foundations, but they do not yet
-constitute a complete whole-game autonomous bot.
+and reaches Petalburg City. The executable campaign registry now owns the
+early post-Wally capabilities, with ROM script identities, story facts, and
+the Roxanne availability/battle target represented explicitly. The Petalburg
+gate is live-validated: the bot enters Norman's gym, completes Wally's
+tutorial, and only then hands off to the Petalburg Woods/Devon frontier. The
+first-badge exit and ROM-backed restart/resume demonstration remain open. The
+campaign rules, immutable observations, lean save-boundary event projection,
+recursive goal resolution, resource policy, and adaptive navigation work are
+valuable foundations, but they do not yet constitute a complete whole-game
+autonomous bot.
 
 ## Definition of done
 
@@ -47,23 +52,34 @@ Nuzbot is complete when, for each supported Gen 3 game:
 
 The supported fresh-run Emerald path currently reaches Petalburg City, which
 the user confirmed from a fresh startup with no save data. The declarative
-objective graph continues through Devon Goods recovery, Rustboro, and Roxanne,
-but the current execution adapter still reports Devon Goods, Rustboro, and
-Roxanne as unsupported. The live controller therefore reaches an unsupported
-objective boundary after the Petalburg milestone rather than a verified first
-badge.
+objective model and Emerald registry now form an executable early graph rather
+than relying on the synthetic `start_nuzlocke` boundary. `reach_petalburg` is
+retained as a useful observed traversal objective: it requires Pokédex receipt
+and Poké Balls, then completes from the ROM's Petalburg visit fact. The
+meaningful Petalburg gate is Norman's Wally tutorial, represented by the
+ROM-backed `PETALBURG_CITY_STATE`/`PETALBURG_GYM_STATE` boundary that opens the
+Petalburg Woods progression toward Rustboro.
 
-The objective planner is declarative and supports dependency resolution. The
-nominal ultimate goal is still named `beat_elite_four`, but its temporary
-completion predicate is `first_badge_obtained` and its implementation marker
-points to Roxanne. Only Roxanne is present in the Emerald boss registry; the
-remaining gyms, rivals, villains, Elite Four, Champion, and Hall of Fame are
-not registered as executable campaign milestones.
+`plan_campaign()` already walks from a goal to producers of unmet predicates;
+the intended architecture is to make that recursive producer/task model the
+primary interface. Given the current observation, it should expose all
+available required and optional goals, choose among them by policy, and hand
+the selected goal to an execution capability. It must not infer progress from
+the order in which a bot-owned objective was selected or from a generator
+having stopped. The nominal ultimate goal is still named `beat_elite_four`,
+but its temporary completion predicate is `first_badge_obtained` and its
+implementation marker points to Roxanne. Only Roxanne is present in the
+Emerald boss registry; the remaining gyms, rivals, villains, Elite Four,
+Champion, and Hall of Fame are not registered as executable campaign
+milestones.
 
-Preparation decisions and trainer policy exist as pure components, but
-automatic preparation insertion is still backlog work. There is no complete
-campaign-level decision cycle connecting preparation, party choice, battle
-planning, recovery, and progression.
+Preparation decisions and trainer policy exist as pure components, and the
+recursive graph now makes Roxanne preparation a real prerequisite of the gym
+objective. The optional Devon Goods chain is discoverable and executable, but
+it is deliberately not a literal Roxanne gate: Roxanne availability is
+derived from visiting Rustboro while `DEFEATED_RUSTBORO_GYM` is false. There is
+still no complete campaign-level decision cycle connecting preparation, party
+choice, battle planning, recovery, and progression.
 
 ### Observation and state
 
@@ -71,20 +87,63 @@ The repository has normalized snapshots, immutable facts, event detection,
 event persistence, campaign projection, and explicit unknown/unavailable
 semantics. Campaign facts remain narrow and Emerald-specific. Story flags are
 explicitly unavailable in `CampaignState`, and most later-world facts are not
-yet represented.
+yet represented. The intended rule is that campaign goals read the ROM first:
+flags, variables, map gates, scripts, inventory, and party state should supply
+most completion facts. Stateful logging is reserved for information the ROM
+does not preserve or expose as a sufficient historical fact, especially
+encounter ownership, captures, faint history, and whiteouts.
 
-The event store is durable and replay helpers exist, but live startup creates
-a fresh `NuzlockeRuntime` after opening the store without loading the existing
-records into its in-memory projections. Restart/recovery correctness must be
-addressed before persistence can be considered complete.
+The ROM-truth audit found that a metadata-only fresh profile can still receive
+an mGBA placeholder `current_save.sav` (128 KiB of `0xff`). That is an
+emulator backend artifact, not a saved game. `CampaignObservationSnapshot` now
+labels the title/main-menu lifecycle as `FRESH_START`, keeps its raw
+save-block reads unavailable, and allows only the opening setup capability to
+mount. It therefore cannot satisfy `first_badge_obtained` or create/advance
+provenance. `ACTIVE` observations remain the only source for save-backed
+campaign facts.
+
+State ownership is intentionally split: controller/generator/debounce fields
+are transient execution state; event projections are durable Nuzlocke
+encounter/death/history state; and ROM flags/variables are campaign progress.
+`nuzlocke_started` is an alias for the current ROM-observed Pokédex receipt,
+not a second campaign milestone. The synthetic `start_nuzlocke` objective and
+controller handoff are removed. The legacy `NuzlockeStarted` event remains
+replay-compatible for rules/audit metadata, but cannot gate campaign progress
+or replace the ROM fact.
+
+The legacy `EmeraldOpeningMode` and its `OpeningSequenceState` are scripted
+opening code, not the target architecture. They may remain temporarily as a
+compatibility path while fresh-start capabilities are migrated, but no new
+campaign logic should be added to them. The observation-driven path must
+classify the current ROM state and delegate the required work to generic
+dialogue, navigation, interaction, and battle executors.
+
+The event store is durable and replay helpers exist. Live startup now hydrates
+the campaign and rules projections from the existing store, and emulator
+reset rehydrates durable history while starting a new frame/session timeline.
+The runtime keeps durable events in memory until a successful save boundary;
+manual save states, in-game saves, and enabled automatic shutdown save states
+commit them. `--no-save-state` suppresses only the automatic shutdown save, so
+manual saves remain valid while an ordinary no-save-state run leaves the event
+store untouched. Battle encounter eligibility is persisted at the battle-start
+boundary so replay does not infer it from later runtime state. Unit coverage
+verifies startup hydration, legacy activation, deferred writes, save-boundary
+commits, ephemeral-sequence rebasing, and reset history preservation; an
+end-to-end process restart still needs ROM-backed validation.
 
 ### Rules
 
 Implemented baseline rules are one encounter per area, fainting/whiteout, and
-an Emerald Roxanne level-cap gateway. `SPECIES_CLAUSE` is now present as a
-configuration identifier, but its enforcement is not implemented. Missing
-configurable semantics also include shiny clause, healing restrictions, item
-restrictions, and the detailed encounter-source rules required by Gen 3.
+an Emerald Roxanne level-cap gateway. The default encounter activation
+boundary is the ROM-observed Pokédex receipt. The Nuzlocke rules system should
+also support an explicit alternative new-game activation mode, including a
+defined policy for encounters that occur before Poké Balls are obtainable or
+that cannot be caught.
+
+`SPECIES_CLAUSE` is now present as a configuration identifier, but its
+enforcement is not implemented. Missing configurable semantics also include
+shiny clause, healing restrictions, item restrictions, and the detailed
+encounter-source rules required by Gen 3.
 
 ### Navigation
 
@@ -116,20 +175,38 @@ death.
 
 ### P0 — Make the existing Emerald pilot genuinely complete
 
-1. Replay the durable event store into the runtime projections on startup.
-2. Implement observed execution for Devon Goods, Rustboro, and Roxanne.
-3. Replace the execution adapter's disconnected objective-ID whitelist with
-   registry-owned executable capability definitions.
-4. Record the currently validated pilot contract explicitly: fresh startup
-   through Petalburg City. Extend that contract to a verified first badge only
-   after the remaining P0 execution and validation work is complete.
-5. Add an end-to-end Emerald fixture from new game through the first badge.
-6. Ensure unsupported objectives cannot be reported as live-ready work.
+1. **Implemented and unit-tested:** replay the durable event store into the
+   runtime projections on startup and after emulator reset, with persistence
+   deferred to successful save boundaries.
+2. **Implemented and unit-tested; live validation outstanding:** provide
+   observed execution and ROM-backed trigger bindings for the Petalburg Woods,
+   Devon Goods, Rustboro, and Roxanne slice.
+3. **Implemented and unit-tested:** replace the disconnected execution
+   objective-ID whitelist with registry-owned executable capability
+   definitions and ROM-backed trigger identities.
+4. **Partially complete:** record the validated pilot contract through
+   Petalburg City as a test/validation boundary, not as a campaign objective.
+   Extend it to a verified first badge only after live execution and
+   restart/resume validation succeed.
+5. **Outstanding:** add an end-to-end Emerald fixture from new game through
+   the first badge.
+6. **Implemented for the current slice:** unsupported objectives are refused
+   by the execution adapter rather than reported as live-ready work.
+7. **Implemented:** keep uninitialized title/menu save reads unavailable,
+   preserve fresh-start capability execution, remove the synthetic
+   `start_nuzlocke` handoff, and derive the default Nuzlocke boundary from
+   Pokédex receipt. The remaining lifecycle work is the optional alternative
+   new-game activation policy.
 
 Current validation: a fresh Emerald run with no save data reaches Petalburg
-City (user-confirmed). Remaining P0 exit criteria: a fresh run can reach and
-verify the first badge, and a process restart can resume the same run without
-losing encounter/death/history state.
+City (user-confirmed); a raw-state live trace completes the Petalburg
+Norman/Wally gate and mounts the post-Wally frontier. A live first-badge run
+has not yet completed: continuation attempts reach the Rustboro/Route 116
+preparation path but have not produced the authoritative
+`first_badge_obtained` fact. Remaining P0 exit criteria are therefore a
+fresh/fixture-backed run through the first badge and a ROM-backed process
+restart that resumes the same run without losing encounter, death, or history
+state.
 
 ### P1 — Mount autonomous preparation and tactical battle control
 
@@ -410,23 +487,64 @@ Recommended triage order:
 5. Enable behavioral unit CI only when the remaining failures are either fixed
    or explicitly marked as known product gaps with issue-level tracking.
 
-### Current validation (2026-08-29)
+### Current validation (2026-08-30)
 
-Under the configured Python 3.12.13 environment, the current unit tier passes
-with **958 passed, 38 deselected** (`pytest -q -m unit`). The deselected tests
-are the ROM/native-emulator tier. The user has also confirmed a fresh no-save
-live run from startup through Petalburg City. Neither result validates the
-first-badge P0 exit criteria, process-startup event replay, or full-game
-completion.
+Under the configured Python 3.12.13 environment, the full default suite passes
+with **1,088 passed, 38 skipped** (`pytest -q`). The skipped tests are the
+optional ROM/native-emulator tier. The focused campaign/persistence set passes
+**396 passed, 5 skipped**. The repaired ignored `profiles/test_begin_nuzlocke` event log is
+valid: its 18 events are contiguous, its provenance matches the profile, and
+`NuzlockeStarted` occurs at sequence 18. The earlier corruption note is stale.
+
+The user-confirmed fresh no-save live run reaches Petalburg City. A raw-state
+live trace additionally proves gym-gate ownership, `ShowGymToPlayer`, Wally's
+tutorial, and the `ReturnFromWallyTutorial` boundary before the campaign
+mounts `recover_devon_goods`. A disposable replay from
+`test_return_to_lab_after_rival_fight` also completed the Pokémon Center nurse
+flow: the render-boundary rescue used a fresh B pulse, the held B was released
+before the actionable A, the nurse script terminated, and overworld movement
+resumed. The original final-dialogue stall is not reproduced from the current
+checkpoint.
+
+The first-badge exit and ROM-backed process restart/resume remain unverified.
+Current continuation attempts reach the Rustboro/Route 116 preparation path,
+but do not yet produce the authoritative `first_badge_obtained` fact. The
+preparation path now disables further wild navigation after the selected
+area's first encounter resolves and hands off to observed trainer goals; the
+new regression coverage is green. Re-running retained Rustboro checkpoints did
+not produce live evidence because mGBA's `run_frame` remained inside the
+emulator core before the first runtime update returned.
+
+The Route 103 trigger comparison found that the selected path is structurally
+minimal among the observed rival activation positions: `(9, 3)` and `(10, 4)`
+require 11 encounterable grass moves, while `(10, 2)` and `(11, 3)` require 12.
+No pathfinding change is indicated by that comparison. The two opening Growl
+actions are intentional behavior in `EmeraldIntroRivalBattleStrategy` and are
+covered by a focused regression test. A controlled 1x replay in this
+environment reported sound initialization failure and then settled at roughly
+20.6 ms per frame (about 48.5 FPS) from the beginning; the emulator core and
+controller work were each below 1 ms. This identifies the sleep-based
+no-audio limiter as the likely explanation for the apparent 80% speed, rather
+than a Route 103 speed setting. A working audio device or a more precise
+fallback limiter is the appropriate performance follow-up.
 
 ## Immediate next actions
 
-1. Fix runtime event-store replay.
-2. Close the unsupported early-objective execution boundary.
-3. Define and validate first-badge completion.
-4. Add a behavioral unit-test CI job once the current baseline is triaged, so
-   CI measures regressions rather than recording a known-red baseline.
-5. Add a native mGBA/ROM-backed emulator job with private fixture
-   provisioning.
-6. Add first-badge fixture/live validation and a restart/resume scenario.
-7. Begin preparation and campaign battle integration.
+1. Drive the same clean profile through Devon Goods, Rustboro, and Roxanne;
+   assert the authoritative `DEFEATED_RUSTBORO_GYM` flag and
+   `first_badge_obtained` fact.
+2. Re-run the Rustboro/Route 116 preparation boundary with a healthy
+   checkpoint, verify the trainer-only handoff after the first encounter, and
+   complete the bounded preparation/battle loop without sacrificing Nuzlocke
+   ownership or entering an over-cap battle.
+3. Capture that path as an end-to-end fixture, then stop/restart the process
+   and verify encounter/death/history continuity from the durable event store.
+4. Add the behavioral unit-test CI gate and native mGBA/ROM-backed job once
+   the fixture boundary is reproducible.
+5. Begin the broader P1 preparation, party/resource, and tactical battle work
+   after the P0 closeout evidence is recorded.
+6. Add the explicit alternative new-game Nuzlocke activation policy, including
+   the treatment of encounters before Poké Balls are obtainable.
+7. Add an explicit read-only/non-persistent profile mode if fresh-profile
+   validation must guarantee that emulator save artifacts—not only the event
+   store—are not written.

@@ -58,7 +58,7 @@ class CampaignFactsTests(unittest.TestCase):
                 )
             )
         )
-        self.assertFalse(facts.nuzlocke_started.value)
+        self.assertTrue(facts.nuzlocke_started.value)
         self.assertFalse(facts.pokeballs_ready.value)
 
     def test_starter_is_not_complete_during_lab_nickname_sequence(self):
@@ -67,6 +67,61 @@ class CampaignFactsTests(unittest.TestCase):
             variables=(NamedVariable("BIRCH_LAB_STATE", 2),),
         ).campaign_facts
         self.assertFalse(facts.starter_obtained.value)
+
+    def test_intro_rival_completion_accepts_post_scene_hide_flag(self):
+        facts = self.state(
+            flags=(
+                NamedFlag("DEFEATED_RIVAL_ROUTE103", False),
+                NamedFlag("HIDE_ROUTE_103_RIVAL", True),
+            )
+        ).campaign_facts
+
+        self.assertTrue(facts.intro_rival_battle_complete.value)
+
+    def test_selector_advances_to_pokedex_after_rival_is_hidden(self):
+        state = self.state(
+            flags=tuple(
+                NamedFlag(name, value)
+                for name, value in (
+                    ("SET_WALL_CLOCK", True),
+                    ("RESCUED_BIRCH", True),
+                    ("DEFEATED_RIVAL_ROUTE103", False),
+                    ("HIDE_ROUTE_103_RIVAL", True),
+                    ("SYS_POKEMON_GET", True),
+                    ("SYS_POKEDEX_GET", False),
+                    ("RECEIVED_POKEDEX_FROM_BIRCH", False),
+                )
+            ),
+            variables=(
+                NamedVariable("LITTLEROOT_INTRO_STATE", 3),
+                NamedVariable("LITTLEROOT_RIVAL_STATE", 3),
+                NamedVariable("BIRCH_LAB_STATE", 3),
+            ),
+            balls=5,
+        )
+
+        selection = select_campaign_objective(state)
+
+        self.assertEqual(selection.objective.objective_id, "receive_pokedex")
+        self.assertEqual(selection.status, ObjectiveStatus.READY)
+
+    def test_intro_rival_completion_is_unknown_when_hide_signal_is_unavailable(self):
+        facts = self.state(
+            flags=(NamedFlag("DEFEATED_RIVAL_ROUTE103", False),)
+        ).campaign_facts
+
+        self.assertEqual(facts.intro_rival_battle_complete.status, FactStatus.UNKNOWN)
+
+    def test_intro_rival_completion_is_known_false_when_both_flags_are_false(self):
+        facts = self.state(
+            flags=(
+                NamedFlag("DEFEATED_RIVAL_ROUTE103", False),
+                NamedFlag("HIDE_ROUTE_103_RIVAL", False),
+            )
+        ).campaign_facts
+
+        self.assertEqual(facts.intro_rival_battle_complete.status, FactStatus.KNOWN)
+        self.assertFalse(facts.intro_rival_battle_complete.value)
 
     def test_pokedex_completion_accepts_either_authoritative_rom_flag(self):
         for flag_name in ("RECEIVED_POKEDEX_FROM_BIRCH", "SYS_POKEDEX_GET"):
@@ -81,10 +136,122 @@ class CampaignFactsTests(unittest.TestCase):
         self.assertEqual(facts.wall_clock_set.status, FactStatus.UNAVAILABLE)
         self.assertEqual(facts.rival_met.status, FactStatus.UNAVAILABLE)
 
+    def test_new_emerald_story_facts_preserve_unknown_and_unavailable_states(self):
+        names = (
+            "petalburg_wally_scene_complete",
+            "petalburg_woods_scene_complete",
+            "devon_goods_stolen",
+            "devon_goods_reported",
+            "devon_goods_recovered",
+            "devon_goods_returned",
+            "devon_goods_delivered",
+            "rustboro_city_state",
+            "rusturf_tunnel_state",
+            "devon_corp_3f_state",
+            "devon_corp_3f_scene_complete",
+            "roxanne_available",
+        )
+
+        unknown = self.state().campaign_facts
+        unavailable = self.state(available=False).campaign_facts
+        for name in names:
+            self.assertEqual(unknown[name].status, FactStatus.UNKNOWN, name)
+            self.assertEqual(unavailable[name].status, FactStatus.UNAVAILABLE, name)
+
     def test_fresh_initialized_save_observes_clock_as_not_set(self):
         facts = self.state(flags=(NamedFlag("SET_WALL_CLOCK", False),)).campaign_facts
         self.assertEqual(facts.wall_clock_set.status, FactStatus.KNOWN)
         self.assertFalse(facts.wall_clock_set.value)
+
+    def test_woods_scene_and_devon_goods_recovery_are_distinct_rom_facts(self):
+        before = self.state(
+            flags=(NamedFlag("RECOVERED_DEVON_GOODS", False),),
+            variables=(NamedVariable("PETALBURG_WOODS_STATE", 0),),
+        ).campaign_facts
+        after = self.state(
+            flags=(NamedFlag("RECOVERED_DEVON_GOODS", False),),
+            variables=(NamedVariable("PETALBURG_WOODS_STATE", 1),),
+        ).campaign_facts
+
+        self.assertFalse(before.petalburg_woods_scene_complete.value)
+        self.assertTrue(after.petalburg_woods_scene_complete.value)
+        self.assertFalse(after.devon_goods_recovered.value)
+
+    def test_devon_goods_progression_reads_each_authoritative_flag_and_state(self):
+        facts = self.state(
+            flags=tuple(
+                NamedFlag(name, True)
+                for name in (
+                    "DEVON_GOODS_STOLEN",
+                    "INTERACTED_WITH_DEVON_EMPLOYEE_GOODS_STOLEN",
+                    "RECOVERED_DEVON_GOODS",
+                    "RETURNED_DEVON_GOODS",
+                    "DELIVERED_DEVON_GOODS",
+                    "VISITED_RUSTBORO_CITY",
+                )
+            ) + (NamedFlag("DEFEATED_RUSTBORO_GYM", False),),
+            variables=(
+                NamedVariable("RUSTBORO_CITY_STATE", 5),
+                NamedVariable("RUSTURF_TUNNEL_STATE", 2),
+                NamedVariable("DEVON_CORP_3F_STATE", 1),
+            ),
+        ).campaign_facts
+
+        self.assertTrue(facts.devon_goods_stolen.value)
+        self.assertTrue(facts.devon_goods_reported.value)
+        self.assertTrue(facts.devon_goods_recovered.value)
+        self.assertTrue(facts.devon_goods_returned.value)
+        self.assertTrue(facts.devon_goods_delivered.value)
+        self.assertEqual(facts.rustboro_city_state.value, 5)
+        self.assertEqual(facts.rusturf_tunnel_state.value, 2)
+        self.assertEqual(facts.devon_corp_3f_state.value, 1)
+        self.assertTrue(facts.devon_corp_3f_scene_complete.value)
+        self.assertTrue(facts.roxanne_available.value)
+
+    def test_roxanne_availability_requires_rustboro_and_no_badge(self):
+        not_reached = self.state(
+            flags=(
+                NamedFlag("VISITED_RUSTBORO_CITY", False),
+                NamedFlag("DEFEATED_RUSTBORO_GYM", False),
+            )
+        ).campaign_facts
+        already_defeated = self.state(
+            flags=(
+                NamedFlag("VISITED_RUSTBORO_CITY", True),
+                NamedFlag("DEFEATED_RUSTBORO_GYM", True),
+            )
+        ).campaign_facts
+        missing_badge_observation = self.state(
+            flags=(NamedFlag("VISITED_RUSTBORO_CITY", True),)
+        ).campaign_facts
+
+        self.assertFalse(not_reached.roxanne_available.value)
+        self.assertFalse(already_defeated.roxanne_available.value)
+        self.assertEqual(missing_badge_observation.roxanne_available.status, FactStatus.UNKNOWN)
+
+    def test_petalburg_wally_completion_waits_for_gym_return_script(self):
+        returning_to_gym = self.state(
+            variables=(
+                NamedVariable("PETALBURG_CITY_STATE", 3),
+                NamedVariable("PETALBURG_GYM_STATE", 1),
+            )
+        ).campaign_facts
+        completed = self.state(
+            variables=(
+                NamedVariable("PETALBURG_CITY_STATE", 3),
+                NamedVariable("PETALBURG_GYM_STATE", 2),
+            )
+        ).campaign_facts
+
+        self.assertFalse(returning_to_gym.petalburg_wally_scene_complete.value)
+        self.assertTrue(completed.petalburg_wally_scene_complete.value)
+
+    def test_petalburg_wally_completion_is_unknown_without_gym_state(self):
+        facts = self.state(
+            variables=(NamedVariable("PETALBURG_CITY_STATE", 3),)
+        ).campaign_facts
+
+        self.assertEqual(facts.petalburg_wally_scene_complete.status, FactStatus.UNKNOWN)
 
     def test_selector_is_ordered_and_does_not_recurse(self):
         state = self.state(
@@ -106,10 +273,16 @@ class CampaignFactsTests(unittest.TestCase):
                 "complete_intro_rival",
                 "receive_pokedex",
                 "receive_pokeballs",
-                "start_nuzlocke",
                 "reach_petalburg",
-                "recover_devon_goods",
+                "complete_petalburg_wally",
+                "complete_petalburg_woods",
                 "reach_rustboro",
+                "complete_rustboro_goods_stolen",
+                "report_devon_goods",
+                "recover_devon_goods",
+                "return_devon_goods",
+                "meet_mr_stone",
+                "prepare_roxanne",
                 "defeat_roxanne",
             ),
         )

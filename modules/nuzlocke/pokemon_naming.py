@@ -9,6 +9,8 @@ PokemonGender = Literal["male", "female", None]
 
 
 def _human_name(gender: PokemonGender) -> str:
+    """Request one human name from the configured name provider."""
+
     import names
 
     return names.get_first_name() if gender is None else names.get_first_name(gender=gender)

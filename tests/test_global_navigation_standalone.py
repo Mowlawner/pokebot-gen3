@@ -3,7 +3,7 @@
 import unittest
 from unittest.mock import patch
 
-from modules.goals import ReachLocation, SemanticTarget
+from modules.goals import ReachLocation, ReachWarp, SemanticTarget
 from modules.map_path import Direction
 from modules.navigation import (
     GoalAwareNavigator,
@@ -22,6 +22,22 @@ def world(map_id, coords, transitions=(), facing=Direction.South):
 
 
 class GlobalNavigationTests(unittest.TestCase):
+    def test_observed_door_warp_avoids_global_expansion(self):
+        source_map, target_map = (98, 1), (98, 2)
+        warp = WarpObservation((source_map, (2, 0)), (target_map, (0, 0)))
+        observed = world(source_map, [(0, 0), (1, 0), (2, 0)], (warp,), facing=Direction.East)
+
+        with patch("modules.navigation.get_world_map_graph", side_effect=AssertionError("global search is unnecessary")):
+            plan, route = plan_with_world_navigation(
+                observed,
+                (source_map, (0, 0)),
+                ReachWarp(destination_map=target_map, destination=warp.destination, warp=warp),
+            )
+
+        self.assertIsNone(route)
+        self.assertEqual(plan.actions[-1].action_type, NavigationActionType.WARP)
+        self.assertEqual(plan.actions[-1].destination, warp.destination)
+
     def test_debug_trace_keeps_first_goal_termination(self):
         from modules.context import context
 
@@ -100,7 +116,7 @@ class GlobalNavigationTests(unittest.TestCase):
             [(a.source[0], a.destination[0], a.transition_kind) for a in cross_map],
             [(house2f, house1f, "warp"), (house1f, town, "warp"), (town, route101, "map_connection")],
         )
-        self.assertEqual(cross_map[-1].source, (town, (1, 1)))  # approach tile
+        self.assertEqual(cross_map[-1].source, (town, (0, 1)))  # boundary tile after the approach move
         self.assertEqual(transitions[-1].entry, (town, (0, 1)))  # validated source endpoint
         self.assertEqual(cross_map[-1].destination, (route101, (0, 0)))
         self.assertEqual(plan.destination, (route101, (0, 0)))
