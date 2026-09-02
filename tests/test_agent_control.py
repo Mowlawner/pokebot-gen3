@@ -10,6 +10,7 @@ from modules.agent_control import (
     AgentAction,
     AgentActionExecutor,
     AgentActionType,
+    ActionDecision,
     AgentControlLoop,
     AgentObservation,
     GoalEvaluation,
@@ -19,14 +20,16 @@ from modules.agent_control import (
     prewarm_warp_destination,
     select_action,
     observe_agent,
+    notify_battle_ended,
 )
-from modules.goals import GoalConstraints, NavigationGoal, ReachLocation, ReachWarp, SemanticTarget
+from modules.goals import GoalConstraints, NavigationGoal, ReachLocation, ReachWarp, SemanticTarget, TrainerMode
 from modules.interaction_state import InteractionObservation, InteractionPhase
 from modules.map_path import Direction
 from modules.memory import GameState
 from modules.navigation import NavigationAction, NavigationActionType, NavigationPlan, NavigationError
 from modules.overworld import (
     MovementState,
+    ObjectObservation,
     OverworldObservation,
     TileObservation,
     TriggerObservation,
@@ -97,6 +100,42 @@ def observation(
 
 
 class AgentActionSelectionTests(TestCase):
+    def test_forced_trainer_exposure_is_not_dispatched_for_avoidance_goal(self):
+        world = overworld({(0, 0), (1, 0), (2, 0)}, start=(0, 0))
+        goal = NavigationGoal(
+            ReachLocation((MAP, (2, 1))),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+        )
+        forced = NavigationPlan(
+            (
+                NavigationAction(
+                    NavigationActionType.MOVE,
+                    Direction.East,
+                    (MAP, (0, 0)),
+                    (MAP, (1, 0)),
+                ),
+            ),
+            (MAP, (2, 0)),
+            forced_trainer_exposure=True,
+        )
+        with patch("modules.agent_control.plan_with_world_navigation", return_value=(forced, None)):
+            decision = select_action(observation(GameState.OVERWORLD, world=world, goal=goal))
+
+        self.assertEqual(decision.goal_evaluation.status, GoalStatus.UNREACHABLE)
+        self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertIn("trainer-free", decision.action.reason)
+
+    def test_goal_evaluation_does_not_collect_readiness_diagnostics_without_trace(self):
+        world = overworld({(0, 0), (1, 0)}, start=(0, 0))
+        goal = ReachLocation((MAP, (1, 0)))
+        with patch("modules.agent_control.context.debug", True), patch(
+            "modules.agent_control.context.debug_trace", False
+        ), patch("modules.nuzlocke.snapshots.get_nuzlocke_snapshot") as snapshot:
+            result = evaluate_goal(observation(GameState.OVERWORLD, world=world, goal=goal))
+
+        self.assertEqual(result.status, GoalStatus.REACHABLE)
+        snapshot.assert_not_called()
+
     def test_semantic_map_goal_completes_when_already_on_target_map(self):
         world = overworld({(0, 0)}, start=(0, 0))
         goal = NavigationGoal(SemanticTarget.map(MAP))
@@ -520,6 +559,38 @@ class AgentActionSelectionTests(TestCase):
         self.assertEqual(third[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
         emulator.press_button.assert_called_once_with("A")
 
+    def test_render_rescue_can_follow_a_previous_dialogue_input(self):
+        from modules.goals import ActivateTrigger
+
+        world = overworld({(0, 0)}, controllable=False)
+        ready = observation(
+            GameState.OVERWORLD,
+            world=world,
+            goal=ActivateTrigger("scene"),
+            controllable=False,
+            field_message_lifecycle_active=True,
+            field_message_advance_ready=True,
+        )
+        rendering = observation(
+            GameState.OVERWORLD,
+            world=world,
+            goal=ActivateTrigger("scene"),
+            controllable=False,
+            field_message_lifecycle_active=True,
+            field_message_render_rescue_available=True,
+            interaction_phase=InteractionPhase.FIELD_MESSAGE_RENDER_WAIT,
+        )
+        emulator = Mock()
+        observations = iter((ready, rendering))
+        with patch("modules.agent_control.context.emulator", emulator):
+            loop = AgentControlLoop(lambda: next(observations), goal=ActivateTrigger("scene"))
+            first = loop.step()
+            second = loop.step()
+
+        self.assertEqual(first[1].action.action_type, AgentActionType.ADVANCE_DIALOGUE)
+        self.assertEqual(second[1].action.action_type, AgentActionType.ACCELERATE_DIALOGUE_RENDER)
+        self.assertEqual(second[2].result_type, ActionResultType.EXECUTED)
+
     def test_controllable_dialogue_remains_unchanged(self):
         emulator = Mock()
         dialogue = observation(GameState.OVERWORLD, dialogue_waiting=True, controllable=True)
@@ -647,8 +718,11 @@ class AgentActionSelectionTests(TestCase):
         self.assertEqual(result.result_type, ActionResultType.WAITING)
         emulator.press_button.assert_not_called()
 
-    def test_safe_batch_groups_straight_and_turning_moves(self):
-        world = overworld({(x, y) for x, y in ((0, 0), (1, 0), (2, 0), (2, 1))})
+    def test_safe_batch_stops_before_direction_change(self):
+        world = overworld(
+            {(x, y) for x, y in ((0, 0), (1, 0), (2, 0), (2, 1))},
+            facing=Direction.East,
+        )
         loop = AgentControlLoop(lambda: None)
         loop._cached_actions = (
             NavigationAction(NavigationActionType.MOVE, Direction.East, (MAP, (0, 0)), (MAP, (1, 0))),
@@ -656,7 +730,22 @@ class AgentActionSelectionTests(TestCase):
             NavigationAction(NavigationActionType.MOVE, Direction.South, (MAP, (2, 0)), (MAP, (2, 1))),
         )
         batch = loop._safe_movement_batch(observation(GameState.OVERWORLD, world=world))
-        self.assertEqual([action.direction for action in batch], [Direction.East, Direction.East, Direction.South])
+        self.assertEqual([action.direction for action in batch], [Direction.East, Direction.East])
+
+    def test_safe_batch_defers_first_turn_to_normal_movement_path(self):
+        world = overworld(
+            {(0, 0), (1, 0), (2, 0)},
+            facing=Direction.North,
+        )
+        loop = AgentControlLoop(lambda: None)
+        loop._cached_actions = (
+            NavigationAction(NavigationActionType.MOVE, Direction.East, (MAP, (0, 0)), (MAP, (1, 0))),
+            NavigationAction(NavigationActionType.MOVE, Direction.East, (MAP, (1, 0)), (MAP, (2, 0))),
+        )
+
+        batch = loop._safe_movement_batch(observation(GameState.OVERWORLD, world=world))
+
+        self.assertEqual(batch, ())
 
     def test_safe_batch_stops_before_warp_and_at_interaction_checkpoint(self):
         trigger = TriggerObservation(
@@ -664,7 +753,7 @@ class AgentActionSelectionTests(TestCase):
             frozenset({(MAP, (3, 0))}),
             activation_locations=frozenset({(MAP, (2, 0))}),
         )
-        world = overworld({(x, 0) for x in range(5)}, triggers=(trigger,))
+        world = overworld({(x, 0) for x in range(5)}, facing=Direction.East, triggers=(trigger,))
         loop = AgentControlLoop(lambda: None)
         loop._cached_actions = tuple(
             NavigationAction(NavigationActionType.MOVE, Direction.East, (MAP, (x, 0)), (MAP, (x + 1, 0)))
@@ -673,6 +762,34 @@ class AgentActionSelectionTests(TestCase):
         batch = loop._safe_movement_batch(observation(GameState.OVERWORLD, world=world))
         self.assertEqual(len(batch), 2)
         self.assertEqual(batch[-1].destination, (MAP, (2, 0)))
+
+    def test_safe_batch_stops_before_occupied_object_tile(self):
+        world = replace(
+            overworld({(0, 0), (1, 0), (2, 0), (3, 0)}, facing=Direction.East),
+            objects=(
+                ObjectObservation(
+                    local_id=9,
+                    location=(MAP, (2, 0)),
+                    trainer_type="Normal",
+                    trainer_defeated=True,
+                ),
+            ),
+        )
+        loop = AgentControlLoop(lambda: None)
+        loop._cached_actions = tuple(
+            NavigationAction(
+                NavigationActionType.MOVE,
+                Direction.East,
+                (MAP, (x, 0)),
+                (MAP, (x + 1, 0)),
+            )
+            for x in range(3)
+        )
+
+        batch = loop._safe_movement_batch(observation(GameState.OVERWORLD, world=world))
+
+        self.assertEqual(len(batch), 1)
+        self.assertEqual(batch[0].destination, (MAP, (1, 0)))
 
     def test_batch_interrupts_on_non_overworld_state(self):
         from modules.agent_control import _MovementBatch
@@ -700,6 +817,9 @@ class AgentActionSelectionTests(TestCase):
                 ),
             )
         )
+        # These tests use a lightweight emulator double.  The live-object
+        # reader is exercised explicitly by the collision regression below.
+        loop._live_object_coordinates = lambda map_id: frozenset()
         avatar = SimpleNamespace(
             map_group_and_number=MAP,
             local_coordinates=coordinates,
@@ -744,6 +864,7 @@ class AgentActionSelectionTests(TestCase):
             local_coordinates=(0, 0),
             facing_direction="Right",
         )
+        loop._live_object_coordinates = lambda map_id: frozenset()
         emulator = Mock()
         with patch("modules.agent_control.context.emulator", emulator), patch(
             "modules.agent_control.get_game_state", return_value=GameState.OVERWORLD
@@ -754,6 +875,59 @@ class AgentActionSelectionTests(TestCase):
 
         self.assertEqual(emulator.hold_button.call_args_list, [call("Right"), call("B")])
         emulator.press_direction.assert_not_called()
+
+    def test_batch_rechecks_live_object_before_dispatch(self):
+        """A newly occupied route tile must cancel the fast path first."""
+
+        loop, avatar = self._movement_batch_loop()
+        del loop._live_object_coordinates
+        object_event = SimpleNamespace(
+            map_group_and_number=MAP,
+            current_coords=(1, 0),
+            flags=("active",),
+        )
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator), patch(
+            "modules.agent_control.get_game_state", return_value=GameState.OVERWORLD
+        ), patch("modules.agent_control.is_field_message_waiting_for_input", return_value=False), patch(
+            "modules.agent_control.get_player_avatar", return_value=avatar
+        ), patch(
+            "modules.agent_control.get_map_objects", return_value=(object_event,)
+        ), patch(
+            "modules.agent_control.state_cache.invalidate_runtime_observations"
+        ) as invalidate:
+            self.assertFalse(loop._advance_movement_batch())
+
+        invalidate.assert_called_once_with()
+        self.assertIsNone(loop._movement_batch)
+        emulator.hold_button.assert_not_called()
+        emulator.press_direction.assert_not_called()
+        emulator.reset_held_buttons.assert_called_once_with()
+
+    def test_live_object_coordinates_reads_only_current_same_map_non_player_objects(self):
+        current_map = MAP
+        objects = (
+            SimpleNamespace(
+                map_group_and_number=current_map,
+                current_coords=(1, 0),
+                flags=("active",),
+            ),
+            SimpleNamespace(
+                map_group_and_number=current_map,
+                current_coords=(2, 0),
+                flags=("active", "isPlayer"),
+            ),
+            SimpleNamespace(
+                map_group_and_number=("other", 0),
+                current_coords=(3, 0),
+                flags=("active",),
+            ),
+        )
+
+        with patch("modules.agent_control.get_map_objects", return_value=objects):
+            occupied = AgentControlLoop._live_object_coordinates(current_map)
+
+        self.assertEqual(occupied, frozenset({(1, 0)}))
 
     def test_fast_path_turns_without_debug_diagnostics(self):
         loop, avatar = self._movement_batch_loop()
@@ -1018,6 +1192,134 @@ class AgentActionSelectionTests(TestCase):
 
 
 class AgentExecutionTests(TestCase):
+    def test_battle_return_discards_suspended_movement_route(self):
+        from modules.agent_control import _MovementBatch
+
+        goal = ReachLocation((MAP, (2, 0)))
+        action = NavigationAction(
+            NavigationActionType.MOVE,
+            Direction.East,
+            (MAP, (0, 0)),
+            (MAP, (1, 0)),
+        )
+        world = overworld({(0, 0), (1, 0), (2, 0)}, start=(0, 0), facing=Direction.East)
+        loop = AgentControlLoop(lambda: observation(GameState.OVERWORLD, world=world, goal=goal), goal=goal)
+        loop._cached_goal = goal
+        loop._cached_evaluation = GoalEvaluation(
+            GoalStatus.REACHABLE,
+            plan=NavigationPlan((action,), action.destination),
+        )
+        loop._cached_actions = (action,)
+        loop._cached_world_signature = loop._world_signature(observation(GameState.OVERWORLD, world=world, goal=goal))
+        loop._movement_batch = _MovementBatch((action,))
+        emulator = Mock()
+
+        with patch("modules.agent_control.context.emulator", emulator):
+            notify_battle_ended()
+            self.assertFalse(loop._advance_movement_batch())
+
+        self.assertIsNone(loop._movement_batch)
+        self.assertIsNone(loop._cached_evaluation)
+        emulator.hold_button.assert_not_called()
+        self.assertEqual(emulator.reset_held_buttons.call_count, 2)
+
+    def test_battle_end_releases_input_before_a_new_recovery_loop_is_mounted(self):
+        emulator = Mock()
+
+        with patch("modules.agent_control.context.emulator", emulator):
+            notify_battle_ended()
+
+        emulator.reset_held_buttons.assert_called_once_with()
+
+    def test_battle_return_replans_before_input_into_defeated_trainer(self):
+        """A post-battle trainer tile must be rejected before the next input."""
+
+        goal = ReachLocation((MAP, (2, 0)))
+        world = replace(
+            overworld(
+                {(0, 1), (1, 1), (2, 1), (1, 0), (2, 0)},
+                start=(1, 1),
+                facing=Direction.North,
+            ),
+            # Exercise the runtime object source directly. This mirrors the
+            # battle-return state where the defeated trainer remains visible
+            # on the tile immediately north of the player.
+            objects=(
+                ObjectObservation(
+                    local_id=9,
+                    location=(MAP, (1, 0)),
+                    trainer_type="Normal",
+                    trainer_defeated=True,
+                ),
+            ),
+        )
+        stale_route = NavigationPlan(
+            (
+                NavigationAction(
+                    NavigationActionType.MOVE,
+                    Direction.North,
+                    (MAP, (1, 1)),
+                    (MAP, (1, 0)),
+                ),
+            ),
+            (MAP, (2, 0)),
+        )
+        emulator = Mock()
+        loop = AgentControlLoop(
+            lambda: observation(GameState.OVERWORLD, world=world, goal=goal),
+            goal=goal,
+            navigation_plan=stale_route,
+        )
+
+        with patch("modules.agent_control.context.emulator", emulator):
+            notify_battle_ended()
+            _, decision, result = loop.step()
+
+        self.assertEqual(result.result_type, ActionResultType.EXECUTED)
+        self.assertEqual(decision.action.direction, Direction.East)
+        self.assertEqual(emulator.press_direction.call_args_list, [call("Right", run=False, fresh=False)])
+        self.assertNotIn(call("Up", run=False, fresh=False), emulator.press_direction.call_args_list)
+
+    def test_battle_return_stale_moving_state_is_bounded_before_replanning(self):
+        """A frozen post-battle movement flag must not suppress recovery."""
+
+        goal = ReachLocation((MAP, (2, 1)))
+        world = replace(
+            overworld(
+                {(0, 1), (1, 1), (2, 1), (1, 0)},
+                start=(1, 1),
+                facing=Direction.North,
+                movement_state=MovementState.MOVING,
+            ),
+            objects=(
+                ObjectObservation(
+                    local_id=9,
+                    location=(MAP, (1, 0)),
+                    trainer_type="Normal",
+                    trainer_defeated=True,
+                ),
+            ),
+        )
+        emulator = Mock()
+
+        with patch("modules.agent_control.context.emulator", emulator):
+            emulator.get_frame_count.return_value = 100
+            notify_battle_ended()
+            # Recovery constructs its loop after the battle notification, so
+            # generation-edge detection alone cannot identify this boundary.
+            loop = AgentControlLoop(
+                lambda: observation(GameState.OVERWORLD, world=world, goal=goal),
+                goal=goal,
+                use_movement_batch=False,
+            )
+            results = [loop.step() for _ in range(loop._post_battle_stale_movement_limit)]
+
+        self.assertTrue(all(result[1].action.action_type is AgentActionType.WAIT_REOBSERVE for result in results[:-1]))
+        self.assertEqual(results[-1][1].action.action_type, AgentActionType.NAVIGATE_TOWARD_GOAL)
+        self.assertEqual(results[-1][1].action.direction, Direction.East)
+        self.assertEqual(results[-1][2].result_type, ActionResultType.EXECUTED)
+        self.assertEqual(emulator.press_direction.call_args_list, [call("Right", run=False, fresh=False)])
+
     def test_post_warp_settling_defers_goal_evaluation_until_controllable(self):
         source_map = (0, 0)
         target_map = (0, 1)
@@ -1190,6 +1492,229 @@ class AgentExecutionTests(TestCase):
         self.assertEqual(second[1].action.direction, Direction.East)
         self.assertEqual(evaluate.call_count, 1)
 
+    def test_supplied_route_is_replanned_when_live_destination_is_occupied(self):
+        goal = ReachLocation((MAP, (2, 0)))
+        world = replace(
+            overworld(
+                {(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)},
+                start=(0, 0),
+            ),
+            dynamic_blocked_coordinates=frozenset({(1, 0)}),
+        )
+        stale_route = NavigationPlan(
+            (
+                NavigationAction(
+                    NavigationActionType.MOVE,
+                    Direction.East,
+                    (MAP, (0, 0)),
+                    (MAP, (1, 0)),
+                ),
+            ),
+            (MAP, (2, 0)),
+        )
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator):
+            loop = AgentControlLoop(
+                lambda: observation(GameState.OVERWORLD, world=world, goal=goal),
+                goal=goal,
+                navigation_plan=stale_route,
+            )
+            _, decision, result = loop.step()
+
+        self.assertEqual(result.result_type, ActionResultType.EXECUTED)
+        self.assertEqual(decision.action.direction, Direction.South)
+        self.assertEqual(emulator.press_direction.call_args_list, [call("Down", run=False, fresh=False)])
+        self.assertIsNone(loop._initial_navigation_plan)
+        self.assertIsNotNone(loop._cached_evaluation)
+
+    def test_supplied_avoidance_route_is_replanned_when_it_crosses_trainer_hazard(self):
+        goal = NavigationGoal(
+            ReachLocation((MAP, (2, 0))),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+        )
+        trainer = TriggerObservation(
+            "trainer:route",
+            frozenset({(MAP, (1, 0))}),
+            hazard_locations=frozenset({(MAP, (1, 0))}),
+            hazard_kind="trainer",
+        )
+        world = overworld(
+            {(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)},
+            start=(0, 0),
+            triggers=(trainer,),
+        )
+        stale_route = NavigationPlan(
+            (
+                NavigationAction(
+                    NavigationActionType.MOVE,
+                    Direction.East,
+                    (MAP, (0, 0)),
+                    (MAP, (1, 0)),
+                ),
+            ),
+            (MAP, (2, 0)),
+        )
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator):
+            loop = AgentControlLoop(
+                lambda: observation(GameState.OVERWORLD, world=world, goal=goal),
+                goal=goal,
+                navigation_plan=stale_route,
+            )
+            _, decision, result = loop.step()
+
+        self.assertEqual(result.result_type, ActionResultType.EXECUTED)
+        self.assertEqual(decision.action.direction, Direction.South)
+        self.assertIsNone(loop._initial_navigation_plan)
+        self.assertNotIn(call("Right", run=False, fresh=False), emulator.press_direction.call_args_list)
+
+    def test_cached_route_is_replanned_when_trainer_approach_appears(self):
+        goal = NavigationGoal(
+            ReachLocation((MAP, (2, 0))),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+        )
+        clear = overworld(
+            {(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)},
+            start=(0, 0),
+        )
+        trainer = TriggerObservation(
+            "trainer:approach",
+            locations=frozenset({(MAP, (1, 1))}),
+            activation_locations=frozenset({(MAP, (1, 0))}),
+            hazard_kind="trainer",
+        )
+        trainer_visible = replace(clear, triggers=(trainer,), movement_state=MovementState.STANDING)
+        observations = iter(
+            (
+                observation(GameState.OVERWORLD, world=clear, goal=goal),
+                observation(GameState.OVERWORLD, world=trainer_visible, goal=goal),
+            )
+        )
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator):
+            loop = AgentControlLoop(
+                lambda: next(observations),
+                goal=goal,
+                use_movement_batch=False,
+            )
+            first = loop.step()
+            second = loop.step()
+
+        self.assertEqual(first[1].action.direction, Direction.East)
+        self.assertEqual(second[1].action.direction, Direction.South)
+        self.assertEqual(
+            emulator.press_direction.call_args_list,
+            [call("Right", run=False, fresh=False), call("Down", run=False, fresh=False)],
+        )
+
+    def test_runtime_object_blocks_route_even_without_normalized_occupancy(self):
+        goal = ReachLocation((MAP, (2, 0)))
+        world = replace(
+            overworld(
+                {(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)},
+                start=(0, 0),
+            ),
+            objects=(
+                ObjectObservation(
+                    local_id=9,
+                    location=(MAP, (1, 0)),
+                    trainer_type="Normal",
+                    trainer_defeated=True,
+                ),
+            ),
+        )
+        stale_route = NavigationPlan(
+            (
+                NavigationAction(
+                    NavigationActionType.MOVE,
+                    Direction.East,
+                    (MAP, (0, 0)),
+                    (MAP, (1, 0)),
+                ),
+            ),
+            (MAP, (2, 0)),
+        )
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator):
+            loop = AgentControlLoop(
+                lambda: observation(GameState.OVERWORLD, world=world, goal=goal),
+                goal=goal,
+                navigation_plan=stale_route,
+            )
+            _, decision, result = loop.step()
+
+        self.assertEqual(result.result_type, ActionResultType.EXECUTED)
+        self.assertEqual(decision.action.direction, Direction.South)
+        self.assertEqual(emulator.press_direction.call_args_list, [call("Down", run=False, fresh=False)])
+
+    def test_selected_blocked_route_action_is_not_sent_to_emulator(self):
+        goal = ReachLocation((MAP, (2, 0)))
+        world = replace(
+            overworld({(0, 0), (1, 0), (2, 0)}, start=(0, 0)),
+            dynamic_blocked_coordinates=frozenset({(1, 0)}),
+        )
+        blocked_action = NavigationAction(
+            NavigationActionType.MOVE,
+            Direction.East,
+            (MAP, (0, 0)),
+            (MAP, (1, 0)),
+        )
+        selected = ActionDecision(
+            AgentAction(
+                AgentActionType.NAVIGATE_TOWARD_GOAL,
+                direction=Direction.East,
+                navigation=blocked_action,
+            ),
+            GoalEvaluation(GoalStatus.REACHABLE, NavigationPlan((blocked_action,), (MAP, (2, 0)))),
+        )
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator), patch(
+            "modules.agent_control.select_action", return_value=selected
+        ):
+            loop = AgentControlLoop(lambda: observation(GameState.OVERWORLD, world=world, goal=goal), goal=goal)
+            _, decision, result = loop.step()
+
+        self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(result.result_type, ActionResultType.WAITING)
+        emulator.press_direction.assert_not_called()
+
+    def test_failed_move_remembers_unreported_blocker_before_replanning(self):
+        """Do not retry an unseen occupied tile forever after a failed step."""
+
+        goal = ReachLocation((MAP, (2, 0)))
+        world = overworld(
+            {(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)},
+            start=(0, 0),
+            facing=Direction.East,
+            movement_state=MovementState.STANDING,
+        )
+        observations = iter(
+            (
+                observation(GameState.OVERWORLD, world=world, goal=goal),
+                observation(GameState.OVERWORLD, world=world, goal=goal),
+                observation(GameState.OVERWORLD, world=world, goal=goal),
+            )
+        )
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator):
+            loop = AgentControlLoop(
+                lambda: next(observations),
+                goal=goal,
+                use_movement_batch=False,
+            )
+            first = loop.step()
+            second = loop.step()
+            third = loop.step()
+
+        self.assertEqual(first[1].action.direction, Direction.East)
+        self.assertEqual(second[1].action.direction, Direction.East)
+        self.assertEqual(third[1].action.direction, Direction.South, (third, loop._locally_blocked_destinations))
+        self.assertIn((MAP, (1, 0)), loop._locally_blocked_destinations)
+        self.assertEqual(
+            [call_args.args[0] for call_args in emulator.press_direction.call_args_list],
+            ["Right", "Right", "Down"],
+        )
+
     def test_control_loop_waits_for_move_destination_before_advancing_cached_plan(self):
         observations = iter(
             (
@@ -1227,6 +1752,68 @@ class AgentExecutionTests(TestCase):
         self.assertEqual(arrived[1].action.navigation.source, (MAP, (1, 0)))
         self.assertEqual(emulator.press_direction.call_args_list, [call("Right", run=False, fresh=False)] * 2)
         self.assertFalse(any("plan divergence" in message for message in messages))
+
+    def test_control_loop_waits_when_destination_coordinate_is_still_moving(self):
+        goal = ReachLocation((MAP, (2, 0)))
+        world = overworld(
+            {(0, 0), (1, 0), (2, 0)},
+            start=(0, 0),
+            facing=Direction.East,
+            movement_state=MovementState.STANDING,
+        )
+        moving_at_destination = overworld(
+            {(0, 0), (1, 0), (2, 0)},
+            start=(1, 0),
+            facing=Direction.East,
+            movement_state=MovementState.MOVING,
+        )
+        standing_at_destination = overworld(
+            {(0, 0), (1, 0), (2, 0)},
+            start=(1, 0),
+            facing=Direction.East,
+            movement_state=MovementState.STANDING,
+        )
+        observations = iter(
+            (
+                observation(GameState.OVERWORLD, world=world, goal=goal),
+                observation(GameState.OVERWORLD, world=moving_at_destination, goal=goal),
+                observation(GameState.OVERWORLD, world=standing_at_destination, goal=goal),
+            )
+        )
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator):
+            loop = AgentControlLoop(lambda: next(observations), use_movement_batch=False)
+            first = loop.step()
+            settling = loop.step()
+            resumed = loop.step()
+
+        self.assertEqual(first[1].action.navigation.destination, (MAP, (1, 0)))
+        self.assertEqual(settling[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(settling[2].result_type, ActionResultType.WAITING)
+        self.assertEqual(resumed[1].action.navigation.destination, (MAP, (2, 0)))
+        self.assertEqual(emulator.press_direction.call_args_list, [call("Right", run=False, fresh=False)] * 2)
+
+    def test_control_loop_waits_before_selecting_navigation_while_avatar_is_moving(self):
+        goal = ReachLocation((MAP, (2, 0)))
+        moving_world = overworld(
+            {(0, 0), (1, 0), (2, 0)},
+            start=(1, 0),
+            facing=Direction.East,
+            movement_state=MovementState.MOVING,
+        )
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator):
+            loop = AgentControlLoop(
+                lambda: observation(GameState.OVERWORLD, world=moving_world, goal=goal),
+                goal=goal,
+                use_movement_batch=False,
+            )
+            _, decision, result = loop.step()
+
+        self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(decision.action.reason, "waiting for avatar movement to settle")
+        self.assertEqual(result.result_type, ActionResultType.WAITING)
+        emulator.press_direction.assert_not_called()
 
     def test_cached_warp_survives_dynamic_world_change_and_waits_for_destination(self):
         source_map = (0, 0)

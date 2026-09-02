@@ -79,7 +79,14 @@ _field_message_render_rescue_pulses = 0
 # input off prematurely.
 
 _FIELD_MESSAGE_TRANSITION_NATIVES = frozenset({"IsFieldMessageBoxHidden"})
-_FIELD_MESSAGE_RENDER_RESCUE_SCRIPTS = frozenset({"EventScript_PkmnCenterNurse_ReturnPkmn"})
+_FIELD_MESSAGE_RENDER_RESCUE_SCRIPTS = frozenset(
+    {
+        "EventScript_PkmnCenterNurse_ReturnPkmn",
+        # This automatic post-Pokédex scene can enter the same Emerald
+        # message-render native while the avatar is not controllable.
+        "LittlerootTown_EventScript_GiveRunningShoesTrigger",
+    }
+)
 _FIELD_MESSAGE_RENDER_RESCUE_SCRIPT_PREFIX = "EventScript_PkmnCenterNurse_"
 _POKEMON_CENTER_NURSE_SCRIPT_SUFFIX = "_PokemonCenter_1F_EventScript_Nurse"
 _FIELD_MESSAGE_RENDER_RESCUE_WRAPPER = "Std_MsgboxYesNo"
@@ -108,11 +115,22 @@ def _field_message_render_rescue_applies(script_context: Any) -> bool:
         )
     ):
         return True
+    if script_name == "Std_MsgboxDefault":
+        # GiveRunningShoes uses the ordinary message helper rather than the
+        # Yes/No wrapper.  The stack marker is required here because
+        # Std_MsgboxDefault is used by many unrelated field messages.
+        try:
+            stack = getattr(script_context, "stack", ())
+            return any(isinstance(marker, str) and "GiveRunningShoesTrigger" in marker for marker in stack)
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            return False
     if script_name != _FIELD_MESSAGE_RENDER_RESCUE_WRAPPER:
         return False
     try:
         stack = getattr(script_context, "stack", ())
-        return any(marker in stack for marker in _POKEMON_CENTER_NURSE_STACK_MARKERS)
+        return any(marker in stack for marker in _POKEMON_CENTER_NURSE_STACK_MARKERS) or any(
+            isinstance(marker, str) and "GiveRunningShoesTrigger" in marker for marker in stack
+        )
     except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
         return False
 

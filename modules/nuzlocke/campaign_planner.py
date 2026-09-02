@@ -66,17 +66,21 @@ class CampaignPlan:
         )
 
 
-def _candidate_location(candidate: Any) -> tuple[Any, tuple[int, int]] | None:
+def _candidate_location(candidate: Any, fallback=None) -> tuple[Any, tuple[int, int]] | None:
     """Extract a concrete outdoor destination from a route candidate."""
 
     destination = getattr(candidate, "destination", None)
     target = getattr(destination, "target", destination)
     location = getattr(target, "location", None)
-    if not isinstance(location, tuple) or len(location) != 2:
-        return None
-    if not isinstance(location[1], tuple) or len(location[1]) != 2:
-        return None
-    return location
+    if isinstance(location, tuple) and len(location) == 2 and isinstance(location[1], tuple) and len(location[1]) == 2:
+        return location
+    # ROM healing goals intentionally target the source interior map, while
+    # RecoveryStop retains the catalog's outdoor destination for status and
+    # execution.  The readiness observation is the authority for that paired
+    # representation; do not guess a door coordinate from the interior map.
+    if isinstance(fallback, tuple) and len(fallback) == 2 and isinstance(fallback[1], tuple) and len(fallback[1]) == 2:
+        return fallback
+    return None
 
 
 def build_campaign_plan(
@@ -122,6 +126,7 @@ def build_campaign_plan(
     critical = getattr(reason, "value", "") in {
         ReadinessReason.CRITICAL_PARTY_HP.value,
         ReadinessReason.NO_USABLE_POKEMON.value,
+        ReadinessReason.FAINTED_PARTY_MEMBER.value,
     }
     candidates = tuple(
         candidate
@@ -192,7 +197,10 @@ def build_campaign_plan(
         )
     else:
         selected = min(candidates, key=lambda candidate: (candidate.detour, candidate.total_cost))
-    location = _candidate_location(selected)
+    location = _candidate_location(
+        selected,
+        getattr(getattr(readiness, "recovery", None), "center_location", None),
+    )
     if location is None:
         return base
     return CampaignPlan(

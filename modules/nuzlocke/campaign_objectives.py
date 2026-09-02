@@ -14,18 +14,29 @@ from typing import Callable
 from modules.goals import (
     EncounterMode,
     Goal,
+    GoalConstraints,
     NavigationGoal,
     ReachLocation,
     ReachWarp,
+    SemanticTarget,
     early_pokeball_goal,
     introductory_rival_goal,
 )
 from modules.map_data import MapRSE
+from modules.console import diagnostic_print
+from modules.context import context
 
 from .campaign_state import CampaignState, Fact, FactStatus, RunStatus
 from .resource_policy import EncounterPolicy, ReadinessImportance, ResourceObjective
 from modules.world_navigation import WorldMapGraph, WorldNavigationError, get_world_map_graph
-from .encounter_catalog import EncounterOpportunity, encounter_opportunities
+from .encounter_catalog import (
+    EncounterOpportunity,
+    campaign_encounter_methods,
+    encounter_candidates_for_location,
+    encounter_opportunities,
+)
+from .capture_policy import CapturePolicyContext, EncounterCandidate, EncounterMethod, score_encounter
+from .trainer_policy import TrainerPolicyInput, choose_trainer_mode
 from .emerald_campaign_registry import emerald_bosses, evaluate_emerald_fact
 from .snapshots import CampaignObservationLifecycle
 
@@ -178,6 +189,10 @@ class CampaignObjective:
     observed: bool | None = None
     reachable: bool | None = None
     encounter_evaluation: EncounterEvaluation | None = None
+    # The objective is location-level until strategic selection resolves a
+    # concrete ROM encounter method.  Keeping the method here lets execution
+    # validate that policy and tactical behavior agree.
+    encounter_method: EncounterMethod | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -577,12 +592,30 @@ def encounter_task(
         if not state.raw_map.is_known or not state.encounters.is_known:
             return Fact(None, state.raw_map.status if not state.raw_map.is_known else state.encounters.status)
         encounter = state.encounter_for(location)
-        return Fact.known(encounter.value.status == "none" and encounter.value.eligible)
+        if encounter.value.status != "none" or not encounter.value.eligible:
+            return Fact.known(False)
+        return Fact.known(_has_current_campaign_encounter(state, location))
 
     return CampaignObjective(
         task_id,
         f"Obtain the first encounter at {location}",
-        (CampaignPredicate(f"encounter_accessible:{location}", "location is accessible and unconsumed", accessible),),
+        (
+            # Encounter legality begins at Pokédex receipt.  Before that ROM
+            # boundary, an observed or catalogued grass table must not become
+            # an executable campaign task.
+            campaign_fact("pokedex_received"),
+            # A legal encounter is not executable until the campaign has
+            # actually acquired Poké Balls.  Keeping this prerequisite
+            # explicit prevents an optional encounter from outranking the
+            # Poké Ball capability and mounting a capture route with no way
+            # to complete it.
+            campaign_fact("pokeballs_ready"),
+            CampaignPredicate(
+                f"encounter_accessible:{location}",
+                "location is accessible and unconsumed",
+                accessible,
+            ),
+        ),
         CampaignPredicate(
             f"encounter_complete:{location}",
             "encounter is consumed",
@@ -597,9 +630,38 @@ def encounter_task(
         destination=location,
         # Encounter acquisition is a reusable tactical navigation request;
         # the selector decides whether this optional task is worth mounting.
-        tactical_target=NavigationGoal(ReachLocation(location), encounter_mode=EncounterMode.SEEK),
+        tactical_target=NavigationGoal(
+            SemanticTarget.map(location),
+            constraints=GoalConstraints(trainer_mode=choose_trainer_mode(TrainerPolicyInput(seeking_encounter=True))),
+            encounter_mode=EncounterMode.SEEK,
+        ),
         observed=observed,
     )
+
+
+def _current_campaign_encounter_candidates(
+    state: CampaignState, location: tuple[int, int]
+) -> tuple[EncounterCandidate, ...]:
+    """Return encounter candidates usable by the current campaign runtime."""
+
+    return encounter_candidates_for_location(
+        location,
+        available_methods=campaign_encounter_methods(state),
+    )
+
+
+def _has_current_campaign_encounter(state: CampaignState, location: tuple[int, int]) -> bool:
+    """Return whether a location has a table the campaign can execute now."""
+
+    try:
+        return bool(_current_campaign_encounter_candidates(state, location))
+    except AttributeError:
+        # Lightweight pure fixtures may intentionally omit a ROM.  In that
+        # boundary an observed encounter record remains authoritative; a live
+        # campaign always has a ROM before this path is mounted.
+        return getattr(context, "rom", None) is None
+    except (RuntimeError, TypeError, ValueError):
+        return False
 
 
 def measure_route_context(
@@ -731,6 +793,53 @@ def progression_destination(
     return None, "multiple available required destinations"
 
 
+def _frontier_encounter_opportunities(
+    state: CampaignState,
+    opportunities: tuple[EncounterOpportunity, ...],
+    progression: tuple[int, int] | None,
+    *,
+    graph: WorldMapGraph | None = None,
+) -> tuple[EncounterOpportunity, ...]:
+    """Keep only encounter maps worth considering for the current frontier.
+
+    The ROM catalog contains every encounter map in the game.  The campaign
+    selector only needs opportunities that are on the current static route or
+    within the same small-detour threshold used by encounter evaluation.
+    Static forward and reverse distance tables make this one bounded graph
+    pass instead of running a fresh shortest-path search for every catalog
+    entry. Observed pending locations are still supplied separately by the
+    caller, so this filter cannot discard a rule projection that has already
+    become relevant.
+    """
+
+    if not opportunities or progression is None or not state.raw_map.is_known:
+        return opportunities
+    try:
+        route_graph = graph or get_world_map_graph()
+        forward = dict(route_graph.map_costs(state.raw_map.value))
+        reverse = dict(route_graph.map_costs_to(progression))
+        direct = forward.get(progression)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        # A static graph is an avenue to try, not an authority that may
+        # convert a live campaign into a terminal failure. The normal route
+        # evaluator will report an unavailable relationship if no graph can
+        # be constructed, while this live frontier remains bounded.
+        return ()
+    if direct is None:
+        return ()
+    policy = EncounterEvaluationPolicy()
+    detour_limit = max(policy.small_detour_cost, direct * policy.small_detour_ratio)
+    return tuple(
+        opportunity
+        for opportunity in opportunities
+        if (
+            (to_encounter := forward.get(opportunity.location)) is not None
+            and (encounter_to_progression := reverse.get(opportunity.location)) is not None
+            and max(0, to_encounter + encounter_to_progression - direct) <= detour_limit
+        )
+    )
+
+
 def available_campaign_tasks(
     state: CampaignState,
     tasks: tuple[CampaignObjective, ...] | None = None,
@@ -738,6 +847,31 @@ def available_campaign_tasks(
 ) -> tuple[CampaignObjective, ...]:
     """Enumerate ready tasks; unavailable/unknown tasks are omitted."""
     candidates = initial_emerald_campaign() if tasks is None else tasks
+    encounter_catalog_error = None
+    opportunity_count = 0
+    catalog_count = 0
+    opportunities = ()
+    route_graph = None
+
+    def task_is_available(task: CampaignObjective) -> bool:
+        """Return whether one task is complete, safe, and executable now."""
+
+        completion = task.completion.evaluate(state)
+        if completion.status is not FactStatus.KNOWN or completion.value:
+            return False
+        if task.failure is not None:
+            failure = task.failure.evaluate(state)
+            if failure.status is not FactStatus.KNOWN or failure.value:
+                return False
+        results = tuple(prerequisite.evaluate(state) for prerequisite in task.prerequisites)
+        return all(result.status is FactStatus.KNOWN and result.value for result in results)
+
+    catalog_allowed = (
+        tasks is None
+        and state.encounters.is_known
+        and state.campaign_facts.pokedex_received.is_known
+        and state.campaign_facts.pokedex_received.value is True
+    )
     if tasks is None and state.encounters.is_known:
         # The rules projection is deliberately the source of truth here.  It
         # knows only locations it has observed, so discovery must not invent
@@ -747,10 +881,27 @@ def available_campaign_tasks(
             for encounter in state.encounters.value or ()
             if encounter.eligible and encounter.status == "none"
         )
+    base_available = tuple(task for task in candidates if task_is_available(task))
+    progression, _ = progression_destination(base_available)
+    catalog_attempted = tasks is None and state.encounters.is_known
+    if catalog_attempted:
         try:
-            opportunities = encounter_opportunities(state, encounter_locations)
-        except (AttributeError, NameError, RuntimeError, TypeError, ValueError):
+            catalog_opportunities = encounter_opportunities(state, encounter_locations)
+            catalog_count = len(catalog_opportunities)
+            if catalog_allowed and encounter_locations is None:
+                route_graph = get_world_map_graph()
+                opportunities = _frontier_encounter_opportunities(
+                    state,
+                    catalog_opportunities,
+                    progression,
+                    graph=route_graph,
+                )
+            else:
+                opportunities = catalog_opportunities
+        except (AttributeError, NameError, RuntimeError, TypeError, ValueError) as error:
             opportunities = ()
+            encounter_catalog_error = f"{type(error).__name__}: {error}"
+        opportunity_count = len(opportunities)
         candidates += tuple(
             encounter_task(item.location, observed=item.observed)
             for item in opportunities
@@ -759,22 +910,35 @@ def available_campaign_tasks(
         # De-duplicate observed locations when the compatibility fallback
         # above and the world catalog describe the same task.
         candidates = tuple({task.objective_id: task for task in candidates}.values())
+    elif tasks is None:
+        # An unavailable encounter projection is not safe to use for task
+        # discovery, even if the campaign facts are otherwise complete.
+        catalog_count = 0
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_ENCOUNTER_DISCOVERY: "
+            f"encounters_status={state.encounters.status.value!r} "
+            f"encounters_known={state.encounters.is_known!r} "
+            f"catalog_attempted={catalog_attempted!r} "
+            f"catalog_allowed={catalog_allowed!r} "
+            f"catalog_count={catalog_count!r} "
+            f"opportunity_count={opportunity_count!r} "
+            f"catalog_error={encounter_catalog_error!r} "
+            f"campaign_methods={tuple(sorted(method.value for method in campaign_encounter_methods(state)))!r} "
+            f"early_locations={tuple(item.location for item in opportunities if item.location in {(0, 16), (0, 17), (0, 18), (0, 19)})!r}"
+        ),
+        trace=True,
+    )
     available: list[CampaignObjective] = []
     for task in candidates:
-        completion = task.completion.evaluate(state)
-        if completion.status is not FactStatus.KNOWN or completion.value:
-            continue
-        if task.failure is not None:
-            failure = task.failure.evaluate(state)
-            if failure.status is not FactStatus.KNOWN or failure.value:
-                continue
-        results = tuple(prerequisite.evaluate(state) for prerequisite in task.prerequisites)
-        if all(result.status is FactStatus.KNOWN and result.value for result in results):
+        if task_is_available(task):
             available.append(task)
     progression, _ = progression_destination(tuple(available))
     result = []
     for task in available:
-        route = measure_route_context(state, task, progression) if task.destination is not None else None
+        route = (
+            measure_route_context(state, task, progression, graph=route_graph) if task.destination is not None else None
+        )
         evaluation = task.encounter_evaluation
         if task.task_kind == "optional" and task.destination is not None:
             fact = state.encounter_for(task.destination)
@@ -784,15 +948,73 @@ def available_campaign_tasks(
                 fact.value.status != "none" if fact.is_known else False,
                 fact.value.eligible if fact.is_known else True,
             )
-            evaluation = evaluate_encounter_opportunity(state, opportunity, progression, task_id=task.objective_id)
+            evaluation = evaluate_encounter_opportunity(
+                state,
+                opportunity,
+                progression,
+                task_id=task.objective_id,
+                graph=route_graph,
+            )
         result.append(replace(task, route_context=route, encounter_evaluation=evaluation))
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_ENCOUNTER_FRONTIER: "
+            f"optional={[{'id': task.objective_id, 'recommendation': task.encounter_evaluation.recommendation.value if task.encounter_evaluation else None, 'classification': task.encounter_evaluation.classification.value if task.encounter_evaluation else None} for task in result if task.task_kind == 'optional']!r}"
+        ),
+        trace=True,
+    )
     return tuple(result)
 
 
-def _select_available_campaign_tasks(available: tuple[CampaignObjective, ...]) -> ObjectiveSelection:
+def _select_available_campaign_tasks(
+    available: tuple[CampaignObjective, ...], state: CampaignState | None = None
+) -> ObjectiveSelection:
     """Select the deterministic best task from one discovery result."""
 
     required = tuple(task for task in available if task.task_kind == "required")
+    # Optional legal encounters may be strategic prerequisites for required
+    # progression.  Prefer an encounter that is on-route or a small detour
+    # when its species table contributes useful coverage; otherwise required
+    # progression retains ownership.
+    strategic_optional = tuple(
+        task
+        for task in available
+        if task.task_kind == "optional"
+        and task.encounter_evaluation is not None
+        and task.encounter_evaluation.recommendation is EncounterRecommendation.PREFER
+        and task.encounter_evaluation.classification
+        in {EncounterClassification.ON_ROUTE, EncounterClassification.SMALL_DETOUR}
+    )
+
+    def strategic_candidate(task: CampaignObjective):
+        try:
+            candidates = _current_campaign_encounter_candidates(state, task.destination) if task.destination else ()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            candidates = ()
+        if not candidates:
+            return None
+        policy_context = _capture_policy_context(state)
+        return max(
+            candidates,
+            key=lambda candidate: (
+                score_encounter(candidate, policy_context),
+                candidate.method.value,
+            ),
+        )
+
+    def strategic_score(task: CampaignObjective) -> float:
+        candidate = strategic_candidate(task)
+        return score_encounter(candidate, _capture_policy_context(state)) if candidate is not None else float("-inf")
+
+    if strategic_optional and required:
+        selected_optional = max(strategic_optional, key=lambda item: (strategic_score(item), item.objective_id))
+        selected_candidate = strategic_candidate(selected_optional)
+        if selected_candidate is not None and strategic_score(selected_optional) > 0:
+            return ObjectiveSelection(
+                replace(selected_optional, encounter_method=selected_candidate.method),
+                ObjectiveStatus.READY,
+                "selected strategic encounter before required progression",
+            )
     if required:
         # Required progression remains the primary task. Preferred encounter
         # work is retained on the same discovery result as opportunistic work.
@@ -808,16 +1030,114 @@ def _select_available_campaign_tasks(available: tuple[CampaignObjective, ...]) -
         )
     )
     if selectable:
+        # Strategic ranking is intentionally applied only when candidate
+        # metadata is available.  Route evaluation remains the stable
+        # fallback for fixtures and partially observed campaign states.
         task = min(
             selectable,
             key=lambda item: (
+                -strategic_score(item),
                 item.encounter_evaluation.detour_cost if item.encounter_evaluation else float("inf"),
                 item.encounter_evaluation.encounter_cost if item.encounter_evaluation else float("inf"),
                 item.objective_id,
             ),
         )
+        candidate = strategic_candidate(task)
+        if candidate is not None:
+            task = replace(task, encounter_method=candidate.method)
         return ObjectiveSelection(task, ObjectiveStatus.READY, "selected from currently available tasks")
     return ObjectiveSelection(None, ObjectiveStatus.COMPLETE, "no campaign task is currently available")
+
+
+def _capture_policy_context(state: CampaignState | None = None) -> CapturePolicyContext:
+    """Return the initial strategic context used by pure task ranking.
+
+    The boss profile is currently the registered Emerald Roxanne slice. Party
+    types are derived from the immutable observed party when available.
+    """
+
+    team_types: set[str] = set()
+    if state is not None and state.party.is_known:
+        from modules.pokemon import get_species_by_name
+
+        for member in state.party.value or ():
+            try:
+                team_types.update(type_.name.lower() for type_ in get_species_by_name(member.species).types)
+            except (KeyError, AttributeError, RuntimeError, TypeError, ValueError):
+                continue
+    return CapturePolicyContext(
+        boss_weakness_types=frozenset({"grass", "water", "fighting", "ground", "steel"}),
+        team_types=frozenset(team_types),
+    )
+
+
+def campaign_planning_signature(state: CampaignState) -> tuple[object, ...]:
+    """Return the dynamic facts that can change the campaign selection.
+
+    Campaign selection is map-level planning.  Avatar coordinates and current
+    HP are intentionally excluded because those change during ordinary
+    movement and are handled by tactical navigation/readiness instead.  The
+    encounter projection, campaign facts, party composition/levels, and
+    resource facts remain part of the key because each can change the
+    executable frontier.
+    """
+
+    def fact_signature(fact: Fact[object]) -> tuple[object, object]:
+        return (fact.status.value, repr(fact.value))
+
+    party_signature = tuple(
+        sorted(
+            (
+                getattr(pokemon, "party_index", None),
+                getattr(pokemon, "species", None),
+                getattr(pokemon, "level", None),
+                getattr(pokemon, "identity", None),
+                getattr(pokemon, "egg", getattr(pokemon, "is_egg", False)),
+                getattr(pokemon, "current_hp", 0) > 0,
+                tuple(getattr(move, "name", None) for move in getattr(pokemon, "moves", ())),
+            )
+            for pokemon in state.party.value or ()
+        )
+        if state.party.is_known
+        else ()
+    )
+    campaign_fact_signature = tuple(
+        (
+            name,
+            fact_signature(getattr(state.campaign_facts, name)),
+        )
+        for name in state.campaign_facts.__dataclass_fields__
+    )
+    encounter_signature = (
+        state.encounters.status.value,
+        (
+            tuple(
+                sorted(
+                    (
+                        encounter.location,
+                        encounter.status,
+                        encounter.eligible,
+                    )
+                    for encounter in state.encounters.value or ()
+                )
+            )
+            if state.encounters.is_known
+            else ()
+        ),
+    )
+    return (
+        fact_signature(state.raw_map),
+        fact_signature(state.badges),
+        fact_signature(state.inventory),
+        fact_signature(state.run_status),
+        fact_signature(state.dead_pokemon),
+        fact_signature(state.rules_legal),
+        fact_signature(state.last_completed_battle),
+        party_signature,
+        encounter_signature,
+        campaign_fact_signature,
+        getattr(state.campaign_lifecycle, "value", state.campaign_lifecycle),
+    )
 
 
 def select_available_campaign_task(
@@ -831,7 +1151,7 @@ def select_available_campaign_task(
     optional tasks, then explicit priority and declaration order decide ties.
     """
 
-    return _select_available_campaign_tasks(available_campaign_tasks(state, tasks, encounter_locations))
+    return _select_available_campaign_tasks(available_campaign_tasks(state, tasks, encounter_locations), state)
 
 
 def campaign_task_diagnostics(
@@ -845,7 +1165,7 @@ def campaign_task_diagnostics(
     # Selection must use the same discovery result as the rows below.  The
     # discovery pass performs route and encounter analysis; recomputing it
     # here doubled that cost on every controller refresh.
-    selection = _select_available_campaign_tasks(available)
+    selection = _select_available_campaign_tasks(available, state)
     preferred = sorted(
         (
             task
@@ -912,6 +1232,13 @@ def campaign_task_diagnostics(
                     if task.encounter_evaluation
                     else None
                 ),
+                "selected_encounter_method": (
+                    selection.objective.encounter_method.value
+                    if selection.objective is not None
+                    and selection.objective.objective_id == task.objective_id
+                    and selection.objective.encounter_method is not None
+                    else None
+                ),
             }
         )
     return tuple(rows)
@@ -969,6 +1296,13 @@ def select_campaign_objective(
                     ObjectiveStatus.BLOCKED,
                     f"prerequisite {prerequisite.predicate_id} is false",
                 )
+        # Encounter tasks are optional in the story graph, but a strategically
+        # useful legal encounter is an interruptible prerequisite for safe
+        # progression. Let the shared frontier selector preempt this ordinary
+        # story task when it has enough observed information to justify doing so.
+        frontier = select_available_campaign_task(state)
+        if frontier.objective is not None and frontier.objective.task_kind == "optional":
+            return frontier
         return ObjectiveSelection(objective, ObjectiveStatus.READY, "all prerequisites are satisfied")
 
     return ObjectiveSelection(None, ObjectiveStatus.COMPLETE, "all campaign objectives are complete")
@@ -1132,6 +1466,9 @@ def plan_campaign(
                     f"no executable producer for unmet prerequisite {prerequisite.predicate_id}",
                 )
 
+            frontier = select_available_campaign_task(state)
+            if frontier.objective is not None and frontier.objective.task_kind == "optional":
+                return frontier
             return ObjectiveSelection(
                 objective,
                 ObjectiveStatus.READY,

@@ -19,21 +19,48 @@ class ReadinessSchedulerTests(unittest.TestCase):
             max_age_ticks=2,
         )
         self.assertEqual(scheduler.observe("objective", "goal"), "observation")
+        self.assertFalse(scheduler.last_observation_was_cache_hit)
         self.assertEqual(scheduler.observe("objective", "goal"), "observation")
+        self.assertTrue(scheduler.last_observation_was_cache_hit)
         self.assertEqual(scheduler.observe("objective", "goal"), "observation")
         self.assertEqual(len(calls), 1)
         self.assertEqual(scheduler.state.refresh_count, 1)
         self.assertEqual(scheduler.state.tick_count, 3)
 
-    def test_map_or_context_change_refreshes_immediately(self):
+    def test_coordinate_only_change_does_not_refresh(self):
         context = [("OVERWORLD", (1, 2), (3, 4))]
+        calls = []
+        scheduler = ReadinessObservationScheduler(
+            lambda *_: calls.append(1) or "observation", lambda: context[0][:2], max_age_ticks=30
+        )
+        scheduler.observe("objective", "goal")
+        context[0] = ("OVERWORLD", (1, 2), (0, 1))
+        scheduler.observe("objective", "goal")
+        self.assertEqual(len(calls), 1)
+
+    def test_map_or_game_state_change_refreshes_immediately(self):
+        context = [("OVERWORLD", (1, 2))]
         calls = []
         scheduler = ReadinessObservationScheduler(
             lambda *_: calls.append(1) or "observation", lambda: context[0], max_age_ticks=30
         )
         scheduler.observe("objective", "goal")
-        context[0] = ("OVERWORLD", (1, 3), (0, 1))
+        context[0] = ("OVERWORLD", (1, 3))
         scheduler.observe("objective", "goal")
+        context[0] = ("CHANGE_MAP", (1, 3))
+        scheduler.observe("objective", "goal")
+        self.assertEqual(len(calls), 3)
+
+    def test_battle_end_invalidation_refreshes_even_when_boundary_context_is_unchanged(self):
+        calls = []
+        scheduler = ReadinessObservationScheduler(
+            lambda *_: calls.append(len(calls)) or calls[-1],
+            lambda: ("OVERWORLD", (1, 2)),
+            max_age_ticks=30,
+        )
+        self.assertEqual(scheduler.observe("objective", "goal"), 0)
+        scheduler.invalidate("battle_ended")
+        self.assertEqual(scheduler.observe("objective", "goal"), 1)
         self.assertEqual(len(calls), 2)
 
     def test_invalidation_refreshes_and_does_not_reuse_stale_data(self):
@@ -47,15 +74,19 @@ class ReadinessSchedulerTests(unittest.TestCase):
         self.assertEqual(scheduler.state.invalidation_reason, None)
         self.assertEqual(scheduler.state.refresh_count, 2)
 
-    def test_unavailable_observation_is_not_cached(self):
+    def test_unavailable_observation_is_cached_until_expiry(self):
         calls = []
         unavailable = SimpleNamespace(overworld_availability=Availability.UNKNOWN)
         valid = SimpleNamespace(overworld_availability=Availability.KNOWN)
         scheduler = ReadinessObservationScheduler(
             lambda *_: calls.append(1) or (unavailable if len(calls) == 1 else valid),
             lambda: "same",
-            max_age_ticks=30,
+            max_age_ticks=2,
         )
+        self.assertIs(scheduler.observe("objective", "goal"), unavailable)
+        self.assertFalse(scheduler.last_observation_was_cache_hit)
+        self.assertIs(scheduler.observe("objective", "goal"), unavailable)
+        self.assertTrue(scheduler.last_observation_was_cache_hit)
         self.assertIs(scheduler.observe("objective", "goal"), unavailable)
         self.assertIs(scheduler.observe("objective", "goal"), valid)
         self.assertEqual(len(calls), 2)

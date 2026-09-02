@@ -2,12 +2,14 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 
-from modules.goals import Goal, ReachLocation
+from modules.context import context
+from modules.goals import Goal, ReachLocation, SemanticTarget
 from modules.navigation import IntermediateRouteAnalysis, RouteAnalysis
 from modules.nuzlocke.campaign_controller import CampaignController, CampaignControllerStatus
 from modules.nuzlocke.campaign_execution import CampaignExecutionResult, CampaignExecutionStatus
 from modules.nuzlocke.campaign_objectives import CampaignObjective, ObjectiveSelection, ObjectiveStatus
 from modules.nuzlocke.campaign_state import Fact, FactStatus
+from modules.nuzlocke.campaign_status import recovery_status
 from modules.nuzlocke.readiness_diagnostics import (
     Availability,
     ProgressionReadinessDiagnostic,
@@ -151,6 +153,47 @@ class CampaignRecoveryIntegrationTests(unittest.TestCase):
         self.assertEqual(len(tactical_starts), 1)
         self.assertEqual(controller.current_objective_id, "reach_generic")
 
+    def test_recovery_completion_replaces_stale_healing_status(self):
+        objective = CampaignObjective(
+            "reach_generic",
+            "Reach the next campaign destination",
+            (),
+            SimpleNamespace(evaluate=lambda _: None),
+            destination=(9, 8),
+        )
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "ready")
+        execution = CampaignExecutionResult(objective, CampaignExecutionStatus.READY, "ready", tactical_goal=Goal())
+
+        def recovery(_):
+            yield "recovery"
+
+        previous_status = context.campaign_status
+        try:
+            context.campaign_status = recovery_status(SemanticTarget.map((1, 2)), "Healing confirmed")
+            controller = CampaignController(
+                lambda: object(),
+                selector=lambda _: selection,
+                adapter=lambda _: execution,
+                tactical_loop_factory=lambda _: iter(()),
+                readiness_provider=lambda *_: readiness(),
+                recovery_factory=recovery,
+            )
+
+            mounted = controller.step()
+            self.assertEqual(mounted.execution_phase, "RECOVERY")
+            self.assertEqual(context.campaign_status.objective, "Recover Party")
+
+            controller._readiness_provider = lambda *_: readiness(ReadinessDecision.CONTINUE)
+            resumed = controller.step()
+
+            self.assertEqual(resumed.execution_phase, "CAMPAIGN")
+            self.assertEqual(context.campaign_status.objective, objective.description)
+            self.assertEqual(context.campaign_status.target, SemanticTarget.map((9, 8)))
+            self.assertEqual(context.campaign_status.intent, "Recovery complete; resuming campaign")
+            self.assertNotEqual(context.campaign_status.intent, "Healing confirmed")
+        finally:
+            context.campaign_status = previous_status
+
     def test_unknown_defers_without_recovery_or_losing_campaign_ownership(self):
         objective = CampaignObjective("reach_generic", "generic", (), SimpleNamespace(evaluate=lambda _: None))
         selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "ready")
@@ -172,6 +215,46 @@ class CampaignRecoveryIntegrationTests(unittest.TestCase):
         controller._readiness_provider = lambda *_: readiness(ReadinessDecision.CONTINUE)
         controller.step()
         self.assertEqual(starts, ["campaign"])
+
+    def test_stable_recovery_unavailable_does_not_force_recheck_loop(self):
+        objective = CampaignObjective("reach_generic", "generic", (), SimpleNamespace(evaluate=lambda _: None))
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "ready")
+        execution = CampaignExecutionResult(objective, CampaignExecutionStatus.READY, "ready", tactical_goal=Goal())
+        observed = replace(
+            readiness(ReadinessDecision.UNKNOWN),
+            overworld_availability=Availability.KNOWN,
+            recovery_availability=Availability.UNAVAILABLE,
+            readiness_reason=ReadinessReason.RECOVERY_UNAVAILABLE,
+        )
+
+        class Provider:
+            def __init__(self):
+                self.calls = 0
+                self.invalidations = []
+
+            def observe(self, *_):
+                self.calls += 1
+                return observed
+
+            def invalidate(self, reason):
+                self.invalidations.append(reason)
+
+        provider = Provider()
+        controller = CampaignController(
+            lambda: object(),
+            selector=lambda _: selection,
+            adapter=lambda _: execution,
+            readiness_provider=provider.observe,
+        )
+
+        first = controller.step()
+        second = controller.step()
+
+        self.assertEqual(first.status, CampaignControllerStatus.READY)
+        self.assertEqual(second.status, CampaignControllerStatus.READY)
+        self.assertFalse(controller._readiness_recheck_pending)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.invalidations, [])
 
     def test_deferred_readiness_is_forced_again_before_tactical_resume(self):
         objective = CampaignObjective("reach_generic", "generic", (), SimpleNamespace(evaluate=lambda _: None))
@@ -205,6 +288,44 @@ class CampaignRecoveryIntegrationTests(unittest.TestCase):
         controller.step()
         self.assertEqual(starts, ["recovery"])
         self.assertIn("deferred_readiness_recheck", provider.invalidations)
+
+    def test_transient_unknown_does_not_force_recheck_every_frame(self):
+        objective = CampaignObjective("reach_generic", "generic", (), SimpleNamespace(evaluate=lambda _: None))
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "ready")
+        execution = CampaignExecutionResult(objective, CampaignExecutionStatus.READY, "ready", tactical_goal=Goal())
+        starts = []
+
+        class Provider:
+            def __init__(self):
+                self.calls = 0
+                self.invalidations = []
+
+            def observe(self, *_):
+                self.calls += 1
+                return readiness(ReadinessDecision.UNKNOWN)
+
+            def invalidate(self, reason):
+                self.invalidations.append(reason)
+
+        provider = Provider()
+        controller = CampaignController(
+            lambda: object(),
+            selector=lambda _: selection,
+            adapter=lambda _: execution,
+            tactical_loop_factory=lambda _: iter((starts.append("campaign"),)),
+            readiness_provider=provider.observe,
+            recovery_factory=lambda _: iter((starts.append("recovery"),)),
+        )
+
+        controller.step()
+        controller.step()
+        controller.step()
+
+        # The controller gets the compatibility retry once, but must not
+        # invalidate a stable transient result on every subsequent frame.
+        self.assertEqual(provider.calls, 2)
+        self.assertEqual(provider.invalidations, ["deferred_readiness_recheck"])
+        self.assertEqual(starts, [])
 
     def test_critical_unknown_game_state_does_not_mount_recovery(self):
         objective = CampaignObjective("reach_generic", "generic", (), SimpleNamespace(evaluate=lambda _: None))

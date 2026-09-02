@@ -72,7 +72,23 @@ from .preparation import (
     discover_trainer_ids,
 )
 from .campaign_state import CampaignFacts, CampaignState, Fact, FactStatus, RunStatus, derive_campaign_facts
-from .encounter_catalog import EncounterOpportunity, encounter_opportunities
+from .encounter_catalog import (
+    EncounterOpportunity,
+    available_encounter_methods,
+    campaign_encounter_methods,
+    encounter_opportunities,
+    encounter_candidates_for_location,
+)
+from .capture_policy import (
+    CapturePolicyContext,
+    CapturePolicyWeights,
+    CaptureRecommendation,
+    EncounterCandidate,
+    EncounterMethod,
+    choose_encounter,
+    score_encounter,
+)
+from .trainer_policy import TrainerPolicyInput, choose_trainer_mode
 from .emerald_healing_catalog import (
     HealingSourceRSE,
     emerald_healing_sources,

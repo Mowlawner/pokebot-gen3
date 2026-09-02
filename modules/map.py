@@ -2349,6 +2349,8 @@ def get_wild_encounters_for_map(map_group: int, map_number: int) -> WildEncounte
 
 def get_maps_with_wild_encounters() -> tuple[tuple[int, int], ...]:
     """Return map IDs whose authoritative ROM encounter tables are non-empty."""
+    from modules.map_data import MapRSE
+
     if not context.rom.is_rse:
         return ()
     result = []

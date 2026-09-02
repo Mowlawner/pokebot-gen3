@@ -299,6 +299,20 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
                 self.assertIs(mode.on_battle_started(None), selected)
             factory.assert_called_once_with()
 
+    def test_battle_end_requests_a_fresh_readiness_observation(self):
+        from modules.modes.campaign import CampaignProgressionMode
+        from unittest.mock import Mock
+
+        mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
+        mode.controller = SimpleNamespace(request_readiness_recheck=Mock())
+        mode._readiness_scheduler = SimpleNamespace(invalidate=Mock())
+
+        with patch("modules.modes.campaign.diagnostic_print"):
+            mode.on_battle_ended(object())
+
+        mode.controller.request_readiness_recheck.assert_called_once_with("battle_ended")
+        mode._readiness_scheduler.invalidate.assert_not_called()
+
     def test_overworld_execution_cache_retains_tactical_loop_between_observations(self):
         from modules.goals import SemanticTarget
         from modules.nuzlocke import emerald_capabilities as capabilities

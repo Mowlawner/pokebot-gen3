@@ -10,7 +10,15 @@ import traceback
 from functools import lru_cache
 
 from modules.agent_control import AgentControlLoop, observe_agent
-from modules.goals import Goal
+from modules.goals import (
+    ActivateTrigger,
+    EngageTrainer,
+    Goal,
+    NavigationGoal,
+    ReachLocation,
+    ReachWarp,
+    SemanticTarget,
+)
 from modules.context import context
 
 from .campaign_execution import CampaignExecutionResult, CampaignExecutionStatus, adapt_campaign_execution
@@ -18,15 +26,19 @@ from .campaign_objectives import (
     ObjectiveSelection,
     ObjectiveStatus,
     campaign_task_diagnostics,
+    campaign_planning_signature,
     select_campaign_objective,
+    select_available_campaign_task,
     heal_party_objective,
 )
 from modules.console import diagnostic_print
+from .campaign_status import CampaignStatus, recovery_status
 from .campaign_state import CampaignState, FactStatus
 from .readiness_diagnostics import (
     CampaignReadinessPolicy,
     ProgressionReadinessDiagnostic,
     ReadinessDecision,
+    ReadinessReason,
 )
 from .campaign_planner import CampaignPlan, build_campaign_plan, RecoveryStop
 
@@ -105,15 +117,84 @@ def _spatial_observation_is_coherent(state: CampaignState) -> bool:
     return state.raw_map.is_known and state.coordinates.is_known
 
 
+_TRANSIENT_READINESS_REASONS = frozenset(
+    {
+        ReadinessReason.OVERWORLD_UNAVAILABLE,
+        ReadinessReason.RESOURCE_INFORMATION_UNKNOWN,
+        ReadinessReason.PARTY_INFORMATION_UNKNOWN,
+        ReadinessReason.RECOVERY_CAPABILITY_UNKNOWN,
+    }
+)
+
+
+def _readiness_requires_recheck(readiness: ProgressionReadinessDiagnostic) -> bool:
+    """Return whether an UNKNOWN result is expected to change next frame."""
+
+    return getattr(readiness, "readiness_reason", None) in _TRANSIENT_READINESS_REASONS
+
+
+def _campaign_target_for_execution(objective, tactical_goal: Goal | None) -> SemanticTarget | None:
+    """Resolve the GUI target for a newly mounted campaign execution.
+
+    Tactical executors are allowed to publish more specific status as they
+    observe the ROM.  This initial projection is nevertheless important at a
+    handoff: encounter executors do not otherwise publish a status, and a
+    completed recovery status must not remain attached to their next route.
+    """
+
+    if isinstance(tactical_goal, NavigationGoal) and isinstance(tactical_goal.target, SemanticTarget):
+        return tactical_goal.target
+    if isinstance(tactical_goal, ReachLocation):
+        return SemanticTarget.at(tactical_goal.location)
+    if isinstance(tactical_goal, ReachWarp):
+        target_map = tactical_goal.destination_map
+        if target_map is None and tactical_goal.destination is not None:
+            target_map = tactical_goal.destination[0]
+        return SemanticTarget.map(target_map) if target_map is not None else None
+    if isinstance(tactical_goal, ActivateTrigger):
+        target_map = None
+        destination = getattr(objective, "destination", None)
+        if isinstance(destination, tuple) and len(destination) == 2:
+            target_map = destination[0]
+        return SemanticTarget.interaction(target_map, tactical_goal.trigger_id)
+    if isinstance(tactical_goal, EngageTrainer):
+        destination = getattr(objective, "destination", None)
+        if isinstance(destination, tuple) and len(destination) == 2:
+            return SemanticTarget.map(destination)
+    destination = getattr(objective, "destination", None)
+    if isinstance(destination, tuple) and len(destination) == 2:
+        return SemanticTarget.map(destination)
+    return None
+
+
+def _post_pokedex_campaign_boundary(state: CampaignState) -> bool:
+    """Return whether the current save is past the overworld safety boundary.
+
+    Opening capabilities such as title-screen setup and starter selection are
+    intentionally targetless and cannot supply meaningful overworld readiness
+    input.  Once the Pokédex has been received, however, targetless Emerald
+    capabilities include ordinary route traversal (for example
+    ``reach_petalburg`` and ``complete_petalburg_wally``).  Those capabilities
+    still need the event-driven post-battle/map readiness check.
+    """
+
+    facts = getattr(state, "campaign_facts", None)
+    pokedex = getattr(facts, "pokedex_received", None)
+    return getattr(pokedex, "status", None) is FactStatus.KNOWN and getattr(pokedex, "value", None) is True
+
+
 class CampaignController:
-    """Select and mount one tactical goal, reevaluating at every frame boundary."""
+    """Select and mount one tactical goal, reevaluating at event boundaries."""
 
     def __init__(
         self,
         state_provider: Callable[[], CampaignState],
         *,
         tactical_loop_factory: TacticalLoopFactory | None = None,
-        selector: Callable[[CampaignState], ObjectiveSelection] = select_campaign_objective,
+        # Campaign Progression must use the dependency frontier: optional
+        # encounter objectives can be strategic prerequisites for required
+        # story progression. The legacy ordered selector cannot discover them.
+        selector: Callable[[CampaignState], ObjectiveSelection] = select_available_campaign_task,
         adapter: Callable[[ObjectiveSelection], CampaignExecutionResult] = adapt_campaign_execution,
         campaign_boundary_handler: CampaignBoundaryHandler | None = None,
         readiness_provider: ReadinessProvider | None = None,
@@ -147,7 +228,19 @@ class CampaignController:
         # boundary.
         self._readiness_recheck_pending = False
         self._pending_readiness_objective_id: str | None = None
+        # Campaign selection and adaptation are boundary work.  Keep the
+        # mounted tactical generator on the hot path and only rebuild the
+        # campaign envelope when an event invalidates it.
+        self._refresh_required = True
+        self._refresh_required_reason = "initial"
+        self._last_readiness_boundary_key = None
         self._campaign_plan: CampaignPlan | None = None
+        self._last_published_campaign_status: CampaignStatus | None = None
+        # Task diagnostics contain route/encounter discovery and are only a
+        # trace aid.  Keep them on the same semantic signature as campaign
+        # planning so enabling tracing cannot turn every frame into a second
+        # planner pass.
+        self._campaign_task_diagnostics_key = None
 
     @staticmethod
     def _default_tactical_loop(goal: Goal) -> Iterator[object]:
@@ -169,6 +262,54 @@ class CampaignController:
             self._execution_phase,
             self._recovery_status,
             self._campaign_plan,
+        )
+
+    def _publish_campaign_status(self, intent: str) -> None:
+        """Publish a fresh status at a campaign/recovery ownership boundary."""
+
+        objective = self.last_selection.objective if self.last_selection is not None else None
+        self._publish_status_for_execution(objective, self.current_tactical_goal, intent)
+
+    def _publish_status_for_execution(self, objective, tactical_goal: Goal | None, intent: str) -> None:
+        """Publish status for an execution before its tactical loop is mounted.
+
+        Readiness is evaluated between objective selection and tactical-loop
+        mounting. When that observation is deferred, the controller has no
+        loop from which to publish status, while the previous capability may
+        have left an obsolete GUI projection behind. Keep the projection tied
+        to the selected execution so a deferred handoff is truthful without
+        granting the execution permission to run.
+        """
+
+        if objective is None:
+            status = CampaignStatus(None, None, intent)
+            if self._last_published_campaign_status == status:
+                return
+            self._last_published_campaign_status = status
+            context.campaign_status = status
+            diagnostic_print(
+                lambda: f"CAMPAIGN_STATUS_BOUNDARY: objective=None target=None intent={intent!r}",
+                trace=True,
+                prefix="CAMPAIGN_STATUS_BOUNDARY",
+            )
+            return
+        status = CampaignStatus(
+            getattr(objective, "description", None) or objective.objective_id,
+            _campaign_target_for_execution(objective, tactical_goal),
+            intent,
+            tactical_goal,
+        )
+        if self._last_published_campaign_status == status:
+            return
+        self._last_published_campaign_status = status
+        context.campaign_status = status
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_STATUS_BOUNDARY: "
+                f"objective={status.objective!r} target={status.target!r} intent={status.intent!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_STATUS_BOUNDARY",
         )
 
     def _terminal(self, execution: CampaignExecutionResult, status: CampaignControllerStatus) -> None:
@@ -197,6 +338,97 @@ class CampaignController:
                 f"status={status.value!r} reason={execution.reason!r} terminal=True"
             ),
             trace=True,
+        )
+
+    def _emit_campaign_task_diagnostics(self, observed_state: CampaignState, selection: ObjectiveSelection) -> None:
+        """Emit task discovery only when map-level planning facts change."""
+
+        # Do this check before constructing the diagnostic key.  Normal runs
+        # must not pay even the small signature cost for a trace-only report.
+        if not context.debug or not getattr(context, "debug_trace", False):
+            return
+        try:
+            key = campaign_planning_signature(observed_state)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            # A partial/custom state is still valid for controller tests and
+            # transient startup boundaries.  Its diagnostics are not safe to
+            # cache semantically, so leave the trace suppressed for that frame.
+            return
+        if key == self._campaign_task_diagnostics_key:
+            return
+        self._campaign_task_diagnostics_key = key
+        diagnostic_print(
+            lambda: "CAMPAIGN_TASK_DISCOVERY: "
+            + json.dumps(
+                {
+                    "tasks": campaign_task_diagnostics(observed_state),
+                    "selected": selection.objective.objective_id if selection.objective else None,
+                    "selection_status": selection.status.value,
+                    "selection_reason": selection.reason,
+                },
+                sort_keys=True,
+                default=str,
+            ),
+            trace=True,
+            prefix="CAMPAIGN_TASK_DISCOVERY",
+        )
+
+    def request_readiness_recheck(self, reason: str) -> None:
+        """Require the next campaign refresh to observe readiness afresh.
+
+        Battle completion can change HP and encounter legality without
+        changing the cheap scheduler context. Keep that explicit event
+        boundary separate from ordinary movement so a stale readiness result
+        cannot authorize the next tactical step.
+        """
+
+        self._refresh_required = True
+        self._refresh_required_reason = reason
+        scheduler = getattr(self._readiness_provider, "__self__", None)
+        invalidate = getattr(scheduler, "invalidate", None)
+        if callable(invalidate):
+            invalidate(reason)
+        if (
+            self._execution_phase == "CAMPAIGN"
+            and self.current_objective_id is not None
+            and self.last_selection is not None
+            and self.last_selection.status is ObjectiveStatus.READY
+            and self.last_selection.objective is not None
+            and self.last_selection.objective.objective_id == self.current_objective_id
+        ):
+            self._readiness_recheck_pending = True
+            self._pending_readiness_objective_id = self.current_objective_id
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_READINESS_RECHECK: "
+                f"controller_id={id(self)!r} frame={getattr(context, 'frame', None)!r} "
+                f"reason={reason!r} objective={self.current_objective_id!r} "
+                f"pending={self._readiness_recheck_pending!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_READINESS_RECHECK:",
+        )
+
+    def request_refresh(self, reason: str) -> None:
+        """Require the campaign envelope to be rebuilt at the next step.
+
+        This is for cheap lifecycle boundaries that do not necessarily alter
+        readiness data (for example, a map transition or a capability
+        finishing).  Readiness-changing events should use
+        :meth:`request_readiness_recheck` so the scheduler is invalidated as
+        well.
+        """
+
+        self._refresh_required = True
+        self._refresh_required_reason = reason
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_REFRESH_REQUEST: "
+                f"controller_id={id(self)!r} frame={getattr(context, 'frame', None)!r} "
+                f"reason={reason!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_REFRESH_REQUEST",
         )
 
     def refresh(self) -> CampaignControllerState:
@@ -431,20 +663,7 @@ class CampaignController:
             ),
             trace=True,
         )
-        diagnostic_print(
-            lambda: "CAMPAIGN_TASK_DISCOVERY: "
-            + json.dumps(
-                {
-                    "tasks": campaign_task_diagnostics(observed_state),
-                    "selected": selection.objective.objective_id if selection.objective else None,
-                    "selection_status": selection.status.value,
-                    "selection_reason": selection.reason,
-                },
-                sort_keys=True,
-                default=str,
-            ),
-            trace=True,
-        )
+        self._emit_campaign_task_diagnostics(observed_state, selection)
         trace = getattr(context, "stutter_trace", None)
         if trace is not None and callable(getattr(trace, "mark", None)):
             intro_completion = getattr(observed_state.campaign_facts, "intro_rival_battle_complete", None)
@@ -529,29 +748,37 @@ class CampaignController:
         # intentionally have no tactical Goal: they must be allowed to observe
         # title/menu/naming/clock state before overworld readiness exists.
         # Most capability-backed opening objectives must be allowed to observe
-        # title/menu/script state before an overworld exists.  The post-battle
-        # Pokédex handoff is different: it is an overworld capability with no
-        # declarative tactical Goal, so skipping readiness here would bypass a
-        # recovery stop exactly when the battle has just reduced party HP.
+        # title/menu/script state before an overworld exists.  The Pokédex
+        # handoff and every later targetless capability are different: they
+        # can own ordinary overworld traversal, so skipping readiness here
+        # would bypass a recovery stop exactly when a battle has reduced HP.
         readiness_capability_boundary = objective_id == "receive_pokedex"
-        if (
-            self._readiness_provider is not None
-            and self._execution_phase == "CAMPAIGN"
-            and (execution.tactical_goal is not None or readiness_capability_boundary)
-        ):
+        readiness_applies = (
+            execution.tactical_goal is not None
+            or readiness_capability_boundary
+            or _post_pokedex_campaign_boundary(observed_state)
+        )
+        if self._readiness_provider is not None and self._execution_phase == "CAMPAIGN" and readiness_applies:
+            forced_readiness_recheck = False
             if self._readiness_recheck_pending:
                 scheduler = getattr(self._readiness_provider, "__self__", None)
                 invalidate = getattr(scheduler, "invalidate", None)
                 if callable(invalidate):
                     invalidate("deferred_readiness_recheck")
+                forced_readiness_recheck = True
                 diagnostic_print(
                     lambda: (
-                        "CAMPAIGN_READINESS_RECHECK: "
+                        "CAMPAIGN_READINESS_RECHECK_FORCED: "
                         f"controller_id={id(self)!r} frame={getattr(context, 'frame', None)!r} "
                         "reason='deferred_readiness_recheck'"
                     ),
                     trace=True,
+                    prefix="CAMPAIGN_READINESS_RECHECK_FORCED:",
                 )
+                # A recheck request is a one-observation invalidation.  A
+                # transient result below may schedule another one; stable
+                # policy results must not create a per-frame invalidation loop.
+                self._readiness_recheck_pending = False
             diagnostic_print(
                 lambda: (
                     "CAMPAIGN_READINESS_PROVIDER: "
@@ -618,6 +845,30 @@ class CampaignController:
                 trace=True,
             )
             schedule = getattr(getattr(self._readiness_provider, "__self__", None), "state", None)
+            readiness_boundary_key = (
+                objective_id,
+                getattr(schedule, "refresh_count", None),
+                getattr(evaluated, "current_map", None),
+                getattr(getattr(evaluated, "readiness_decision", None), "value", None),
+                getattr(getattr(evaluated, "readiness_reason", None), "value", None),
+                getattr(getattr(evaluated, "overworld_availability", None), "value", None),
+                getattr(getattr(evaluated, "resource_availability", None), "value", None),
+            )
+            if readiness_boundary_key != self._last_readiness_boundary_key:
+                self._last_readiness_boundary_key = readiness_boundary_key
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_READINESS_BOUNDARY: "
+                        f"controller_id={id(self)!r} frame={getattr(context, 'frame', None)!r} "
+                        f"objective={objective_id!r} refresh_count={getattr(schedule, 'refresh_count', None)!r} "
+                        f"tick_count={getattr(schedule, 'tick_count', None)!r} "
+                        f"current_map={evaluated.current_map!r} "
+                        f"decision={getattr(getattr(evaluated, 'readiness_decision', None), 'value', None)!r} "
+                        f"reason={getattr(getattr(evaluated, 'readiness_reason', None), 'value', None)!r}"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_READINESS_BOUNDARY",
+                )
             diagnostic_print(
                 lambda: "CAMPAIGN_READINESS_LIFECYCLE: "
                 + json.dumps(
@@ -689,8 +940,24 @@ class CampaignController:
                     lambda: f"CAMPAIGN_READINESS_DEFERRED: controller_id={id(self)!r} frame={getattr(context, 'frame', None)!r} objective={objective_id!r} reason={evaluated.readiness_reason.value!r}",
                     trace=True,
                 )
-                self._readiness_recheck_pending = True
-                self._pending_readiness_objective_id = objective_id
+                # The scheduler retains this bounded UNKNOWN observation, so
+                # do not turn it into a per-frame invalidation loop.  An
+                # explicit battle-end request has already forced the next
+                # observation; if that observation is still transient, let
+                # its bounded cache/age policy handle the retry.  Retain the
+                # one retry for custom providers that do not expose a cache,
+                # preserving the controller's historical startup behavior.
+                scheduler = getattr(self._readiness_provider, "__self__", None)
+                cached_observation = bool(getattr(scheduler, "last_observation_was_cache_hit", False))
+                self._readiness_recheck_pending = (
+                    not forced_readiness_recheck and not cached_observation and _readiness_requires_recheck(evaluated)
+                )
+                self._pending_readiness_objective_id = objective_id if self._readiness_recheck_pending else None
+                self._publish_status_for_execution(
+                    execution.objective,
+                    execution.tactical_goal,
+                    "Waiting / readiness temporarily unavailable",
+                )
                 targetless_capability_boundary = execution.capability is not None and execution.tactical_goal is None
                 if not targetless_capability_boundary:
                     self.status = CampaignControllerStatus.READY
@@ -728,10 +995,15 @@ class CampaignController:
                         # ownership and ask for a stable re-observation; do
                         # not turn the absence of a route into a fallback
                         # Center selection.
-                        self._readiness_recheck_pending = True
-                        self._pending_readiness_objective_id = objective_id
+                        # A forced retry has already consumed the one
+                        # compatibility re-observation. If the second
+                        # observation is still contradictory, wait for a new
+                        # lifecycle event instead of refreshing every frame.
+                        self._readiness_recheck_pending = not forced_readiness_recheck
+                        self._pending_readiness_objective_id = objective_id if self._readiness_recheck_pending else None
                         self.status = CampaignControllerStatus.READY
                         self._execution_phase = "CAMPAIGN"
+                        self._publish_campaign_status("Recovery deferred; re-evaluating campaign readiness")
                         self.transition_reason = (
                             "recovery deferred: "
                             f"{evaluated.readiness_reason.value if evaluated.readiness_reason else 'recovery requested'}; "
@@ -745,6 +1017,11 @@ class CampaignController:
                     self.status = CampaignControllerStatus.BLOCKED
                     self._execution_phase = "BLOCKED"
                     self._recovery_status = "UNAVAILABLE"
+                    context.campaign_status = CampaignStatus(
+                        None,
+                        None,
+                        "Campaign blocked: no executable recovery route",
+                    )
                     self.transition_reason = "campaign planner produced no executable recovery stop"
                     diagnostic_print(
                         lambda: (
@@ -786,6 +1063,11 @@ class CampaignController:
                     self.status = CampaignControllerStatus.BLOCKED
                     self._execution_phase = "BLOCKED"
                     self._recovery_status = "UNAVAILABLE"
+                    context.campaign_status = CampaignStatus(
+                        None,
+                        None,
+                        f"Recovery unavailable: {type(error).__name__}",
+                    )
                     self.transition_reason = f"recovery unavailable: {error}"
                     diagnostic_print(
                         lambda: f"CAMPAIGN_REFRESH_RETURN: frame={getattr(context, 'frame', None)!r} branch='recovery_unavailable' status={self.status.value!r} reason={self.transition_reason!r}",
@@ -798,12 +1080,29 @@ class CampaignController:
                 self.current_tactical_goal = execution.tactical_goal
                 self._tactical_loop_objective_id = objective_id
                 self.status = CampaignControllerStatus.READY
+                context.campaign_status = recovery_status(None, "Recovery planned")
                 self.transition_reason = f"recover before {objective_id}"
                 diagnostic_print(
                     lambda: f"CAMPAIGN_REFRESH_RETURN: frame={getattr(context, 'frame', None)!r} branch='recovery_mounted' status={self.status.value!r} reason={self.transition_reason!r}",
                     trace=True,
                 )
                 return self.state
+        elif self._readiness_recheck_pending:
+            # A lifecycle event can arrive while an opening targetless
+            # capability owns the controller.  That capability has no
+            # meaningful overworld readiness input, so retaining the pending
+            # flag would force ``step()`` to refresh every frame forever.
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_READINESS_RECHECK_DISCARDED: "
+                    f"controller_id={id(self)!r} frame={getattr(context, 'frame', None)!r} "
+                    f"objective={objective_id!r} reason='readiness_not_applicable'"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_READINESS_RECHECK_DISCARDED",
+            )
+            self._readiness_recheck_pending = False
+            self._pending_readiness_objective_id = None
         if (
             self.current_objective_id != objective_id
             or self.current_tactical_goal != execution.tactical_goal
@@ -837,6 +1136,7 @@ class CampaignController:
                 ),
                 trace=True,
             )
+            self._publish_campaign_status("Campaign objective selected")
             self.transition_reason = f"selected {objective_id}"
         self.status = CampaignControllerStatus.READY
         return self.state
@@ -866,7 +1166,10 @@ class CampaignController:
     def _step_impl(self) -> CampaignControllerState:
         """Perform one controller step across campaign or recovery phases."""
 
-        if self._execution_phase == "BLOCKED":
+        if self._execution_phase == "BLOCKED" or self.status in {
+            CampaignControllerStatus.COMPLETE,
+            CampaignControllerStatus.FAILED,
+        }:
             return self.state
         if self._execution_phase == "RECOVERY":
             try:
@@ -880,6 +1183,8 @@ class CampaignController:
             except StopIteration:
                 completed_recovery_loop_id = id(self._tactical_loop) if self._tactical_loop is not None else None
                 self._tactical_loop = None
+                self._refresh_required = True
+                self._refresh_required_reason = "recovery_completed"
                 self._execution_phase = "CAMPAIGN"
                 self._recovery_status = "COMPLETED"
                 if self._campaign_plan is not None:
@@ -889,6 +1194,7 @@ class CampaignController:
                 if callable(invalidate):
                     invalidate("recovery_completed")
                 self.status = CampaignControllerStatus.READY
+                self._publish_campaign_status("Recovery complete; resuming campaign")
                 self.transition_reason = "recovery verified; reevaluating campaign readiness"
                 diagnostic_print(
                     lambda: f"CAMPAIGN_RECOVERY_COMPLETE: frame={getattr(context, 'frame', None)!r} controller_id={id(self)!r} recovery_loop_id={completed_recovery_loop_id!r} objective={self.current_objective_id!r} invalidation='recovery_completed' resumed_phase={self._execution_phase}",
@@ -913,10 +1219,45 @@ class CampaignController:
                 self._execution_phase = "BLOCKED"
                 self._recovery_status = "FAILED"
                 self.status = CampaignControllerStatus.BLOCKED
+                context.campaign_status = CampaignStatus(
+                    None,
+                    None,
+                    f"Recovery failed: {type(error).__name__}",
+                )
                 self.transition_reason = f"recovery failed: {error}"
             return self.state
         try:
-            current = self.refresh()
+            if self._refresh_required or self._readiness_recheck_pending:
+                refresh_reason = self._refresh_required_reason
+                current = self.refresh()
+                # A refresh may deliberately leave no tactical loop mounted
+                # while readiness is deferred (for example, while a battle
+                # listener owns the emulator).  That is still a handled
+                # boundary; at most the one compatibility retry represented
+                # by _readiness_recheck_pending may follow it. Further
+                # refreshes must come from an explicit event rather than from
+                # the absence of a loop alone.
+                if current.status in {
+                    CampaignControllerStatus.READY,
+                    CampaignControllerStatus.UNKNOWN,
+                    CampaignControllerStatus.BLOCKED,
+                    CampaignControllerStatus.COMPLETE,
+                    CampaignControllerStatus.FAILED,
+                }:
+                    self._refresh_required = False
+                    self._refresh_required_reason = None
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_REFRESH_BOUNDARY: "
+                        f"controller_id={id(self)!r} frame={getattr(context, 'frame', None)!r} "
+                        f"reason={refresh_reason!r} status={current.status.value!r} "
+                        f"loop_id={id(self._tactical_loop) if self._tactical_loop else None!r}"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_REFRESH_BOUNDARY",
+                )
+            else:
+                current = self.state
         except Exception as error:
             # Readiness and planner inputs are assembled from several ROM
             # structures that do not become visible on the same frame after a
@@ -926,6 +1267,8 @@ class CampaignController:
             failed_loop_id = id(self._tactical_loop) if self._tactical_loop is not None else None
             self._tactical_loop = None
             self._tactical_loop_objective_id = None
+            self._refresh_required = True
+            self._refresh_required_reason = "refresh_exception"
             self.status = CampaignControllerStatus.UNKNOWN
             self.transition_reason = f"campaign refresh failed; will re-evaluate: {type(error).__name__}: {error!r}"
             diagnostic_print(
@@ -968,6 +1311,8 @@ class CampaignController:
                 # and remount it on the next frame instead of declaring a
                 # tactical failure.
                 self._tactical_loop = None
+                self._refresh_required = True
+                self._refresh_required_reason = "capability_boundary"
                 self.transition_reason = "capability boundary; awaiting authoritative completion"
                 diagnostic_print(
                     lambda: f"CAMPAIGN_STEP_RETURN: controller_id={id(self)!r} frame={getattr(context, 'frame', None)!r} branch='capability_boundary' status={self.status.value!r} reason={self.transition_reason!r} input_emitted=unknown",
@@ -988,6 +1333,8 @@ class CampaignController:
             # the controller recoverable so a later Campaign-mode entry can
             # select the current objective and rebuild fresh execution state.
             self._tactical_loop = None
+            self._refresh_required = True
+            self._refresh_required_reason = "tactical_exception"
             self.status = CampaignControllerStatus.UNKNOWN
             self.transition_reason = f"tactical execution failed; will re-evaluate: {type(error).__name__}: {error!r}"
             diagnostic_print(

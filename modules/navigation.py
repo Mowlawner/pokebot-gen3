@@ -151,11 +151,15 @@ def _semantic_plan_cache_key(world: "NavigationWorld", start: Location, goal: Na
     )
     blocked = tuple(sorted(location[1] for location, tile in world.tiles.items() if tile.blocked))
     hazards = tuple(sorted(location for trigger in world.triggers for location in trigger.hazard_locations))
+    constraints = goal.constraints
     return (
         start,
         world.facing,
         world.running_shoes,
         repr(target),
+        tuple(sorted(constraints.avoid_trigger_ids)),
+        tuple(sorted(constraints.avoid_locations, key=repr)),
+        getattr(getattr(constraints, "trainer_mode", None), "value", None),
         goal.encounter_mode.value,
         goal.encounter_penalty,
         transitions,
@@ -205,6 +209,7 @@ def effective_transition(transition: WorldTransition) -> WorldTransition:
                 f"observed={observation.observed_destination!r}"
             ),
             trace=True,
+            prefix="CAMPAIGN_WORLD_ROUTE_DEBUG",
         )
     # Reconcile only the destination learned from the live ROM.  Rebuilding
     # the object as a generic WorldTransition silently discards executable
@@ -285,16 +290,26 @@ class _LazyStaticTileMapping(Mapping[Location, NavigableTile]):
     most once and is retained by the existing static navigation cache.
     """
 
-    def __init__(self, initial: Mapping[Location, NavigableTile], map_ids):
-        self._models = {
+    def __init__(self, initial: Mapping[Location, NavigableTile], map_ids, *, static_maps=()):
+        self._observed = {
             map_id: dict((location, tile) for location, tile in initial.items() if location[0] == map_id)
             for map_id in {location[0] for location in initial}
         }
+        # Live perception is often a partial window around the avatar.  Do
+        # not treat those entries as a complete model: the ROM tile map must
+        # still be loaded so a static transition several tiles away remains
+        # reachable.  Observed tiles are overlaid afterward so dynamic
+        # occupancy and live collision information retain precedence.
+        self._models: dict[MapId, dict[Location, NavigableTile]] = {}
         self._map_ids = frozenset(map_ids)
-        self._loaded = set(self._models)
+        self._static_maps = frozenset(static_maps)
+        self._loaded: set[MapId] = set()
 
     def _load(self, map_id) -> dict[Location, NavigableTile]:
-        if map_id not in self._loaded:
+        if map_id not in self._static_maps and map_id in self._observed:
+            self._models[map_id] = dict(self._observed[map_id])
+            self._loaded.add(map_id)
+        elif map_id not in self._loaded:
             try:
                 static_tiles = prewarm_static_map_observation(map_id)
             except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
@@ -305,12 +320,15 @@ class _LazyStaticTileMapping(Mapping[Location, NavigableTile]):
                 self._loaded.add(map_id)
                 return self._models[map_id]
             prewarm_navigation_tiles(map_id, static_tiles)
-            self._models[map_id] = _static_navigation_tiles[map_id][1]
+            self._models[map_id] = dict(_static_navigation_tiles[map_id][1])
             self._loaded.add(map_id)
             profile_count("global_navigation_new_map_models")
             profile_count("global_navigation_materialized_tiles", len(self._models[map_id]))
         else:
             profile_count("global_navigation_cached_map_model_lookups")
+        observed = self._observed.get(map_id)
+        if observed:
+            self._models.setdefault(map_id, {}).update(observed)
         return self._models.get(map_id, {})
 
     def __getitem__(self, location: Location) -> NavigableTile:
@@ -403,9 +421,19 @@ class NavigationWorld:
             static_tiles = _static_navigation_tiles[observation.map_id][1]
         else:
             static_tiles = cache[1]
+        # Runtime object events are authoritative occupancy evidence even for
+        # callers that provide ``objects`` without the normalized coordinate
+        # overlay. This matters when a defeated trainer remains on its battle
+        # tile as control returns from the battle listener.
+        object_blocked_coordinates = frozenset(
+            object_observation.location[1]
+            for object_observation in getattr(observation, "objects", ())
+            if object_observation.location[0] == observation.map_id
+        )
+        blocked_coordinates = frozenset(observation.dynamic_blocked_coordinates) | object_blocked_coordinates
         tiles: Mapping[Location, NavigableTile] = static_tiles
-        if observation.dynamic_blocked_coordinates:
-            tiles = _DynamicTileMapping(static_tiles, observation.dynamic_blocked_coordinates)
+        if blocked_coordinates:
+            tiles = _DynamicTileMapping(static_tiles, blocked_coordinates)
         return cls(
             tiles=tiles,
             warps=observation.warps,
@@ -747,9 +775,9 @@ def encounter_cost_components(mode: EncounterMode, penalty: int = 8) -> tuple[in
 
 
 def goal_target_map(world: NavigationWorld, goal: Goal) -> MapId | None:
-    if isinstance(goal, SemanticTarget):
-        return goal.target_map or (goal.location[0] if goal.location else None)
     target = goal.target if isinstance(goal, NavigationGoal) else goal
+    if isinstance(target, SemanticTarget):
+        return target.target_map or (target.location[0] if target.location else None)
     if isinstance(target, ReachLocation):
         return target.location[0]
     if isinstance(target, ActivateTrigger | ReachInteractionPosition):
@@ -844,20 +872,56 @@ def _global_navigation_world(
     graph; dynamic occupancy remains applied only to the currently observed
     map.  ``WorldEdge`` candidates stay separate, including connection spans.
     """
-    tiles: Mapping[Location, NavigableTile] = _LazyStaticTileMapping(
-        observation_world.tiles,
-        {edge.source_map for edge in graph.edges} | {edge.destination_map for edge in graph.edges},
-    )
+    observed_maps = {location[0] for location in observation_world.tiles}
+    # Live perception is authoritative for the current map, but it is not
+    # guaranteed to expose every exit (notably interior exits while an object
+    # table is still settling).  Keep the observed transitions and use ROM
+    # transitions as fallback avenues on every map involved in the search.
     transitions: list[WorldTransition] = list(observation_world.transitions or observation_world.warps)
     rom_transitions: dict[MapId, tuple[WorldTransition, ...]] = {}
-    for map_id in enrich_maps:
+    observed_maps = {location[0] for location in observation_world.tiles}
+    maps_to_enrich = tuple(dict.fromkeys((*observed_maps, *enrich_maps)))
+    for map_id in maps_to_enrich:
         try:
             rom_transitions[map_id] = static_map_transitions(map_id)
         except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
             # A partially available map should not make a semantic route
             # disappear. The graph transition remains a valid fallback.
             continue
+    # Expand the current map only when a ROM avenue leads beyond the live
+    # tile window. Complete synthetic/live maps should continue to use their
+    # observed topology without being replaced by unrelated ROM coordinates.
+    current_static_needed = False
+    current_map = next(iter(observed_maps), None)
+    current_candidates = tuple(rom_transitions.get(current_map, ())) + tuple(
+        WorldTransition(
+            (edge.source_map, source),
+            (edge.destination_map, destination),
+            required_facing=(edge.required_facing if isinstance(edge.required_facing, Direction) else None),
+            kind="map_connection" if edge.kind == "connection" else "warp",
+        )
+        for edge in graph.edges
+        if edge.source_map == current_map
+        for source, destination in zip(edge.source_coordinates, edge.destination_coordinates)
+    )
+    for transition in current_candidates:
+        source = transition_approach_position(transition) if transition.kind == "map_connection" else transition.entry
+        if source is not None and source not in observation_world.tiles:
+            current_static_needed = True
+            break
+    tiles: Mapping[Location, NavigableTile] = _LazyStaticTileMapping(
+        observation_world.tiles,
+        {edge.source_map for edge in graph.edges} | {edge.destination_map for edge in graph.edges},
+        static_maps=observed_maps if current_static_needed else set(),
+    )
     known_entries = {(t.kind, t.entry, t.destination) for t in transitions}
+    for map_id, candidates in rom_transitions.items():
+        for transition in candidates:
+            transition = effective_transition(transition)
+            key = (transition.kind, transition.entry, transition.destination)
+            if key not in known_entries:
+                transitions.append(transition)
+                known_entries.add(key)
     for edge in graph.edges:
         for source, destination in zip(edge.source_coordinates, edge.destination_coordinates):
             transition = WorldTransition(
@@ -936,7 +1000,7 @@ def plan_with_world_navigation(
         # spend long enough in that comparison that the frame loop stops
         # advancing.  Exact observed transitions are local tactical goals;
         # reserve global search for unresolved semantic destinations.
-        return plan_observed_warp_locally(world, start, navigation_goal.target), None
+        return plan_observed_warp_locally(world, start, navigation_goal), None
     if target_map is None or target_map == start[0]:
         return GoalAwareNavigator(world).plan(start, goal, algorithm=algorithm), None
 
@@ -946,7 +1010,21 @@ def plan_with_world_navigation(
     if trace is not None:
         trace.duration("world_map_graph_lookup_duration_ms", trace_graph_start)
     trace_route_start = trace.now() if trace is not None else 0
-    route = graph.route(start[0], target_map)
+    try:
+        route = graph.route(start[0], target_map)
+    except WorldNavigationError as error:
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_WORLD_ROUTE_DEBUG: "
+                f"start_map={start[0]!r} target_map={target_map!r} "
+                f"edge_count={len(graph.edges)!r} "
+                f"outgoing_start={graph.outgoing(start[0])!r} "
+                f"error={str(error)!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_WORLD_ROUTE_DEBUG",
+        )
+        raise NavigationError(str(error)) from error
     if trace is not None:
         trace.duration("world_map_route_lookup_duration_ms", trace_route_start)
     normalized_target = (
@@ -973,7 +1051,11 @@ def plan_with_world_navigation(
         enrich_maps=tuple(route.maps[:-1]),
     )
     if isinstance(navigation_goal.target, ReachWarp):
-        global_goal = navigation_goal.target
+        # Keep the complete NavigationGoal wrapper.  Unwrapping the target
+        # here silently restored the default TrainerMode.IGNORE, which made
+        # planner-composed recovery routes cross live trainer sight lines
+        # despite being requested with TrainerMode.AVOID.
+        global_goal = navigation_goal
         # The static graph's connection direction is map metadata, while the
         # live observation carries the executable facing.  They can disagree
         # at edge endpoints (the metadata direction describes the adjoining
@@ -998,18 +1080,44 @@ def plan_with_world_navigation(
     else:
         # An unresolved interaction is intentionally a map-boundary goal.
         # Runtime observation resolves its interaction after arrival.
-        global_goal = normalized_target
+        global_goal = replace(navigation_goal, target=normalized_target)
         if normalized_target.location is not None:
-            global_goal = ReachLocation(normalized_target.location)
-    plan = GoalAwareNavigator(global_world).plan(
-        start,
-        global_goal,
-        algorithm=algorithm,
-        # Semantic campaign routes expose the crossing input as the action
-        # from the executable approach state.  Preserve the legacy boundary
-        # source representation for exact ReachLocation callers.
-        connection_source_is_approach=isinstance(navigation_goal.target, SemanticTarget),
-    )
+            global_goal = replace(navigation_goal, target=ReachLocation(normalized_target.location))
+    try:
+        plan = GoalAwareNavigator(global_world).plan(
+            start,
+            global_goal,
+            algorithm=algorithm,
+            # Semantic campaign routes expose the crossing input as the action
+            # from the executable approach state.  Preserve the legacy boundary
+            # source representation for exact ReachLocation callers.
+            connection_source_is_approach=isinstance(navigation_goal.target, SemanticTarget),
+        )
+    except Exception as error:
+        current_tiles = tuple(
+            global_world.tiles.get(location) for location in global_world.tiles if location[0] == start[0]
+        )
+        current_transitions = tuple(
+            transition for transition in global_world.transitions if transition.entry[0] == start[0]
+        )
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_WORLD_ROUTE_DEBUG: "
+                f"phase=state_search_failed start={start!r} target={target_map!r} "
+                f"route_maps={route.maps!r} enriched_maps={tuple(route.maps[:-1])!r} "
+                f"loaded_maps={tuple(sorted(getattr(global_world.tiles, '_models', {}).keys(), key=repr))!r} "
+                f"current_tile_count={len(current_tiles)!r} current_transition_count={len(current_transitions)!r} "
+                f"current_transitions={current_transitions!r} error={str(error)!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_WORLD_ROUTE_DEBUG",
+        )
+        if isinstance(error, NavigationError):
+            raise NavigationError(
+                f"{error}; current tile count={len(current_tiles)}, "
+                f"current transition count={len(current_transitions)}"
+            ) from error
+        raise
     if cache_key is not None:
         _semantic_cross_map_plan_cache[cache_key] = (plan, route)
     if context.debug and getattr(context, "debug_trace", False):
@@ -1429,9 +1537,11 @@ def plan_with_world_navigation(
 def plan_observed_warp_locally(
     world: NavigationWorld,
     start: Location,
-    goal: ReachWarp,
+    goal: ReachWarp | NavigationGoal,
 ) -> NavigationPlan:
     """Plan to an exact observed warp without consulting the map graph."""
+    navigation_goal = goal if isinstance(goal, NavigationGoal) else NavigationGoal(goal)
+    goal = navigation_goal.target
     selected = goal.warp
     if selected is None or not any(
         transitions_match(selected, observed) for observed in (world.transitions or world.warps)
@@ -1454,7 +1564,10 @@ def plan_observed_warp_locally(
         and start != selected.entry
         and start in selected.activation_locations
     ):
-        local_plan = GoalAwareNavigator(world).plan(start, ReachLocation(selected.entry))
+        local_plan = GoalAwareNavigator(world).plan(
+            start,
+            replace(navigation_goal, target=ReachLocation(selected.entry)),
+        )
         return NavigationPlan(
             local_plan.actions,
             selected.entry,
@@ -1479,7 +1592,10 @@ def plan_observed_warp_locally(
             # ReachWarp here would synthesize a second WARP action from the
             # normalized/static transition and can carry the wrong facing;
             # the observed transition is appended explicitly below.
-            local_plan = GoalAwareNavigator(world).plan(start, ReachLocation(approach))
+            local_plan = GoalAwareNavigator(world).plan(
+                start,
+                replace(navigation_goal, target=ReachLocation(approach)),
+            )
             boundary_move = NavigationAction(
                 NavigationActionType.MOVE,
                 direction,
@@ -1500,7 +1616,7 @@ def plan_observed_warp_locally(
             selected.entry,
             GoalAwareNavigator(world)._metrics(actions),
         )
-    local_plan = GoalAwareNavigator(world).plan(start, goal)
+    local_plan = GoalAwareNavigator(world).plan(start, navigation_goal)
     # A recovery handoff can arrive on a step-on door tile via a
     # ReachLocation goal.  In that case the local planner may regard the
     # ReachWarp position as already satisfied and return no action, even
@@ -1541,6 +1657,18 @@ def plan_observed_warp_locally(
         )
         if direction is None:
             raise NavigationError("directional observed warp has no activation direction")
+        # GoalAwareNavigator.plan() already appends the executable WARP when
+        # its ReachWarp terminal state is reached.  The observed-warp path
+        # historically appended the directional activation a second time,
+        # producing two identical WARP actions at arrow warps.  Keep the
+        # planner-produced action when it is already the selected transition;
+        # only append here for a local plan that stopped at the entry tile.
+        already_appended = bool(
+            local_plan.actions
+            and local_plan.actions[-1].action_type is NavigationActionType.WARP
+            and local_plan.actions[-1].source == selected.entry
+            and local_plan.actions[-1].destination == selected.destination
+        )
         activation_source = selected.entry
         activation = NavigationAction(
             NavigationActionType.WARP,
@@ -1548,7 +1676,7 @@ def plan_observed_warp_locally(
             activation_source,
             selected.destination,
         )
-        actions = local_plan.actions + (activation,)
+        actions = local_plan.actions if already_appended else local_plan.actions + (activation,)
         return NavigationPlan(
             actions,
             local_plan.destination,
@@ -2252,7 +2380,11 @@ class GoalAwareNavigator:
             return True
         trainer_mode = getattr(constraints, "trainer_mode", None)
         if trainer_mode is not None and trainer_mode.name == "AVOID":
-            if any(location in trigger.hazard_locations for trigger in self.world.triggers):
+            if any(
+                location in trigger.hazard_locations
+                or (getattr(trigger, "hazard_kind", None) == "trainer" and location in trigger.activation_locations)
+                for trigger in self.world.triggers
+            ):
                 return True
         return any(
             location in trigger.locations and trigger.trigger_id in constraints.avoid_trigger_ids
