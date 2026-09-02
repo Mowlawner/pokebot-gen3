@@ -288,6 +288,23 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             with self.assertRaises(StopIteration):
                 next(campaign)
 
+    def test_completed_petalburg_wally_capability_releases_on_rom_state(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        observation = SimpleNamespace(
+            map_id=MapRSE.PETALBURG_CITY_GYM.value,
+            dialogue_lifecycle_active=False,
+            campaign_facts=(
+                ("petalburg_city_state", 3),
+                ("petalburg_gym_state", 2),
+                ("petalburg_wally_scene_complete", True),
+            ),
+        )
+        with patch.object(capabilities, "_emerald_observation", return_value=observation):
+            campaign = capabilities.observation_driven_emerald_campaign("complete_petalburg_wally")
+            with self.assertRaises(StopIteration):
+                next(campaign)
+
     def test_missing_current_map_affordance_releases_navigation_capability(self):
         from modules.nuzlocke import emerald_capabilities as capabilities
 

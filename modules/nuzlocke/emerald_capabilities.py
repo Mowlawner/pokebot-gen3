@@ -1808,6 +1808,42 @@ def _emerald_observation(
         else:
             controllable = False
     observed_text_speed_fast = _observed_text_speed_fast() if live_context else None
+    # Wally's tutorial is not complete when the city state first reaches 3:
+    # the ROM still has a return-to-gym script and dialogue to run.  Read both
+    # save-backed variables so the mounted capability can release only at the
+    # same conservative boundary used by derive_campaign_facts().
+    if live_context and objective_id == "complete_petalburg_wally":
+        petalburg_city_state = _safe_event_var("PETALBURG_CITY_STATE")
+        petalburg_gym_state = _safe_event_var("PETALBURG_GYM_STATE")
+        petalburg_wally_complete = (
+            None
+            if petalburg_city_state is None or petalburg_gym_state is None
+            else petalburg_city_state >= 3 and petalburg_gym_state >= 2
+        )
+    else:
+        petalburg_city_state = None
+        petalburg_gym_state = None
+        petalburg_wally_complete = None
+    if objective_id == "complete_petalburg_wally":
+        wally_state_signature = (
+            petalburg_city_state,
+            petalburg_gym_state,
+            petalburg_wally_complete,
+        )
+        previous_wally_state_signature = getattr(context, "_campaign_wally_state_signature", None)
+        if previous_wally_state_signature != wally_state_signature:
+            setattr(context, "_campaign_wally_state_signature", wally_state_signature)
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_WALLY_STATE: "
+                    f"frame={getattr(context, 'frame', None)!r} "
+                    f"city_state={petalburg_city_state!r} "
+                    f"gym_state={petalburg_gym_state!r} "
+                    f"complete={petalburg_wally_complete!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_WALLY_STATE",
+            )
     facts = (
         ("text_speed_fast", legacy.text_speed_fast if observed_text_speed_fast is None else observed_text_speed_fast),
         ("new_game_setup_complete", legacy.new_game_setup_complete),
@@ -1825,6 +1861,12 @@ def _emerald_observation(
             else False if defeated_rival is False and hidden_rival is False else None
         )
         facts += (("intro_rival_battle_complete", rival_complete),)
+    if objective_id == "complete_petalburg_wally":
+        facts += (
+            ("petalburg_city_state", petalburg_city_state),
+            ("petalburg_gym_state", petalburg_gym_state),
+            ("petalburg_wally_scene_complete", petalburg_wally_complete),
+        )
     clock_interaction = None
     if live_context:
         try:
@@ -1887,6 +1929,9 @@ def _emerald_observation(
             trace.mark("littleroot_rival_state", get_event_var("LITTLEROOT_RIVAL_STATE"))
         except (AttributeError, RuntimeError, ValueError, TypeError, IndexError, KeyError):
             pass
+        trace.mark("petalburg_city_state", petalburg_city_state)
+        trace.mark("petalburg_gym_state", petalburg_gym_state)
+        trace.mark("petalburg_wally_scene_complete", petalburg_wally_complete)
         if overworld is not None:
             trace.mark("observed_objects", repr(overworld.objects))
             trace.mark("observed_triggers", repr(overworld.triggers))
@@ -2082,6 +2127,15 @@ def _safe_event_flag(name: str) -> bool | None:
         return None
 
 
+def _safe_event_var(name: str) -> int | None:
+    """Read a ROM event variable without turning a transient error into zero."""
+
+    try:
+        return get_event_var(name)
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        return None
+
+
 def _observed_text_speed_fast() -> bool | None:
     """Read the ROM-owned text-speed value without consulting opening phase."""
     try:
@@ -2235,6 +2289,23 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
                     "CAMPAIGN_CAPABILITY_BOUNDARY: "
                     f"frame={getattr(context, 'frame', None)!r} "
                     "objective='complete_intro_rival' "
+                    "reason='authoritative_completion_observed'"
+                ),
+                trace=True,
+            )
+            return
+        if (
+            objective_id == "complete_petalburg_wally"
+            and dict(observation.campaign_facts).get("petalburg_wally_scene_complete") is True
+        ):
+            # The ROM has closed Wally's tutorial. Release the capability
+            # before another generic interaction/navigation pass can select
+            # Norman's already-completed interaction again.
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_CAPABILITY_BOUNDARY: "
+                    f"frame={getattr(context, 'frame', None)!r} "
+                    "objective='complete_petalburg_wally' "
                     "reason='authoritative_completion_observed'"
                 ),
                 trace=True,

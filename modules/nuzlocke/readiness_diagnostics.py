@@ -44,6 +44,7 @@ class ReadinessReason(Enum):
     TRAINER_HAZARD_UNKNOWN = "TRAINER_HAZARD_UNKNOWN"
     RECOVERY_UNAVAILABLE = "RECOVERY_UNAVAILABLE"
     RECOVERY_CAPABILITY_UNKNOWN = "RECOVERY_CAPABILITY_UNKNOWN"
+    FAINTED_PARTY_MEMBER = "FAINTED_PARTY_MEMBER"
     NO_IMMINENT_TRAINER = "NO_IMMINENT_TRAINER"
     PARTY_HEALTHY = "PARTY_HEALTHY"
     OVERWORLD_UNAVAILABLE = "OVERWORLD_UNAVAILABLE"
@@ -193,18 +194,20 @@ class ReadinessScheduleState:
 class ReadinessObservationScheduler:
     """Small bounded scheduler for expensive readiness observations."""
 
-    def __init__(self, provider, cheap_context, *, max_age_ticks: int = 15):
+    def __init__(self, provider, cheap_context, *, max_age_ticks: int = 15, unknown_max_age_ticks: int = 90):
         """Create a bounded scheduler around expensive readiness observations."""
 
         self._provider = provider
         self._cheap_context = cheap_context
         self._max_age_ticks = max_age_ticks
+        self._unknown_max_age_ticks = max(max_age_ticks, unknown_max_age_ticks)
         self._cached: ProgressionReadinessDiagnostic | None = None
         self._cached_key = None
         self._age = None
         self._tick_count = 0
         self._refresh_count = 0
         self._invalidation_reason = "initial"
+        self._last_observation_was_cache_hit = False
 
     def invalidate(self, reason: str) -> None:
         """Discard cached readiness and record why it became invalid."""
@@ -224,19 +227,24 @@ class ReadinessObservationScheduler:
             self._cached is not None
             and self._cached_key == key
             and self._age is not None
-            and self._age < self._max_age_ticks
+            and self._age
+            < (
+                self._unknown_max_age_ticks
+                if _readiness_observation_is_transient(self._cached)
+                else self._max_age_ticks
+            )
         )
+        self._last_observation_was_cache_hit = can_reuse
         if can_reuse:
             self._age += 1
             self._invalidation_reason = None
-            diagnostic_print(
-                lambda: f"READINESS_SCHEDULER: cache=hit tick={self._tick_count} objective={getattr(objective, 'objective_id', None)!r}",
-                trace=True,
-            )
+            # Cache hits are intentionally silent. They occur during ordinary
+            # movement and are not useful boundary diagnostics.
             return self._cached
         diagnostic_print(
-            lambda: f"READINESS_SCHEDULER: cache=miss tick={self._tick_count} objective={getattr(objective, 'objective_id', None)!r}",
+            lambda: f"READINESS_SCHEDULER_REFRESH: cache=miss tick={self._tick_count} objective={getattr(objective, 'objective_id', None)!r}",
             trace=True,
+            prefix="READINESS_SCHEDULER_REFRESH",
         )
         result = self._provider(objective, goal)
         self._cached = result
@@ -244,15 +252,21 @@ class ReadinessObservationScheduler:
         self._age = 0
         self._refresh_count += 1
         self._invalidation_reason = None
-        if (
-            getattr(result, "overworld_availability", None) is Availability.UNKNOWN
-            or getattr(result, "resource_availability", None) is Availability.UNKNOWN
-        ):
-            self._cached = None
-            self._cached_key = None
-            self._age = None
-            self._invalidation_reason = "observation_unavailable"
+        # An unavailable observation is still a useful synchronization result:
+        # it tells the controller to keep campaign ownership while a battle,
+        # script, or warp settles.  Dropping it here causes the controller to
+        # repeat all ROM reads on every frame of a long scripted sequence,
+        # which can reduce the emulator to a crawl.  The normal age limit,
+        # explicit battle invalidation, and the map/game-state key change all
+        # provide bounded re-observation without allowing stale readiness to
+        # authorize work indefinitely.
         return result
+
+    @property
+    def last_observation_was_cache_hit(self) -> bool:
+        """Return whether the most recent observation reused the cache."""
+
+        return self._last_observation_was_cache_hit
 
     @property
     def state(self) -> ReadinessScheduleState:
@@ -261,7 +275,14 @@ class ReadinessObservationScheduler:
         return ReadinessScheduleState(
             (
                 "fresh"
-                if self._cached is not None and self._age is not None and self._age < self._max_age_ticks
+                if self._cached is not None
+                and self._age is not None
+                and self._age
+                < (
+                    self._unknown_max_age_ticks
+                    if _readiness_observation_is_transient(self._cached)
+                    else self._max_age_ticks
+                )
                 else "stale"
             ),
             self._age,
@@ -269,6 +290,16 @@ class ReadinessObservationScheduler:
             self._tick_count,
             self._invalidation_reason,
         )
+
+
+def _readiness_observation_is_transient(value) -> bool:
+    """Return whether a cached observation lacks a stable decision input."""
+    if not isinstance(value, ProgressionReadinessDiagnostic):
+        return False
+    return any(
+        getattr(value, field, Availability.UNKNOWN) is not Availability.KNOWN
+        for field in ("overworld_availability", "resource_availability", "party_availability")
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +352,11 @@ class CampaignReadinessPolicy:
             return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.PARTY_INFORMATION_UNKNOWN)
         if getattr(readiness, "usable_count", None) == 0:
             return self._recovery_result(readiness, ReadinessReason.NO_USABLE_POKEMON)
+        # A living party member cannot compensate for a fainted member. The
+        # Center must restore the fainted slot before the campaign exposes
+        # the party to another trainer or wild battle.
+        if getattr(readiness, "fainted_count", None) > 0:
+            return self._recovery_result(readiness, ReadinessReason.FAINTED_PARTY_MEMBER)
         if getattr(readiness, "lowest_hp_ratio", None) is None:
             return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.PARTY_INFORMATION_UNKNOWN)
 
@@ -330,25 +366,22 @@ class CampaignReadinessPolicy:
         # An imminent trainer interaction is part of the active campaign
         # objective.  Do not divert for optional healing immediately before
         # it; critical HP recovery above remains authoritative.
-        if not imminent:
-            if readiness.route_analysis is None or readiness.route_analysis.normal_cost is None:
-                if readiness.lowest_hp_ratio <= self.opportunistic_hp_ratio:
-                    # Some observation-driven objectives intentionally have
-                    # no declarative campaign goal.  At that boundary the
-                    # recovery route is still authoritative; requiring a
-                    # normal-route comparison would strand the controller
-                    # after a battle with a known nearby Center.
-                    if (
-                        readiness.objective_id == "receive_pokedex"
-                        and center_available
-                        and center_safe
-                        and readiness.recovery.distance_to_center is not None
-                        and readiness.recovery.distance_to_center <= self.opportunistic_detour_threshold
-                    ):
-                        return self._recovery_result(readiness, ReadinessReason.OPPORTUNISTIC_RECOVERY)
-                    return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.OPPORTUNISTIC_ROUTE_UNAVAILABLE)
-            elif self._opportunistic_recovery_available(readiness):
-                return self._recovery_result(readiness, ReadinessReason.OPPORTUNISTIC_RECOVERY)
+        if readiness.route_analysis is None or readiness.route_analysis.normal_cost is None:
+            if readiness.lowest_hp_ratio <= self.opportunistic_hp_ratio:
+                # A trainer ahead is a reason to perform this safety check,
+                # not a reason to skip it.  Targetless capabilities retain
+                # their direct known-Center recovery path.
+                if (
+                    readiness.objective_id == "receive_pokedex"
+                    and center_available
+                    and center_safe
+                    and readiness.recovery.distance_to_center is not None
+                    and readiness.recovery.distance_to_center <= self.opportunistic_detour_threshold
+                ):
+                    return self._recovery_result(readiness, ReadinessReason.OPPORTUNISTIC_RECOVERY)
+                return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.OPPORTUNISTIC_ROUTE_UNAVAILABLE)
+        elif self._opportunistic_recovery_available(readiness):
+            return self._recovery_result(readiness, ReadinessReason.OPPORTUNISTIC_RECOVERY)
         if not critical:
             return ReadinessResult(ReadinessDecision.CONTINUE, ReadinessReason.PARTY_HEALTHY)
 

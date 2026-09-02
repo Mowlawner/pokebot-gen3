@@ -117,7 +117,14 @@ class InteractionStateTests(unittest.TestCase):
             script.script_function_name = "Std_MsgboxYesNo"
             runtime["printer_state"] = 0
             self.assertTrue(observe_interaction().field_message_render_rescue_available)
+            # GiveRunningShoes displays an ordinary field message. Its
+            # stack marker keeps the rescue scoped away from unrelated
+            # Std_MsgboxDefault messages.
+            script.script_function_name = "Std_MsgboxDefault"
+            script.stack = ("LittlerootTown_EventScript_GiveRunningShoesTrigger",)
+            self.assertTrue(observe_interaction().field_message_render_rescue_available)
             script.script_function_name = "OldaleTown_PokemonCenter_1F_EventScript_Nurse"
+            script.stack = ("Common_EventScript_PkmnCenterNurse",)
             self.assertTrue(observe_interaction().field_message_render_rescue_available)
             script.script_function_name = "EventScript_PkmnCenterNurse_ReturnPkmn"
             interaction_state._field_message_render_rescue_pulses = 0

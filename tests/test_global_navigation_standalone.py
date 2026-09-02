@@ -3,16 +3,17 @@
 import unittest
 from unittest.mock import patch
 
-from modules.goals import ReachLocation, ReachWarp, SemanticTarget
+from modules.goals import GoalConstraints, NavigationGoal, ReachLocation, ReachWarp, SemanticTarget, TrainerMode
 from modules.map_path import Direction
 from modules.navigation import (
     GoalAwareNavigator,
     NavigationActionType,
     NavigationWorld,
     NavigableTile,
+    plan_observed_warp_locally,
     plan_with_world_navigation,
 )
-from modules.overworld import MapConnectionObservation, WarpObservation
+from modules.overworld import MapConnectionObservation, TriggerObservation, WarpActivation, WarpObservation
 from modules.world_navigation import WorldEdge, WorldMapGraph
 
 
@@ -22,6 +23,67 @@ def world(map_id, coords, transitions=(), facing=Direction.South):
 
 
 class GlobalNavigationTests(unittest.TestCase):
+    def test_cross_map_navigation_preserves_trainer_avoidance_constraints(self):
+        source_map, target_map = (56, 0), (56, 1)
+        coordinates = {(source_map, (x, y)) for y in range(2) for x in range(3)}
+        trainer = TriggerObservation(
+            "trainer:route",
+            frozenset({(source_map, (1, 0))}),
+            hazard_locations=frozenset({(source_map, (1, 0))}),
+            hazard_kind="trainer",
+        )
+        observed = NavigationWorld(
+            tiles={location: NavigableTile(location, False, frozenset(Direction)) for location in coordinates},
+            triggers=(trainer,),
+            facing=Direction.East,
+        )
+        graph = WorldMapGraph(
+            (
+                WorldEdge(
+                    source_map,
+                    target_map,
+                    "warp",
+                    ((2, 0),),
+                    ((0, 0),),
+                ),
+            )
+        )
+        goal = NavigationGoal(
+            ReachWarp(destination_map=target_map),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+        )
+
+        plan, _ = plan_with_world_navigation(observed, (source_map, (0, 0)), goal, graph)
+
+        route_locations = {
+            location
+            for action in plan.actions
+            for location in (action.source, action.destination)
+            if location is not None
+        }
+        self.assertNotIn((source_map, (1, 0)), route_locations)
+
+    def test_observed_directional_warp_does_not_duplicate_activation(self):
+        source_map, target_map = (8, 1), (0, 0)
+        warp = WarpObservation(
+            (source_map, (1, 0)),
+            (target_map, (15, 8)),
+            required_facing=Direction.East,
+            activation=WarpActivation.DIRECTIONAL_STEP,
+        )
+        observed = world(source_map, [(0, 0), (1, 0)], (warp,), facing=Direction.East)
+
+        plan = plan_observed_warp_locally(
+            observed,
+            (source_map, (0, 0)),
+            ReachWarp(destination_map=target_map, destination=warp.destination, warp=warp),
+        )
+
+        warp_actions = [action for action in plan.actions if action.action_type is NavigationActionType.WARP]
+        self.assertEqual(len(warp_actions), 1)
+        self.assertEqual(warp_actions[0].source, warp.entry)
+        self.assertEqual(warp_actions[0].destination, warp.destination)
+
     def test_observed_door_warp_avoids_global_expansion(self):
         source_map, target_map = (98, 1), (98, 2)
         warp = WarpObservation((source_map, (2, 0)), (target_map, (0, 0)))
@@ -128,6 +190,35 @@ class GlobalNavigationTests(unittest.TestCase):
             if item.args
         )
         self.assertIn("GLOBAL_ROUTE_FOUND", diagnostic_text)
+
+    def test_navigation_goal_wrapper_routes_semantic_destination_cross_map(self):
+        source, middle, target = (12, 1), (12, 2), (12, 3)
+        transitions = (
+            WarpObservation((source, (1, 0)), (middle, (1, 1))),
+            MapConnectionObservation((middle, (0, 1)), (target, (0, 0)), required_facing=Direction.West),
+        )
+        tiles = {
+            (map_id, (x, y)): NavigableTile((map_id, (x, y)), False, frozenset(Direction))
+            for map_id in (source, middle, target)
+            for y in range(3)
+            for x in range(3)
+        }
+        graph = WorldMapGraph(
+            (
+                WorldEdge(source, middle, "warp", ((1, 0),), ((1, 1),)),
+                WorldEdge(middle, target, "connection", ((0, 1),), ((0, 0),)),
+            )
+        )
+
+        plan, route = plan_with_world_navigation(
+            NavigationWorld(tiles=tiles, transitions=transitions, facing=Direction.East),
+            (source, (0, 0)),
+            NavigationGoal(SemanticTarget.map(target)),
+            graph,
+        )
+
+        self.assertEqual(route.maps, (source, middle, target))
+        self.assertEqual(plan.actions[-1].destination, (target, (0, 0)))
 
     def test_rival_house_also_reaches_route101_without_lab_substitution(self):
         rival, town, route101 = ((11, 1), (11, 2), (11, 3))

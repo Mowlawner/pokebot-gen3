@@ -31,6 +31,7 @@ class PokebotGui:
     ):
         from modules.gui.create_profile_screen import CreateProfileScreen
         from modules.gui.emulator_screen import EmulatorScreen
+        from modules.gui.select_profile_screen import SelectProfileScreen
 
         if not no_theme:
             theme = "equilux" if darkdetect.isDark() else "clam"

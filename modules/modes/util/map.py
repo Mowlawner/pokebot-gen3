@@ -59,6 +59,11 @@ _closest_pokemon_centers: dict[MapFRLG | MapRSE, list[PokemonCenter]] = {
     MapRSE.LILYCOVE_CITY: [PokemonCenter.LilycoveCity],
     MapRSE.MOSSDEEP_CITY: [PokemonCenter.MossdeepCity],
     MapRSE.EVER_GRANDE_CITY: [PokemonCenter.EvergrandeCity],
+    # Littleroot has no Pokémon Center, but its indoor maps can still be
+    # exited and routed to Oldale.  Keeping the outdoor parent in the same
+    # registry lets every Littleroot interior use the normal cross-map
+    # recovery planner.
+    MapRSE.LITTLEROOT_TOWN: [PokemonCenter.OldaleTown],
     MapRSE.OLDALE_TOWN: [PokemonCenter.OldaleTown],
     # Birch's Lab has no Center of its own, but the player can leave
     # Littleroot and reach Oldale's Center through Route 101.  Keep the
@@ -99,17 +104,54 @@ _closest_pokemon_centers: dict[MapFRLG | MapRSE, list[PokemonCenter]] = {
 }
 
 
+def _recovery_parent_map(map_id: MapFRLG | MapRSE) -> MapFRLG | MapRSE | None:
+    """Return the registered outdoor map owning an indoor map.
+
+    The map groups in RSE/FRLG use stable names such as
+    ``PETALBURG_CITY_GYM`` and ``ROUTE104_PRETTY_PETAL_FLOWER_SHOP``.
+    Recovery previously required an exact outdoor-map key, so a battle that
+    ended inside any ordinary building appeared to have no healing route.
+    Use the longest registered name prefix as a ROM-derived boundary.  This
+    does not claim that the indoor map is itself a Center; it only supplies
+    the outdoor recovery candidates whose route is then validated by the
+    world planner.
+    """
+
+    try:
+        enum_map = map_id if isinstance(map_id, (MapFRLG, MapRSE)) else get_map_enum(map_id)
+    except (TypeError, ValueError):
+        return None
+    parents = tuple(
+        candidate
+        for candidate in _closest_pokemon_centers
+        if isinstance(candidate, type(enum_map)) and enum_map.name.startswith(f"{candidate.name}_")
+    )
+    return max(parents, key=lambda candidate: len(candidate.name), default=None)
+
+
+def _candidates_for_map(map_id: MapFRLG | MapRSE) -> tuple[PokemonCenter, ...]:
+    """Return direct or ROM-name-derived recovery candidates."""
+
+    candidates = _closest_pokemon_centers.get(map_id, ())
+    if candidates:
+        return tuple(dict.fromkeys(candidates))
+    parent = _recovery_parent_map(map_id)
+    return tuple(dict.fromkeys(_closest_pokemon_centers.get(parent, ()))) if parent is not None else ()
+
+
 def pokemon_center_candidates(
     location: MapLocation | tuple[MapFRLG | MapRSE, tuple[int, int]] | None = None,
 ) -> tuple[PokemonCenter, ...]:
     """Return all registered recovery sources for the current map."""
     if isinstance(location, MapLocation):
         map_id = location.map_group_and_number
+    elif isinstance(location, (MapFRLG, MapRSE)):
+        map_id = location
     elif location is not None:
         map_id = location[0]
     else:
         map_id = get_player_location()[0]
-    return tuple(dict.fromkeys(_closest_pokemon_centers.get(map_id, ())))
+    return _candidates_for_map(map_id)
 
 
 def find_closest_pokemon_center(
@@ -117,6 +159,8 @@ def find_closest_pokemon_center(
 ) -> PokemonCenter:
     if isinstance(location, MapLocation):
         training_spot_map = location.map_group_and_number
+    elif isinstance(location, (MapFRLG, MapRSE)):
+        training_spot_map = location
     elif location is not None:
         training_spot_map = location[0]
     else:
@@ -124,18 +168,25 @@ def find_closest_pokemon_center(
     pokemon_center = None
     path_length_to_pokemon_center = None
 
-    candidates = _closest_pokemon_centers.get(training_spot_map, ())
+    candidates = pokemon_center_candidates(training_spot_map)
+    parent_map = _recovery_parent_map(training_spot_map)
     diagnostic_print(
         lambda: "recovery_center_candidate_discovery: "
         + json.dumps(
-            {"source": location, "candidate_count": len(candidates), "candidates": candidates},
+            {
+                "source": location,
+                "source_map": training_spot_map,
+                "parent_map": parent_map,
+                "candidate_count": len(candidates),
+                "candidates": candidates,
+            },
             default=str,
             sort_keys=True,
         ),
         trace=True,
     )
-    if training_spot_map in _closest_pokemon_centers:
-        for pokemon_center_candidate in _closest_pokemon_centers[training_spot_map]:
+    if candidates:
+        for pokemon_center_candidate in candidates:
             operation_started = perf_counter_ns()
             path_to = path_from = None
             try:
@@ -246,12 +297,27 @@ def find_closest_pokemon_center(
                 pass
 
     if pokemon_center is None:
-        # ``calculate_path`` intentionally does not cross map warps.  The
-        # lab-to-Oldale recovery route is nevertheless executable by the
-        # world navigation planner, so retain the registered Center as the
-        # recovery destination and let that planner validate the route.
-        if training_spot_map is MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB:
-            return PokemonCenter.OldaleTown
+        # ``calculate_path`` intentionally does not cross map warps.  An
+        # indoor-to-outdoor recovery route is nevertheless executable by the
+        # world navigation planner, so retain the first registered Center as
+        # the recovery destination and let that planner validate the route.
+        if parent_map is not None and training_spot_map != parent_map and candidates:
+            diagnostic_print(
+                lambda: "recovery_center_selected: "
+                + json.dumps(
+                    {
+                        "candidate": candidates[0],
+                        "path_length": None,
+                        "selection": "indoor_parent_fallback",
+                        "source_map": training_spot_map,
+                        "parent_map": parent_map,
+                    },
+                    default=str,
+                    sort_keys=True,
+                ),
+                trace=True,
+            )
+            return candidates[0]
         raise BotModeError("Could not find a suitable path from here to a Pokemon Center nearby.")
 
     return pokemon_center
@@ -260,4 +326,4 @@ def find_closest_pokemon_center(
 def map_has_pokemon_center_nearby(map_enum: MapFRLG | MapRSE | tuple[int, int]) -> bool:
     if isinstance(map_enum, tuple):
         map_enum = get_map_enum(map_enum)
-    return map_enum in _closest_pokemon_centers
+    return bool(_candidates_for_map(map_enum))

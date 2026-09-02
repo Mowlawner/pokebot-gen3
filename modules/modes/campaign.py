@@ -5,9 +5,10 @@ from typing import Generator
 import traceback
 
 from modules.context import context
+from modules.agent_control import notify_battle_ended
 from modules.console import diagnostic_print
 from modules.nuzlocke.campaign_controller import CampaignController, runtime_campaign_state
-from modules.nuzlocke.campaign_objectives import plan_campaign
+from modules.nuzlocke.campaign_objectives import campaign_planning_signature, plan_campaign
 from modules.nuzlocke.campaign_status import CampaignStatus
 
 from ._interface import BattleAction, BotMode
@@ -41,10 +42,10 @@ from modules.overworld import (
     publish_shared_overworld_observation,
 )
 from modules.interaction_state import InteractionPhase, observe_interaction
-from modules.player import get_player_avatar
+from modules.player import get_player_avatar, player_avatar_is_controllable
 from modules.memory import GameState, get_game_state
 from modules.pokemon_party import get_party
-from modules.goals import ReachLocation
+from modules.goals import EncounterMode, GoalConstraints, NavigationGoal, ReachLocation, SemanticTarget, TrainerMode
 from modules.navigation import NavigationWorld, RouteCostAnalyzer
 from modules.world_navigation import get_world_map_graph
 from modules.modes.util.map import pokemon_center_candidates
@@ -102,7 +103,7 @@ class CampaignProgressionMode(BotMode):
         )
         self.controller = CampaignController(
             runtime_campaign_state,
-            selector=plan_campaign,
+            selector=self._select_campaign,
             readiness_provider=self._readiness_scheduler.observe,
             # CampaignPlan owns recovery selection.  There is deliberately no
             # fallback here that can reopen the healing catalog or select a
@@ -114,6 +115,21 @@ class CampaignProgressionMode(BotMode):
             ),
         )
         self._readiness_evaluated = False
+        self._campaign_selection_key = None
+        self._campaign_selection = None
+        self._campaign_boundary_context_seen = False
+        self._last_campaign_boundary_context = None
+
+    def _select_campaign(self, state):
+        """Reuse map-level planning until a relevant campaign fact changes."""
+
+        key = campaign_planning_signature(state)
+        if key == self._campaign_selection_key and self._campaign_selection is not None:
+            return self._campaign_selection
+        selection = plan_campaign(state)
+        self._campaign_selection_key = key
+        self._campaign_selection = selection
+        return selection
 
     def _campaign_controller(self):
         """Return the controller owned by this mode instance."""
@@ -122,17 +138,33 @@ class CampaignProgressionMode(BotMode):
 
     @staticmethod
     def _cheap_readiness_context():
-        """Read inexpensive position inputs used to age readiness diagnostics."""
+        """Read inexpensive boundary inputs used to age readiness diagnostics.
+
+        Exact coordinates are intentionally excluded.  Walking normally changes
+        them every frame, but does not change the party's readiness facts or the
+        set of map-level recovery affordances.  Battle completion explicitly
+        invalidates the scheduler, while the map identity below naturally
+        invalidates it across a map transition.
+        """
 
         try:
             avatar = get_player_avatar()
-            return (
-                getattr(get_game_state(), "name", None),
-                avatar.map_group_and_number,
-                avatar.local_coordinates,
-            )
+            state = getattr(get_game_state(), "name", None)
+            map_id = avatar.map_group_and_number
         except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
             return None
+        try:
+            # A script can leave the game state and map unchanged while
+            # releasing control on a later frame. Include this cheap
+            # boundary so an unavailable readiness result is refreshed
+            # immediately when tactical ownership returns. Keep a failed
+            # control read distinct from a failed avatar/map read so test
+            # doubles and transient emulator boundaries still have a useful
+            # map-level cache key.
+            controllable = player_avatar_is_controllable()
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            controllable = None
+        return (state, map_id, controllable)
 
     @staticmethod
     def _recovery_candidate_goals(current_location, recovery, *, is_rse):
@@ -145,6 +177,13 @@ class CampaignProgressionMode(BotMode):
         Keep same-map sources when present (there can be more than one in a
         future ROM), otherwise compare the selected destination only.
         """
+        selected_goal = getattr(recovery, "navigation_goal", None)
+        if selected_goal is not None:
+            # Recovery runtime already selected and validated one catalog
+            # source. Reuse its executable interior-warp goal so the
+            # readiness composition measures the same route that recovery
+            # will execute.
+            return (selected_goal,)
         if is_rse:
             local_sources = emerald_healing_sources_for_map(current_location[0])
             if local_sources:
@@ -163,6 +202,29 @@ class CampaignProgressionMode(BotMode):
         # Perceive the overworld first.  The callback-based game-state reader
         # can briefly report UNKNOWN at a battle/script boundary even when
         # the authoritative overworld observation has already become stable.
+        # Several Emerald capabilities intentionally have no tactical goal:
+        # their observation-driven delegate owns the script interaction. They
+        # still have a declared map destination, which is sufficient for
+        # readiness to compare continuing with returning to a healing source.
+        # Without this projection a damaged party is classified as
+        # opportunistically unknown and the campaign waits in place.
+        readiness_goal = goal
+        if readiness_goal is None:
+            destination = getattr(objective, "destination", None)
+            if isinstance(destination, tuple) and len(destination) == 2:
+                target_map = (
+                    destination[0]
+                    if isinstance(destination[0], tuple)
+                    and len(destination[0]) == 2
+                    and isinstance(destination[1], tuple)
+                    else destination
+                )
+                readiness_goal = NavigationGoal(
+                    SemanticTarget.map(target_map),
+                    constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+                    encounter_mode=EncounterMode.AVOID,
+                )
+
         overworld = perceive_overworld()
         publish_shared_overworld_observation(overworld)
         runtime = getattr(context, "nuzlocke_runtime", None)
@@ -295,6 +357,7 @@ class CampaignProgressionMode(BotMode):
             and resource_observation_valid
             and (
                 not resources.usable_party
+                or any(member.fainted for member in resources.party)
                 or resources.worst_hp_ratio < minimum_hp_ratio
                 or resources.worst_hp_ratio <= CampaignReadinessPolicy().opportunistic_hp_ratio
             )
@@ -361,15 +424,15 @@ class CampaignProgressionMode(BotMode):
             trace=True,
         )
         route_analysis = None
-        if overworld is None or goal is None or not snapshot.player_available:
+        if overworld is None or readiness_goal is None:
             diagnostic_print(
                 lambda: (
                     "ROUTE_ANALYSIS_CONSTRUCTION_FAILURE\n"
                     "exception_type=UnavailableContext\n"
                     "exception_message=route-analysis precondition unavailable\n"
                     "failing_operation=precondition\n"
-                    f"active_tactical_goal={goal!r}\n"
-                    f"goal_type={type(goal).__name__ if goal is not None else None}\n"
+                    f"active_tactical_goal={readiness_goal!r}\n"
+                    f"goal_type={type(readiness_goal).__name__ if readiness_goal is not None else None}\n"
                     f"navigation_world_available={overworld is not None}\n"
                     f"world_graph_available=False\n"
                     "candidate_count=0\n"
@@ -381,8 +444,7 @@ class CampaignProgressionMode(BotMode):
             recovery_needed
             and overworld is not None
             and overworld_availability is Availability.KNOWN
-            and goal is not None
-            and snapshot.player_available
+            and readiness_goal is not None
         ):
             operation = "initialization"
             candidate_goals = ()
@@ -411,7 +473,32 @@ class CampaignProgressionMode(BotMode):
                 operation = "WorldMapGraph acquisition"
                 graph = get_world_map_graph()
                 operation = "RouteCostAnalyzer.analyze"
-                route_analysis = RouteCostAnalyzer(world, graph=graph).analyze(current_location, goal, candidates)
+                route_analysis = RouteCostAnalyzer(world, graph=graph).analyze(
+                    current_location, readiness_goal, candidates
+                )
+                diagnostic_print(
+                    lambda: (
+                        "READINESS_ROUTE_ANALYSIS: "
+                        f"start={current_location!r} goal={readiness_goal!r} "
+                        f"normal_cost={route_analysis.normal_cost!r} "
+                        f"normal_destination={getattr(route_analysis.normal_route, 'destination', None)!r} "
+                        "candidates="
+                        f"{[
+                            {
+                                'destination': repr(candidate.destination),
+                                'reachable': candidate.reachable,
+                                'total_cost': candidate.total_cost,
+                                'detour': candidate.detour,
+                                'reason': candidate.reason,
+                                'first_destination': getattr(candidate.first_route, 'destination', None),
+                                'continuation_destination': getattr(candidate.continuation_route, 'destination', None),
+                            }
+                            for candidate in route_analysis.candidates
+                        ]!r}"
+                    ),
+                    trace=True,
+                    prefix="READINESS_ROUTE_ANALYSIS",
+                )
             except (RuntimeError, TypeError, ValueError) as error:
                 diagnostic_print(
                     lambda: (
@@ -419,8 +506,8 @@ class CampaignProgressionMode(BotMode):
                         f"exception_type={type(error).__name__}\n"
                         f"exception_message={error}\n"
                         f"failing_operation={operation}\n"
-                        f"active_tactical_goal={goal!r}\n"
-                        f"goal_type={type(goal).__name__ if goal is not None else None}\n"
+                        f"active_tactical_goal={readiness_goal!r}\n"
+                        f"goal_type={type(readiness_goal).__name__ if readiness_goal is not None else None}\n"
                         f"current_map_location={current_location!r}\n"
                         f"navigation_world_available={world is not None}\n"
                         f"world_graph_available={graph is not None}\n"
@@ -436,7 +523,7 @@ class CampaignProgressionMode(BotMode):
             objective_id=objective.objective_id if objective is not None else None,
             objective_status="ready",
             destination=getattr(objective, "destination", None),
-            navigation_goal=goal,
+            navigation_goal=readiness_goal,
             campaign_mode="Campaign Progression",
             overworld=overworld,
             resource_snapshot=resources,
@@ -499,7 +586,7 @@ class CampaignProgressionMode(BotMode):
                             f"location={location!r} action='Catch' objective="
                             f"{controller.last_selection.objective.objective_id!r}"
                         ),
-                        trace=True,
+                        trace=False,
                     )
                     return BattleAction.Catch
             if objective.objective_id == "prepare_roxanne":
@@ -531,7 +618,7 @@ class CampaignProgressionMode(BotMode):
                         f"location={location!r} action='Catch' objective="
                         f"{controller.last_selection.objective.objective_id!r}"
                     ),
-                    trace=True,
+                    trace=False,
                 )
                 return BattleAction.Catch
             objective = controller.last_selection.objective
@@ -565,9 +652,21 @@ class CampaignProgressionMode(BotMode):
                     return BattleAction.RunAway
         return BattleAction.Fight
 
+    def on_spotted_by_trainer(self) -> None:
+        """Recheck campaign readiness when a trainer battle becomes imminent."""
+
+        controller = getattr(self, "controller", None)
+        request_recheck = getattr(controller, "request_readiness_recheck", None)
+        if callable(request_recheck):
+            request_recheck("trainer_spotted")
+
     def on_battle_ended(self, outcome) -> None:
         """Invalidate readiness after a battle changes party or route state."""
 
+        # Campaign tactical loops are suspended while BattleListener owns the
+        # battle. Publish the boundary so a cached recovery/navigation suffix
+        # cannot resume by pressing into a trainer that moved during battle.
+        notify_battle_ended()
         diagnostic_print(
             lambda: (
                 "CAMPAIGN_BATTLE_ENDED: "
@@ -578,8 +677,46 @@ class CampaignProgressionMode(BotMode):
             trace=True,
         )
         scheduler = getattr(self, "_readiness_scheduler", None)
-        if scheduler is not None:
+        controller = getattr(self, "controller", None)
+        request_recheck = getattr(controller, "request_readiness_recheck", None)
+        if callable(request_recheck):
+            request_recheck("battle_ended")
+        elif scheduler is not None:
+            # Keep lightweight/test embeddings safe when they provide only a
+            # scheduler and not the full campaign controller. The normal mode
+            # path invalidates through the controller so the pending
+            # ownership boundary and scheduler cache stay synchronized.
             scheduler.invalidate("battle_ended")
+
+    def _observe_campaign_boundary(self, controller) -> None:
+        """Invalidate campaign planning when a coarse ROM boundary changes."""
+
+        current = self._cheap_readiness_context()
+        if not getattr(self, "_campaign_boundary_context_seen", False):
+            self._campaign_boundary_context_seen = True
+            self._last_campaign_boundary_context = current
+            return
+
+        previous = self._last_campaign_boundary_context
+        self._last_campaign_boundary_context = current
+        if current == previous:
+            return
+
+        reason = "campaign_boundary_changed"
+        if isinstance(previous, tuple) and isinstance(current, tuple):
+            if len(previous) > 1 and len(current) > 1 and previous[1] != current[1]:
+                reason = "map_changed"
+            elif len(previous) > 0 and len(current) > 0 and previous[0] != current[0]:
+                reason = "game_state_changed"
+            elif len(previous) > 2 and len(current) > 2 and previous[2] != current[2]:
+                reason = "control_boundary_changed"
+
+        request_recheck = getattr(controller, "request_readiness_recheck", None)
+        request_refresh = getattr(controller, "request_refresh", None)
+        if callable(request_recheck):
+            request_recheck(reason)
+        elif callable(request_refresh):
+            request_refresh(reason)
 
     def run(self) -> Generator:
         """Yield frame boundaries while the campaign controller remains active."""
@@ -589,6 +726,7 @@ class CampaignProgressionMode(BotMode):
         previous = None
         while True:
             controller = self._campaign_controller()
+            self._observe_campaign_boundary(controller)
             state = controller.step()
             marker = (state.status, state.objective_id, state.reason)
             if marker != previous:

@@ -2,7 +2,7 @@
 
 from collections import deque
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 from modules.items import InvalidItemIndexError, get_item_bag, get_item_storage, get_item_by_name
@@ -15,7 +15,7 @@ from modules.agent_control import (
     observe_agent,
     select_action,
 )
-from modules.interaction_state import InteractionPhase
+from modules.interaction_state import InteractionPhase, InteractionType
 from modules.goals import (
     ActivateTrigger,
     EncounterMode,
@@ -43,8 +43,15 @@ from modules.navigation import (
     NavigationPlan,
     NavigationWorld,
     plan_with_world_navigation,
+    transitions_match,
 )
-from modules.overworld import MovementState, OverworldObservationResult, perceive_overworld
+from modules.overworld import (
+    MovementState,
+    OverworldObservationResult,
+    perceive_overworld,
+    static_map_transitions,
+    WorldTransition,
+)
 from modules.world_navigation import get_world_map_graph
 from modules.modes.util.pc_interaction import PCAction, interact_with_pc
 from modules.modes._interface import BotModeError
@@ -52,6 +59,8 @@ from modules.pokemon_party import get_party
 from modules.console import diagnostic_print
 from .campaign_status import recovery_status
 from modules.goals import SemanticTarget
+from .capture_policy import EncounterMethod
+from .trainer_policy import TrainerPolicyInput, choose_trainer_mode
 from .identity import PokemonIdentity
 from .emerald_healing_catalog import (
     emerald_healing_source_for_destination,
@@ -65,6 +74,36 @@ from .resource_policy import (
     ResourceSnapshot,
 )
 from .resource_policy import ResourceDecision, RouteRecovery, assess_campaign_resources
+
+
+def _recovery_agent_logger(message: str) -> None:
+    """Expose only recovery route boundaries from the tactical loop.
+
+    Recovery uses the same agent controller as ordinary campaign navigation,
+    but its default diagnostic stream is intentionally filtered. Keep the
+    useful route/input evidence visible without re-enabling every per-frame
+    agent record (which materially slows the emulator).
+    """
+
+    visible = (
+        "AGENT_ROUTE_PLAN",
+        "AGENT_REPLAN",
+        "AGENT_MOVE_BATCH",
+        "AGENT_BATTLE_RETURN",
+        "AGENT_WATCHDOG",
+        "AGENT_WORLD:",
+        "AGENT_TRANSITION",
+        "AGENT_ACTION:",
+        "AGENT_GOAL:",
+        "AGENT_PLAN:",
+    )
+    if not message.startswith(visible):
+        return
+    diagnostic_print(
+        lambda: f"CAMPAIGN_RECOVERY_STAGE: {message}",
+        trace=True,
+        prefix="CAMPAIGN_RECOVERY_STAGE",
+    )
 
 
 def _pulse_toward_entry(observation, destination) -> bool:
@@ -111,8 +150,12 @@ def _recovery_navigation_goal(destination, source=None):
     if interior_map is None:
         # Preserve compatibility for non-Emerald providers that expose only a
         # standable destination coordinate.
-        return ReachLocation(destination)
-    return ReachWarp(destination_map=_map_id_value(interior_map))
+        target = ReachLocation(destination)
+    else:
+        target = ReachWarp(destination_map=_map_id_value(interior_map))
+    # Recovery is safety-critical: the route must avoid undefeated trainer
+    # sight lines whenever the observed world exposes them.
+    return NavigationGoal(target, constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID))
 
 
 def _navigation_plan_from_legacy_path(start, waypoints) -> NavigationPlan | None:
@@ -175,6 +218,7 @@ def _prewarm_interior_map_identity(interior_map_id) -> None:
 # phase.  Bound a failed live-map observation so a bad ROM observation is
 # reported instead of leaving the bot motionless forever.
 _MAP_IDENTITY_RESOLUTION_TIMEOUT = 300
+_RECOVERY_CATALOG_CANDIDATE_LIMIT = 4
 
 
 class HealingSourceType(Enum):
@@ -517,6 +561,118 @@ def _preparation_training_location(training_map) -> tuple[tuple, tuple[tuple[int
 
 
 _PREPARATION_NAVIGATION_RETRY_LIMIT = 12
+_ENCOUNTER_STAGE_RETRY_DELAY_MAX = 64
+
+
+def _encounter_stage_goal(overworld, transition, next_map, trainer_mode):
+    """Build the exact local goal for one ROM-backed encounter exit."""
+
+    live_transitions = tuple(getattr(overworld, "transitions", ()) or overworld.warps)
+    if not any(transitions_match(transition, candidate) for candidate in live_transitions):
+        live_transitions += (transition,)
+    staged_overworld = replace(overworld, transitions=live_transitions)
+    goal = NavigationGoal(
+        ReachWarp(
+            destination_map=next_map,
+            destination=transition.destination,
+            warp=transition,
+        ),
+        constraints=GoalConstraints(trainer_mode=trainer_mode),
+        encounter_mode=EncounterMode.AVOID,
+    )
+    return staged_overworld, goal
+
+
+def _probe_encounter_stage_route(overworld, transition, next_map, trainer_mode):
+    """Probe one exit without sending input to the emulator."""
+
+    staged_overworld, goal = _encounter_stage_goal(overworld, transition, next_map, trainer_mode)
+    plan, _ = plan_with_world_navigation(
+        NavigationWorld.from_overworld(staged_overworld),
+        (overworld.map_id, overworld.player_coordinates),
+        goal,
+    )
+    return plan
+
+
+def _encounter_stage_trainer_mode(overworld, transitions, next_map):
+    """Choose the trainer policy for one cross-map encounter stage.
+
+    Encounter acquisition should preserve an available first encounter, but
+    it must not deadlock when an undefeated trainer's sight line partitions
+    the map. Probe every ROM-backed exit to the destination, preferring a
+    route that avoids trainers. If no safe exit exists, the policy is allowed
+    to let a trainer battle happen as part of normal travel; the campaign
+    battle listener will own the battle and readiness will be checked again
+    when it ends.
+
+    Return the selected transition along with its policy so callers do not
+    probe one exit and then execute a different, arbitrarily chosen exit.
+    """
+    current_map = getattr(overworld, "map_id", None)
+    current_coordinates = getattr(overworld, "player_coordinates", None)
+    if current_map is None or current_coordinates is None:
+        return transitions[0], choose_trainer_mode(TrainerPolicyInput(seeking_encounter=True)), "position_unavailable"
+
+    safe_routes = []
+    safe_errors = []
+    for index, transition in enumerate(transitions):
+        try:
+            plan = _probe_encounter_stage_route(overworld, transition, next_map, TrainerMode.AVOID)
+        except (NavigationError, PathFindingError, RuntimeError, TypeError, ValueError) as error:
+            safe_errors.append((index, type(error).__name__, str(error)))
+            continue
+        # GoalAwareNavigator may fall back from AVOID to IGNORE when every
+        # hazard-free route is blocked. That is a valid navigation fallback,
+        # but it is not evidence that this exit is safe for the probe.
+        if getattr(plan, "forced_trainer_exposure", False):
+            safe_errors.append((index, "TrainerExposure", "safe route required trainer exposure"))
+            continue
+        safe_routes.append((plan, index, transition))
+
+    if safe_routes:
+        plan, index, transition = min(
+            safe_routes,
+            key=lambda item: (
+                getattr(getattr(item[0], "metrics", None), "total_route_cost", float("inf")),
+                item[1],
+            ),
+        )
+        del plan
+        return (
+            transition,
+            choose_trainer_mode(TrainerPolicyInput(seeking_encounter=True)),
+            f"safe_route_available:candidate={index}",
+        )
+
+    exposed_routes = []
+    exposed_errors = []
+    for index, transition in enumerate(transitions):
+        try:
+            plan = _probe_encounter_stage_route(overworld, transition, next_map, TrainerMode.IGNORE)
+        except (NavigationError, PathFindingError, RuntimeError, TypeError, ValueError) as error:
+            exposed_errors.append((index, type(error).__name__, str(error)))
+            continue
+        exposed_routes.append((plan, index, transition))
+
+    if exposed_routes:
+        plan, index, transition = min(
+            exposed_routes,
+            key=lambda item: (
+                getattr(getattr(item[0], "metrics", None), "total_route_cost", float("inf")),
+                item[1],
+            ),
+        )
+        del plan
+        mode = choose_trainer_mode(TrainerPolicyInput(seeking_encounter=True, trainer_blocks_route=True))
+        return transition, mode, f"safe_route_unavailable:using_candidate={index}"
+
+    # Preserve a deterministic retry target while the observed map settles.
+    # The caller applies bounded backoff instead of remounting the whole
+    # campaign objective on every failed probe.
+    transition = transitions[0]
+    mode = choose_trainer_mode(TrainerPolicyInput(seeking_encounter=True, trainer_blocks_route=True))
+    return transition, mode, f"all_routes_unavailable:safe={safe_errors!r}:ignore={exposed_errors!r}"
 
 
 def _reachable_local_positions(world, start, training_map):
@@ -620,7 +776,7 @@ def _preparation_navigation_goal(
                 "CAMPAIGN_PREPARATION_WILD_DISABLED: "
                 f"map={training_map!r} start={start!r} reason='area encounter already resolved'"
             ),
-            trace=True,
+            trace=False,
         )
 
     trainers = sorted(
@@ -698,6 +854,323 @@ def _preparation_encounter_resolved(training_map) -> bool:
         None,
     )
     return encounter is not None and getattr(encounter, "status", None) not in {"none", "pending", "unknown"}
+
+
+def _encounter_roll_direction(overworld) -> tuple[Direction | None, str]:
+    """Choose an input that rolls for an encounter without leaving grass.
+
+    Gen III checks for a wild encounter on a movement/turn input, not while
+    the avatar is merely standing on an encounter tile.  Prefer a legal step
+    onto another encounter tile, since it is the most reliable way to produce
+    the roll.  If the tile is isolated, turn into a blocked direction instead
+    so the avatar remains on encounter terrain.
+    """
+    if overworld is None:
+        return None, "overworld_observation_unavailable"
+
+    map_id = getattr(overworld, "map_id", None)
+    coordinates = getattr(overworld, "player_coordinates", None)
+    if map_id is None or not isinstance(coordinates, tuple) or len(coordinates) != 2:
+        return None, "player_position_unavailable"
+
+    world = NavigationWorld.from_overworld(overworld)
+    start = (map_id, coordinates)
+    current_tile = world.tiles.get(start)
+    if current_tile is None or not current_tile.has_encounters:
+        return None, "not_on_encounter_terrain"
+
+    legal_directions: set[Direction] = set()
+    encounter_neighbors: list[tuple[Direction, tuple, bool]] = []
+    for direction, destination, is_warp in world.neighbors(start):
+        legal_directions.add(direction)
+        destination_tile = world.tiles.get(destination)
+        if (
+            not is_warp
+            and destination[0] == map_id
+            and destination_tile is not None
+            and destination_tile.has_encounters
+        ):
+            encounter_neighbors.append((direction, destination, is_warp))
+
+    if encounter_neighbors:
+        direction, _destination, _is_warp = min(
+            encounter_neighbors,
+            key=lambda candidate: candidate[0].value,
+        )
+        return direction, "move_within_encounter_terrain"
+
+    # A blocked input changes facing without changing coordinates.  Only use
+    # a direction that the live world says is not a legal step; pressing into a
+    # walkable non-grass tile would defeat the purpose of this phase.
+    facing = getattr(overworld, "facing", None)
+    for direction in Direction:
+        if direction is not facing and direction not in legal_directions:
+            return direction, "turn_in_place_on_blocked_edge"
+
+    return None, "no_safe_encounter_roll_input"
+
+
+def _issue_encounter_roll_input(direction: Direction) -> None:
+    """Send one fresh directional edge for encounter generation."""
+    emulator = context.emulator
+    reset_held_buttons = getattr(emulator, "reset_held_buttons", None)
+    if callable(reset_held_buttons):
+        # A navigation batch may have held its final direction until the goal
+        # boundary. Do not let that ownership bleed into acquisition input.
+        reset_held_buttons()
+
+    press_direction = getattr(emulator, "press_direction", None)
+    if callable(press_direction):
+        press_direction(direction.button_name, run=False, fresh=True)
+        return
+
+    press_button_fresh = getattr(emulator, "press_button_fresh", None)
+    if callable(press_button_fresh):
+        press_button_fresh(direction.button_name)
+        return
+
+    # Keep lightweight emulator adapters usable while still giving the real
+    # adapter the fresh-edge behavior above.
+    emulator.press_button(direction.button_name)
+
+
+def _acquire_campaign_encounter(encounter_map) -> Iterator[object]:
+    """Generate encounter rolls after navigation reaches encounter terrain."""
+    rolls = 0
+    executor = AgentActionExecutor()
+    while True:
+        observation = observe_agent()
+        interaction_type = observation.interaction_type
+        if interaction_type is InteractionType.BATTLE:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_ENCOUNTER_ACQUISITION: " f"event=battle_started map={encounter_map!r} rolls={rolls}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_ENCOUNTER_ACQUISITION:",
+            )
+            # BattleListener now owns the battle. Returning lets the campaign
+            # controller re-evaluate encounter completion from its projection.
+            return
+
+        if _preparation_encounter_resolved(encounter_map):
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_ENCOUNTER_ACQUISITION: " f"event=encounter_resolved map={encounter_map!r} rolls={rolls}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_ENCOUNTER_ACQUISITION:",
+            )
+            return
+
+        if interaction_type is not InteractionType.OVERWORLD or not observation.interaction.controllable:
+            decision = select_action(observation)
+            executor.execute(decision.action, observation)
+            yield
+            continue
+
+        overworld = observation.overworld
+        if overworld is None:
+            yield
+            continue
+        if getattr(overworld, "map_id", None) != _map_id_value(encounter_map):
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_ENCOUNTER_ACQUISITION: "
+                    f"event=map_changed map={getattr(overworld, 'map_id', None)!r} "
+                    f"expected={_map_id_value(encounter_map)!r} rolls={rolls}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_ENCOUNTER_ACQUISITION:",
+            )
+            # A whiteout, warp, or other external transition should be
+            # handled by campaign replanning rather than by sending an input
+            # on the wrong map.
+            return
+
+        if (
+            getattr(overworld, "movement_state", None) is not None
+            and overworld.movement_state is not MovementState.STANDING
+        ):
+            yield
+            continue
+
+        direction, reason = _encounter_roll_direction(overworld)
+        if direction is None:
+            raise BotModeError(f"cannot generate an encounter roll on map {encounter_map!r}: {reason}")
+        _issue_encounter_roll_input(direction)
+        rolls += 1
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_ENCOUNTER_ACQUISITION: "
+                f"event=roll_input map={overworld.map_id!r} "
+                f"coordinates={overworld.player_coordinates!r} "
+                f"direction={direction.name!r} reason={reason!r} rolls={rolls}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_ENCOUNTER_ACQUISITION:",
+        )
+        yield
+
+
+def execute_campaign_encounter(
+    encounter_map, *, encounter_method: EncounterMethod = EncounterMethod.LAND
+) -> Iterator[object]:
+    """Navigate to the nearest reachable land-encounter tile on a map.
+
+    Cross-map travel is executed one ROM-backed exit at a time.  A semantic
+    destination is useful to campaign policy, but making the tactical search
+    infer an entire interior-to-route chain in one state search can lose the
+    first exit when live perception is partial.
+    """
+
+    if not isinstance(encounter_method, EncounterMethod):
+        raise BotModeError(f"malformed campaign encounter method: {encounter_method!r}")
+    if encounter_method is not EncounterMethod.LAND:
+        raise BotModeError(
+            f"campaign encounter method {encounter_method.value!r} is not supported; land is currently implemented"
+        )
+
+    map_id, encounter_candidates = _preparation_training_location(encounter_map)
+    graph = get_world_map_graph()
+    stage_retry_delay = 0
+    stage_failures = 0
+
+    while True:
+        if stage_retry_delay:
+            stage_retry_delay -= 1
+            yield
+            continue
+        current = observe_agent()
+        overworld = getattr(current, "overworld", None)
+        if overworld is None:
+            yield
+            continue
+        current_map = overworld.map_id
+        if current_map == map_id:
+            break
+
+        route = graph.route(current_map, map_id)
+        if len(route.maps) < 2:
+            raise BotModeError(f"no next map while routing from {current_map!r} to {map_id!r}")
+        next_map = route.maps[1]
+        static_candidates = tuple(
+            transition
+            for transition in static_map_transitions(current_map)
+            if transition.destination is not None and transition.destination[0] == next_map
+        )
+        if not static_candidates:
+            raise BotModeError(f"no ROM-backed exit from {current_map!r} to {next_map!r}")
+        transition, trainer_mode, trainer_mode_reason = _encounter_stage_trainer_mode(
+            overworld,
+            static_candidates,
+            next_map,
+        )
+        stage_goal = NavigationGoal(
+            ReachWarp(
+                destination_map=next_map,
+                destination=transition.destination,
+                warp=transition,
+            ),
+            constraints=GoalConstraints(trainer_mode=trainer_mode),
+            encounter_mode=EncounterMode.AVOID,
+        )
+
+        stage_last_observation = None
+
+        def observe_stage(goal=stage_goal):
+            nonlocal stage_last_observation
+            observation = observe_agent(goal=goal)
+            stage_last_observation = observation
+            observed_world = getattr(observation, "overworld", None)
+            if observed_world is None or observed_world.map_id != current_map:
+                return observation
+            live = tuple(getattr(observed_world, "transitions", ()) or observed_world.warps)
+            if not any(transitions_match(transition, candidate) for candidate in live):
+                live = live + (transition,)
+            return replace(observation, overworld=replace(observed_world, transitions=live))
+
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_ENCOUNTER_STAGE: "
+                f"current_map={current_map!r} next_map={next_map!r} "
+                f"trainer_mode={trainer_mode.name!r} trainer_mode_reason={trainer_mode_reason!r} "
+                f"transition={transition!r}"
+            ),
+            trace=True,
+        )
+        stage_loop = AgentControlLoop(
+            observe_stage,
+            goal=stage_goal,
+            logger=lambda message: diagnostic_print(
+                lambda: f"CAMPAIGN_ENCOUNTER_STAGE: {message}",
+                trace=True,
+                prefix="CAMPAIGN_ENCOUNTER_STAGE:",
+            ),
+        )
+        try:
+            yield from stage_loop.run()
+        except (NavigationError, PathFindingError) as error:
+            # AgentControlLoop cannot safely resume a failed navigation
+            # generator. Keep the campaign encounter capability mounted and
+            # retry the stage with exponential backoff instead of making the
+            # controller tear down and remount the entire objective every
+            # frame. A trainer may have moved, a transition may still be
+            # settling, or another ROM-backed exit may become usable.
+            stage_failures += 1
+            stage_retry_delay = min(
+                _ENCOUNTER_STAGE_RETRY_DELAY_MAX,
+                2 ** min(stage_failures, 6),
+            )
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_ENCOUNTER_STAGE_RETRY: "
+                    f"current_map={current_map!r} next_map={next_map!r} "
+                    f"transition={transition!r} trainer_mode={trainer_mode.name!r} "
+                    f"failure={stage_failures} delay={stage_retry_delay} "
+                    f"error_type={type(error).__name__!r} error={error!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_ENCOUNTER_STAGE_RETRY",
+            )
+            continue
+        stage_failures = 0
+        observed_world = getattr(stage_last_observation, "overworld", None)
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_ENCOUNTER_STAGE: "
+                f"event=loop_return current_map={current_map!r} next_map={next_map!r} "
+                f"observed_map={getattr(observed_world, 'map_id', None)!r} "
+                f"observed_coordinates={getattr(observed_world, 'player_coordinates', None)!r}"
+            ),
+            trace=True,
+        )
+
+    attempts = 0
+    while True:
+        observation = observe_agent()
+        overworld = getattr(observation, "overworld", None)
+        if overworld is None or getattr(overworld, "map_id", None) != map_id:
+            yield
+            continue
+        navigation_goal, error = _preparation_navigation_goal(overworld, map_id, encounter_candidates, allow_wild=True)
+        if navigation_goal is None:
+            raise BotModeError(f"no reachable encounter tile on map {map_id!r}: {error}")
+        attempts += 1
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_ENCOUNTER_TILE_SELECTED: "
+                f"map={map_id!r} start={overworld.player_coordinates!r} "
+                f"goal={navigation_goal!r} attempt={attempts}"
+            ),
+            trace=True,
+        )
+        yield from AgentControlLoop(lambda: observe_agent(goal=navigation_goal), goal=navigation_goal).run()
+        # Reaching grass is only the setup boundary. The ROM does not roll
+        # while the avatar is idle, so explicitly drive movement/turn inputs
+        # until BattleListener observes the desired wild battle.
+        yield from _acquire_campaign_encounter(map_id)
+        return
 
 
 def execute_campaign_preparation(training_map, *, target_level: int) -> Iterator[object]:
@@ -933,7 +1406,11 @@ def execute_planned_recovery(destination, planned_source=None, planned_route=Non
     # blocked warp entry in the ROM rather than a standable location.  Ask the
     # world navigator to execute the exact door warp so it can stop on the
     # adjacent activation tile and issue the required directional input.
-    navigation_goal = ReachWarp(destination_map=interior_map.value if hasattr(interior_map, "value") else interior_map)
+    # Keep the recovery safety policy on the goal that owns the route.  A bare
+    # ReachWarp carries GoalConstraints() and therefore silently changes
+    # TrainerMode.AVOID back to TrainerMode.IGNORE when a supplied route is
+    # invalidated (most importantly after a trainer battle).
+    navigation_goal = _recovery_navigation_goal(destination, catalog_source)
     context.campaign_status = recovery_status(
         SemanticTarget.at(destination),
         "Navigate to healing source",
@@ -943,7 +1420,16 @@ def execute_planned_recovery(destination, planned_source=None, planned_route=Non
         # terminates on the Center's interior map. A planner-composed
         # ReachLocation route, by contrast, ends on the selected exterior
         # destination and retains the historical goal contract.
-        planned_goal = ReachLocation(destination)
+        # A legacy route can terminate on the outdoor Center destination,
+        # while a world-composed route normally terminates after the door warp
+        # on the interior map. Preserve the route shape, but retain the
+        # recovery constraints in either case.
+        planned_goal = NavigationGoal(
+            ReachLocation(destination),
+            constraints=navigation_goal.constraints,
+            encounter_mode=navigation_goal.encounter_mode,
+            encounter_penalty=navigation_goal.encounter_penalty,
+        )
         planned_destination = getattr(planned_route, "destination", None)
         if (
             isinstance(planned_destination, tuple)
@@ -955,11 +1441,15 @@ def execute_planned_recovery(destination, planned_source=None, planned_route=Non
             lambda: observe_agent(goal=planned_goal),
             goal=planned_goal,
             navigation_plan=planned_route,
+            logger=_recovery_agent_logger,
+            use_movement_batch=False,
         ).run()
     else:
         yield from AgentControlLoop(
             lambda: observe_agent(goal=navigation_goal),
             goal=navigation_goal,
+            logger=_recovery_agent_logger,
+            use_movement_batch=False,
         ).run()
     if center is not None:
         yield from _wait_for_center_interior(center)
@@ -1249,9 +1739,28 @@ def observe_route_recovery() -> RouteRecovery:
             if trace is not None:
                 trace.duration("campaign_route_recovery_observation_duration_ms", started)
             return result
-        center = find_closest_pokemon_center(location)
+        center = None
+        center_lookup_error = None
+        try:
+            center = find_closest_pokemon_center(location)
+        except (BotModeError, PathFindingError) as error:
+            # The legacy table is intentionally incomplete: it contains
+            # route-level Center hints, not every map that can lead to one.
+            # In particular, Petalburg Woods has no direct table entry.  Keep
+            # that failure as a diagnostic and fall through to the ROM
+            # healing catalog below.
+            center_lookup_error = error
         center_location = getattr(center, "value", None)
-        if (
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_RECOVERY_ROUTE_SELECTED: "
+                f"source={location!r} center={center!r} destination={center_location!r} "
+                f"legacy_error={center_lookup_error!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_RECOVERY_ROUTE_SELECTED",
+        )
+        if center is not None and (
             not isinstance(center_location, tuple)
             or len(center_location) != 2
             or center_location[0] is None
@@ -1263,40 +1772,116 @@ def observe_route_recovery() -> RouteRecovery:
             if trace is not None:
                 trace.duration("campaign_route_recovery_observation_duration_ms", started)
             return result
-        route = None
-        try:
-            legacy_path = calculate_path(location, center_location)
-            distance = len(legacy_path)
-            route = _navigation_plan_from_legacy_path(location, legacy_path)
-        except PathFindingError:
-            # The legacy pathfinder deliberately cannot cross map warps. Use
-            # the same world planner that executes campaign navigation for
-            # recovery sources inside interiors such as Birch's Lab.
-            overworld = perceive_overworld()
-            if isinstance(overworld, OverworldObservationResult):
-                raise
-            plan, _ = plan_with_world_navigation(
-                NavigationWorld.from_overworld(overworld),
-                location,
-                _recovery_navigation_goal(center_location),
-                get_world_map_graph(),
+
+        # A valid legacy Center remains the first choice for compatibility,
+        # but Emerald's catalog supplies the executable interior target.  If
+        # the legacy map table has no candidate, probe cataloged sources and
+        # retain the first safe route after ranking by the actual tactical
+        # route cost.  This covers interior maps and outdoor areas such as
+        # Petalburg Woods without inventing a Center coordinate.
+        if center is not None:
+            source = emerald_healing_source_for_destination(center_location)
+            sources = (source,) if source is not None else (None,)
+        elif getattr(getattr(context, "rom", None), "is_rse", False):
+            source_map = location[0]
+            local_sources = tuple(
+                source
+                for source in emerald_healing_sources()
+                if source.outdoor_location[0] == source_map or source.interior_map == source_map
             )
-            if plan.metrics is None or plan.destination is None:
-                raise PathFindingError("world recovery route has no executable metrics")
-            distance = plan.metrics.total_route_cost
-            if distance is None:
-                raise PathFindingError("world recovery route has no cost")
+            sources = local_sources or emerald_healing_sources()
+        else:
+            sources = ()
+
+        if not sources:
+            raise center_lookup_error or BotModeError("no cataloged healing source is available")
+
+        overworld = perceive_overworld()
+        if isinstance(overworld, OverworldObservationResult):
+            raise PathFindingError("overworld observation unavailable")
+        world = NavigationWorld.from_overworld(overworld)
+        graph = get_world_map_graph()
+        start = (_map_id_value(location[0]), location[1])
+
+        # The static graph gives a cheap ordering for the catalog.  Every
+        # candidate is still validated by the live-world planner, because a
+        # trainer sight line or a dynamic obstacle can make the map-level
+        # nearest source unsafe or temporarily unreachable.
+        def estimated_map_cost(source):
+            if source is None:
+                return 0
+            try:
+                return graph.route(start[0], _map_id_value(source.interior_map)).estimated_cost
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                return float("inf")
+
+        ordered_sources = tuple(sorted(enumerate(sources), key=lambda item: (estimated_map_cost(item[1]), item[0])))
+        # The static graph is an avenue selector, not a reason to probe every
+        # healing source in Hoenn.  Keep a small nearest-source frontier: the
+        # first candidate normally identifies Petalburg Center from Woods,
+        # while the bounded alternates preserve a chance to route around a
+        # temporary trainer/occupancy hazard without monopolizing the frame
+        # loop with eighteen global searches.
+        ordered_sources = ordered_sources[:_RECOVERY_CATALOG_CANDIDATE_LIMIT]
+        route_candidates = []
+        route_errors = []
+        for index, source in ordered_sources:
+            destination = center_location if source is None else source.outdoor_location
+            navigation_goal = _recovery_navigation_goal(
+                destination,
+                source,
+            )
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_RECOVERY_CATALOG_CANDIDATE: "
+                    f"source={location!r} healing_source={getattr(source, 'source_id', None)!r} "
+                    f"destination={destination!r} rank={index!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_RECOVERY_CATALOG_CANDIDATE",
+            )
+            try:
+                plan, _ = plan_with_world_navigation(world, start, navigation_goal, graph)
+                if getattr(plan, "forced_trainer_exposure", False):
+                    raise NavigationError("world recovery route requires trainer exposure")
+                if plan.metrics is None or plan.destination is None:
+                    raise PathFindingError("world recovery route has no executable metrics")
+                distance = plan.metrics.total_route_cost
+                if distance is None:
+                    raise PathFindingError("world recovery route has no cost")
+                route_candidates.append((distance, index, source, destination, navigation_goal, plan))
+            except (BotModeError, NavigationError, PathFindingError, TypeError, ValueError) as error:
+                route_errors.append((index, getattr(source, "source_id", None), type(error).__name__, str(error)))
+
+        if not route_candidates:
+            raise PathFindingError(f"no safe cataloged healing route: {route_errors!r}")
+        distance, _, source, destination, navigation_goal, route = min(
+            route_candidates,
+            key=lambda candidate: (candidate[0], candidate[1]),
+        )
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_RECOVERY_CATALOG_SELECTION: "
+                f"source={location!r} healing_source={getattr(source, 'source_id', None)!r} "
+                f"destination={destination!r} distance={distance!r} "
+                f"candidates={[(item[2].source_id if item[2] is not None else None, item[0]) for item in route_candidates]!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_RECOVERY_CATALOG_SELECTION",
+        )
         result = RouteRecovery(
             center_available=True,
-            center_location=center_location,
+            center_location=destination,
             distance_to_center=distance,
             safe_to_reach_center=True,
+            healing_source_available=True,
             route=route,
+            navigation_goal=navigation_goal,
         )
         if trace is not None:
             trace.duration("campaign_route_recovery_observation_duration_ms", started)
         return result
-    except (BotModeError, PathFindingError):
+    except (BotModeError, NavigationError, PathFindingError) as error:
         # A valid observation with no usable route is known, not transient.
         local_catalog_source = next(
             (
@@ -1306,7 +1891,19 @@ def observe_route_recovery() -> RouteRecovery:
             ),
             None,
         )
-        result = RouteRecovery(healing_source_available=local_catalog_source is not None)
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_RECOVERY_ROUTE_FAILURE: "
+                f"source={location!r} error_type={type(error).__name__!r} error={str(error)!r} "
+                f"catalog_source={getattr(local_catalog_source, 'source_id', None)!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_RECOVERY_ROUTE_FAILURE",
+        )
+        result = RouteRecovery(
+            healing_source_available=local_catalog_source is not None,
+            observation_error=str(error),
+        )
         if trace is not None:
             trace.duration("campaign_route_recovery_observation_duration_ms", started)
         return result

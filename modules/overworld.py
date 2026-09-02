@@ -35,6 +35,7 @@ EMERALD_MB_COUNTER = 0x80
 # to the capability so it does not rebuild the same map/object/trigger model a
 # second time before issuing its first action.
 _shared_overworld_observation_frame = None
+_shared_overworld_observation_context = None
 _shared_overworld_observation_emulator = None
 _shared_overworld_observation_avatar_reader = None
 _shared_overworld_observation = None
@@ -60,8 +61,9 @@ def _current_emulator_frame():
 def invalidate_shared_overworld_observation() -> None:
     """Discard the passive world read after an explicit runtime invalidation."""
 
-    global _shared_overworld_observation_frame, _shared_overworld_observation_emulator, _shared_overworld_observation_avatar_reader, _shared_overworld_observation
+    global _shared_overworld_observation_frame, _shared_overworld_observation_context, _shared_overworld_observation_emulator, _shared_overworld_observation_avatar_reader, _shared_overworld_observation
     _shared_overworld_observation_frame = None
+    _shared_overworld_observation_context = None
     _shared_overworld_observation_emulator = None
     _shared_overworld_observation_avatar_reader = None
     _shared_overworld_observation = None
@@ -70,11 +72,12 @@ def invalidate_shared_overworld_observation() -> None:
 def publish_shared_overworld_observation(observation) -> None:
     """Publish a passive overworld read for another owner in this frame."""
 
-    global _shared_overworld_observation_frame, _shared_overworld_observation_emulator, _shared_overworld_observation_avatar_reader, _shared_overworld_observation
+    global _shared_overworld_observation_frame, _shared_overworld_observation_context, _shared_overworld_observation_emulator, _shared_overworld_observation_avatar_reader, _shared_overworld_observation
     frame = _current_emulator_frame()
     if frame is None:
         return
     _shared_overworld_observation_frame = frame
+    _shared_overworld_observation_context = context
     _shared_overworld_observation_emulator = getattr(context, "emulator", None)
     _shared_overworld_observation_avatar_reader = get_player_avatar
     _shared_overworld_observation = observation
@@ -88,6 +91,7 @@ def shared_overworld_observation_for_current_frame():
         return None
     if (
         frame != _shared_overworld_observation_frame
+        or context is not _shared_overworld_observation_context
         or getattr(context, "emulator", None) is not _shared_overworld_observation_emulator
         or get_player_avatar is not _shared_overworld_observation_avatar_reader
     ):
@@ -313,11 +317,16 @@ def trainer_hazard_locations(
         return frozenset()
     tile_by_location = {tile.location: tile for tile in tiles}
     occupied = {obj.location for obj in objects if obj.location != trainer.location}
-    directions = (
-        tuple(Direction)
-        if trainer.trainer_type == "See All Directions"
-        else (Direction.from_string(trainer.facing or "South"),)
-    )
+    # ``Normal`` trainer facing is not a stable predictor at a planning
+    # boundary.  Emerald updates an object event's facing while its movement
+    # script is running, and a trainer can turn as part of the approach/battle
+    # handoff.  In particular, a live object may be facing east in the frame
+    # where the player is actually exposed from the north.  Recovery uses
+    # these locations as a safety boundary, so model every cardinal sightline
+    # for a normal trainer and let collision/object occupancy stop each line.
+    # ``See All Directions`` is already equivalent, but retaining the explicit
+    # branch documents the ROM distinction.
+    directions = tuple(Direction) if trainer.trainer_type in {"Normal", "See All Directions"} else ()
     vectors = {Direction.North: (0, -1), Direction.East: (1, 0), Direction.South: (0, 1), Direction.West: (-1, 0)}
     x, y = trainer.location[1]
     result: set[Location] = set()
@@ -940,6 +949,10 @@ def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservatio
         pass
     for task_name in (
         "Task_Warp",
+        # Emerald's arrow/door warp path uses this task name while the map
+        # remains on the source header.  It is the authoritative signal that
+        # a pending transition is still being resolved.
+        "Task_WarpAndLoadMap",
         "Task_DoorWarp",
         "Task_EscalatorWarp",
         "Task_ArrowWarp",
@@ -1072,10 +1085,17 @@ def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservatio
     # them.  Publish their ROM-derived sight lines immediately so a trainer-
     # avoiding route does not commit to an unsafe approach before that load.
     for trainer in static_trainers:
+        activation_requirements = resolve_object_activation_positions(
+            trainer,
+            tuple(runtime_objects) + static_trainers,
+            tiles,
+            (map_width, map_height),
+        )
         triggers.append(
             TriggerObservation(
                 trigger_id=f"static_object:{trainer.local_id}:{trainer.script}",
                 locations=frozenset({trainer.location}),
+                activation_locations=frozenset(location for location, _ in activation_requirements),
                 kind="trainer_hazard",
                 affordance_id=trainer.trainer_id,
                 hazard_locations=trainer_hazard_locations(

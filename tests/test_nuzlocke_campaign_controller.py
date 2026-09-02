@@ -1,10 +1,13 @@
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from modules.goals import Goal, ReachLocation
+from modules.context import context
+from modules.goals import Goal, NavigationGoal, ReachLocation, SemanticTarget
 from modules.navigation import IntermediateRouteAnalysis, RouteAnalysis
 from modules.nuzlocke.campaign_controller import CampaignController, CampaignControllerStatus
+from modules.nuzlocke.campaign_status import CampaignStatus
 from modules.nuzlocke.campaign_execution import (
     CampaignExecutionResult,
     CampaignExecutionStatus,
@@ -21,7 +24,12 @@ from modules.nuzlocke.campaign_objectives import (
     ultimate_emerald_campaign_goal,
 )
 from modules.nuzlocke.campaign_state import Fact, RunStatus
-from modules.nuzlocke.readiness_diagnostics import Availability, PartyReadinessMember, ProgressionReadinessDiagnostic
+from modules.nuzlocke.readiness_diagnostics import (
+    Availability,
+    PartyReadinessMember,
+    ProgressionReadinessDiagnostic,
+    ReadinessDecision,
+)
 
 from tests.test_nuzlocke_campaign_objectives import CampaignObjectiveTests
 
@@ -42,6 +50,9 @@ class CampaignControllerTests(unittest.TestCase):
         )
         self.created: list[Goal] = []
         self.executed = 0
+
+    def tearDown(self):
+        self.fixture.tearDown()
 
     def state(self, **changes):
         self.current = replace(self.current, **changes)
@@ -65,6 +76,25 @@ class CampaignControllerTests(unittest.TestCase):
         result = controller.refresh()
         self.assertEqual(result.objective_id, "complete_intro_rival")
         self.assertEqual(result.status, CampaignControllerStatus.READY)
+
+    def test_task_diagnostics_are_cached_with_map_level_planning_facts(self):
+        objective = self.fixture.objective("diagnostic", self.fixture.predicate("diagnostic_done", False))
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "diagnostic")
+        execution = CampaignExecutionResult(
+            objective, CampaignExecutionStatus.READY, "diagnostic", tactical_goal=Goal()
+        )
+        controller = CampaignController(
+            lambda: self.current,
+            selector=lambda _: selection,
+            adapter=lambda _: execution,
+        )
+        with patch.object(context, "debug", True), patch.object(context, "debug_trace", True), patch(
+            "modules.nuzlocke.campaign_controller.campaign_task_diagnostics", return_value=()
+        ) as diagnostics:
+            controller.refresh()
+            controller.refresh()
+
+        diagnostics.assert_called_once_with(self.current)
 
     def test_completed_intro_battle_reselects_next_declarative_objective(self):
         controller = self.controller()
@@ -160,6 +190,182 @@ class CampaignControllerTests(unittest.TestCase):
         # capability boundary; the legacy tactical-loop factory is not used.
         self.assertEqual(len(self.created), 0)
         self.assertEqual(self.executed, 0)
+
+    def test_mounted_tactical_loop_skips_campaign_refresh_until_requested(self):
+        objective = self.fixture.objective("stable", self.fixture.predicate("stable_done", False))
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "stable")
+        selector_calls = []
+
+        def select(_state):
+            selector_calls.append(1)
+            return selection
+
+        def capability():
+            while True:
+                yield
+
+        execution = CampaignExecutionResult(
+            objective,
+            CampaignExecutionStatus.READY,
+            "stable capability",
+            capability=capability,
+        )
+        controller = CampaignController(
+            lambda: self.current,
+            selector=select,
+            adapter=lambda _: execution,
+        )
+
+        controller.step()
+        controller.step()
+        controller.step()
+        self.assertEqual(len(selector_calls), 1)
+
+        controller.request_refresh("map_changed")
+        controller.step()
+        self.assertEqual(len(selector_calls), 2)
+
+    def test_readiness_recheck_requests_campaign_refresh(self):
+        objective = self.fixture.objective("stable", self.fixture.predicate("stable_done", False))
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "stable")
+        controller = CampaignController(
+            lambda: self.current,
+            selector=lambda _: selection,
+            adapter=lambda _: CampaignExecutionResult(
+                objective,
+                CampaignExecutionStatus.READY,
+                "stable capability",
+                capability=lambda: iter((None,)),
+            ),
+        )
+
+        controller.step()
+        self.assertFalse(controller._refresh_required)
+        controller.request_readiness_recheck("battle_ended")
+        self.assertTrue(controller._refresh_required)
+
+    def test_post_pokedex_targetless_capability_rechecks_readiness_once(self):
+        objective = next(item for item in initial_emerald_campaign() if item.objective_id == "reach_petalburg")
+        self.state(
+            campaign_facts=self.fixture.facts(
+                text_speed_fast=True,
+                new_game_setup_complete=True,
+                wall_clock_set=True,
+                rival_met=True,
+                birch_rescued=True,
+                starter_obtained=True,
+                intro_rival_battle_complete=True,
+                pokedex_received=True,
+                pokeballs_ready=True,
+            )
+        )
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "route traversal")
+        readiness_calls = []
+        readiness = ProgressionReadinessDiagnostic(
+            objective_id=objective.objective_id,
+            objective_status="ready",
+            destination=objective.destination,
+            navigation_goal=None,
+            current_map=(0, 18),
+            current_coordinates=(10, 3),
+            game_state="OVERWORLD",
+            campaign_mode="test",
+            party=(PartyReadinessMember(0, "Treecko", 1, 10, 1.0, False, True, "none"),),
+            has_usable_pokemon=True,
+            healing_available=False,
+            recovery=None,
+            trainers=(),
+            party_availability=Availability.KNOWN,
+            trainer_availability=Availability.KNOWN,
+            recovery_availability=Availability.UNAVAILABLE,
+            navigation_availability=Availability.NOT_APPLICABLE,
+            overworld_availability=Availability.KNOWN,
+            resource_availability=Availability.KNOWN,
+        )
+
+        def readiness_provider(*_):
+            readiness_calls.append(1)
+            return readiness
+
+        def capability():
+            while True:
+                yield
+
+        execution = CampaignExecutionResult(
+            objective,
+            CampaignExecutionStatus.READY,
+            "route capability",
+            capability=capability,
+        )
+        controller = CampaignController(
+            lambda: self.current,
+            selector=lambda _: selection,
+            adapter=lambda _: execution,
+            readiness_provider=readiness_provider,
+        )
+
+        controller.step()
+        controller.request_readiness_recheck("battle_ended")
+        controller.step()
+        controller.step()
+
+        self.assertEqual(len(readiness_calls), 2)
+        self.assertFalse(controller._readiness_recheck_pending)
+
+    def test_opening_targetless_capability_discards_inapplicable_recheck(self):
+        objective = self.fixture.objective("opening", self.fixture.predicate("opening_done", False))
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "opening")
+
+        def capability():
+            while True:
+                yield
+
+        execution = CampaignExecutionResult(
+            objective,
+            CampaignExecutionStatus.READY,
+            "opening capability",
+            capability=capability,
+        )
+        controller = CampaignController(
+            lambda: self.current,
+            selector=lambda _: selection,
+            adapter=lambda _: execution,
+        )
+
+        controller.step()
+        controller.request_readiness_recheck("battle_ended")
+        controller.step()
+        controller.step()
+
+        self.assertFalse(controller._readiness_recheck_pending)
+        self.assertFalse(controller._refresh_required)
+
+    def test_deferred_no_loop_state_does_not_refresh_every_frame(self):
+        objective = self.fixture.objective("deferred", self.fixture.predicate("deferred_done", False))
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "deferred")
+        selector_calls = []
+
+        def select(_state):
+            selector_calls.append(1)
+            return selection
+
+        controller = CampaignController(
+            lambda: self.current,
+            selector=select,
+            adapter=lambda _: CampaignExecutionResult(
+                objective,
+                CampaignExecutionStatus.UNKNOWN,
+                "emulator boundary",
+            ),
+        )
+
+        controller.step()
+        controller.step()
+        self.assertEqual(len(selector_calls), 1)
+
+        controller.request_refresh("battle_returned")
+        controller.step()
+        self.assertEqual(len(selector_calls), 2)
 
     def test_capability_remains_active_until_authoritative_fact_changes(self):
         calls = []
@@ -425,6 +631,7 @@ class CampaignControllerTests(unittest.TestCase):
         )
 
         first = controller.step()
+        controller.request_readiness_recheck("test_observation_boundary")
         second = controller.step()
 
         self.assertEqual(first.status, CampaignControllerStatus.READY)
@@ -486,6 +693,67 @@ class CampaignControllerTests(unittest.TestCase):
         self.assertEqual(mounted, ["receive_pokedex"])
         self.assertIsNotNone(controller._tactical_loop)
 
+    def test_deferred_readiness_publishes_new_execution_status(self):
+        objective = CampaignObjective(
+            "next_objective",
+            "Next Objective",
+            (),
+            self.fixture.predicate("next_done", False),
+            destination=(0, 17),
+            tactical_target=NavigationGoal(SemanticTarget.map((0, 17))),
+        )
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "next frontier")
+        execution = CampaignExecutionResult(
+            objective,
+            CampaignExecutionStatus.READY,
+            "next capability",
+            tactical_goal=objective.tactical_target,
+            capability=lambda: iter(()),
+        )
+        unknown = ProgressionReadinessDiagnostic(
+            objective_id=objective.objective_id,
+            objective_status="ready",
+            destination=objective.destination,
+            navigation_goal=objective.tactical_target,
+            current_map=(0, 18),
+            current_coordinates=(10, 3),
+            game_state="BATTLE",
+            campaign_mode="test",
+            party=(),
+            has_usable_pokemon=None,
+            healing_available=None,
+            recovery=None,
+            trainers=(),
+            party_availability=Availability.UNKNOWN,
+            trainer_availability=Availability.UNKNOWN,
+            recovery_availability=Availability.UNKNOWN,
+            navigation_availability=Availability.KNOWN,
+            overworld_availability=Availability.UNKNOWN,
+            resource_availability=Availability.UNKNOWN,
+        )
+        previous_status = context.campaign_status
+        try:
+            context.campaign_status = CampaignStatus(
+                "Wally's Tutorial",
+                SemanticTarget.map((8, 1)),
+                "Waiting / target temporarily unavailable",
+            )
+            controller = CampaignController(
+                lambda: self.current,
+                selector=lambda _: selection,
+                adapter=lambda _: execution,
+                readiness_provider=lambda *_: unknown,
+            )
+
+            result = controller.step()
+
+            self.assertEqual(result.status, CampaignControllerStatus.READY)
+            self.assertEqual(context.campaign_status.objective, "Next Objective")
+            self.assertEqual(context.campaign_status.target, SemanticTarget.map((0, 17)))
+            self.assertEqual(context.campaign_status.intent, "Waiting / readiness temporarily unavailable")
+        finally:
+            context.campaign_status = previous_status
+
     def test_later_active_objective_releases_on_coherent_save_regression(self):
         objectives = {objective.objective_id: objective for objective in initial_emerald_campaign()}
         active = objectives["prepare_roxanne"]
@@ -513,6 +781,7 @@ class CampaignControllerTests(unittest.TestCase):
         )
 
         controller.step()
+        controller.request_refresh("test_selection_boundary")
         result = controller.step()
 
         self.assertEqual(result.objective_id, "set_text_speed")
@@ -550,6 +819,7 @@ class CampaignControllerTests(unittest.TestCase):
         )
 
         controller.step()
+        controller.request_refresh("test_selection_boundary")
         result = controller.step()
 
         self.assertEqual(result.objective_id, "prepare_roxanne")

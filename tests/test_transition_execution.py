@@ -1,3 +1,4 @@
+from dataclasses import replace
 import unittest
 from unittest.mock import patch
 
@@ -71,6 +72,29 @@ def transition(kind="warp", destination=((0, 9), (1, 1))):
 
 
 class TestTransitionExecution(unittest.TestCase):
+    def test_transition_signal_prevents_premature_watchdog(self):
+        action = transition()
+        base = observation()
+        signaled = replace(
+            base,
+            overworld=replace(
+                base.overworld,
+                transition_in_progress=True,
+                transition_signals=frozenset({"task:Task_WarpAndLoadMap"}),
+            ),
+        )
+        loop, emulator, selected = self.make_loop((base, signaled), action)
+        loop._pending_transition_watchdog_limit = 1
+        with patch("modules.agent_control.context.emulator", emulator), patch(
+            "modules.agent_control.select_action", return_value=selected
+        ):
+            loop.step()
+            _, decision, result = loop.step()
+
+        self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(result.result_type, ActionResultType.WAITING)
+        self.assertIsNotNone(loop._pending_transition)
+
     def test_rom_control_releases_bot_direction_before_control_returns(self):
         emulator = _Emulator()
         emulator.active.add("Down")

@@ -47,7 +47,7 @@ class EmulatorControls:
         return 200
 
     def add_to_window(self) -> None:
-        from modules.gui import LoadStateWindow
+        from modules.gui.load_state_window import LoadStateWindow
 
         self.menu_bar = Menu(self.window)
 

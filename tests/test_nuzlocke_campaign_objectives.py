@@ -1,7 +1,11 @@
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from modules.map_data import MapRSE
+import modules.nuzlocke.campaign_objectives as campaign_objectives_module
+import modules.nuzlocke.encounter_catalog as encounter_catalog_module
 from modules.nuzlocke.campaign_objectives import (
     CampaignObjective,
     CampaignGoal,
@@ -31,6 +35,7 @@ from modules.nuzlocke.campaign_state import CampaignFacts, CampaignState, Fact, 
 from modules.nuzlocke.identity import PokemonIdentity
 from modules.nuzlocke.rules import LocationEncounter
 from modules.nuzlocke.encounter_catalog import encounter_opportunities
+from modules.nuzlocke.capture_policy import EncounterMethod
 from modules.nuzlocke.campaign_simulation import CampaignCheckpoint, simulate_checkpoint
 from modules.world_navigation import WorldEdge, WorldMapGraph
 from modules.nuzlocke.snapshots import (
@@ -45,6 +50,19 @@ from modules.nuzlocke.snapshots import (
 class CampaignObjectiveTests(unittest.TestCase):
     identity = PokemonIdentity(10, 20, 30)
 
+    def setUp(self):
+        # These are pure planner tests. Prevent a ROM left by an emulator-tier
+        # test from turning the static world catalog into an implicit extra
+        # fixture and changing the required-objective assertions.
+        self._previous_objectives_context = campaign_objectives_module.context
+        self._previous_catalog_context = encounter_catalog_module.context
+        campaign_objectives_module.context = SimpleNamespace(rom=None)
+        encounter_catalog_module.context = SimpleNamespace(rom=None)
+
+    def tearDown(self):
+        campaign_objectives_module.context = self._previous_objectives_context
+        encounter_catalog_module.context = self._previous_catalog_context
+
     def test_available_task_discovery_filters_prerequisites_and_keeps_optional_tasks(self):
         first = CampaignObjective(
             "required",
@@ -53,9 +71,27 @@ class CampaignObjectiveTests(unittest.TestCase):
             CampaignPredicate("done", "done", lambda _: Fact.known(False)),
             task_kind="required",
         )
-        optional = encounter_task(MapRSE.OLDALE_TOWN.value)
-        tasks = available_campaign_tasks(self.state(), (first, optional))
+        optional = encounter_task(MapRSE.ROUTE102.value)
+        tasks = available_campaign_tasks(
+            replace(
+                self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True)),
+                encounters=Fact.known((LocationEncounter(MapRSE.ROUTE102.value, "none"),)),
+            ),
+            (first, optional),
+        )
         self.assertEqual(tuple(task.objective_id for task in tasks), ("required", optional.objective_id))
+
+    def test_encounter_tasks_require_pokedex_before_observed_or_catalog_discovery(self):
+        state = replace(
+            self.state(),
+            encounters=Fact.known((LocationEncounter(MapRSE.ROUTE102.value, "none"),)),
+        )
+        before = available_campaign_tasks(state)
+        self.assertNotIn("obtain_encounter:0:17", tuple(task.objective_id for task in before))
+
+        after = replace(state, campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True))
+        discovered = available_campaign_tasks(after)
+        self.assertIn("obtain_encounter:0:17", tuple(task.objective_id for task in discovered))
 
     def test_consumed_encounter_is_not_available(self):
         optional = encounter_task(MapRSE.OLDALE_TOWN.value)
@@ -65,7 +101,7 @@ class CampaignObjectiveTests(unittest.TestCase):
 
     def test_default_discovery_uses_only_unconsumed_observed_encounter_locations(self):
         state = replace(
-            self.state(),
+            self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True)),
             encounters=Fact.known(
                 (
                     LocationEncounter(MapRSE.ROUTE102.value, "none"),
@@ -88,9 +124,48 @@ class CampaignObjectiveTests(unittest.TestCase):
         self.assertEqual(opportunities[1].observed, True)
         self.assertEqual(opportunities[1].consumed, True)
 
+    def test_world_catalog_is_reused_until_encounter_projection_changes(self):
+        state = self.state()
+        locations = (MapRSE.ROUTE102.value, MapRSE.ROUTE103.value)
+        first = encounter_opportunities(state, locations)
+        second = encounter_opportunities(state, locations)
+        self.assertIs(first, second)
+
+        changed = replace(
+            state,
+            encounters=Fact.known((LocationEncounter(MapRSE.ROUTE102.value, "captured"),)),
+        )
+        third = encounter_opportunities(changed, locations)
+        self.assertIsNot(first, third)
+        self.assertTrue(third[0].consumed)
+
+    def test_default_discovery_omits_location_with_only_unavailable_encounter_tables(self):
+        state = self.state()
+        with (
+            patch(
+                "modules.nuzlocke.encounter_catalog._world_encounter_locations",
+                return_value=(MapRSE.PETALBURG_CITY.value,),
+            ),
+            patch(
+                "modules.nuzlocke.campaign_objectives.encounter_candidates_for_location",
+                return_value=(),
+            ) as candidates,
+        ):
+            tasks = available_campaign_tasks(state)
+
+        self.assertNotIn(
+            "obtain_encounter:0:0",
+            tuple(task.objective_id for task in tasks),
+        )
+        candidates.assert_called()
+        self.assertEqual(
+            candidates.call_args.kwargs["available_methods"],
+            frozenset({EncounterMethod.LAND}),
+        )
+
     def test_encounter_diagnostics_report_projection_consumption(self):
         state = replace(
-            self.state(),
+            self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True)),
             encounters=Fact.known((LocationEncounter(MapRSE.ROUTE102.value, "none"),)),
         )
         row = next(row for row in campaign_task_diagnostics(state) if row["task_id"] == "obtain_encounter:0:17")
@@ -223,8 +298,11 @@ class CampaignObjectiveTests(unittest.TestCase):
         self.assertIsNone(available_campaign_tasks(self.state(), (task,))[0].route_context)
 
     def test_task_diagnostics_are_structured_and_non_mutating(self):
-        task = encounter_task(MapRSE.OLDALE_TOWN.value)
-        state = self.state()
+        task = encounter_task(MapRSE.ROUTE102.value)
+        state = replace(
+            self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True)),
+            encounters=Fact.known((LocationEncounter(MapRSE.ROUTE102.value, "none"),)),
+        )
         before = state
         rows = campaign_task_diagnostics(state, (task,))
         self.assertEqual(rows[0]["task_id"], task.objective_id)

@@ -3,6 +3,7 @@
 from collections import deque
 import heapq
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Mapping
 
 from modules.context import context
@@ -88,9 +89,12 @@ class WorldMapGraph:
     def __init__(self, edges: tuple[WorldEdge, ...] = ()):
         self.edges = edges
         self._outgoing: dict[MapId, tuple[WorldEdge, ...]] = {}
+        self._incoming: dict[MapId, tuple[WorldEdge, ...]] = {}
         for edge in edges:
             self._outgoing.setdefault(edge.source_map, ())
             self._outgoing[edge.source_map] += (edge,)
+            self._incoming.setdefault(edge.destination_map, ())
+            self._incoming[edge.destination_map] += (edge,)
 
     @classmethod
     def from_map_data(cls, maps: Mapping[MapId, object]) -> "WorldMapGraph":
@@ -137,6 +141,51 @@ class WorldMapGraph:
     def outgoing(self, map_id: MapId) -> tuple[WorldEdge, ...]:
         return self._outgoing.get(map_id, ())
 
+    @lru_cache(maxsize=8192)
+    @traced("world_map_costs_calculation")
+    def map_costs(self, source_map: MapId) -> tuple[tuple[MapId, int], ...]:
+        """Return static shortest-path costs from one map to every reachable map.
+
+        Campaign planning often needs to compare one current map with many
+        encounter maps. Calling :meth:`route` once per destination reruns the
+        same Dijkstra search each time. This immutable distance table keeps
+        the ROM/static graph as the source of routing avenues while avoiding
+        that repeated work.
+        """
+
+        return self._costs(source_map, reverse=False)
+
+    @lru_cache(maxsize=8192)
+    @traced("world_map_reverse_costs_calculation")
+    def map_costs_to(self, target_map: MapId) -> tuple[tuple[MapId, int], ...]:
+        """Return static shortest-path costs from every map to ``target_map``."""
+
+        return self._costs(target_map, reverse=True)
+
+    def _costs(self, source_map: MapId, *, reverse: bool) -> tuple[tuple[MapId, int], ...]:
+        """Run one Dijkstra search over outgoing or reversed static edges."""
+
+        queue: list[tuple[int, int, MapId]] = []
+        order = 0
+        distances: dict[MapId, int] = {source_map: 0}
+        heapq.heappush(queue, (0, order, source_map))
+        while queue:
+            distance, _, current = heapq.heappop(queue)
+            if distance != distances[current]:
+                continue
+            edges = self._incoming.get(current, ()) if reverse else self.outgoing(current)
+            for edge in edges:
+                edge_cost = max(1, edge.estimated_cost)
+                next_map = edge.source_map if reverse else edge.destination_map
+                next_distance = distance + edge_cost
+                if next_distance >= distances.get(next_map, float("inf")):
+                    continue
+                distances[next_map] = next_distance
+                order += 1
+                heapq.heappush(queue, (next_distance, order, next_map))
+        return tuple(sorted(distances.items()))
+
+    @lru_cache(maxsize=8192)
     @traced("world_map_route_calculation")
     def route(self, source_map: MapId, target_map: MapId, *, prefer_interior: bool = False) -> WorldRoute:
         """Return the cheapest route, optionally preferring interior warps.

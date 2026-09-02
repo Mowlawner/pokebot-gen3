@@ -1,14 +1,15 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from modules.goals import ActivateTrigger, NavigationGoal, ReachLocation, ReachWarp
+from modules.goals import ActivateTrigger, NavigationGoal, ReachLocation, ReachWarp, TrainerMode
 from modules.nuzlocke.resource_policy import PartyResource, ResourceDecision, ResourceSnapshot, RouteRecovery
 from modules.nuzlocke.resource_runtime import (
     CampaignCapability,
     HealingSource,
     HealingSourceType,
     discover_healing_source,
+    execute_campaign_encounter,
     execute_campaign_recovery,
     execute_campaign_preparation,
     execute_heal_party,
@@ -24,11 +25,101 @@ from modules.agent_control import AgentObservation
 from modules.interaction_state import InteractionObservation
 from modules.memory import GameState
 from modules.map_data import MapRSE, PokemonCenter
+from modules.map_path import Direction
 from modules.modes.util.pokecenter_loop import PokecenterLoopController
-from modules.overworld import MovementState
+from modules.overworld import MovementState, OverworldObservation, TileObservation
+from modules.nuzlocke.resource_runtime import _encounter_roll_direction
 
 
 class CampaignCapabilityTests(unittest.TestCase):
+    @staticmethod
+    def _encounter_world(*, tiles, facing=Direction.North, current=(1, 1)):
+        map_id = MapRSE.ROUTE102.value
+        observations = tuple(
+            TileObservation(
+                (map_id, coordinates),
+                blocked=False,
+                walkable_neighbors=frozenset(Direction),
+                has_encounters=True,
+            )
+            for coordinates in tiles
+        )
+        return OverworldObservation(
+            map_id=map_id,
+            player_coordinates=current,
+            facing=facing,
+            controllable=True,
+            tiles=observations,
+            warps=(),
+            objects=(),
+            triggers=(),
+            movement_state=MovementState.STANDING,
+        )
+
+    def test_encounter_roll_prefers_adjacent_encounter_terrain(self):
+        overworld = self._encounter_world(tiles=((1, 1), (2, 1)))
+
+        direction, reason = _encounter_roll_direction(overworld)
+
+        self.assertEqual(direction, Direction.East)
+        self.assertEqual(reason, "move_within_encounter_terrain")
+
+    def test_encounter_roll_turns_into_blocked_edge_when_tile_isolated(self):
+        overworld = self._encounter_world(tiles=((1, 1),), facing=Direction.East)
+
+        direction, reason = _encounter_roll_direction(overworld)
+
+        self.assertEqual(direction, Direction.North)
+        self.assertEqual(reason, "turn_in_place_on_blocked_edge")
+
+    def test_campaign_encounter_does_not_finish_at_grass(self):
+        overworld = self._encounter_world(tiles=((1, 1), (2, 1)))
+        battle = AgentObservation(InteractionObservation(GameState.BATTLE))
+        observations = iter(
+            (
+                AgentObservation(InteractionObservation(GameState.OVERWORLD, controllable=True), overworld),
+                AgentObservation(InteractionObservation(GameState.OVERWORLD, controllable=True), overworld),
+                AgentObservation(InteractionObservation(GameState.OVERWORLD, controllable=True), overworld),
+                battle,
+            )
+        )
+        emulator = SimpleNamespace(
+            reset_held_buttons=lambda: None,
+            press_direction=Mock(),
+        )
+
+        class FakeNavigationLoop:
+            def run(self):
+                return iter(())
+
+        with patch(
+            "modules.nuzlocke.resource_runtime._preparation_training_location",
+            return_value=(MapRSE.ROUTE102.value, ((1, 1),)),
+        ), patch(
+            "modules.nuzlocke.resource_runtime._preparation_navigation_goal",
+            return_value=(ReachLocation((MapRSE.ROUTE102.value, (1, 1))), None),
+        ), patch(
+            "modules.nuzlocke.resource_runtime.get_world_map_graph",
+            return_value=SimpleNamespace(),
+        ), patch(
+            "modules.nuzlocke.resource_runtime.AgentControlLoop",
+            return_value=FakeNavigationLoop(),
+        ), patch(
+            "modules.nuzlocke.resource_runtime.observe_agent",
+            side_effect=observations,
+        ), patch(
+            "modules.nuzlocke.resource_runtime._preparation_encounter_resolved",
+            return_value=False,
+        ), patch(
+            "modules.nuzlocke.resource_runtime.context",
+            SimpleNamespace(emulator=emulator, nuzlocke_runtime=None),
+        ):
+            execution = execute_campaign_encounter(MapRSE.ROUTE102.value)
+            next(execution)
+            emulator.press_direction.assert_called_once_with("Right", run=False, fresh=True)
+            with self.assertRaises(StopIteration):
+                next(execution)
+
     def test_preparation_center_loop_uses_observation_driven_recovery_handler(self):
         recovery_calls = []
 
@@ -305,7 +396,8 @@ class CampaignCapabilityTests(unittest.TestCase):
                 return iter(())
 
         with patch("modules.nuzlocke.resource_runtime.party_is_restored", side_effect=[False, True]), patch(
-            "modules.nuzlocke.resource_runtime.AgentControlLoop", side_effect=lambda _factory, goal: FakeLoop(goal=goal)
+            "modules.nuzlocke.resource_runtime.AgentControlLoop",
+            side_effect=lambda _factory, goal, **_kwargs: FakeLoop(goal=goal),
         ), patch("modules.nuzlocke.resource_runtime.observe_agent", return_value=interior), patch(
             "modules.nuzlocke.resource_runtime.discover_healing_source", return_value=nurse
         ), patch(
@@ -316,8 +408,10 @@ class CampaignCapabilityTests(unittest.TestCase):
             list(execute_planned_recovery(PokemonCenter.OldaleTown.value))
 
         self.assertEqual(len(navigation_goals), 2)
-        self.assertIsInstance(navigation_goals[0], ReachWarp)
-        self.assertEqual(navigation_goals[0].destination_map, MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value)
+        self.assertIsInstance(navigation_goals[0], NavigationGoal)
+        self.assertIsInstance(navigation_goals[0].target, ReachWarp)
+        self.assertEqual(navigation_goals[0].target.destination_map, MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value)
+        self.assertIs(navigation_goals[0].constraints.trainer_mode, TrainerMode.AVOID)
         self.assertEqual(navigation_goals[1].trigger_id, "object:nurse")
 
     def test_planned_recovery_adopts_planner_route_for_outdoor_leg(self):
@@ -354,7 +448,9 @@ class CampaignCapabilityTests(unittest.TestCase):
 
         self.assertEqual(len(loop_calls), 2)
         self.assertIs(loop_calls[0][1]["navigation_plan"], planned_route)
-        self.assertIsInstance(loop_calls[0][1]["goal"], ReachLocation)
+        self.assertIsInstance(loop_calls[0][1]["goal"], NavigationGoal)
+        self.assertIsInstance(loop_calls[0][1]["goal"].target, ReachLocation)
+        self.assertIs(loop_calls[0][1]["goal"].constraints.trainer_mode, TrainerMode.AVOID)
         self.assertNotIn("navigation_plan", loop_calls[1][1])
 
     def test_heal_party_uses_cataloged_door_warp_for_center_destination(self):
@@ -407,8 +503,9 @@ class CampaignCapabilityTests(unittest.TestCase):
         ):
             list(execute_heal_party())
 
-        self.assertIsInstance(goals[0], ReachWarp)
-        self.assertEqual(goals[0].destination_map, MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value)
+        self.assertIsInstance(goals[0], NavigationGoal)
+        self.assertIsInstance(goals[0].target, ReachWarp)
+        self.assertEqual(goals[0].target.destination_map, MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value)
 
     def test_observed_center_nurse_becomes_healing_affordance(self):
         trigger = type(
@@ -666,7 +763,8 @@ class CampaignCapabilityTests(unittest.TestCase):
         with patch("modules.nuzlocke.resource_runtime.AgentControlLoop", return_value=FakeLoop()) as loop:
             self.assertEqual(list(_navigate_recovery_to_center(center)), ["navigation"])
         goal = loop.call_args.kwargs["goal"]
-        self.assertEqual(goal.location, ("OldaleTown", (6, 16)))
+        self.assertIsInstance(goal, NavigationGoal)
+        self.assertEqual(goal.target.location, ("OldaleTown", (6, 16)))
 
     def test_recovery_handoff_waits_for_stable_center_interior(self):
         transient = type(

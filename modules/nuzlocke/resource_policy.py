@@ -134,6 +134,12 @@ class RouteRecovery:
     # measured the recovery distance. CampaignPlan can adopt it directly so
     # recovery does not run a second synchronous pathfinding search.
     route: Any | None = None
+    # The exact semantic target used to produce ``route``.  A Pokémon Center
+    # door is represented by its outdoor destination for compatibility, but
+    # executable routing must target the cataloged interior warp.  Retaining
+    # this goal lets readiness compose the same route without converting a
+    # blocked door tile into a false ReachLocation target.
+    navigation_goal: Any | None = None
 
 
 @dataclass(frozen=True, slots=True)

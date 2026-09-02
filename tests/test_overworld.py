@@ -46,25 +46,35 @@ class TestOverworldPerception(unittest.TestCase):
         ):
             self.assertEqual(map_module.get_live_map_id(), (2, 2))
 
-    def test_trainer_hazards_follow_facing_and_range(self):
+    def test_normal_trainer_hazards_cover_all_cardinal_lines(self):
         map_id = (1, 2)
-        tiles = tuple(TileObservation((map_id, (x, 0)), False, frozenset(Direction), elevation=0) for x in range(5))
+        tiles = tuple(
+            TileObservation((map_id, (x, y)), False, frozenset(Direction), elevation=0)
+            for x in range(5)
+            for y in range(5)
+        )
         trainer = ObjectObservation(
             1, (map_id, (1, 0)), facing="East", trainer_type="Normal", trainer_range=3, trainer_defeated=False
         )
-        self.assertEqual(
-            trainer_hazard_locations(trainer, tiles),
-            frozenset({(map_id, (2, 0)), (map_id, (3, 0)), (map_id, (4, 0))}),
-        )
+        hazards = trainer_hazard_locations(trainer, tiles)
+        self.assertIn((map_id, (1, 1)), hazards)
+        self.assertIn((map_id, (0, 0)), hazards)
+        self.assertIn((map_id, (4, 0)), hazards)
+        self.assertEqual(len(hazards), 7)
 
     def test_defeated_trainer_has_no_hazards_and_objects_block_sight(self):
         map_id = (1, 2)
-        tiles = tuple(TileObservation((map_id, (x, 0)), False, frozenset(Direction)) for x in range(5))
+        tiles = tuple(
+            TileObservation((map_id, (x, y)), False, frozenset(Direction)) for x in range(5) for y in range(5)
+        )
         trainer = ObjectObservation(
             1, (map_id, (1, 0)), facing="East", trainer_type="Normal", trainer_range=3, trainer_defeated=False
         )
         blocker = ObjectObservation(2, (map_id, (3, 0)))
-        self.assertEqual(trainer_hazard_locations(trainer, tiles, (blocker,)), frozenset({(map_id, (2, 0))}))
+        hazards = trainer_hazard_locations(trainer, tiles, (blocker,))
+        self.assertNotIn((map_id, (3, 0)), hazards)
+        self.assertIn((map_id, (1, 1)), hazards)
+        self.assertIn((map_id, (0, 0)), hazards)
         self.assertEqual(trainer_hazard_locations(replace(trainer, trainer_defeated=True), tiles), frozenset())
 
     def test_static_trainer_fallback_covers_unspawned_runtime_object(self):
@@ -84,11 +94,15 @@ class TestOverworldPerception(unittest.TestCase):
         fallback = static_trainer_observations(map_id, SimpleNamespace(objects=(template,)), ())
         self.assertEqual(len(fallback), 1)
         self.assertEqual(fallback[0].trainer_id, "trainer:(11, 3):3")
-        tiles = tuple(TileObservation((map_id, (x, 9)), False, frozenset(Direction), elevation=3) for x in range(5))
-        self.assertEqual(
-            trainer_hazard_locations(fallback[0], tiles),
-            frozenset({(map_id, (1, 9)), (map_id, (0, 9))}),
+        tiles = tuple(
+            TileObservation((map_id, (x, y)), False, frozenset(Direction), elevation=3)
+            for x in range(5)
+            for y in range(7, 12)
         )
+        hazards = trainer_hazard_locations(fallback[0], tiles)
+        self.assertIn((map_id, (1, 9)), hazards)
+        self.assertIn((map_id, (3, 9)), hazards)
+        self.assertIn((map_id, (2, 8)), hazards)
 
     def test_static_trainer_fallback_does_not_duplicate_runtime_object(self):
         map_id = (11, 3)
@@ -333,6 +347,10 @@ class TestOverworldPerception(unittest.TestCase):
         ):
             first = perceive_overworld()
             avatar.local_coordinates = (1, 0)
+            # The test exercises static-tile reuse across passive reads; an
+            # explicit boundary keeps that assertion independent of a live
+            # emulator frame left by another test.
+            invalidate_shared_overworld_observation()
             second = perceive_overworld()
 
         self.assertIs(first.tiles, second.tiles)

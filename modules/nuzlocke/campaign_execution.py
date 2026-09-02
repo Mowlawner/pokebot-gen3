@@ -16,6 +16,7 @@ from modules.map_data import MapRSE
 
 from .campaign_objectives import CampaignObjective, ObjectiveSelection, ObjectiveStatus
 from .emerald_campaign_registry import emerald_capability_definition
+from .capture_policy import EncounterMethod
 
 
 @dataclass(frozen=True)
@@ -154,12 +155,32 @@ class CampaignExecutionAdapter:
                     "encounter objective has no valid navigation goal",
                     objective.execution_id,
                 )
+            method = objective.encounter_method or EncounterMethod.LAND
+            if not isinstance(method, EncounterMethod):
+                return CampaignExecutionResult(
+                    objective,
+                    CampaignExecutionStatus.UNSUPPORTED,
+                    f"encounter objective has malformed encounter method {method!r}",
+                    objective.execution_id,
+                    goal,
+                )
+            if method is not EncounterMethod.LAND:
+                return CampaignExecutionResult(
+                    objective,
+                    CampaignExecutionStatus.UNSUPPORTED,
+                    f"encounter method {method.value!r} is not supported by the campaign executor",
+                    objective.execution_id,
+                    goal,
+                )
             return CampaignExecutionResult(
                 objective,
                 CampaignExecutionStatus.READY,
-                "translated encounter objective to SEEK navigation",
+                f"translated {method.value} encounter objective to SEEK navigation",
                 objective.execution_id,
                 goal,
+                capability=lambda: __import__(
+                    "modules.nuzlocke.resource_runtime", fromlist=["execute_campaign_encounter"]
+                ).execute_campaign_encounter(goal.target.target_map, encounter_method=method),
             )
 
         if objective.objective_id == "prepare_roxanne":

@@ -27,6 +27,7 @@ from modules.map_path import Direction
 from modules.memory import GameState
 from modules.navigation import (
     GoalAwareNavigator,
+    _global_navigation_world,
     NavigationAction,
     NavigationActionType,
     NavigationWorld,
@@ -64,6 +65,50 @@ def edge(source, destination, source_coordinate=(0, 0), destination_coordinate=(
 
 
 class TestWorldMapGraph(unittest.TestCase):
+    def test_global_overlay_uses_static_current_map_transition_as_fallback(self):
+        source = (1, 4)
+        destination = (0, 9)
+        static_exit = WorldTransition(entry=(source, (1, 0)), destination=(destination, (2, 2)))
+        observed = NavigationWorld(
+            tiles={
+                (source, (0, 0)): NavigableTile((source, (0, 0)), False, frozenset(Direction)),
+            },
+            warps=(),
+            triggers=(),
+            bindings=(),
+            facing=Direction.East,
+            transitions=(),
+        )
+        graph = WorldMapGraph((edge(source, destination, source_coordinate=(1, 0), destination_coordinate=(2, 2)),))
+
+        with patch("modules.navigation.static_map_transitions", return_value=(static_exit,)):
+            global_world = _global_navigation_world(observed, graph, enrich_maps=())
+
+        self.assertIn(static_exit, global_world.transitions)
+
+    def test_global_overlay_preserves_live_transition_over_static_duplicate(self):
+        source = (1, 4)
+        destination = (0, 9)
+        live_exit = WorldTransition(entry=(source, (1, 0)), destination=(destination, (2, 2)))
+        static_exit = WorldTransition(
+            entry=(source, (1, 0)), destination=(destination, (2, 2)), required_facing=Direction.East
+        )
+        observed = NavigationWorld(
+            tiles={(source, (0, 0)): NavigableTile((source, (0, 0)), False, frozenset(Direction))},
+            warps=(),
+            triggers=(),
+            bindings=(),
+            facing=Direction.East,
+            transitions=(live_exit,),
+        )
+        graph = WorldMapGraph((edge(source, destination, source_coordinate=(1, 0), destination_coordinate=(2, 2)),))
+
+        with patch("modules.navigation.static_map_transitions", return_value=(static_exit,)):
+            global_world = _global_navigation_world(observed, graph, enrich_maps=())
+
+        matching = tuple(t for t in global_world.transitions if t.entry == live_exit.entry)
+        self.assertEqual(matching, (live_exit,))
+
     def test_connection_endpoint_requires_static_passability_and_no_object(self):
         tile = SimpleNamespace(accessible_from_direction=[True, False, False, False])
         metadata = SimpleNamespace(objects=())
@@ -1301,6 +1346,37 @@ class TestTrainerAvoidance(unittest.TestCase):
         plan = GoalAwareNavigator(world).plan((self.MAP, (0, 0)), goal)
         self.assertIn((self.MAP, (1, 0)), {action.destination for action in plan.actions})
         self.assertTrue(plan.forced_trainer_exposure)
+
+    def test_avoid_treats_trainer_approach_positions_as_hazards(self):
+        coordinates = (
+            (0, 1),
+            (1, 1),
+            (2, 1),
+            (0, 2),
+            (1, 2),
+            (2, 2),
+        )
+        tiles = {
+            (self.MAP, coordinate): NavigableTile((self.MAP, coordinate), allowed_directions=frozenset(Direction))
+            for coordinate in coordinates
+        }
+        trainer = TriggerObservation(
+            "trainer:approach",
+            locations=frozenset({(self.MAP, (1, 0))}),
+            activation_locations=frozenset({(self.MAP, (1, 1))}),
+            hazard_kind="trainer",
+        )
+        world = NavigationWorld(tiles=tiles, triggers=(trainer,))
+        goal = NavigationGoal(
+            ReachLocation((self.MAP, (2, 1))),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+        )
+
+        plan = GoalAwareNavigator(world).plan((self.MAP, (0, 1)), goal)
+
+        destinations = {action.destination for action in plan.actions if action.destination is not None}
+        self.assertNotIn((self.MAP, (1, 1)), destinations)
+        self.assertGreater(len(plan.actions), 2)
 
 
 if __name__ == "__main__":

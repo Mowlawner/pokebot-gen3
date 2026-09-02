@@ -179,7 +179,9 @@ def test_policy_critical_hp_at_or_below_threshold_before_trainer_recovers():
     trainer = ((4, 4), 4, False)  # distance 1, within range
     assert policy.evaluate(readiness(4, trainer=trainer)).decision is ReadinessDecision.RECOVER
     assert policy.evaluate(readiness(4, trainer=trainer)).reason is ReadinessReason.CRITICAL_PARTY_HP
-    assert policy.evaluate(readiness(5, trainer=trainer)).decision is ReadinessDecision.CONTINUE
+    # Opportunistic recovery must not be bypassed merely because a trainer is
+    # imminent.  With no route analysis, the safe result is to re-observe.
+    assert policy.evaluate(readiness(5, trainer=trainer)).decision is ReadinessDecision.UNKNOWN
 
 
 def test_policy_trainer_provenance_and_recovery_provenance_are_explicit():
@@ -233,15 +235,15 @@ def test_policy_opportunistically_recovers_meaningfully_damaged_party_at_nearby_
     assert result.reason is ReadinessReason.OPPORTUNISTIC_RECOVERY
 
 
-def test_policy_does_not_preempt_imminent_trainer_for_opportunistic_recovery():
+def test_policy_rechecks_before_imminent_trainer_for_opportunistic_recovery():
     value = readiness(
         9,
         trainer=((4, 4), 4, False),
         recovery=Availability.KNOWN,
     )
     result = CampaignReadinessPolicy().evaluate(value)
-    assert result.decision is ReadinessDecision.CONTINUE
-    assert result.reason is ReadinessReason.PARTY_HEALTHY
+    assert result.decision is ReadinessDecision.UNKNOWN
+    assert result.reason is ReadinessReason.OPPORTUNISTIC_ROUTE_UNAVAILABLE
 
 
 def test_policy_does_not_opportunistically_recover_for_minor_damage_or_long_detour():
