@@ -6,6 +6,7 @@ from modules.battle_strategies import (
 )
 from modules.battle_strategies import TurnAction
 from modules.context import context
+from modules.console import diagnostic_print
 from modules.items import Item, get_item_bag, PokeblockType
 from modules.map import get_map_data_for_current_position
 from modules.pokedex import get_pokedex
@@ -42,7 +43,24 @@ class CatchStrategy(DefaultBattleStrategy):
     def should_flee_after_faint(self, battle_state: BattleState) -> bool:
         return False
 
+    def capture_target_is_authorized(self, battle_state: BattleState) -> bool:
+        """Return whether this strategy may use a ball on the battle."""
+
+        return True
+
     def decide_turn(self, battle_state: BattleState) -> tuple["TurnAction", any]:
+        if not self.capture_target_is_authorized(battle_state):
+            # This is a hard veto: a caller may have mounted CatchStrategy
+            # during a battle-start race, but it must never turn an ineligible
+            # encounter into a capture merely because a ball is available.
+            context.message = getattr(self, "_capture_veto_message", None) or (
+                "Capture strategy rejected this encounter; no Poké Ball will be thrown."
+            )
+            diagnostic_print(
+                lambda: f"CAPTURE_BALL_VETO: reason={context.message!r}",
+                trace=True,
+            )
+            return DefaultBattleStrategy.decide_turn(self, battle_state)
         ball_to_throw = self._get_best_poke_ball(battle_state)
         if ball_to_throw is None:
             context.message = "Player does not have any Poké Balls, cannot catch."

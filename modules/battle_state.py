@@ -289,11 +289,23 @@ class BattleState:
             return False
         try:
             location = get_player_avatar().map_group_and_number
-            result = runtime.capture_target_for(
-                location,
-                is_wild=not self.is_trainer_battle,
-                is_trainer=self.is_trainer_battle,
-            )
+            species = ()
+            try:
+                opponent = self.opponent.active_battler
+                if opponent is not None:
+                    species = (opponent.species.name,)
+            except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+                # A battle-start callback can precede a complete battler
+                # buffer. The runtime can still use its latest immutable
+                # snapshot in that case.
+                pass
+            capture_query = {
+                "is_wild": not self.is_trainer_battle,
+                "is_trainer": self.is_trainer_battle,
+            }
+            if species:
+                capture_query["species"] = species
+            result = runtime.capture_target_for(location, **capture_query)
             diagnostic_print(
                 lambda: (
                     "BATTLESTATE_CAPTURE_TARGET: "

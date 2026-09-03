@@ -20,7 +20,6 @@ IMPORTANT = ResourceObjective(
     readiness=ReadinessImportance.IMPORTANT,
     encounters=EncounterPolicy.PRESERVE,
     mandatory_battle=True,
-    recover_before_completion=True,
 )
 
 
@@ -60,10 +59,10 @@ def test_healthy_party_can_continue_without_immediate_danger():
     assert assess_campaign_resources(objective, party(20), RouteRecovery()) is ResourceDecision.CONTINUE
 
 
-def test_center_on_route_is_preferred_before_important_battle():
+def test_healthy_party_does_not_force_center_before_important_battle():
     assert (
         assess_campaign_resources(IMPORTANT, party(18), RouteRecovery(center_available=True, center_on_route=True))
-        is ResourceDecision.RECOVER_AT_CENTER
+        is ResourceDecision.CONTINUE
     )
 
 

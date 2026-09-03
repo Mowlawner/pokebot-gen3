@@ -124,6 +124,18 @@ class CampaignObjectiveTests(unittest.TestCase):
         self.assertEqual(opportunities[1].observed, True)
         self.assertEqual(opportunities[1].consumed, True)
 
+    def test_world_catalog_keeps_ineligible_repeat_area_open(self):
+        state = replace(
+            self.state(),
+            encounters=Fact.known((LocationEncounter(MapRSE.ROUTE102.value, "unknown", eligible=False),)),
+        )
+
+        opportunity = encounter_opportunities(state, (MapRSE.ROUTE102.value,))[0]
+
+        self.assertTrue(opportunity.observed)
+        self.assertFalse(opportunity.consumed)
+        self.assertTrue(opportunity.eligible)
+
     def test_world_catalog_is_reused_until_encounter_projection_changes(self):
         state = self.state()
         locations = (MapRSE.ROUTE102.value, MapRSE.ROUTE103.value)
@@ -346,6 +358,42 @@ class CampaignObjectiveTests(unittest.TestCase):
     def test_non_spatial_task_has_no_route_context(self):
         task = CampaignObjective("story", "story", (), CampaignPredicate("done", "done", lambda _: Fact.known(False)))
         self.assertIsNone(available_campaign_tasks(self.state(), (task,))[0].route_context)
+
+    def test_ineligible_repeat_history_does_not_hide_open_encounter(self):
+        task = encounter_task(MapRSE.ROUTE102.value)
+        state = replace(
+            self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True)),
+            encounters=Fact.known((LocationEncounter(MapRSE.ROUTE102.value, "unknown", eligible=False),)),
+        )
+
+        available = available_campaign_tasks(state, (task,))
+
+        self.assertEqual(tuple(item.objective_id for item in available), (task.objective_id,))
+        self.assertEqual(state.encounter_for(MapRSE.ROUTE102.value).value.status, "none")
+
+    def test_deferred_encounter_is_fallback_when_no_required_task_is_executable(self):
+        task = replace(
+            encounter_task(MapRSE.ROUTE102.value),
+            encounter_evaluation=campaign_objectives_module.EncounterEvaluation(
+                task_id="obtain_encounter:0:17",
+                location=MapRSE.ROUTE102.value,
+                progression_destination=MapRSE.PETALBURG_CITY.value,
+                classification=EncounterClassification.LARGE_DETOUR,
+                recommendation=EncounterRecommendation.DEFER,
+                direct_progression_cost=10,
+                encounter_cost=20,
+                encounter_to_progression_cost=20,
+                via_encounter_cost=40,
+                detour_cost=30,
+                detour_ratio=3.0,
+            ),
+        )
+
+        selection = campaign_objectives_module._select_available_campaign_tasks((task,), self.state())
+
+        self.assertEqual(selection.status, ObjectiveStatus.READY)
+        self.assertEqual(selection.objective.objective_id, task.objective_id)
+        self.assertIn("deferred encounter", selection.reason)
 
     def test_task_diagnostics_are_structured_and_non_mutating(self):
         task = encounter_task(MapRSE.ROUTE102.value)

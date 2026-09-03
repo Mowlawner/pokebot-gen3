@@ -24,6 +24,7 @@ class CampaignRuleId(str, Enum):
     FAINTING = "fainting"
     SPECIES_CLAUSE = "species_clause"
     LEVEL_CAP = "level_cap"
+    SET_BATTLE_STYLE = "set_battle_style"
 
 
 DEFAULT_NUZLOCKE_RULES = frozenset(

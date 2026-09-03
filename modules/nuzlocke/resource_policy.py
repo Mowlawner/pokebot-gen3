@@ -198,7 +198,6 @@ class ResourceObjective:
     readiness: ReadinessImportance = ReadinessImportance.NONE
     encounters: EncounterPolicy = EncounterPolicy.NORMAL
     mandatory_battle: bool = False
-    recover_before_completion: bool = False
     # Minimum acceptable health for an important objective. This is objective
     # metadata, not a global HP rule.
     minimum_hp_ratio: float = 0.5
@@ -228,19 +227,6 @@ def assess_campaign_resources(
         return ResourceDecision.CONTINUE
     if not snapshot.usable_party:
         return ResourceDecision.RECOVER_AT_CENTER if route.center_available else ResourceDecision.PRESERVE_RESOURCES
-
-    # A recover-before-completion objective must use an already-known Center
-    # opportunity before the important battle, even when the party is still
-    # above the ordinary minimum-health threshold.  Waiting until HP becomes
-    # critical defeats the purpose of the route-level recovery affordance.
-    if (
-        objective.recover_before_completion
-        and not wild_encounter
-        and route.center_available
-        and route.center_on_route
-        and snapshot.total_missing_hp > 0
-    ):
-        return ResourceDecision.RECOVER_AT_CENTER
 
     healthy = snapshot.worst_hp_ratio >= objective.minimum_hp_ratio
     # A healthy party may spend some HP before a planned recovery point. The

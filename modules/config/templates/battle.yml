@@ -20,11 +20,8 @@ stop_evolution: true
 switch_strategy: first_available # `first_available`, `lowest_level`
 banned_moves:
   - None
-  # 2-turn
-  - Bounce
-  - Dig
-  - Dive
-  - Fly
+  # Unsupported two-turn moves remain banned. Bounce, Dig, Dive, and Fly are
+  # evaluated as charge/strike lines by the battle planner.
   - Sky Attack
   - Razor Wind
   - Doom Desire

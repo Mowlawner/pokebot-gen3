@@ -492,7 +492,16 @@ class CampaignState:
             return Fact(None, self.encounters.status)
         return Fact.known(
             next(
-                (encounter for encounter in self.encounters.value or () if encounter.location == location),
+                # Ineligible repeat battles are retained in the rules history
+                # for auditability, but they do not consume the area's legal
+                # encounter. Match NuzlockeCampaignState.encounter_for() and
+                # expose only the eligible first-encounter projection to
+                # campaign predicates.
+                (
+                    encounter
+                    for encounter in self.encounters.value or ()
+                    if encounter.location == location and encounter.eligible
+                ),
                 LocationEncounter(location),
             )
         )

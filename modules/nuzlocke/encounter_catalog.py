@@ -120,20 +120,34 @@ def _cached_encounter_opportunities(
     """Overlay one immutable encounter projection onto the static catalog."""
 
     status, records = encounter_signature
-    observed = {record[0]: (record[1], record[2]) for record in records}
+    # Repeat battles are retained as ineligible history, but they do not
+    # consume an area's still-open legal encounter. Reduce by location using
+    # the eligible first-encounter record only. This also prevents a later
+    # ineligible history row from overwriting an earlier captured/lost result.
+    observed: dict[tuple[int, int], tuple[bool, bool, bool]] = {}
+    for location, encounter_status, eligible in records:
+        previous = observed.get(location)
+        if previous is None:
+            observed[location] = (True, encounter_status != "none", bool(eligible))
+            continue
+        observed[location] = (
+            True,
+            previous[1] if previous[2] else encounter_status != "none",
+            previous[2] or bool(eligible),
+        )
     result = []
     for location in sorted(set(world_locations)):
         record = observed.get(location)
         if status != "known" or record is None:
             result.append(EncounterOpportunity(location, False, False, True))
             continue
-        encounter_status, eligible = record
+        was_observed, consumed, has_eligible_record = record
         result.append(
             EncounterOpportunity(
                 location,
+                was_observed,
+                consumed if has_eligible_record else False,
                 True,
-                encounter_status != "none",
-                eligible,
             )
         )
     return tuple(result)

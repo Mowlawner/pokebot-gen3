@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 from uuid import uuid4
 from typing import TYPE_CHECKING
 
@@ -17,13 +18,31 @@ from .policy import EventSink, EventStatistics, PersistenceClass, classify_event
 from .snapshots import NuzlockeSnapshot, get_nuzlocke_snapshot
 from .campaign_state import Fact, derive_campaign_facts
 from .projection import CampaignProjection
-from .rules import NuzlockeRulesProjection
+from .rules import (
+    CAPTURED,
+    FAINTED,
+    LOST,
+    UNKNOWN,
+    NuzlockeRulesProjection,
+    species_clause_conflict_reason,
+)
 from .rule_config import CampaignRulesConfig, CampaignRuleId
 from .persistence import JsonEventStore
 from modules.console import diagnostic_print
 
 if TYPE_CHECKING:
     from typing import Deque
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureEligibility:
+    """Explain whether a wild battle is authorized to use a Poké Ball."""
+
+    eligible: bool
+    reason: str
+    location: tuple[int, int] | None = None
+    species: tuple[str, ...] = ()
+    encounter_status: str | None = None
 
 
 class NuzlockeRuntime:
@@ -260,20 +279,43 @@ class NuzlockeRuntime:
         self._campaign_history_hydrated = True
         return True
 
-    def capture_target_for(
+    def capture_eligibility_for(
         self,
         location: tuple[int, int] | None,
         *,
         is_wild: bool,
         is_trainer: bool,
-    ) -> bool:
-        """Return whether this already-observed battle is the legal target.
+        species: tuple[str, ...] | None = None,
+    ) -> CaptureEligibility:
+        """Return a structured, read-only capture authorization decision.
 
-        This is intentionally a read-only view of the rules projection.  It
-        never claims an encounter; the observer claims it when BattleStarted
-        is delivered.  Trainers and location-less battles can never opt in.
+        This never claims an encounter; the observer claims it when
+        ``BattleStarted`` is delivered.  The result is also the hard safety
+        boundary used by the Nuzlocke capture strategy before it can select a
+        ball, so an ineligible encounter cannot be captured by a policy race.
         """
         projection = self._rules_projection
+        if species is None:
+            snapshot_battle = getattr(self._latest_snapshot, "battle", None)
+            species = tuple(
+                getattr(pokemon, "species", "")
+                for pokemon in getattr(snapshot_battle, "opponent_active", ())
+                if getattr(pokemon, "species", None)
+            )
+        species = tuple(species or ())
+
+        def result(eligible: bool, reason: str, status: str | None = None) -> CaptureEligibility:
+            decision = CaptureEligibility(eligible, reason, location, species, status)
+            diagnostic_print(
+                lambda: (
+                    "NUZLOCKE_CAPTURE_ELIGIBILITY: "
+                    f"location={location!r} species={species!r} eligible={eligible!r} "
+                    f"reason={reason!r} encounter_status={status!r}"
+                ),
+                trace=True,
+            )
+            return decision
+
         diagnostic_print(
             lambda: (
                 "NUZLOCKE_CAPTURE_TARGET_TRACE: "
@@ -286,42 +328,57 @@ class NuzlockeRuntime:
             trace=True,
         )
         if not is_wild or is_trainer or location is None:
-            if is_wild and not is_trainer:
-                diagnostic_print(
-                    lambda: (
-                        "NUZLOCKE_CAPTURE_TARGET: "
-                        f"location={location!r} is_wild={is_wild} is_trainer={is_trainer} "
-                        "projection_encounter_found=False status=None eligible=None returned=False"
-                    ),
-                    trace=True,
-                )
-            return False
-        encounters = projection.state.encounters
-        registered_locations = tuple(item.location for item in encounters)
-        encounter = projection.state.encounter_for(location)
-        registered_location = next(
-            (item.location for item in encounters if item.location == location),
-            None,
-        )
-        locations_equal = registered_location == location
-        result = encounter.eligible and encounter.status == "pending"
-        diagnostic_print(
-            lambda: (
-                "NUZLOCKE_CAPTURE_TARGET_TRACE: "
-                f"runtime_id={id(self)} location_arg={location!r} "
-                f"is_wild={is_wild} is_trainer={is_trainer} "
-                f"projection_id={id(projection)} "
-                f"projection_encounter_lookup={encounter!r} "
-                f"registered_locations={registered_locations!r} "
-                f"registered_location={registered_location!r} "
-                f"locations_equal={locations_equal} "
-                f"status={encounter.status!r} eligible={encounter.eligible!r} "
-                f"status_pending={encounter.status == 'pending'} "
-                f"final_return={result}"
-            ),
-            trace=True,
-        )
-        return result
+            reason = "trainer battle is never capture-eligible" if is_trainer else (
+                "battle is not wild" if not is_wild else "encounter location is unavailable"
+            )
+            return result(False, reason)
+
+        facts = self._latest_campaign_facts
+        pokedex = getattr(facts, "pokedex_received", None)
+        if pokedex is None or not getattr(pokedex, "is_known", False):
+            return result(False, "pokedex receipt is unknown")
+        if pokedex.value is not True:
+            return result(False, "previous encounters were before pokedex receipt")
+        if not projection.rule_config.is_enabled(CampaignRuleId.ONE_ENCOUNTER_PER_AREA):
+            return result(False, "one-encounter-per-area rule is disabled")
+
+        if projection.rule_config.is_enabled(CampaignRuleId.SPECIES_CLAUSE) and species:
+            conflict = species_clause_conflict_reason(projection.state, species)
+            if conflict is not None:
+                return result(False, conflict)
+
+        encounters = tuple(item for item in projection.state.encounters if item.location == location)
+        encounter = next((item for item in encounters if item.eligible), None)
+        if encounter is None:
+            if encounters:
+                return result(False, "encounter was recorded as ineligible", encounters[-1].status)
+            return result(False, "wild encounter has not been registered by the observer")
+        if encounter.status == "pending":
+            return result(True, "first eligible encounter is pending", encounter.status)
+        if encounter.status in (LOST, FAINTED):
+            return result(False, "failed to catch first eligible encounter", encounter.status)
+        if encounter.status == CAPTURED:
+            return result(False, "area encounter already resolved", encounter.status)
+        if encounter.status == UNKNOWN:
+            return result(False, "first eligible encounter outcome is unknown", encounter.status)
+        return result(False, "area encounter is not pending", encounter.status)
+
+    def capture_target_for(
+        self,
+        location: tuple[int, int] | None,
+        *,
+        is_wild: bool,
+        is_trainer: bool,
+        species: tuple[str, ...] | None = None,
+    ) -> bool:
+        """Compatibility boolean wrapper around :meth:`capture_eligibility_for`."""
+
+        return self.capture_eligibility_for(
+            location,
+            is_wild=is_wild,
+            is_trainer=is_trainer,
+            species=species,
+        ).eligible
 
     def update(self, snapshot: NuzlockeSnapshot | None = None) -> tuple[Event, ...]:
         """Process the current frame and return events generated by it.
@@ -408,20 +465,13 @@ class NuzlockeRuntime:
                     and event.is_wild
                     and not event.is_trainer
                     and self._rule_config.is_enabled(CampaignRuleId.SPECIES_CLAUSE)
-                    and any(
-                        isinstance(species, str)
-                        and any(
-                            species.casefold() == captured.casefold()
-                            for captured in self._rules_projection.state.captured_species
-                        )
-                        for species in event.opponent_species
-                    )
+                    and species_clause_conflict_reason(
+                        self._rules_projection.state, event.opponent_species
+                    ) is not None
                 ):
                     # A duplicate species is still a real battle, but it is
                     # not the route's eligible encounter under Species Clause.
                     event_encounter_eligible = False
-                from dataclasses import replace
-
                 event = replace(event, encounter_eligible=event_encounter_eligible)
                 encounter_eligible_for_event = event_encounter_eligible
             else:
@@ -446,9 +496,14 @@ class NuzlockeRuntime:
                         f"is_wild={event.is_wild} is_trainer={event.is_trainer} "
                         f"pokedex_received_status={campaign_facts.pokedex_received.status.value} "
                         f"pokedex_received_value={campaign_facts.pokedex_received.value!r} "
-                        f"encounter_eligible={encounter_eligible} emitted=True "
+                        # Keep the global Pokédex/rule gate separate from the
+                        # final decision attached to this event.  The latter
+                        # also includes area and Species Clause checks.
+                        f"encounter_eligible={event.encounter_eligible!r} "
+                        f"global_encounter_gate={encounter_eligible!r} emitted=True "
                         f"projection_encounter_status={getattr(encounter, 'status', None)!r} "
                         f"projection_encounter_eligible={getattr(encounter, 'eligible', None)!r} "
+                        f"projection_encounter_frame={getattr(encounter, 'frame', None)!r} "
                         f"projection_pokemon_identity={getattr(encounter, 'pokemon_identity', None)!r}"
                     ),
                     trace=True,

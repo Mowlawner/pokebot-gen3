@@ -96,6 +96,16 @@ class BattleStrategy:
         """
         raise NotImplementedError
 
+    def choose_trainer_replacement(self, battle_state: BattleState) -> int | None:
+        """Choose a party slot for an optional trainer replacement prompt.
+
+        ``None`` means answer the ROM prompt with No.  The default preserves
+        the existing Set-style behavior for every strategy; campaign rules
+        opt into strategic replacement selection explicitly.
+        """
+
+        return None
+
     def decide_turn_in_double_battle(self, battle_state: BattleState, battler_index: int) -> tuple["TurnAction", any]:
         """
         This is similar to `decide_turn()`, except that it is called in double battles -- once for each

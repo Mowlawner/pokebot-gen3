@@ -39,6 +39,7 @@ from modules.navigation import (
     transition_world_route,
     TransitionRelevance,
     NavigationError,
+    NavigationSearchLimitExceeded,
 )
 from modules.overworld import (
     MapConnectionObservation,
@@ -375,6 +376,26 @@ class TestWorldGoalIntegration(unittest.TestCase):
 
 class TestWeightedNavigation(unittest.TestCase):
     MAP = (99, 0)
+
+    def test_bounded_search_reports_expansion_limit(self):
+        observed = self.world([(x, 0) for x in range(8)])
+
+        with self.assertRaises(NavigationSearchLimitExceeded):
+            GoalAwareNavigator(observed).plan(
+                (self.MAP, (0, 0)),
+                ReachLocation((self.MAP, (7, 0))),
+                max_expansions=2,
+            )
+
+    def test_bounded_search_reports_incumbent_cost_ceiling(self):
+        observed = self.world([(x, 0) for x in range(5)])
+
+        with self.assertRaises(NavigationSearchLimitExceeded):
+            GoalAwareNavigator(observed).plan(
+                (self.MAP, (0, 0)),
+                ReachLocation((self.MAP, (4, 0))),
+                cost_ceiling=(0, 3),
+            )
 
     @classmethod
     def world(cls, coordinates, grass=(), blocked=()):

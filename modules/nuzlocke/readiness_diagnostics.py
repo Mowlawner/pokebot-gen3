@@ -111,6 +111,11 @@ class ProgressionReadinessDiagnostic:
     readiness_decision: ReadinessDecision | None = None
     readiness_reason: ReadinessReason | None = None
     route_analysis: "RouteAnalysis | None" = None
+    # The execution adapter may project a declared destination into
+    # ``navigation_goal`` for diagnostics even when the active capability has
+    # no tactical route of its own. Preserve that distinction for the pure
+    # readiness policy without keying behavior to an objective ID.
+    targetless: bool = False
 
     @property
     def party_count(self) -> int | None:
@@ -218,7 +223,15 @@ class ReadinessObservationScheduler:
         self._invalidation_reason = reason
 
     def observe(self, objective, goal):
-        """Reuse or refresh readiness based on a cheap context key and age."""
+        """Reuse readiness until an objective or semantic context changes.
+
+        Party/resource transitions are represented by the cheap context key
+        supplied by Campaign Progression, while battle and recovery
+        boundaries call :meth:`invalidate` explicitly. A frame-age timeout is
+        intentionally not a correctness boundary: walking does not change
+        readiness, and periodic synchronous re-evaluation was the source of
+        avoidable post-battle stalls.
+        """
 
         self._tick_count += 1
         cheap = self._cheap_context()
@@ -226,13 +239,6 @@ class ReadinessObservationScheduler:
         can_reuse = (
             self._cached is not None
             and self._cached_key == key
-            and self._age is not None
-            and self._age
-            < (
-                self._unknown_max_age_ticks
-                if _readiness_observation_is_transient(self._cached)
-                else self._max_age_ticks
-            )
         )
         self._last_observation_was_cache_hit = can_reuse
         if can_reuse:
@@ -256,10 +262,9 @@ class ReadinessObservationScheduler:
         # it tells the controller to keep campaign ownership while a battle,
         # script, or warp settles.  Dropping it here causes the controller to
         # repeat all ROM reads on every frame of a long scripted sequence,
-        # which can reduce the emulator to a crawl.  The normal age limit,
-        # explicit battle invalidation, and the map/game-state key change all
-        # provide bounded re-observation without allowing stale readiness to
-        # authorize work indefinitely.
+        # which can reduce the emulator to a crawl. Semantic context changes
+        # and explicit lifecycle invalidation provide the re-observation
+        # boundaries instead of a blind frame-age timeout.
         return result
 
     @property
@@ -273,18 +278,10 @@ class ReadinessObservationScheduler:
         """Return immutable scheduler counters and freshness state."""
 
         return ReadinessScheduleState(
-            (
-                "fresh"
-                if self._cached is not None
-                and self._age is not None
-                and self._age
-                < (
-                    self._unknown_max_age_ticks
-                    if _readiness_observation_is_transient(self._cached)
-                    else self._max_age_ticks
-                )
-                else "stale"
-            ),
+            # Cache age is retained as telemetry, but it is not a validity
+            # boundary. Walking does not change party/resource readiness;
+            # explicit invalidation and semantic context changes do.
+            "fresh" if self._cached is not None else "stale",
             self._age,
             self._refresh_count,
             self._tick_count,
@@ -369,10 +366,11 @@ class CampaignReadinessPolicy:
         if readiness.route_analysis is None or readiness.route_analysis.normal_cost is None:
             if readiness.lowest_hp_ratio <= self.opportunistic_hp_ratio:
                 # A trainer ahead is a reason to perform this safety check,
-                # not a reason to skip it.  Targetless capabilities retain
-                # their direct known-Center recovery path.
+                # not a reason to skip it. A known nearby healing source is
+                # sufficient even when the active capability has no tactical
+                # goal of its own.
                 if (
-                    readiness.objective_id == "receive_pokedex"
+                    getattr(readiness, "targetless", False)
                     and center_available
                     and center_safe
                     and readiness.recovery.distance_to_center is not None
@@ -496,6 +494,7 @@ def build_progression_readiness_diagnostic(
     resource_availability: Availability | None = None,
     resource_reason: str | None = None,
     route_analysis: "RouteAnalysis | None" = None,
+    targetless: bool = False,
 ) -> ProgressionReadinessDiagnostic:
     """Build a point-in-time diagnostic without applying a survival policy."""
     members = _party(snapshot)
@@ -583,6 +582,7 @@ def build_progression_readiness_diagnostic(
         None,
         None,
         route_analysis,
+        targetless,
     )
 
 

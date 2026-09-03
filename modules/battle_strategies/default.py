@@ -23,6 +23,37 @@ class DefaultBattleStrategy(BattleStrategy):
     def party_can_battle(self) -> bool:
         return any(self.pokemon_can_battle(pokemon) for pokemon in get_party())
 
+    def is_switch_target_valid(self, battle_state: BattleState, party_index: int) -> bool:
+        """Validate a switch against the current opponent before execution.
+
+        Strategies may override this for an explicitly modeled continuation
+        (for example a temporary EXP tag). The default contract keeps the
+        executor from blindly sending out a party member that cannot damage
+        the opponent.
+        """
+
+        return party_index in self.get_valid_switch_targets(battle_state)
+
+    def get_valid_switch_targets(self, battle_state: BattleState) -> tuple[int, ...]:
+        """Return current-opponent-compatible switch targets."""
+
+        try:
+            return tuple(BattleStrategyUtil(battle_state).get_potential_rotation_targets(battle_state))
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            return ()
+
+    def select_valid_switch_target(self, battle_state: BattleState) -> int | None:
+        """Select one target from the strategy's validated switch set."""
+
+        targets = self.get_valid_switch_targets(battle_state)
+        if not targets:
+            return None
+        try:
+            selected = BattleStrategyUtil(battle_state).select_rotation_target(battle_state)
+            return selected if selected in targets else targets[0]
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            return targets[0]
+
     def pokemon_can_battle(self, pokemon: Pokemon) -> bool:
         if pokemon.is_egg or not self._pokemon_has_enough_hp(pokemon):
             return False

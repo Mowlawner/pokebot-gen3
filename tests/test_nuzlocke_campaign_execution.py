@@ -641,9 +641,9 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
             AgentAction(AgentActionType.WAIT_REOBSERVE),
             "warp activation failed",
         )
-        with patch.object(loop, "step", return_value=(None, None, terminal)):
+        with patch.object(loop, "step", side_effect=((None, None, terminal), (None, None, terminal))):
             with self.assertRaises(NavigationError):
-                next(loop.run())
+                list(loop.run())
 
 
 if __name__ == "__main__":

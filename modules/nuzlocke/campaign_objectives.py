@@ -443,7 +443,6 @@ def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
                 readiness=ReadinessImportance.IMPORTANT,
                 encounters=EncounterPolicy.PRESERVE,
                 mandatory_battle=True,
-                recover_before_completion=True,
             ),
             destination=MapRSE.ROUTE103.value,
         ),
@@ -573,7 +572,6 @@ def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
                 readiness=ReadinessImportance.IMPORTANT,
                 encounters=EncounterPolicy.PRESERVE,
                 mandatory_battle=True,
-                recover_before_completion=True,
                 minimum_hp_ratio=0.75,
             ),
         ),
@@ -1144,7 +1142,12 @@ def _select_available_campaign_tasks(
         if task.task_kind != "optional"
         or (
             task.encounter_evaluation is not None
-            and task.encounter_evaluation.recommendation is EncounterRecommendation.PREFER
+            # DEFER means "not worth interrupting required progression for";
+            # it is still a known reachable encounter. If no required task
+            # is executable, it must remain a valid fallback instead of
+            # turning the campaign frontier into a terminal COMPLETE result.
+            and task.encounter_evaluation.recommendation
+            in {EncounterRecommendation.PREFER, EncounterRecommendation.DEFER}
         )
     )
     if selectable:
@@ -1163,7 +1166,16 @@ def _select_available_campaign_tasks(
         candidate = strategic_candidate(task)
         if candidate is not None:
             task = replace(task, encounter_method=candidate.method)
-        return ObjectiveSelection(task, ObjectiveStatus.READY, "selected from currently available tasks")
+        return ObjectiveSelection(
+            task,
+            ObjectiveStatus.READY,
+            (
+                "selected from currently available tasks"
+                if task.encounter_evaluation is None
+                or task.encounter_evaluation.recommendation is EncounterRecommendation.PREFER
+                else "selected deferred encounter because no required task is executable"
+            ),
+        )
     return ObjectiveSelection(None, ObjectiveStatus.COMPLETE, "no campaign task is currently available")
 
 

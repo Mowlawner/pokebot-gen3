@@ -3,7 +3,11 @@ import unittest
 from types import SimpleNamespace
 
 from modules.nuzlocke.campaign_state import CampaignFacts, Fact, FactStatus
-from modules.nuzlocke.level_cap import assess_level_cap, evaluate_battle_entry
+from modules.nuzlocke.level_cap import (
+    assess_level_cap,
+    can_receive_experience_without_exceeding_cap,
+    evaluate_battle_entry,
+)
 from modules.nuzlocke.rule_config import CampaignRulesConfig
 
 
@@ -54,6 +58,17 @@ class LevelCapTests(unittest.TestCase):
         )
 
         self.assertTrue(decision.allowed)
+
+    def test_projected_experience_must_remain_below_the_next_cap_level(self):
+        growth = SimpleNamespace(get_experience_needed_for_level=lambda level: {15: 3000, 16: 4000}[level])
+        pokemon = SimpleNamespace(
+            level=14,
+            total_exp=3900,
+            species=SimpleNamespace(level_up_type=growth),
+        )
+
+        self.assertTrue(can_receive_experience_without_exceeding_cap(pokemon, 50, 15))
+        self.assertFalse(can_receive_experience_without_exceeding_cap(pokemon, 100, 15))
 
 
 if __name__ == "__main__":

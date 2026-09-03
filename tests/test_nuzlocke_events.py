@@ -276,6 +276,140 @@ class TestNuzlockeEvents(unittest.TestCase):
         events = observer.observe(self.snapshot(frame=2, state=State.BATTLE, battle=self.battle()))
         self.assertEqual(sum(isinstance(event, BattleStarted) for event in events), 1)
 
+    def test_stale_opponent_buffer_is_not_accepted_as_new_battle(self):
+        from modules.nuzlocke.events import BattleEnded, BattleStarted, NuzlockeEventObserver
+        from modules.nuzlocke.identity import PokemonIdentity
+        from modules.nuzlocke.snapshots import BattlePokemonSnapshot, BattleSnapshot
+
+        def battle(species: str, personality_value: int) -> BattleSnapshot:
+            own = BattlePokemonSnapshot(
+                0,
+                "Treecko",
+                10,
+                10,
+                "none",
+                False,
+                False,
+                (),
+                PokemonIdentity(100, 2, 3),
+            )
+            opponent = BattlePokemonSnapshot(
+                1,
+                species,
+                5,
+                10,
+                "none",
+                False,
+                False,
+                (),
+                PokemonIdentity(personality_value, 4, 5),
+            )
+            return BattleSnapshot(("WILD",), False, True, False, (own,), (opponent,), "InProgress")
+
+        observer = NuzlockeEventObserver()
+        observer.observe(self.snapshot())
+        first = observer.observe(self.snapshot(frame=2, state=State.BATTLE, battle=battle("Poochyena", 10)))
+        self.assertTrue(any(isinstance(event, BattleStarted) for event in first))
+        self.assertTrue(any(isinstance(event, BattleEnded) for event in observer.observe(self.snapshot(frame=3))))
+
+        # The first ready frames of the next battle still contain the prior
+        # Poochyena in Emerald's shared opponent buffer.
+        for frame in (4, 5):
+            self.assertFalse(
+                any(
+                    isinstance(event, BattleStarted)
+                    for event in observer.observe(
+                        self.snapshot(frame=frame, state=State.BATTLE, battle=battle("Poochyena", 10))
+                    )
+                )
+            )
+
+        # A new species/identity is first treated as a candidate, then
+        # accepted only after it remains stable for another observation.
+        self.assertFalse(
+            any(
+                isinstance(event, BattleStarted)
+                for event in observer.observe(
+                    self.snapshot(frame=6, state=State.BATTLE, battle=battle("Zigzagoon", 20))
+                )
+            )
+        )
+        started = observer.observe(self.snapshot(frame=7, state=State.BATTLE, battle=battle("Zigzagoon", 20)))
+        battle_started = next(event for event in started if isinstance(event, BattleStarted))
+        self.assertEqual(battle_started.opponent_species, ("Zigzagoon",))
+
+    def test_same_species_new_identity_is_a_new_battle(self):
+        from modules.nuzlocke.events import BattleStarted, NuzlockeEventObserver
+        from modules.nuzlocke.identity import PokemonIdentity
+        from modules.nuzlocke.snapshots import BattlePokemonSnapshot, BattleSnapshot
+
+        def battle(personality_value: int) -> BattleSnapshot:
+            opponent = BattlePokemonSnapshot(
+                1,
+                "Poochyena",
+                5,
+                10,
+                "none",
+                False,
+                False,
+                (),
+                PokemonIdentity(personality_value, 4, 5),
+            )
+            return BattleSnapshot(
+                ("WILD",),
+                False,
+                True,
+                False,
+                (),
+                (opponent,),
+                "InProgress",
+            )
+
+        observer = NuzlockeEventObserver()
+        observer.observe(self.snapshot())
+        self.assertTrue(
+            any(
+                isinstance(event, BattleStarted)
+                for event in observer.observe(self.snapshot(frame=2, state=State.BATTLE, battle=battle(10)))
+            )
+        )
+        observer.observe(self.snapshot(frame=3))
+        observer.observe(self.snapshot(frame=4, state=State.BATTLE, battle=battle(10)))
+        self.assertFalse(
+            any(
+                isinstance(event, BattleStarted)
+                for event in observer.observe(self.snapshot(frame=5, state=State.BATTLE, battle=battle(20)))
+            )
+        )
+        started = observer.observe(self.snapshot(frame=6, state=State.BATTLE, battle=battle(20)))
+        self.assertEqual(sum(isinstance(event, BattleStarted) for event in started), 1)
+
+    def test_missing_opponent_identity_preserves_legacy_boundary_behavior(self):
+        from modules.nuzlocke.events import BattleEnded, BattleStarted, NuzlockeEventObserver
+        from modules.nuzlocke.snapshots import BattlePokemonSnapshot, BattleSnapshot
+
+        battle = BattleSnapshot(
+            ("WILD",),
+            False,
+            True,
+            False,
+            (),
+            (BattlePokemonSnapshot(1, "Poochyena", 5, 10, "none", False, False, (), None),),
+            "InProgress",
+        )
+        observer = NuzlockeEventObserver()
+        observer.observe(self.snapshot())
+        self.assertTrue(
+            any(isinstance(event, BattleStarted) for event in observer.observe(self.snapshot(frame=2, state=State.BATTLE, battle=battle)))
+        )
+        self.assertTrue(any(isinstance(event, BattleEnded) for event in observer.observe(self.snapshot(frame=3))))
+
+        # Snapshot producers that cannot provide stable opponent identities
+        # cannot safely detect the stale shared buffer, so retain the previous
+        # one-shot boundary behavior for compatibility.
+        next_battle = observer.observe(self.snapshot(frame=4, state=State.BATTLE, battle=battle))
+        self.assertEqual(sum(isinstance(event, BattleStarted) for event in next_battle), 1)
+
     def test_partial_battle_teardown_does_not_end_battle_early(self):
         from modules.nuzlocke.events import (
             BattleEnded,
@@ -303,6 +437,44 @@ class TestNuzlockeEvents(unittest.TestCase):
         ended = observer.observe(self.snapshot(frame=4, state=State.OVERWORLD))
         self.assertEqual(sum(isinstance(event, BattleEnded) for event in ended), 1)
         self.assertEqual(observer.observe(self.snapshot(frame=5, state=State.OVERWORLD)), ())
+
+    def test_missing_battle_snapshot_during_switch_does_not_end_or_restart_battle(self):
+        from modules.nuzlocke.events import BattleEnded, BattleStarted, NuzlockeEventObserver
+
+        observer = NuzlockeEventObserver()
+        battle = self.battle()
+        observer.observe(self.snapshot())
+        started = observer.observe(self.snapshot(frame=2, state=State.BATTLE, battle=battle))
+        self.assertEqual(sum(isinstance(event, BattleStarted) for event in started), 1)
+
+        # The game remains in the battle lifecycle while Emerald briefly
+        # cannot materialize the battle object during a party switch.
+        transient = observer.observe(self.snapshot(frame=3, state=State.BATTLE, battle=None))
+        self.assertFalse(any(isinstance(event, (BattleStarted, BattleEnded)) for event in transient))
+
+        resumed = observer.observe(self.snapshot(frame=4, state=State.BATTLE, battle=battle))
+        self.assertFalse(any(isinstance(event, (BattleStarted, BattleEnded)) for event in resumed))
+
+        ended = observer.observe(self.snapshot(frame=5, state=State.OVERWORLD, battle=None))
+        self.assertEqual(sum(isinstance(event, BattleEnded) for event in ended), 1)
+
+    def test_unknown_state_during_battle_read_gap_does_not_end_battle(self):
+        from modules.nuzlocke.events import BattleEnded, BattleStarted, NuzlockeEventObserver
+
+        class UnknownState(Enum):
+            UNKNOWN = 1
+
+        observer = NuzlockeEventObserver()
+        battle = self.battle()
+        observer.observe(self.snapshot(state=State.BATTLE, battle=battle))
+        transient = observer.observe(self.snapshot(frame=2, state=UnknownState.UNKNOWN, battle=None))
+        self.assertFalse(any(isinstance(event, (BattleStarted, BattleEnded)) for event in transient))
+        self.assertTrue(
+            any(
+                isinstance(event, BattleEnded)
+                for event in observer.observe(self.snapshot(frame=3, state=State.OVERWORLD, battle=None))
+            )
+        )
 
 
 if __name__ == "__main__":

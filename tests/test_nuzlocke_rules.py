@@ -13,6 +13,7 @@ from modules.nuzlocke.rules import (
     PENDING,
     UNKNOWN,
     NuzlockeRulesProjection,
+    species_clause_conflict_reason,
     load_rules,
     reduce_rules,
 )
@@ -148,6 +149,46 @@ class TestNuzlockeRules(unittest.TestCase):
 
         self.assertEqual(len(projection.state.encounters), 2)
         self.assertEqual(projection.state.encounters[-1].status, PENDING)
+
+    def test_species_clause_treats_evolution_line_as_one_species(self):
+        captured = PokemonIdentity(99, 20, 30)
+        state = reduce_rules(
+            (
+                self.start(species=("Poochyena",)),
+                PokemonCaptured(2, captured, self.a, "Poochyena"),
+            )
+        )
+
+        self.assertIsNotNone(species_clause_conflict_reason(state, ("Mightyena",)))
+        self.assertIsNone(species_clause_conflict_reason(state, ("Zigzagoon",)))
+
+    def test_species_clause_preserves_wurmple_branch_exception(self):
+        captured = PokemonIdentity(99 << 16, 20, 30)
+        state = reduce_rules(
+            (
+                self.start(species=("Wurmple",)),
+                PokemonCaptured(2, captured, self.a, "Wurmple"),
+            )
+        )
+
+        self.assertEqual(state.captured_evolution_branches, (("wurmple", "cascoon"),))
+        self.assertIsNotNone(species_clause_conflict_reason(state, ("Wurmple",)))
+        self.assertIsNotNone(species_clause_conflict_reason(state, ("Cascoon",)))
+        self.assertIsNotNone(species_clause_conflict_reason(state, ("Dustox",)))
+        self.assertIsNone(species_clause_conflict_reason(state, ("Silcoon",)))
+        self.assertIsNone(species_clause_conflict_reason(state, ("Beautifly",)))
+
+    def test_species_clause_matches_lowercase_evolution_names(self):
+        captured = PokemonIdentity(99, 20, 30)
+        state = reduce_rules(
+            (
+                self.start(species=("wurmple",)),
+                PokemonCaptured(2, captured, self.a, "wurmple", "cascoon"),
+            )
+        )
+
+        self.assertIsNotNone(species_clause_conflict_reason(state, ("dustox",)))
+        self.assertIsNone(species_clause_conflict_reason(state, ("silcoon",)))
 
     def test_violation_reason_is_deterministic(self):
         events = (self.start(), self.end(), self.start(3))

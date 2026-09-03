@@ -195,9 +195,11 @@ class TestNuzlockeRuntime(unittest.TestCase):
     def test_pre_pokeball_wild_battle_does_not_consume_location(self):
         runtime = NuzlockeRuntime()
         runtime.update(snapshot(1, pokedex_received=False))
-        runtime.update(self.wild_battle(2))
+        runtime.update(self.wild_battle(2, pokedex_received=False))
         self.assertEqual(runtime.rules_projection.state.encounters, ())
-        self.assertFalse(runtime.capture_target_for((1, 2), is_wild=True, is_trainer=False))
+        eligibility = runtime.capture_eligibility_for((1, 2), is_wild=True, is_trainer=False)
+        self.assertFalse(eligibility.eligible)
+        self.assertEqual(eligibility.reason, "previous encounters were before pokedex receipt")
 
         balls = InventorySnapshot((), (ItemQuantity("Poké Ball", 1),), ())
         runtime.update(replace(snapshot(3, pokedex_received=True), inventory=balls))
@@ -206,6 +208,18 @@ class TestNuzlockeRuntime(unittest.TestCase):
         self.assertEqual(len(encounters), 1)
         self.assertEqual(encounters[0].location, (1, 2))
         self.assertTrue(runtime.capture_target_for((1, 2), is_wild=True, is_trainer=False))
+
+    def test_failed_first_encounter_reports_capture_ineligibility_reason(self):
+        runtime = NuzlockeRuntime()
+        runtime.update(snapshot(1, pokedex_received=True))
+        failed_battle = self.wild_battle(2, pokedex_received=True)
+        failed_battle = replace(failed_battle, battle=replace(failed_battle.battle, outcome="RanAway"))
+        runtime.update(failed_battle)
+        runtime.update(snapshot(3, pokedex_received=True))
+
+        eligibility = runtime.capture_eligibility_for((1, 2), is_wild=True, is_trainer=False)
+        self.assertFalse(eligibility.eligible)
+        self.assertEqual(eligibility.reason, "failed to catch first eligible encounter")
 
     def test_pokedex_receipt_not_ball_quantity_makes_wild_battle_eligible(self):
         runtime = NuzlockeRuntime()

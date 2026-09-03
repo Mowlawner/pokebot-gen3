@@ -25,6 +25,7 @@ from .events import (
 from .identity import PokemonIdentity
 from .rule_config import CampaignRuleId, CampaignRulesConfig
 from .persistence import JsonEventStore, deserialize_event
+from modules.pokemon import get_species_by_index, get_species_by_name
 
 NO_ENCOUNTER = "none"
 PENDING = "pending"
@@ -77,6 +78,10 @@ class NuzlockeCampaignState:
     # Species caught under an eligible encounter.  Keep the original spelling
     # for diagnostics, while comparisons use case-folded values.
     captured_species: tuple[str, ...] = ()
+    # Branch metadata is needed for branched evolutionary families. The
+    # species tuple remains the public compatibility view; this parallel tuple
+    # records the branch known at capture time, e.g. ("wurmple", "cascoon").
+    captured_evolution_branches: tuple[tuple[str, str], ...] = ()
 
     @property
     def legal(self) -> bool:
@@ -260,11 +265,121 @@ def _normalize_species(species: str | None) -> str | None:
     return value or None
 
 
+def _species_family(species: str | None) -> frozenset[str]:
+    """Return normalized evolutionary-line members for a species name."""
+
+    normalized = _normalize_species(species)
+    if normalized is None:
+        return frozenset()
+    try:
+        value = get_species_by_name(species.strip())
+    except KeyError:
+        # Live event producers normally preserve the ROM's title casing, but
+        # older logs and lightweight integrations may provide lowercase
+        # species names.  The species module's public name lookup is exact,
+        # so resolve that compatibility form against the indexed catalogue.
+        value = None
+        for index in range(1000):
+            try:
+                candidate = get_species_by_index(index)
+            except IndexError:
+                break
+            if _normalize_species(getattr(candidate, "name", None)) == normalized:
+                value = candidate
+                break
+        if value is None:
+            return frozenset({normalized})
+    try:
+        return frozenset(
+            name
+            for name in (_normalize_species(get_species_by_index(index).name) for index in value.family)
+            if name is not None
+        )
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+        return frozenset({normalized})
+
+
+def _wurmple_branch(species: str | None, identity: PokemonIdentity | None = None) -> str | None:
+    """Return a Wurmple branch, preserving the personality-based split."""
+
+    normalized = _normalize_species(species)
+    if normalized == "wurmple" and identity is not None:
+        # Pokemon.wurmple_evolution uses the upper 16 bits of the personality
+        # value, modulo ten. Capture events retain that stable identity even
+        # though they intentionally do not retain emulator-facing Pokémon data.
+        return "silcoon" if ((identity.personality_value >> 16) & 0xFFFF) % 10 <= 4 else "cascoon"
+    if normalized in {"silcoon", "beautifly"}:
+        return "silcoon"
+    if normalized in {"cascoon", "dustox"}:
+        return "cascoon"
+    return None
+
+
+def _captured_branch(state: NuzlockeCampaignState, species: str) -> str | None:
+    """Find persisted branch metadata for one captured species."""
+
+    normalized = _normalize_species(species)
+    if normalized is None:
+        return None
+    for captured_species, branch in state.captured_evolution_branches:
+        if _normalize_species(captured_species) == normalized:
+            return branch
+    return _wurmple_branch(species)
+
+
+def _species_clause_conflict(state: NuzlockeCampaignState, species: tuple[str, ...]) -> str | None:
+    """Return the prior capture that makes a candidate species ineligible.
+
+    Normal evolutionary families share one clause slot. Wurmple is the
+    deliberate exception: its personality-selected branch blocks Wurmple and
+    that branch's descendants, while leaving the alternate branch available.
+    The common ancestor itself is always blocked once any Wurmple-family
+    capture exists.
+    """
+
+    for candidate in species:
+        candidate_name = _normalize_species(candidate)
+        if candidate_name is None:
+            continue
+        candidate_family = _species_family(candidate)
+        candidate_branch = _wurmple_branch(candidate)
+        for captured in state.captured_species:
+            captured_name = _normalize_species(captured)
+            if captured_name is None:
+                continue
+            captured_family = _species_family(captured)
+            if not candidate_family.intersection(captured_family):
+                continue
+            if candidate_name == captured_name:
+                return captured
+            if "wurmple" not in candidate_family or "wurmple" not in captured_family:
+                return captured
+            # Wurmple itself is the shared ancestor, regardless of the branch
+            # selected by the individual that was caught.
+            if candidate_name == "wurmple" or captured_name == "wurmple":
+                captured_branch = _captured_branch(state, captured)
+                if candidate_name == "wurmple" or captured_branch is None:
+                    return captured
+                if candidate_branch == captured_branch:
+                    return captured
+                continue
+            captured_branch = _captured_branch(state, captured)
+            if candidate_branch is None or captured_branch is None or candidate_branch == captured_branch:
+                return captured
+    return None
+
+
+def species_clause_conflict_reason(state: NuzlockeCampaignState, species: tuple[str, ...]) -> str | None:
+    """Return a user-facing Species Clause explanation, if one applies."""
+
+    captured = _species_clause_conflict(state, species)
+    return f"previous encounter was already obtained species/evolution line: {captured}" if captured else None
+
+
 def _species_is_captured(state: NuzlockeCampaignState, species: tuple[str, ...]) -> bool:
     """Return whether any observed opponent species is already captured."""
 
-    captured = {_normalize_species(item) for item in state.captured_species}
-    return any(normalized in captured for item in species if (normalized := _normalize_species(item)) is not None)
+    return _species_clause_conflict(state, species) is not None
 
 
 class SpeciesClauseRule:
@@ -303,7 +418,19 @@ class SpeciesClauseRule:
             stored = (
                 event.species.strip() if isinstance(event.species, str) and event.species.strip() else encounter.species
             )
-            return replace(state, captured_species=state.captured_species + (stored or species,))
+            branch = (
+                event.evolution_branch
+                if event.evolution_branch in {"silcoon", "cascoon"}
+                else _wurmple_branch(species, event.identity)
+            )
+            branches = state.captured_evolution_branches
+            if branch is not None and stored is not None:
+                branches = branches + ((_normalize_species(stored) or stored, branch),)
+            return replace(
+                state,
+                captured_species=state.captured_species + (stored or species,),
+                captured_evolution_branches=branches,
+            )
         return state
 
     def evaluate(self, state: NuzlockeCampaignState) -> RuleAssessment:

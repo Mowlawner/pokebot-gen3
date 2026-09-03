@@ -276,6 +276,7 @@ def test_policy_recovers_capability_boundary_without_normal_route_goal():
         recovery=RouteRecovery(center_available=True, distance_to_center=38, safe_to_reach_center=True),
         recovery_availability=Availability.KNOWN,
         overworld_availability=Availability.KNOWN,
+        targetless=True,
     )
     result = CampaignReadinessPolicy().evaluate(value)
     assert result.decision is ReadinessDecision.RECOVER

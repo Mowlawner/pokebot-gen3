@@ -381,15 +381,13 @@ class CampaignOrchestrationTests(unittest.TestCase):
         ):
             diagnostic = mode._readiness_input(objective, None)
 
-        analyzer.analyze.assert_called_once()
+        analyzer.analyze.assert_not_called()
         self.assertEqual(diagnostic.navigation_goal.target.target_map, MapRSE.PETALBURG_CITY_GYM.value)
-        self.assertIs(diagnostic.route_analysis, route_analysis)
+        self.assertIsNone(diagnostic.route_analysis)
 
-    def test_post_battle_recovery_policy_is_retained_for_next_objective(self):
+    def test_targetless_objective_uses_universal_readiness(self):
         mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
         mode._readiness_evaluated = False
-        policy = SimpleNamespace(minimum_hp_ratio=0.5, recover_before_completion=True)
-        mode._post_battle_recovery_policy = policy
         snapshot = SimpleNamespace(
             frame=1,
             game_state=SimpleNamespace(name="OVERWORLD"),
@@ -454,10 +452,9 @@ class CampaignOrchestrationTests(unittest.TestCase):
         self.assertEqual(diagnostic.lowest_hp_ratio, 8 / 25)
         self.assertIs(diagnostic.recovery, recovery)
 
-    def test_post_battle_recovery_policy_does_not_leak_into_restock(self):
+    def test_universal_readiness_applies_to_restock_objective(self):
         mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
         mode._readiness_evaluated = False
-        mode._post_battle_recovery_policy = SimpleNamespace(minimum_hp_ratio=0.5, recover_before_completion=True)
         snapshot = SimpleNamespace(
             frame=1,
             game_state=SimpleNamespace(name="OVERWORLD"),
@@ -503,15 +500,12 @@ class CampaignOrchestrationTests(unittest.TestCase):
         ):
             diagnostic = mode._readiness_input(objective, None)
 
-        observe_recovery.assert_not_called()
-        self.assertIsNone(mode._post_battle_recovery_policy)
+        observe_recovery.assert_called_once_with(candidate_limit=None)
         self.assertEqual(diagnostic.lowest_hp_ratio, 8 / 25)
 
-    def test_post_battle_recovery_policy_survives_transient_rival_selection(self):
+    def test_universal_readiness_survives_transient_rival_selection(self):
         mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
         mode._readiness_evaluated = False
-        policy = SimpleNamespace(minimum_hp_ratio=0.5, recover_before_completion=True)
-        mode._post_battle_recovery_policy = policy
         snapshot = SimpleNamespace(
             frame=1,
             game_state=SimpleNamespace(name="OVERWORLD"),
@@ -533,7 +527,7 @@ class CampaignOrchestrationTests(unittest.TestCase):
         )
         objective = SimpleNamespace(
             objective_id="complete_intro_rival",
-            resource_policy=policy,
+            resource_policy=None,
         )
 
         with (
@@ -561,13 +555,11 @@ class CampaignOrchestrationTests(unittest.TestCase):
             diagnostic = mode._readiness_input(objective, None)
 
         observe_recovery.assert_called_once_with(candidate_limit=None)
-        self.assertIs(mode._post_battle_recovery_policy, policy)
         self.assertEqual(diagnostic.lowest_hp_ratio, 8 / 25)
 
-    def test_battle_end_arms_completed_objective_recovery_policy(self):
+    def test_battle_end_requests_universal_readiness_recheck(self):
         mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
-        policy = SimpleNamespace(recover_before_completion=True, minimum_hp_ratio=0.5)
-        objective = SimpleNamespace(objective_id="complete_intro_rival", resource_policy=policy)
+        objective = SimpleNamespace(objective_id="complete_intro_rival", resource_policy=None)
         mode._active_battle_wild = False
         mode.controller = SimpleNamespace(
             last_selection=SimpleNamespace(objective=objective),
@@ -577,7 +569,7 @@ class CampaignOrchestrationTests(unittest.TestCase):
         with patch("modules.modes.campaign.notify_battle_ended"), patch("modules.modes.campaign.diagnostic_print"):
             mode.on_battle_ended(object())
 
-        self.assertIs(mode._post_battle_recovery_policy, policy)
+        mode.controller.request_readiness_recheck.assert_called_once_with("battle_ended")
 
     def test_controller_is_constructed_during_mode_initialization(self):
         with patch("modules.modes.campaign.CampaignController") as controller_factory:

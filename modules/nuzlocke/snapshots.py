@@ -335,28 +335,50 @@ def _player() -> tuple[PlayerSnapshot, bool]:
 
 
 def _battle(game_state: GameState) -> BattleSnapshot | None:
-    """Read battle state only while the runtime reports a battle lifecycle."""
+    """Read battle state while the ROM's battle engine is still active.
 
-    if getattr(game_state, "name", None) not in {
+    Emerald temporarily reports menu states while it owns the party or bag UI
+    for a battle.  Those states are outside the normal ``BATTLE``
+    enum, but ``battle_is_active()`` remains the authoritative ROM signal until
+    the battle has actually torn down.  Treating those menus as no battle
+    caused the event observer to manufacture a BattleEnded/BattleStarted pair
+    around ordinary switches and captures.
+    """
+
+    game_state_name = getattr(game_state, "name", None)
+    in_battle_game_state = game_state_name in {
         "BATTLE",
         "BATTLE_STARTING",
         "BATTLE_ENDING",
-    }:
+    }
+    if not in_battle_game_state and game_state_name not in {"BAG_MENU", "PARTY_MENU"}:
         return None
-    from modules.battle_state import (
-        BattleState,
-        BattleType,
-        get_battle_state,
-        get_last_battle_outcome,
-    )
-    from modules.memory import GameState
+    if not in_battle_game_state:
+        try:
+            from modules.battle_state import battle_is_active, get_last_battle_outcome
 
-    if game_state not in (
-        GameState.BATTLE,
-        GameState.BATTLE_STARTING,
-        GameState.BATTLE_ENDING,
-    ):
-        return None
+            battle_active = battle_is_active()
+            if not battle_active:
+                # Emerald pauses the battle main callback while it owns the
+                # party/bag UI, even though the battle is still
+                # unresolved.  A normal field menu has the last terminal
+                # outcome instead, so this is a useful second signal for
+                # distinguishing the two cases.
+                if getattr(get_last_battle_outcome(), "name", None) != "InProgress":
+                    return None
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+            return None
+
+    from modules.battle_state import BattleState, BattleType, get_battle_state, get_last_battle_outcome
+    if in_battle_game_state:
+        from modules.memory import GameState
+
+        if game_state not in (
+            GameState.BATTLE,
+            GameState.BATTLE_STARTING,
+            GameState.BATTLE_ENDING,
+        ):
+            return None
     state: BattleState | None = get_battle_state()
     if state is None:
         return BattleSnapshot((), False, False, False, (), (), "Unknown", ready=False)

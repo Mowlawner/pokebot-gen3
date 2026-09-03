@@ -70,6 +70,38 @@ def assess_level_cap(
     )
 
 
+def can_receive_experience_without_exceeding_cap(
+    pokemon: object,
+    experience_gain: int,
+    level_cap: int,
+) -> bool:
+    """Return whether a known Pokémon can receive EXP and remain cap-legal.
+
+    The live party exposes both total EXP and the species growth formula.  A
+    current-level check alone is insufficient: a level-14 Pokémon can already
+    be close enough to level 16 that one encounter would make it illegal for a
+    level-15 leader.  Unknown EXP facts fail closed because this helper is used
+    only to authorize an optional training participant.
+    """
+
+    if experience_gain < 0 or level_cap < 1:
+        return False
+    try:
+        level = pokemon.level
+        total_exp = pokemon.total_exp
+        growth = pokemon.species.level_up_type
+        if not isinstance(level, int) or not isinstance(total_exp, int):
+            return False
+        if level > level_cap:
+            return False
+        if level_cap >= 100:
+            return True
+        next_cap_exp = growth.get_experience_needed_for_level(level_cap + 1)
+        return total_exp + experience_gain < next_cap_exp
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 class LevelCapRule:
     """Campaign-rule adapter for cap assessment."""
 

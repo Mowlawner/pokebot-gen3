@@ -11,7 +11,7 @@ from modules.nuzlocke.readiness_diagnostics import (
 
 
 class ReadinessSchedulerTests(unittest.TestCase):
-    def test_initial_refresh_then_bounded_reuse(self):
+    def test_initial_refresh_then_indefinite_semantic_reuse(self):
         calls = []
         scheduler = ReadinessObservationScheduler(
             lambda objective, goal: calls.append((objective, goal)) or "observation",
@@ -22,10 +22,12 @@ class ReadinessSchedulerTests(unittest.TestCase):
         self.assertFalse(scheduler.last_observation_was_cache_hit)
         self.assertEqual(scheduler.observe("objective", "goal"), "observation")
         self.assertTrue(scheduler.last_observation_was_cache_hit)
-        self.assertEqual(scheduler.observe("objective", "goal"), "observation")
+        for _ in range(10):
+            self.assertEqual(scheduler.observe("objective", "goal"), "observation")
         self.assertEqual(len(calls), 1)
         self.assertEqual(scheduler.state.refresh_count, 1)
-        self.assertEqual(scheduler.state.tick_count, 3)
+        self.assertEqual(scheduler.state.tick_count, 12)
+        self.assertEqual(scheduler.state.status, "fresh")
 
     def test_coordinate_only_change_does_not_refresh(self):
         context = [("OVERWORLD", (1, 2), (3, 4))]
@@ -74,7 +76,7 @@ class ReadinessSchedulerTests(unittest.TestCase):
         self.assertEqual(scheduler.state.invalidation_reason, None)
         self.assertEqual(scheduler.state.refresh_count, 2)
 
-    def test_unavailable_observation_is_cached_until_expiry(self):
+    def test_unavailable_observation_is_cached_until_explicit_invalidation(self):
         calls = []
         unavailable = SimpleNamespace(overworld_availability=Availability.UNKNOWN)
         valid = SimpleNamespace(overworld_availability=Availability.KNOWN)
@@ -87,9 +89,12 @@ class ReadinessSchedulerTests(unittest.TestCase):
         self.assertFalse(scheduler.last_observation_was_cache_hit)
         self.assertIs(scheduler.observe("objective", "goal"), unavailable)
         self.assertTrue(scheduler.last_observation_was_cache_hit)
-        self.assertIs(scheduler.observe("objective", "goal"), unavailable)
+        for _ in range(10):
+            self.assertIs(scheduler.observe("objective", "goal"), unavailable)
+        scheduler.invalidate("observation_boundary")
         self.assertIs(scheduler.observe("objective", "goal"), valid)
         self.assertEqual(len(calls), 2)
+        self.assertEqual(scheduler.state.status, "fresh")
 
     def test_unknown_overworld_blocks_readiness(self):
         readiness = SimpleNamespace(

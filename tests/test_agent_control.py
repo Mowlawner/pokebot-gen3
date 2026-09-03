@@ -2195,10 +2195,63 @@ class AgentExecutionTests(TestCase):
     def test_run_propagates_unreachable_instead_of_reporting_completion(self):
         loop = AgentControlLoop(lambda: observation(GameState.UNKNOWN))
         action = AgentAction(AgentActionType.WAIT_REOBSERVE, reason="blocked")
+        terminal = ActionResult(ActionResultType.UNREACHABLE, action, "no route")
         with patch.object(
             loop,
             "step",
-            return_value=(None, None, ActionResult(ActionResultType.UNREACHABLE, action, "no route")),
+            side_effect=((None, None, terminal), (None, None, terminal)),
         ):
             with self.assertRaises(NavigationError):
-                next(loop.run())
+                list(loop.run())
+
+    def test_run_retries_terminal_navigation_once_after_twenty_frames(self):
+        loop = AgentControlLoop(lambda: observation(GameState.UNKNOWN))
+        action = AgentAction(AgentActionType.WAIT_REOBSERVE, reason="stale route")
+        terminal = ActionResult(ActionResultType.UNREACHABLE, action, "stale route")
+        complete = ActionResult(ActionResultType.GOAL_COMPLETE, action, "recovered")
+        emulator = Mock()
+
+        with patch.object(loop, "step", side_effect=((None, None, terminal), (None, None, complete))) as step, patch(
+            "modules.agent_control.context.emulator", emulator
+        ):
+            yielded = list(loop.run())
+
+        assert len(yielded) == 20
+        assert step.call_count == 2
+        assert emulator.reset_held_buttons.call_count >= 2
+
+    def test_run_makes_second_terminal_navigation_failure_fatal(self):
+        loop = AgentControlLoop(lambda: observation(GameState.UNKNOWN))
+        action = AgentAction(AgentActionType.WAIT_REOBSERVE, reason="unreachable")
+        terminal = ActionResult(ActionResultType.UNREACHABLE, action, "unreachable")
+        emulator = Mock()
+
+        with patch.object(loop, "step", side_effect=((None, None, terminal), (None, None, terminal))) as step, patch(
+            "modules.agent_control.context.emulator", emulator
+        ):
+            with self.assertRaises(NavigationError):
+                list(loop.run())
+
+        assert step.call_count == 2
+        assert emulator.reset_held_buttons.call_count >= 2
+
+    def test_run_retries_navigation_error_raised_by_movement_batch_once(self):
+        loop = AgentControlLoop(lambda: observation(GameState.UNKNOWN))
+        loop._movement_batch = object()
+        action = AgentAction(AgentActionType.WAIT_REOBSERVE, reason="movement batch")
+        complete = ActionResult(ActionResultType.GOAL_COMPLETE, action, "recovered")
+        emulator = Mock()
+
+        with patch.object(
+            loop,
+            "_advance_movement_batch",
+            side_effect=(NavigationError("movement batch"), False),
+        ) as advance, patch.object(loop, "step", return_value=(None, None, complete)) as step, patch(
+            "modules.agent_control.context.emulator", emulator
+        ):
+            yielded = list(loop.run())
+
+        assert len(yielded) == 20
+        assert advance.call_count == 1
+        step.assert_called_once_with()
+        assert emulator.reset_held_buttons.call_count >= 2

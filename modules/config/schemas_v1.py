@@ -27,11 +27,9 @@ class Battle(BaseConfig):
     switch_strategy: Literal["first_available", "lowest_level"] = "first_available"
     banned_moves: list[str] = [
         "None",
-        # 2-turn
-        "Bounce",
-        "Dig",
-        "Dive",
-        "Fly",
+        # Unsupported two-turn moves remain banned. Semi-invulnerable moves
+        # (Bounce, Dig, Dive, and Fly) are evaluated as charge/strike lines by
+        # the battle planner and are intentionally not listed here.
         "Sky Attack",
         "Razor Wind",
         "Doom Desire",
@@ -83,7 +81,9 @@ class NuzlockeRules(BaseConfig):
     """Enabled campaign rules for a profile or global run configuration."""
 
     filename: ClassVar = "nuzlocke_rules.yml"
-    enabled_rules: list[Literal["one_encounter_per_area", "fainting", "species_clause", "level_cap"]] = [
+    enabled_rules: list[
+        Literal["one_encounter_per_area", "fainting", "species_clause", "level_cap", "set_battle_style"]
+    ] = [
         "one_encounter_per_area",
         "fainting",
         "species_clause",

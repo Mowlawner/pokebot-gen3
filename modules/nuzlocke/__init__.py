@@ -21,7 +21,7 @@ from .snapshots import (
 )
 from .identity import PokemonIdentity
 from .events import NuzlockeStarted, PokemonCaptured, PokemonStorageLocation, StorageChanged
-from .runtime import NuzlockeRuntime
+from .runtime import CaptureEligibility, NuzlockeRuntime
 from .policy import EventStatistics, PersistenceClass, classify_event
 from .diagnostics import BoundedEventTrace
 from .persistence import (
@@ -205,6 +205,7 @@ __all__ = [
     "NuzlockeStarted",
     "get_nuzlocke_snapshot",
     "NuzlockeRuntime",
+    "CaptureEligibility",
     "PersistenceClass",
     "EventStatistics",
     "classify_event",

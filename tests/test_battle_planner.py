@@ -352,6 +352,7 @@ class BattlePlannerTests(unittest.TestCase):
             is_trainer_battle=False,
         )
         alternate = PartyPokemonWithoutPartyIndex("Torchic", 18)
+        alternate.moves = (SimpleNamespace(move=move, pp=1),)
         party = [PartyPokemonWithoutPartyIndex("Treecko", 2), alternate]
         damage_range = SimpleNamespace(min=3, max=4)
         util = SimpleNamespace(
@@ -449,6 +450,40 @@ class BattlePlannerTests(unittest.TestCase):
         self.assertEqual(decision.action, PlannerAction.UseMove)
         self.assertIn("estimated 3 hits", decision.rationale)
         self.assertIn("safe sequence established", decision.rationale)
+
+    def test_semi_invulnerable_move_models_charge_before_strike(self):
+        decision = BattlePlanner().plan(
+            context(
+                active_hp=10,
+                opponent_hp=10,
+                moves=(PlannerMove(0, "Fly", 10, 10, turns_required=2),),
+                opponent_moves=(PlannerOpponentMove("Tackle", 10, 10),),
+                active_speed=30,
+                opponent_speed=20,
+            )
+        )
+        self.assertEqual(decision.action, PlannerAction.UseMove)
+        self.assertEqual(decision.target, 0)
+        self.assertEqual(decision.classification, PlannerDecisionClass.SAFE)
+        self.assertIn("Fly (charge) → Fly", decision.rationale)
+        self.assertIn("2 turn(s)", decision.rationale)
+        self.assertIn("projected incoming damage 0", decision.rationale)
+
+    def test_semi_invulnerable_move_can_still_be_rejected_when_strike_is_exposed(self):
+        decision = BattlePlanner().plan(
+            context(
+                active_hp=10,
+                opponent_hp=10,
+                moves=(PlannerMove(0, "Dig", 10, 10, turns_required=2),),
+                opponent_moves=(PlannerOpponentMove("Tackle", 10, 10),),
+                active_speed=20,
+                opponent_speed=30,
+            )
+        )
+        self.assertEqual(decision.action, PlannerAction.UseMove)
+        self.assertEqual(decision.classification, PlannerDecisionClass.BEST_AVAILABLE)
+        self.assertEqual(decision.safety, PlannerSafety.UNSAFE_OR_UNCERTAIN)
+        self.assertIn("Two-turn moves", decision.rationale)
 
     def test_multi_turn_attack_is_rejected_when_exchange_can_faint_player(self):
         decision = BattlePlanner().plan(
@@ -572,6 +607,37 @@ class BattlePlannerTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, PlannerAction.SwitchPokemon)
         self.assertEqual(decision.target, 1)
+
+    def test_safe_switch_requires_matchup_damage(self):
+        decision = BattlePlanner().plan(
+            context(
+                active_hp=2,
+                active_max_hp=20,
+                opponent_damage_max=8,
+                moves=(),
+                can_switch=True,
+                switches=(PlannerSwitch(1, "Lotad", 18, 20, 5, 0),),
+            )
+        )
+        self.assertNotEqual(decision.action, PlannerAction.SwitchPokemon)
+        self.assertNotEqual(decision.target, 1)
+
+    def test_safe_switch_prefers_the_matchup_capable_member_over_zero_damage_member(self):
+        decision = BattlePlanner().plan(
+            context(
+                active_hp=2,
+                active_max_hp=20,
+                opponent_damage_max=8,
+                moves=(),
+                can_switch=True,
+                switches=(
+                    PlannerSwitch(1, "Lotad", 18, 20, 5, 0),
+                    PlannerSwitch(2, "Treecko", 15, 20, 5, 6),
+                ),
+            )
+        )
+        self.assertEqual(decision.action, PlannerAction.SwitchPokemon)
+        self.assertEqual(decision.target, 2)
 
     def test_low_hp_still_attacks_when_ko_is_guaranteed(self):
         decision = BattlePlanner().plan(

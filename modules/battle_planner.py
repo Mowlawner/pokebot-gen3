@@ -5,12 +5,13 @@ adapter at the bottom is the only part that knows about the live battle
 objects; this keeps strategic reasoning out of battle menu input code.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
 from modules.battle_observation import BattleKnowledge, KnowledgePolicy
 from modules.console import diagnostic_print
+from modules.context import context
 
 
 class PlannerAction(Enum):
@@ -102,6 +103,11 @@ class PlannerMove:
     effect: str | None = None
     stat_target: str | None = None
     stat_delta: int = 0
+    # Gen III semi-invulnerable moves (Fly, Dig, Dive, and Bounce) spend one
+    # turn charging before their damaging turn.  Keeping this on the
+    # planner-facing fact lets the evaluator model the continuation without
+    # changing the executor's ordinary move-selection API.
+    turns_required: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,7 +231,10 @@ class BattlePlanner:
         guaranteed = [
             move
             for move in usable
-            if move.damage_min >= context.opponent_hp and move.accuracy >= 1 and move.mechanics_supported
+            if move.turns_required == 1
+            and move.damage_min >= context.opponent_hp
+            and move.accuracy >= 1
+            and move.mechanics_supported
         ]
         if guaranteed:
             move = max(guaranteed, key=lambda candidate: (candidate.damage_min, candidate.damage_max))
@@ -309,6 +318,11 @@ class BattlePlanner:
                 and candidate.max_hp > 0
                 and candidate.incoming_damage_max is not None
                 and candidate.incoming_damage_max < candidate.hp
+                # A switch is a battle replacement, not merely a way to put
+                # an arbitrary party member on the field.  EXP-tag switches
+                # need an explicit continuation plan and are handled by the
+                # leveling strategy; they must not enter this fallback.
+                and candidate.offensive_damage_max > 0
             ]
             if context.can_switch
             else []
@@ -342,6 +356,8 @@ class BattlePlanner:
                 rationale += f" estimated {state['turns']} hits to KO; safe sequence established."
             if any(move.damage_max == 0 for move in sequence):
                 rationale += " Supported stat/effect changes are included in the damage and exposure comparison."
+            if any(move.turns_required > 1 for move in sequence):
+                rationale += " Two-turn moves are modeled as a charge followed by an automatic strike."
             if not state["known_response"]:
                 rationale += " Opponent response is unknown, so survival is not claimed as safe."
             evidence = (
@@ -511,7 +527,7 @@ class BattlePlanner:
         )
         results = []
 
-        def visit(sequence, hp, opponent_hp, stages, incoming, critical_incoming, accuracy, turns):
+        def visit(sequence, hp, opponent_hp, stages, incoming, critical_incoming, accuracy, turns, pending_move=None):
             if turns and opponent_hp <= 0:
                 results.append(
                     (
@@ -536,26 +552,48 @@ class BattlePlanner:
                 return
             if turns >= self._MAX_FORECAST_TURNS:
                 return
-            for move in moves:
+            # A semi-invulnerable move is represented as a two-step line.  The
+            # first step is the charge and the second is the automatic strike;
+            # no new player choice is introduced between them.
+            choices = (
+                ((pending_move, False),)
+                if pending_move is not None
+                else tuple((move, move.turns_required > 1) for move in moves)
+            )
+            for move, is_charge in choices:
                 next_stages = dict(stages)
                 move_accuracy = max(0.0, min(1.0, move.accuracy))
-                next_accuracy = accuracy * move_accuracy
-                damage = self._scaled_damage(move, next_stages)
+                next_accuracy = accuracy if is_charge else accuracy * move_accuracy
+                damage = 0 if is_charge else self._scaled_damage(move, next_stages)
                 next_opponent_hp = max(0, opponent_hp - damage)
-                if move.effect in self._STAT_EFFECTS:
+                if not is_charge and move.effect in self._STAT_EFFECTS:
                     side, stat, delta = self._STAT_EFFECTS[move.effect]
                     key = (side, stat)
                     next_stages[key] = max(-6, min(6, next_stages.get(key, 0) + delta))
                 # Unknown responses remain unknown; a known response is conservatively worst-case.
                 player_first = self._player_acts_first(context, move, opponent_moves)
-                response = incoming_max if known_response and (not player_first or next_opponent_hp > 0) else 0
+                # Fly/Dig/etc. avoid ordinary incoming damage during the
+                # charge.  The strike is exposed normally according to turn
+                # order, and a KO prevents the opponent's response.
+                response = (
+                    0
+                    if is_charge
+                    else incoming_max if known_response and (not player_first or next_opponent_hp > 0) else 0
+                )
                 critical_response = (
-                    incoming_critical_max if known_response and (not player_first or next_opponent_hp > 0) else 0
+                    0
+                    if is_charge
+                    else incoming_critical_max if known_response and (not player_first or next_opponent_hp > 0) else 0
                 )
                 next_hp = hp - response
                 next_incoming = incoming + response
                 next_critical_incoming = critical_incoming + critical_response
-                next_sequence = sequence + (move,)
+                sequence_move = (
+                    replace(move, name=f"{move.name} (charge)", damage_min=0, damage_max=0, turns_required=1)
+                    if is_charge
+                    else move
+                )
+                next_sequence = sequence + (sequence_move,)
                 if next_hp <= 0:
                     results.append(
                         (
@@ -621,6 +659,7 @@ class BattlePlanner:
                         next_critical_incoming,
                         next_accuracy,
                         turns + 1,
+                        move if is_charge else None,
                     )
 
         visit((), context.active_hp, context.opponent_hp, {}, 0, 0, 1.0, 0)
@@ -714,7 +753,8 @@ class BattlePlanner:
         if not move.mechanics_supported or move.damage_min <= 0 or move.accuracy <= 0:
             return None
         hits = (context.opponent_hp + move.damage_min - 1) // move.damage_min
-        if hits <= 0 or hits > self._MAX_FORECAST_TURNS:
+        action_turns = hits * max(1, move.turns_required)
+        if hits <= 0 or action_turns > self._MAX_FORECAST_TURNS:
             return None
         sequence_accuracy = move.accuracy**hits
         if sequence_accuracy < self._MIN_SEQUENCE_ACCURACY:
@@ -735,6 +775,9 @@ class BattlePlanner:
             default=incoming,
         )
         player_first = self._player_acts_first(context, move, opponent_moves)
+        # Semi-invulnerable moves expose the user only on their strike turn;
+        # the charge turn is still part of the forecast horizon but does not
+        # receive the ordinary visible response damage.
         incoming_exchanges = max(0, hits - 1) if player_first else hits
         projected_incoming = incoming * incoming_exchanges
         projected_critical_incoming = critical_incoming * incoming_exchanges
@@ -748,7 +791,8 @@ class BattlePlanner:
         )
         return confidence, (
             f"{move.name}: {move.damage_min}-{move.damage_max} damage; estimated {hits} hits to KO; "
-            f"sequence accuracy {sequence_accuracy:.0%}; projected incoming damage {projected_incoming}; "
+            f"{action_turns} action turns; sequence accuracy {sequence_accuracy:.0%}; "
+            f"projected incoming damage {projected_incoming}; "
             f"{order_note}; critical-hit ceiling {projected_critical_incoming}; safe sequence established."
         )
 
@@ -768,8 +812,12 @@ class BattlePlanner:
         if not move.mechanics_supported:
             return f"{move.name}: unsupported mechanics materially reduce confidence."
         hits = (context.opponent_hp + move.damage_min - 1) // move.damage_min if move.damage_min > 0 else 0
-        if hits > BattlePlanner._MAX_FORECAST_TURNS:
-            return f"{move.name}: requires at least {hits} minimum-damage hits, beyond the forecast horizon."
+        action_turns = hits * max(1, move.turns_required)
+        if action_turns > BattlePlanner._MAX_FORECAST_TURNS:
+            return (
+                f"{move.name}: requires {action_turns} action turns for at least {hits} minimum-damage hits, "
+                "beyond the forecast horizon."
+            )
         if move.accuracy < 1 and move.accuracy ** max(1, hits) < BattlePlanner._MIN_SEQUENCE_ACCURACY:
             return f"{move.name}: accuracy is too uncertain for the estimated {hits}-hit sequence."
         if hits > 1 and not context.opponent_moves and context.opponent_damage_max is None:
@@ -792,12 +840,13 @@ class BattlePlanner:
         if (opponent_moves or context.opponent_damage_max is not None) and context.active_hp <= projected_incoming:
             return (
                 f"{move.name}: {context.active_hp}/{context.active_max_hp} HP cannot survive the "
-                f"projected {projected_incoming} incoming damage over {hits} hits; the multi-turn sequence is rejected."
+                f"projected {projected_incoming} incoming damage over {action_turns} action turns; "
+                "the sequence is rejected."
             )
         if (opponent_moves or context.opponent_damage_max is not None) and context.active_hp <= critical_incoming:
             return (
                 f"{move.name}: a modeled critical-hit ceiling of {critical_incoming} damage can be lethal "
-                f"before the {hits}-hit line completes; the sequence is risky rather than safe."
+                f"before the {action_turns}-turn line completes; the sequence is risky rather than safe."
             )
         return f"{move.name}: no safe winning sequence established."
 
@@ -835,7 +884,7 @@ def format_planner_decision_diagnostic(decision: PlannerDecision, context: Plann
     hits = (context.opponent_hp + move.damage_min - 1) // move.damage_min if move and move.damage_min > 0 else None
     known_moves = [candidate.name for candidate in context.opponent_moves]
     unknown = not bool(known_moves or context.opponent_damage_max is not None)
-    setup = bool(move and (move.damage_max == 0 or move.effect or move.stat_delta))
+    setup = bool(move and (move.damage_max == 0 or move.effect or move.stat_delta or move.turns_required > 1))
     rejected = decision.rejected_candidates[0] if decision.rejected_candidates else "none recorded"
     fallback = decision.classification is PlannerDecisionClass.BEST_AVAILABLE and not decision.is_safe_to_execute
     reason = decision.rationale
@@ -949,7 +998,7 @@ def plan_battle_state(battle_state: Any, knowledge: BattleKnowledge | None = Non
     opponent_damage_max = max((candidate.damage_max for candidate in opponent_moves), default=None)
     moves = []
     for index, learned in enumerate(active.moves):
-        if learned is None or learned.pp <= 0:
+        if learned is None or learned.pp <= 0 or learned.move.name in context.config.battle.banned_moves:
             continue
         try:
             if active.disabled_move is learned.move:
@@ -970,6 +1019,7 @@ def plan_battle_state(battle_state: Any, knowledge: BattleKnowledge | None = Non
                         if getattr(getattr(learned.move, "type", None), "kind", None) == "Special"
                         else "attack"
                     ),
+                    turns_required=2 if getattr(learned.move, "effect", None) == "SEMI_INVULNERABLE" else 1,
                 )
             )
         except (AttributeError, RuntimeError, TypeError, ValueError):
@@ -982,7 +1032,12 @@ def plan_battle_state(battle_state: Any, knowledge: BattleKnowledge | None = Non
         incoming = [value for name in opponent_moves if (value := damage(opponent, pokemon, name)) is not None]
         offensive = []
         for learned in pokemon.moves:
-            if learned is not None and learned.pp > 0 and learned.move.base_power > 0:
+            if (
+                learned is not None
+                and learned.pp > 0
+                and learned.move.base_power > 0
+                and learned.move.name not in context.config.battle.banned_moves
+            ):
                 value = damage(pokemon, opponent, learned.move.name)
                 if value is not None:
                     offensive.append(value)

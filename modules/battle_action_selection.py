@@ -34,7 +34,73 @@ def handle_battle_action_selection(strategy: BattleStrategy) -> Generator:
         "HandleTurnActionSelectionState",
         "sub_8012324",
     ):
-        if get_battle_controller_callback(0) in (
+        if (
+            not battle_state.is_double_battle
+            and battle_state.is_trainer_battle
+            and get_battle_controller_callback(0) == "PlayerHandleYesNoBox"
+        ):
+            # In Switch mode Emerald asks before each incoming trainer
+            # Pokémon. The ordinary battle fallback pressed B here, which
+            # permanently selected No. An opt-in strategy can instead return
+            # a validated party slot; the prompt is answered Yes and the
+            # battle-owned party menu is completed before the next action.
+            try:
+                replacement_index = strategy.choose_trainer_replacement(battle_state)
+            except (AttributeError, RuntimeError, TypeError, ValueError, IndexError) as error:
+                diagnostic_print(
+                    lambda: f"TRAINER_REPLACEMENT_PROMPT: strategy_error={error!r} answer='No'",
+                    trace=True,
+                )
+                replacement_index = None
+            if replacement_index is None:
+                diagnostic_print(
+                    lambda: "TRAINER_REPLACEMENT_PROMPT: answer='No'",
+                    trace=True,
+                )
+                context.emulator.press_button("B")
+                yield
+                continue
+            if replacement_index < 0 or replacement_index >= get_party_size():
+                diagnostic_print(
+                    lambda: (
+                        "TRAINER_REPLACEMENT_PROMPT: "
+                        f"invalid_party_index={replacement_index!r} answer='No'"
+                    ),
+                    trace=True,
+                )
+                context.emulator.press_button("B")
+                yield
+                continue
+
+            diagnostic_print(
+                lambda: (
+                    "TRAINER_REPLACEMENT_PROMPT: "
+                    f"answer='Yes' replacement_party_index={replacement_index!r}"
+                ),
+                trace=True,
+            )
+            # The battle yes/no box opens with No selected in the Gen III
+            # battle UI. Move to Yes, confirm it, then wait for the ROM-owned
+            # replacement menu to become ready.
+            context.emulator.press_button("Up")
+            yield
+            context.emulator.press_button("A")
+            yield
+            for _ in range(120):
+                if get_game_state() == GameState.PARTY_MENU:
+                    in_battle_index = battle_state.map_battle_party_index(replacement_index)
+                    yield from scroll_to_party_menu_index(in_battle_index)
+                    context.emulator.press_button("A")
+                    yield
+                    while get_game_state() == GameState.PARTY_MENU:
+                        context.emulator.press_button("A")
+                        yield
+                    break
+                if get_battle_controller_callback(0) != "PlayerHandleYesNoBox":
+                    break
+                yield
+            continue
+        elif get_battle_controller_callback(0) in (
             "HandleInputChooseAction",
             "sub_802C098",
             "bx_battle_menu_t6_2",
@@ -119,6 +185,34 @@ def handle_battle_action_selection(strategy: BattleStrategy) -> Generator:
                     len(battle_state.battling_pokemon) > 2 and index == battle_state.battling_pokemon[2].party_index
                 ):
                     raise RuntimeError(f"Cannot switch in {get_party()[index].name} because it is already in battle.")
+
+                # A strategy can emit a switch based on an earlier snapshot.
+                # Recheck the matchup at the menu boundary so an invalid
+                # generic/planner switch cannot send out a zero-damage member
+                # and fail later in the battle GUI. Specialized strategies may
+                # authorize a verified multi-step continuation explicitly.
+                is_valid_switch = False
+                validator = getattr(strategy, "is_switch_target_valid", None)
+                if not callable(validator):
+                    # Third-party/legacy strategies may implement the
+                    # original BattleStrategy contract without the optional
+                    # matchup validator. Preserve their established switch
+                    # behavior; built-in strategies all provide validation.
+                    is_valid_switch = True
+                else:
+                    is_valid_switch = bool(validator(battle_state, index))
+                if not is_valid_switch:
+                    selector = getattr(strategy, "select_valid_switch_target", None)
+                    fallback_index = selector(battle_state) if callable(selector) else None
+                    if fallback_index is None:
+                        raise RuntimeError(
+                            f"Cannot switch in {get_party()[index].name}: it has no valid matchup switch target."
+                        )
+                    diagnostic_print(
+                        lambda: ("BATTLE_SWITCH_REPLANNED: " f"requested={index!r} replacement={fallback_index!r}"),
+                        trace=True,
+                    )
+                    index = fallback_index
 
                 in_battle_index = battle_state.map_battle_party_index(index)
 

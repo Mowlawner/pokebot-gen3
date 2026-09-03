@@ -639,6 +639,62 @@ class NavigationError(RuntimeError):
     pass
 
 
+class NavigationSearchLimitExceeded(NavigationError):
+    """A bounded search stopped before proving a route or no-route result."""
+
+
+def _validate_search_limit(value: int | None, name: str) -> None:
+    """Validate an optional non-negative navigation search limit."""
+
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer or None")
+
+
+def _cost_prefix(metrics: "NavigationMetrics") -> tuple[int, ...]:
+    """Return the search-cost prefix used by recovery incumbent pruning."""
+
+    return metrics.encounter_opportunities, metrics.total_route_cost
+
+
+def _enforce_plan_limits(
+    plan: "NavigationPlan",
+    *,
+    max_route_cost: int | None = None,
+    cost_ceiling: tuple[int, ...] | int | None = None,
+) -> None:
+    """Reject a manually-composed plan that exceeds speculative limits."""
+
+    _validate_search_limit(max_route_cost, "max_route_cost")
+    if isinstance(cost_ceiling, bool) or (
+        cost_ceiling is not None and not isinstance(cost_ceiling, (int, tuple))
+    ):
+        raise ValueError("cost_ceiling must be an integer, tuple, or None")
+    if isinstance(cost_ceiling, tuple) and not all(
+        isinstance(item, int) and not isinstance(item, bool) for item in cost_ceiling
+    ):
+        raise ValueError("cost_ceiling tuple must contain integers")
+    metrics = plan.metrics
+    if metrics is None:
+        return
+    if max_route_cost is not None and metrics.total_route_cost > max_route_cost:
+        raise NavigationSearchLimitExceeded(
+            f"route cost {metrics.total_route_cost} exceeds max_route_cost {max_route_cost}"
+        )
+    if cost_ceiling is not None:
+        if isinstance(cost_ceiling, int):
+            exceeded = metrics.total_route_cost > cost_ceiling
+            ceiling = cost_ceiling
+        else:
+            ceiling = cost_ceiling
+            exceeded = bool(ceiling) and _cost_prefix(metrics)[: len(ceiling)] > ceiling
+        if exceeded:
+            raise NavigationSearchLimitExceeded(
+                f"route cost prefix {_cost_prefix(metrics)!r} exceeds cost_ceiling {ceiling!r}"
+            )
+
+
 @dataclass(frozen=True)
 class IntermediateRouteAnalysis:
     """Cost of completing a goal after visiting one intermediate goal."""
@@ -670,10 +726,20 @@ class RouteCostAnalyzer:
     such as ``ReachWarp`` and ``ActivateTrigger`` retain their meaning.
     """
 
-    def __init__(self, world: NavigationWorld, *, graph: WorldMapGraph | None = None, planner=None):
+    def __init__(
+        self,
+        world: NavigationWorld,
+        *,
+        graph: WorldMapGraph | None = None,
+        planner=None,
+        max_expansions: int | None = None,
+        max_route_cost: int | None = None,
+    ):
         self.world = world
         self.graph = graph
         self._planner = planner or plan_with_world_navigation
+        self._max_expansions = max_expansions
+        self._max_route_cost = max_route_cost
 
     @staticmethod
     def _cost(plan: NavigationPlan | None) -> int | None:
@@ -690,7 +756,12 @@ class RouteCostAnalyzer:
         """Return the normal route and independently composed candidate routes."""
 
         def plan(world, origin, target):
-            result = self._planner(world, origin, target, self.graph, algorithm=algorithm)
+            kwargs = {"algorithm": algorithm}
+            if self._max_expansions is not None:
+                kwargs["max_expansions"] = self._max_expansions
+            if self._max_route_cost is not None:
+                kwargs["max_route_cost"] = self._max_route_cost
+            result = self._planner(world, origin, target, self.graph, **kwargs)
             return result[0] if isinstance(result, tuple) else result
 
         try:
@@ -978,8 +1049,18 @@ def plan_with_world_navigation(
     graph: WorldMapGraph | None = None,
     *,
     algorithm: str = "dijkstra",
+    max_expansions: int | None = None,
+    max_route_cost: int | None = None,
+    cost_ceiling: tuple[int, ...] | int | None = None,
 ) -> tuple[NavigationPlan, WorldRoute | None]:
-    """Plan one local segment, appending one generic map transition if needed."""
+    """Plan one local segment, appending one generic map transition if needed.
+
+    The optional limits are intended for speculative route comparisons.  A
+    bounded caller must be able to abandon an unreachable candidate without
+    monopolizing the emulator loop. ``cost_ceiling`` is a lexicographic
+    prefix of the search cost and is useful when an incumbent candidate has
+    already been found; ``max_route_cost`` is an absolute safety budget.
+    """
     navigation_goal = goal if isinstance(goal, NavigationGoal) else NavigationGoal(goal)
     target_map = goal_target_map(world, goal)
     # A concrete observed boundary is already the runtime transition to use.
@@ -1000,9 +1081,29 @@ def plan_with_world_navigation(
         # spend long enough in that comparison that the frame loop stops
         # advancing.  Exact observed transitions are local tactical goals;
         # reserve global search for unresolved semantic destinations.
-        return plan_observed_warp_locally(world, start, navigation_goal), None
+        return (
+            plan_observed_warp_locally(
+                world,
+                start,
+                navigation_goal,
+                max_expansions=max_expansions,
+                max_route_cost=max_route_cost,
+                cost_ceiling=cost_ceiling,
+            ),
+            None,
+        )
     if target_map is None or target_map == start[0]:
-        return GoalAwareNavigator(world).plan(start, goal, algorithm=algorithm), None
+        return (
+            GoalAwareNavigator(world).plan(
+                start,
+                goal,
+                algorithm=algorithm,
+                max_expansions=max_expansions,
+                max_route_cost=max_route_cost,
+                cost_ceiling=cost_ceiling,
+            ),
+            None,
+        )
 
     trace = getattr(context, "stutter_trace", None)
     trace_graph_start = trace.now() if trace is not None else 0
@@ -1039,7 +1140,19 @@ def plan_with_world_navigation(
         cached = _semantic_cross_map_plan_cache.get(cache_key)
         if cached is not None:
             profile_count("semantic_cross_map_plan_cache_hits")
-            return cached
+            try:
+                _enforce_plan_limits(
+                    cached[0],
+                    max_route_cost=max_route_cost,
+                    cost_ceiling=cost_ceiling,
+                )
+            except NavigationSearchLimitExceeded:
+                # A cached route may have been produced for a different
+                # incumbent candidate. It is still useful as a cache entry,
+                # but it cannot satisfy the tighter speculative bound.
+                pass
+            else:
+                return cached
         profile_count("semantic_cross_map_plan_cache_misses")
     # Search the exact finite world graph. The old first-edge candidate code
     # remains below for compatibility with callers that explicitly require a
@@ -1099,6 +1212,9 @@ def plan_with_world_navigation(
             start,
             global_goal,
             algorithm=search_algorithm,
+            max_expansions=max_expansions,
+            max_route_cost=max_route_cost,
+            cost_ceiling=cost_ceiling,
             # Semantic campaign routes expose the crossing input as the action
             # from the executable approach state.  Preserve the legacy boundary
             # source representation for exact ReachLocation callers.
@@ -1238,6 +1354,8 @@ def plan_with_world_navigation(
         encounter_penalty=navigation_goal.encounter_penalty,
         algorithm=algorithm,
         target_groups=shared_target_groups,
+        max_expansions=max_expansions,
+        max_route_cost=max_route_cost,
     )
     for candidate_id, coordinates, choices_for_candidate in candidate_choices:
         selected_index = next(
@@ -1549,6 +1667,10 @@ def plan_observed_warp_locally(
     world: NavigationWorld,
     start: Location,
     goal: ReachWarp | NavigationGoal,
+    *,
+    max_expansions: int | None = None,
+    max_route_cost: int | None = None,
+    cost_ceiling: tuple[int, ...] | int | None = None,
 ) -> NavigationPlan:
     """Plan to an exact observed warp without consulting the map graph."""
     navigation_goal = goal if isinstance(goal, NavigationGoal) else NavigationGoal(goal)
@@ -1578,12 +1700,17 @@ def plan_observed_warp_locally(
         local_plan = GoalAwareNavigator(world).plan(
             start,
             replace(navigation_goal, target=ReachLocation(selected.entry)),
+            max_expansions=max_expansions,
+            max_route_cost=max_route_cost,
+            cost_ceiling=cost_ceiling,
         )
-        return NavigationPlan(
+        result = NavigationPlan(
             local_plan.actions,
             selected.entry,
             GoalAwareNavigator(world)._metrics(local_plan.actions),
         )
+        _enforce_plan_limits(result, max_route_cost=max_route_cost, cost_ceiling=cost_ceiling)
+        return result
     # ReachWarp's local terminal condition is deliberately the entry/source
     # state.  For directional-step warps that is not the transition itself:
     # the ROM consumes one additional directional input while standing on the
@@ -1606,6 +1733,9 @@ def plan_observed_warp_locally(
             local_plan = GoalAwareNavigator(world).plan(
                 start,
                 replace(navigation_goal, target=ReachLocation(approach)),
+                max_expansions=max_expansions,
+                max_route_cost=max_route_cost,
+                cost_ceiling=cost_ceiling,
             )
             boundary_move = NavigationAction(
                 NavigationActionType.MOVE,
@@ -1622,12 +1752,20 @@ def plan_observed_warp_locally(
             transition_kind="map_connection",
         )
         actions = local_actions + (crossing,)
-        return NavigationPlan(
+        result = NavigationPlan(
             actions,
             selected.entry,
             GoalAwareNavigator(world)._metrics(actions),
         )
-    local_plan = GoalAwareNavigator(world).plan(start, navigation_goal)
+        _enforce_plan_limits(result, max_route_cost=max_route_cost, cost_ceiling=cost_ceiling)
+        return result
+    local_plan = GoalAwareNavigator(world).plan(
+        start,
+        navigation_goal,
+        max_expansions=max_expansions,
+        max_route_cost=max_route_cost,
+        cost_ceiling=cost_ceiling,
+    )
     # A recovery handoff can arrive on a step-on door tile via a
     # ReachLocation goal.  In that case the local planner may regard the
     # ReachWarp position as already satisfied and return no action, even
@@ -1657,11 +1795,13 @@ def plan_observed_warp_locally(
             selected.destination,
             transition_kind=selected.kind,
         )
-        return NavigationPlan(
+        result = NavigationPlan(
             local_plan.actions + (crossing,),
             selected.entry,
             GoalAwareNavigator(world)._metrics(local_plan.actions + (crossing,)),
         )
+        _enforce_plan_limits(result, max_route_cost=max_route_cost, cost_ceiling=cost_ceiling)
+        return result
     if selected.activation is WarpActivation.DIRECTIONAL_STEP:
         direction = (
             selected.activation_direction if selected.activation_direction is not None else selected.required_facing
@@ -1688,11 +1828,13 @@ def plan_observed_warp_locally(
             selected.destination,
         )
         actions = local_plan.actions if already_appended else local_plan.actions + (activation,)
-        return NavigationPlan(
+        result = NavigationPlan(
             actions,
             local_plan.destination,
             GoalAwareNavigator(world)._metrics(actions),
         )
+        _enforce_plan_limits(result, max_route_cost=max_route_cost, cost_ceiling=cost_ceiling)
+        return result
     return local_plan
 
 
@@ -1832,8 +1974,21 @@ class GoalAwareNavigator:
         *,
         algorithm: str = "dijkstra",
         connection_source_is_approach: bool | None = None,
+        max_expansions: int | None = None,
+        max_route_cost: int | None = None,
+        cost_ceiling: tuple[int, ...] | int | None = None,
     ) -> NavigationPlan:
         navigation_goal = goal if isinstance(goal, NavigationGoal) else NavigationGoal(goal)
+        _validate_search_limit(max_expansions, "max_expansions")
+        _validate_search_limit(max_route_cost, "max_route_cost")
+        if isinstance(cost_ceiling, bool) or (
+            cost_ceiling is not None and not isinstance(cost_ceiling, (int, tuple))
+        ):
+            raise ValueError("cost_ceiling must be an integer, tuple, or None")
+        if isinstance(cost_ceiling, tuple) and not all(
+            isinstance(item, int) and not isinstance(item, bool) for item in cost_ceiling
+        ):
+            raise ValueError("cost_ceiling tuple must contain integers")
         if context.debug and getattr(context, "debug_trace", False):
             diagnostic_print(
                 lambda: (
@@ -1895,6 +2050,7 @@ class GoalAwareNavigator:
         # hang.  Keep the counters/progress diagnostics below, but always
         # return on the first valid state as production planning does.
         collect_candidate_diagnostics = False
+        limit_pruned = False
 
         def priority(cost, state):
             if algorithm == "dijkstra":
@@ -1924,9 +2080,23 @@ class GoalAwareNavigator:
             queue[0] = (priority(initial_cost, initial_state), queue[0][1], initial_state, initial_cost)
         generated = 1
         while queue:
+            if max_expansions is not None and expanded >= max_expansions:
+                record(False)
+                raise NavigationSearchLimitExceeded(
+                    f"navigation search exceeded max_expansions {max_expansions}"
+                )
             _, _, (current, facing), current_cost = heapq.heappop(queue)
             state = (current, facing)
             if current_cost != costs[state]:
+                continue
+            if max_route_cost is not None and current_cost[1] > max_route_cost:
+                limit_pruned = True
+                continue
+            if isinstance(cost_ceiling, int) and current_cost[1] > cost_ceiling:
+                limit_pruned = True
+                continue
+            if isinstance(cost_ceiling, tuple) and cost_ceiling and current_cost[: len(cost_ceiling)] > cost_ceiling:
+                limit_pruned = True
                 continue
             expanded += 1
             frontier_max = max(frontier_max, len(queue))
@@ -1943,6 +2113,15 @@ class GoalAwareNavigator:
                 if isinstance(navigation_goal.target, ReachWarp):
                     actions, current = self._append_warp_activation(actions, current, facing, navigation_goal.target)
                 metrics = self._metrics(actions, navigation_goal.encounter_mode)
+                if max_route_cost is not None and metrics.total_route_cost > max_route_cost:
+                    limit_pruned = True
+                    continue
+                if isinstance(cost_ceiling, int) and metrics.total_route_cost > cost_ceiling:
+                    limit_pruned = True
+                    continue
+                if isinstance(cost_ceiling, tuple) and cost_ceiling and _cost_prefix(metrics)[: len(cost_ceiling)] > cost_ceiling:
+                    limit_pruned = True
+                    continue
                 if not collect_candidate_diagnostics:
                     record(True, metrics)
                     return NavigationPlan(actions, current, metrics)
@@ -2069,6 +2248,8 @@ class GoalAwareNavigator:
             return NavigationPlan(
                 selected_actions, selected_destination, selected_metrics, tuple(item[0] for item in complete_candidates)
             )
+        if limit_pruned:
+            raise NavigationSearchLimitExceeded("navigation search reached its configured cost bound")
         # Trainer avoidance is a preference, not a reason to strand the
         # controller. If every route crosses a sight line, retry once with
         # trainer hazards disabled and make that decision visible to callers.
@@ -2076,7 +2257,15 @@ class GoalAwareNavigator:
         if trainer_mode is not None and trainer_mode.name == "AVOID":
             fallback_constraints = replace(navigation_goal.constraints, trainer_mode=type(trainer_mode).IGNORE)
             fallback_goal = replace(navigation_goal, constraints=fallback_constraints)
-            fallback = self.plan(start, fallback_goal, algorithm=algorithm)
+            fallback = self.plan(
+                start,
+                fallback_goal,
+                algorithm=algorithm,
+                connection_source_is_approach=connection_source_is_approach,
+                max_expansions=max_expansions,
+                max_route_cost=max_route_cost,
+                cost_ceiling=cost_ceiling,
+            )
             record(False)
             return replace(fallback, forced_trainer_exposure=True)
         record(False)
@@ -2091,6 +2280,8 @@ class GoalAwareNavigator:
         encounter_penalty: int = 8,
         algorithm: str = "dijkstra",
         target_groups: tuple[tuple[Location, ...], ...] | None = None,
+        max_expansions: int | None = None,
+        max_route_cost: int | None = None,
     ) -> dict[Location, NavigationPlan]:
         """Resolve several ReachLocation goals from one shared state search.
 
@@ -2107,6 +2298,8 @@ class GoalAwareNavigator:
         """
         if algorithm not in ("dijkstra", "astar"):
             raise ValueError(f"Unknown navigation search algorithm: {algorithm!r}")
+        _validate_search_limit(max_expansions, "max_expansions")
+        _validate_search_limit(max_route_cost, "max_route_cost")
         requested = frozenset(targets)
         if not requested:
             return {}
@@ -2135,8 +2328,14 @@ class GoalAwareNavigator:
         results: dict[Location, NavigationPlan] = {}
         groups = target_groups or tuple((target,) for target in requested)
         while queue:
+            if max_expansions is not None and expanded >= max_expansions:
+                raise NavigationSearchLimitExceeded(
+                    f"navigation search exceeded max_expansions {max_expansions}"
+                )
             _, _, state, current_cost = heapq.heappop(queue)
             if current_cost != costs.get(state):
+                continue
+            if max_route_cost is not None and current_cost[1] > max_route_cost:
                 continue
             expanded += 1
             frontier_max = max(frontier_max, len(queue))

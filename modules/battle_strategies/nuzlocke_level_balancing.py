@@ -13,6 +13,7 @@ from modules.console import diagnostic_print
 from modules.nuzlocke.identity import PokemonIdentity
 from modules.pokemon import get_move_by_name
 from modules.pokemon_party import get_party
+from modules.player import get_player_avatar
 
 
 def _nuzlocke_dead_identities() -> frozenset[PokemonIdentity]:
@@ -47,16 +48,121 @@ def _eligible_indices(*, only_non_fainted: bool = False) -> tuple[int, ...]:
 
 def _lowest_level_index(*, only_non_fainted: bool = False) -> int | None:
     indices = _eligible_indices(only_non_fainted=only_non_fainted)
-    return min(indices, key=lambda index: (get_party()[index].level, index)) if indices else None
+    return min(indices, key=lambda index: _training_priority(index)) if indices else None
 
 
-def _lowest_battle_capable_index(strategy: "NuzlockeLevelBalancingBattleStrategy") -> int | None:
-    """Return the lowest-level living member that can actually take a turn."""
+def _training_priority(index: int) -> tuple[int, int, int]:
+    """Order candidates by level, then by progress within that level."""
+
+    pokemon = get_party()[index]
+    try:
+        total_exp = pokemon.total_exp
+        if not isinstance(total_exp, int):
+            total_exp = 0
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        total_exp = 0
+    level = getattr(pokemon, "level", 0)
+    if not isinstance(level, int):
+        level = 0
+    return level, total_exp, index
+
+
+def _active_level_cap() -> int | None:
+    """Return the currently active cap when campaign facts can prove one."""
+
+    runtime = getattr(context, "nuzlocke_runtime", None)
+    if runtime is None:
+        return None
+    try:
+        from modules.nuzlocke.campaign_controller import runtime_campaign_state
+        from modules.nuzlocke.level_cap import assess_level_cap
+        from modules.nuzlocke.rule_config import CampaignRuleId
+
+        rule_config = getattr(runtime, "rule_config", None)
+        if rule_config is not None and not rule_config.is_enabled(CampaignRuleId.LEVEL_CAP):
+            return None
+        assessment = assess_level_cap(runtime_campaign_state().campaign_facts, get_party())
+        return assessment.level_cap if getattr(assessment.status, "value", None) == "known" else None
+    except (AttributeError, ImportError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _encounter_experience_reward(battle_state: BattleState, opponent=None) -> int | None:
+    """Estimate a conservative EXP budget for the active encounter.
+
+    This intentionally omits participant splitting and assumes the full
+    encounter reward for every participant. That is conservative for cap
+    legality and covers temporary EXP-tag switches as well as the finisher.
+    """
+
+    try:
+        opponent = opponent or battle_state.opponent.active_battler
+        base_yield = opponent.species.base_experience_yield
+        level = opponent.level
+        if not isinstance(base_yield, int) or not isinstance(level, int):
+            return None
+        reward = max(1, (base_yield * level) // 7)
+        if battle_state.is_trainer_battle:
+            reward = (reward * 3) // 2
+        # A participant can also receive Gen III trade/Lucky Egg modifiers.
+        # Use a deliberately conservative fourfold budget rather than risk
+        # authorizing a line whose actual reward crosses the next cap level.
+        return max(1, reward * 4)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _participants_remain_cap_legal(
+    battle_state: BattleState, participant_indices: set[int], *, opponent=None
+) -> bool:
+    """Check projected EXP for every member that can participate in the win."""
+
+    cap = _active_level_cap()
+    if cap is None:
+        return True
+    reward = _encounter_experience_reward(battle_state, opponent)
+    if reward is None:
+        # A cap is active but the encounter's EXP yield is not observable;
+        # optional training tags must not be authorized on an unknown budget.
+        return False
+    from modules.nuzlocke.level_cap import can_receive_experience_without_exceeding_cap
+
+    return all(
+        can_receive_experience_without_exceeding_cap(get_party()[index], reward, cap) for index in participant_indices
+    )
+
+
+def _battle_capable_indices(
+    strategy: "NuzlockeLevelBalancingBattleStrategy", battle_state: BattleState | None = None
+) -> tuple[int, ...]:
+    """Return living members that can damage the current opponent, if known."""
 
     candidates = tuple(
         index for index in _eligible_indices(only_non_fainted=True) if strategy.pokemon_can_battle(get_party()[index])
     )
-    return min(candidates, key=lambda index: (get_party()[index].level, index)) if candidates else None
+    opponent = getattr(getattr(battle_state, "opponent", None), "active_battler", None)
+    if opponent is None:
+        return candidates
+
+    try:
+        util = BattleStrategyUtil(battle_state)
+        return tuple(
+            index for index in candidates if util.get_strongest_move_against(get_party()[index], opponent) is not None
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+        # A live battle with unavailable matchup facts is not proof that a
+        # generic damaging move is effective.  The caller can still fall back
+        # to the ordinary planner/escape policy.
+        return ()
+
+
+def _lowest_battle_capable_index(
+    strategy: "NuzlockeLevelBalancingBattleStrategy", battle_state: BattleState | None = None
+) -> int | None:
+    """Return the lowest-level living member that can damage this opponent."""
+
+    candidates = _battle_capable_indices(strategy, battle_state)
+    return min(candidates, key=_training_priority) if candidates else None
 
 
 class NuzlockeLevelBalancingBattleStrategy(LevelBalancingBattleStrategy):
@@ -70,6 +176,12 @@ class NuzlockeLevelBalancingBattleStrategy(LevelBalancingBattleStrategy):
         # policy immediately switches back and the battle can ping-pong
         # between the two members without resolving.
         self._battle_support_index: int | None = None
+        # A temporary EXP tag is a two-step policy action: send a safe but
+        # matchup-incapable low-level member in, then immediately return to a
+        # validated finisher.  The executor only sees ordinary switch actions;
+        # this state carries the continuation across the next turn boundary.
+        self._pending_exp_tag_index: int | None = None
+        self._pending_exp_finisher_index: int | None = None
 
     def pokemon_can_battle(self, pokemon) -> bool:
         return _is_eligible_pokemon(pokemon) and super().pokemon_can_battle(pokemon)
@@ -81,8 +193,174 @@ class NuzlockeLevelBalancingBattleStrategy(LevelBalancingBattleStrategy):
         # in the battle loop.
         return any(self.pokemon_can_battle(pokemon) for pokemon in get_party())
 
+    def is_switch_target_valid(self, battle_state: BattleState, party_index: int) -> bool:
+        """Allow only ordinary matchup switches or a live EXP-tag plan."""
+
+        if party_index != getattr(self, "_pending_exp_tag_index", None):
+            if party_index not in _eligible_indices(only_non_fainted=True) or not super().is_switch_target_valid(
+                battle_state, party_index
+            ):
+                return False
+            active_index = getattr(battle_state.own_side.active_battler, "party_index", None)
+            if active_index is None:
+                return False
+            return _participants_remain_cap_legal(battle_state, {active_index, party_index})
+        active_index = getattr(battle_state.own_side.active_battler, "party_index", None)
+        if active_index == party_index:
+            return False
+        if party_index not in _eligible_indices(only_non_fainted=True):
+            return False
+        try:
+            util = BattleStrategyUtil(battle_state)
+            opponent = battle_state.opponent.active_battler
+            known_response_moves = _known_opponent_move_names()
+            if not util.can_switch() or not known_response_moves:
+                return False
+            tag = get_party()[party_index]
+            if not self.pokemon_can_battle(tag) or not self._survives_visible_response(
+                util, opponent, tag, known_response_moves
+            ):
+                return False
+            finisher = self._battle_finisher_target(battle_state, excluded={party_index})
+            return finisher == getattr(self, "_pending_exp_finisher_index", None) and _participants_remain_cap_legal(
+                battle_state, {active_index, party_index, finisher}
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            return False
+
+    def get_valid_switch_targets(self, battle_state: BattleState) -> tuple[int, ...]:
+        """Filter executor fallbacks through the Nuzlocke death projection."""
+
+        eligible = set(_eligible_indices(only_non_fainted=True))
+        active_index = getattr(battle_state.own_side.active_battler, "party_index", None)
+        if active_index is None:
+            return ()
+        return tuple(
+            index
+            for index in super().get_valid_switch_targets(battle_state)
+            if index in eligible and _participants_remain_cap_legal(battle_state, {active_index, index})
+        )
+
+    def choose_trainer_replacement(self, battle_state: BattleState) -> int | None:
+        """Choose a safe EXP-aware replacement for a trainer's next Pokémon."""
+
+        runtime = getattr(context, "nuzlocke_runtime", None)
+        rule_config = getattr(runtime, "rule_config", None)
+        from modules.nuzlocke.rule_config import CampaignRuleId
+
+        if rule_config is None or not rule_config.is_enabled(CampaignRuleId.SET_BATTLE_STYLE):
+            return None
+        if getattr(battle_state, "is_double_battle", False):
+            # Double battles deliberately retain their existing action path.
+            return None
+
+        try:
+            current_opponent = battle_state.opponent.active_battler
+            current_opponent_index = current_opponent.party_index
+            from modules.pokemon_party import get_opponent_party
+
+            opponent_party = get_opponent_party()
+            next_opponent = next(
+                (
+                    pokemon
+                    for pokemon in (opponent_party or ())
+                    if getattr(pokemon, "index", -1) > current_opponent_index
+                    and not pokemon.is_empty
+                    and pokemon.is_valid
+                    and pokemon.current_hp > 0
+                ),
+                None,
+            )
+            if next_opponent is None:
+                return None
+            util = BattleStrategyUtil(battle_state)
+            active_indices = {
+                battler.party_index for battler in battle_state.own_side.active_battlers if battler is not None
+            }
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            return None
+
+        response_moves = tuple(
+            learned_move.move.name
+            for learned_move in getattr(next_opponent, "moves", ())
+            if learned_move is not None
+            and getattr(learned_move, "move", None) is not None
+            and getattr(learned_move, "pp", 1) > 0
+        )
+        if not response_moves:
+            return None
+
+        candidates = []
+        current_index = getattr(battle_state.own_side.active_battler, "party_index", None)
+        for index in _eligible_indices(only_non_fainted=True):
+            # In a single battle the current Pokémon is a legitimate
+            # "stay in" candidate.  Returning None is how the handler
+            # answers the ROM prompt with No. Other active slots remain
+            # excluded for safety and for future multi-battle callers.
+            if index in active_indices and index != current_index:
+                continue
+            pokemon = get_party()[index]
+            if not self.pokemon_can_battle(pokemon):
+                continue
+            try:
+                move_index = util.get_strongest_move_against(pokemon, next_opponent)
+                if move_index is None:
+                    continue
+                move = pokemon.moves[move_index].move
+                damage = util.calculate_move_damage_range(move, pokemon, next_opponent)
+                if damage.max <= 0:
+                    continue
+                if not self._survives_visible_response(
+                    util,
+                    next_opponent,
+                    pokemon,
+                    response_moves,
+                    damage_min=damage.min,
+                ):
+                    continue
+                if not _participants_remain_cap_legal(
+                    battle_state,
+                    {index},
+                    opponent=next_opponent,
+                ):
+                    continue
+                guaranteed_ko = damage.min >= next_opponent.current_hp
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+                continue
+            candidates.append(
+                (
+                    not guaranteed_ko,
+                    _training_priority(index),
+                    -damage.min,
+                    -damage.max,
+                    -getattr(pokemon, "current_hp", 0),
+                    index,
+                )
+            )
+
+        if not candidates:
+            return None
+        selected = min(candidates)[-1]
+        if selected == current_index:
+            context.battle_decision_source = "NUZLOCKE TRAINER SWITCH"
+            context.battle_decision_detail = "current Pokémon is the safest eligible response"
+            return None
+        context.battle_decision_source = "NUZLOCKE TRAINER SWITCH"
+        context.battle_decision_detail = (
+            f"next opponent={getattr(next_opponent.species, 'name', next_opponent.species)!r}; "
+            f"selected lowest safe cap-legal party slot {selected}"
+        )
+        context.message = f"TRAINER SWITCH: sending party slot {selected} into the next opponent"
+        return selected
+
     def choose_new_lead_after_faint(self, battle_state: BattleState) -> int:
-        index = _lowest_level_index(only_non_fainted=True)
+        index = _lowest_battle_capable_index(self, battle_state)
+        if index is None and getattr(getattr(battle_state, "opponent", None), "active_battler", None) is None:
+            # Preserve the old selection behavior when the replacement menu is
+            # reached without an opponent snapshot.  In a live battle with an
+            # opponent, ``has_replacement_after_faint`` prevents this branch
+            # from selecting a known non-damaging replacement.
+            index = _lowest_level_index(only_non_fainted=True)
         if index is None:
             raise RuntimeError("no living Pokémon is available for campaign preparation")
         return index
@@ -91,10 +369,12 @@ class NuzlockeLevelBalancingBattleStrategy(LevelBalancingBattleStrategy):
         active_indices = {
             battler.party_index for battler in battle_state.own_side.active_battlers if battler is not None
         }
-        return any(
-            index not in active_indices and self.pokemon_can_battle(get_party()[index])
-            for index in _eligible_indices(only_non_fainted=True)
+        eligible_non_active = tuple(
+            index for index in _eligible_indices(only_non_fainted=True) if index not in active_indices
         )
+        if not eligible_non_active:
+            return False
+        return any(index in _battle_capable_indices(self, battle_state) for index in eligible_non_active)
 
     def choose_new_lead_after_battle(self) -> int | None:
         index = _lowest_level_index(only_non_fainted=True)
@@ -130,15 +410,64 @@ class NuzlockeLevelBalancingBattleStrategy(LevelBalancingBattleStrategy):
             if capture_action[0] is not TurnAction.SwitchToManual:
                 return capture_action
 
+        active = getattr(getattr(battle_state, "own_side", None), "active_battler", None)
+        active_index = getattr(active, "party_index", None)
+
+        # Complete a previously authorized EXP-tag line before asking the
+        # generic planner to choose an action for a Pokémon that may have no
+        # effective move.  Revalidate the finisher because HP, status, and
+        # battle restrictions can change during the switch response.
+        pending_tag = getattr(self, "_pending_exp_tag_index", None)
+        pending_finisher = getattr(self, "_pending_exp_finisher_index", None)
+        if pending_tag is not None:
+            if active_index == pending_tag:
+                finisher = self._battle_finisher_target(battle_state, excluded={pending_tag})
+                if finisher is not None and finisher == pending_finisher:
+                    try:
+                        can_switch = BattleStrategyUtil(battle_state).can_switch()
+                    except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+                        can_switch = False
+                    if can_switch:
+                        self._pending_exp_tag_index = None
+                        self._pending_exp_finisher_index = None
+                        context.battle_decision_source = "NUZLOCKE EXP TAG CONTINUATION"
+                        context.battle_decision_detail = (
+                            f"return from temporary EXP tag {pending_tag} to finisher {pending_finisher}"
+                        )
+                        return TurnAction.rotate_lead(pending_finisher)
+            # A battle transition, unexpected active slot, or invalidated
+            # finisher ends the pending line. The ordinary policy below can
+            # still choose an effective replacement or an escape.
+            self._pending_exp_tag_index = None
+            self._pending_exp_finisher_index = None
+
         # Lead rotation after the previous battle is a useful fallback, but
         # it cannot cover a newly captured member or a battle that begins
         # before the post-battle menu handoff is available.  Make the policy
         # explicit at every single-battle turn boundary: use the lowest-level
         # living, battle-capable member whenever switching is legal.
         if not getattr(battle_state, "is_double_battle", False):
-            active = getattr(getattr(battle_state, "own_side", None), "active_battler", None)
-            candidate = _lowest_battle_capable_index(self)
-            active_index = getattr(active, "party_index", None)
+            candidate = _lowest_battle_capable_index(self, battle_state)
+            tag_plan = self._choose_exp_tag_plan(battle_state, active_index, candidate)
+            if tag_plan is not None:
+                tag_index, finisher_index = tag_plan
+                self._pending_exp_tag_index = tag_index
+                self._pending_exp_finisher_index = finisher_index
+                context.battle_decision_source = "NUZLOCKE EXP TAG"
+                context.battle_decision_detail = (
+                    f"temporary tag {tag_index} is safe; validated finisher is {finisher_index}"
+                )
+                context.message = (
+                    f"NUZLOCKE EXP TAG: switching to party slot {tag_index} for EXP, "
+                    f"then returning to slot {finisher_index}"
+                )
+                diagnostic_print(
+                    lambda: (
+                        "NUZLOCKE_EXP_TAG: " f"tag={tag_index!r} finisher={finisher_index!r} active={active_index!r}"
+                    ),
+                    trace=True,
+                )
+                return TurnAction.rotate_lead(tag_index)
             if getattr(self, "_battle_support_index", None) == active_index:
                 action = super().decide_turn(battle_state)
                 if action[0] is TurnAction.RotateLead:
@@ -148,7 +477,13 @@ class NuzlockeLevelBalancingBattleStrategy(LevelBalancingBattleStrategy):
                 can_switch = BattleStrategyUtil(battle_state).can_switch()
             except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
                 can_switch = False
-            if candidate is not None and candidate != active_index and can_switch:
+            if (
+                candidate is not None
+                and candidate != active_index
+                and can_switch
+                and active_index is not None
+                and _participants_remain_cap_legal(battle_state, {active_index, candidate})
+            ):
                 diagnostic_print(
                     lambda: (
                         "NUZLOCKE_LEVEL_BALANCE_SWITCH: "
@@ -158,6 +493,27 @@ class NuzlockeLevelBalancingBattleStrategy(LevelBalancingBattleStrategy):
                     trace=True,
                 )
                 return TurnAction.rotate_lead(candidate)
+
+            # Do not let an otherwise legal attack consume the encounter's
+            # EXP on a member whose projected total would cross the active
+            # cap. Prefer another cap-legal finisher, or escape a wild battle
+            # when no such line exists.
+            if active_index is not None and not _participants_remain_cap_legal(battle_state, {active_index}):
+                cap_legal_finisher = self._battle_finisher_target(battle_state, excluded={active_index})
+                if cap_legal_finisher is not None and can_switch:
+                    return TurnAction.rotate_lead(cap_legal_finisher)
+                if getattr(battle_state, "is_wild", not getattr(battle_state, "is_trainer_battle", False)):
+                    try:
+                        escape = BattleStrategyUtil(battle_state).get_best_escape_method()
+                    except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+                        escape = None
+                    if escape is not None:
+                        context.battle_decision_source = "NUZLOCKE LEVEL CAP ESCAPE"
+                        context.battle_decision_detail = "no cap-legal participant can safely resolve the encounter"
+                        return escape
+                context.battle_decision_source = "NUZLOCKE LEVEL CAP BLOCK"
+                context.battle_decision_detail = "projected encounter EXP would cross the active level cap"
+                return TurnAction.switch_to_manual()
         action = super().decide_turn(battle_state)
         if action[0] is TurnAction.RotateLead:
             self._battle_support_index = action[1]
@@ -196,8 +552,26 @@ class NuzlockeLevelBalancingBattleStrategy(LevelBalancingBattleStrategy):
             active_indices = {
                 battler.party_index for battler in battle_state.own_side.active_battlers if battler is not None
             }
-            if not _is_eligible_pokemon(replacement) or replacement.current_hp <= 0 or action[1] in active_indices:
+            replacement_is_usable = (
+                _is_eligible_pokemon(replacement) and replacement.current_hp > 0 and action[1] not in active_indices
+            )
+            opponent = getattr(getattr(battle_state, "opponent", None), "active_battler", None)
+            if replacement_is_usable and opponent is not None:
+                try:
+                    replacement_is_usable = (
+                        BattleStrategyUtil(battle_state).get_strongest_move_against(replacement, opponent) is not None
+                    )
+                except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+                    replacement_is_usable = False
+            if not replacement_is_usable:
                 util = BattleStrategyUtil(battle_state)
+                fallback_index = _lowest_battle_capable_index(self, battle_state)
+                if (
+                    fallback_index is not None
+                    and fallback_index != getattr(battle_state.own_side.active_battler, "party_index", None)
+                    and util.can_switch()
+                ):
+                    return TurnAction.rotate_lead(fallback_index)
                 move = util.get_strongest_move_against(
                     battle_state.own_side.active_battler,
                     battle_state.opponent.active_battler,
@@ -205,6 +579,154 @@ class NuzlockeLevelBalancingBattleStrategy(LevelBalancingBattleStrategy):
                 if move is not None:
                     return TurnAction.use_move(move)
         return action
+
+    def _choose_exp_tag_plan(
+        self,
+        battle_state: BattleState,
+        active_index: int | None,
+        lowest_capable_index: int | None,
+    ) -> tuple[int, int] | None:
+        """Return a safe low-level tag and its immediate battle finisher.
+
+        A tag is considered only when a lower-level eligible member cannot
+        damage the current opponent but another legal member can.  This keeps
+        the useful EXP from the weak member without turning the next turn into
+        the old ``no damaging moves`` error path.
+        """
+
+        if active_index is None or lowest_capable_index is None:
+            return None
+        try:
+            util = BattleStrategyUtil(battle_state)
+            opponent = battle_state.opponent.active_battler
+            if not util.can_switch():
+                return None
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            return None
+
+        known_response_moves = _known_opponent_move_names()
+        # A temporary no-damage switch is allowed only when the response is
+        # actually known; otherwise there is no basis for a survival claim.
+        if not known_response_moves:
+            return None
+
+        capable_indices = set(_battle_capable_indices(self, battle_state))
+        tag_candidates = sorted(
+            (
+                index
+                for index in _eligible_indices(only_non_fainted=True)
+                if index != active_index and index not in capable_indices
+            ),
+            key=_training_priority,
+        )
+        for tag_index in tag_candidates:
+            tag = get_party()[tag_index]
+            if not self.pokemon_can_battle(tag):
+                continue
+            if not self._survives_visible_response(util, opponent, tag, known_response_moves):
+                continue
+            finisher = self._battle_finisher_target(battle_state, excluded={tag_index})
+            if finisher is None:
+                continue
+            if not _participants_remain_cap_legal(battle_state, {active_index, tag_index, finisher}):
+                diagnostic_print(
+                    lambda: (
+                        "NUZLOCKE_EXP_TAG_REJECTED: "
+                        f"tag={tag_index!r} finisher={finisher!r} reason='projected EXP exceeds active cap'"
+                    ),
+                    trace=True,
+                )
+                continue
+            return tag_index, finisher
+        return None
+
+    def _battle_finisher_target(self, battle_state: BattleState, *, excluded: set[int]) -> int | None:
+        """Choose the lowest-level eligible member with a winning damage line."""
+
+        try:
+            util = BattleStrategyUtil(battle_state)
+            opponent = battle_state.opponent.active_battler
+            can_switch = util.can_switch()
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            return None
+
+        active_index = getattr(battle_state.own_side.active_battler, "party_index", None)
+        known_response_moves = _known_opponent_move_names()
+        candidates = []
+        for index in _eligible_indices(only_non_fainted=True):
+            if index in excluded:
+                continue
+            pokemon = get_party()[index]
+            if not self.pokemon_can_battle(pokemon):
+                continue
+            try:
+                move_index = util.get_strongest_move_against(pokemon, opponent)
+                if move_index is None:
+                    continue
+                damage = util.calculate_move_damage_range(pokemon.moves[move_index].move, pokemon, opponent)
+                damage_min = getattr(damage, "min", getattr(damage, "max", 0))
+                damage_max = getattr(damage, "max", 0)
+                if damage_max <= 0 or damage_min <= 0:
+                    continue
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+                continue
+
+            if known_response_moves and not self._survives_visible_response(
+                util, opponent, pokemon, known_response_moves, damage_min=damage_min
+            ):
+                continue
+            if active_index is not None and not _participants_remain_cap_legal(battle_state, {active_index, index}):
+                continue
+            if index != active_index and not can_switch:
+                continue
+            # Lower level and lower EXP progress are preferred; damage is only
+            # a tie-breaker after the training objective and survival checks.
+            candidates.append(
+                (
+                    _training_priority(index),
+                    damage_min >= getattr(opponent, "current_hp", 0),
+                    damage_min,
+                    damage_max,
+                    getattr(pokemon, "current_hp", 0),
+                    -index,
+                    index,
+                )
+            )
+        return (
+            min(candidates, key=lambda item: (item[0], -int(item[1]), -item[2], -item[3], -item[4], item[5]))[-1]
+            if candidates
+            else None
+        )
+
+    @staticmethod
+    def _survives_visible_response(
+        util: BattleStrategyUtil,
+        opponent,
+        pokemon,
+        move_names: tuple[str, ...],
+        *,
+        damage_min: int | None = None,
+    ) -> bool:
+        """Require a visible response to leave the candidate alive."""
+
+        incoming = _capture_response_damage_ceiling(util, opponent, pokemon, move_names)
+        if incoming is None or incoming >= getattr(pokemon, "current_hp", 0):
+            return False
+        if damage_min is None:
+            return True
+        opponent_hp = getattr(opponent, "current_hp", 0)
+        hits = (opponent_hp + damage_min - 1) // damage_min if damage_min > 0 else 0
+        if hits <= 0:
+            return False
+        # If the candidate is slower, the opponent can respond before each
+        # strike. If it is faster, the final KO prevents the last response.
+        try:
+            player_speed = pokemon.stats.speed
+            opponent_speed = opponent.stats.speed
+            exchanges = max(0, hits - 1) if player_speed > opponent_speed else hits
+        except (AttributeError, TypeError, ValueError):
+            exchanges = hits
+        return incoming * exchanges < getattr(pokemon, "current_hp", 0)
 
     def _stronger_battle_support_target(self, battle_state: BattleState, active_index: int | None) -> int | None:
         """Choose a stronger healthy member for an unsafe weak-lead battle.
@@ -255,6 +777,8 @@ class NuzlockeLevelBalancingBattleStrategy(LevelBalancingBattleStrategy):
             response_is_survivable = response_is_known and incoming < pokemon.current_hp
             if known_response_moves and not response_is_survivable:
                 continue
+            if not _participants_remain_cap_legal(battle_state, {active_index, index}):
+                continue
             candidates.append(
                 (
                     damage.min >= opponent.current_hp,
@@ -290,6 +814,47 @@ class NuzlockeCaptureStrategy(CatchStrategy):
         """Return whether any living eligible party member remains usable."""
 
         return any(self.pokemon_can_battle(pokemon) for pokemon in get_party())
+
+    def capture_target_is_authorized(self, battle_state: BattleState) -> bool:
+        """Apply the runtime's hard no-ball eligibility decision."""
+
+        runtime = getattr(context, "nuzlocke_runtime", None)
+        if runtime is None:
+            self._capture_veto_message = "Nuzlocke capture eligibility is unavailable; no Poké Ball will be thrown."
+            return False
+        try:
+            location = get_player_avatar().map_group_and_number
+            opponent_side = getattr(battle_state, "opponent", None)
+            eligibility = runtime.capture_eligibility_for(
+                location,
+                is_wild=not battle_state.is_trainer_battle,
+                is_trainer=battle_state.is_trainer_battle,
+                species=tuple(
+                    getattr(getattr(pokemon, "species", None), "name", "")
+                    for pokemon in getattr(opponent_side, "active_battlers", ())
+                    if getattr(getattr(pokemon, "species", None), "name", None)
+                ) or None,
+            )
+            self._capture_veto_message = (
+                f"Capture {'authorized' if eligibility.eligible else 'rejected'} at {location}: "
+                f"{eligibility.reason}."
+            )
+            diagnostic_print(
+                lambda: (
+                    "NUZLOCKE_CAPTURE_DECISION: "
+                    f"eligible={eligibility.eligible!r} location={location!r} "
+                    f"species={eligibility.species!r} reason={eligibility.reason!r}"
+                ),
+                trace=True,
+            )
+            return eligibility.eligible
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError) as error:
+            self._capture_veto_message = (
+                "Nuzlocke capture eligibility could not be resolved "
+                f"({type(error).__name__}); no Poké Ball will be thrown."
+            )
+            diagnostic_print(lambda: f"NUZLOCKE_CAPTURE_DECISION: error={error!r} eligible=False", trace=True)
+            return False
 
     def choose_new_lead_after_faint(self, battle_state: BattleState) -> int:
         """Choose the lowest-level eligible replacement, excluding actives."""

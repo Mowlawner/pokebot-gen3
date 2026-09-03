@@ -776,15 +776,22 @@ class CampaignController:
         # intentionally have no tactical Goal: they must be allowed to observe
         # title/menu/naming/clock state before overworld readiness exists.
         # Most capability-backed opening objectives must be allowed to observe
-        # title/menu/script state before an overworld exists.  The Pokédex
-        # handoff and every later targetless capability are different: they
-        # can own ordinary overworld traversal, so skipping readiness here
-        # would bypass a recovery stop exactly when a battle has reduced HP.
-        readiness_capability_boundary = objective_id == "receive_pokedex"
+        # title/menu/script state before an overworld exists. A capability
+        # with a declared campaign destination, or any targetless capability
+        # after the Pokédex boundary, can own ordinary overworld traversal and
+        # therefore must pass through the same recovery readiness gate. This
+        # is deliberately derived from execution shape and campaign state,
+        # rather than from one objective ID.
+        readiness_capability_boundary = (
+            execution.capability is not None
+            and (
+                getattr(execution.objective, "destination", None) is not None
+                or _post_pokedex_campaign_boundary(observed_state)
+            )
+        )
         readiness_applies = (
             execution.tactical_goal is not None
             or readiness_capability_boundary
-            or _post_pokedex_campaign_boundary(observed_state)
         )
         if self._readiness_provider is not None and self._execution_phase == "CAMPAIGN" and readiness_applies:
             forced_readiness_recheck = False

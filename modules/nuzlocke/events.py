@@ -22,6 +22,14 @@ from .snapshots import NuzlockeSnapshot, PartyPokemonSnapshot
 from .identity import PokemonIdentity
 
 
+def _wurmple_evolution_branch(species: str | None, identity: PokemonIdentity | None) -> str | None:
+    """Derive Wurmple's personality-selected branch for capture facts."""
+
+    if not isinstance(species, str) or species.strip().casefold() != "wurmple" or identity is None:
+        return None
+    return "silcoon" if ((identity.personality_value >> 16) & 0xFFFF) % 10 <= 4 else "cascoon"
+
+
 @dataclass(frozen=True, slots=True)
 class BattleStarted:
     """Observation of a battle becoming fully identifiable in the ROM."""
@@ -73,6 +81,10 @@ class PokemonCaptured:
     identity: PokemonIdentity
     location: tuple[int, int] | None = None
     species: str | None = None
+    # Wurmple's evolutionary branch is selected by personality value at
+    # capture. Keep it on the fact so replay can distinguish Cascoon and
+    # Silcoon lines without retaining emulator-facing Pokémon data.
+    evolution_branch: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,12 +220,29 @@ def _map(snapshot: NuzlockeSnapshot) -> tuple[int, int] | None:
 class NuzlockeEventObserver:
     """Convert a sequence of normalized snapshots into one-shot transitions."""
 
+    _BATTLE_LIFECYCLE_NAMES = frozenset({"BATTLE", "BATTLE_STARTING", "BATTLE_ENDING"})
+    _BATTLE_TERMINAL_NAMES = frozenset(
+        {
+            "OVERWORLD",
+            "CHANGE_MAP",
+            "WHITEOUT",
+            "TITLE_SCREEN",
+            "MAIN_MENU",
+        }
+    )
+
     def __init__(self) -> None:
         """Create an observer with no prior snapshot baseline."""
 
         self._previous: NuzlockeSnapshot | None = None
         self._previous_battle: NuzlockeSnapshot | None = None
         self._previous_ready_battle: NuzlockeSnapshot | None = None
+        # Keep the most recent accepted battle signature after the active
+        # battle baseline is cleared. Emerald reuses its battler buffers while
+        # starting the next battle, so a ready-looking snapshot can still be
+        # the previous opponent.
+        self._last_ready_battle_signature: tuple[tuple[PokemonIdentity | None, str], ...] | None = None
+        self._battle_start_candidate_signature: tuple[tuple[PokemonIdentity | None, str], ...] | None = None
         self._previous_map: NuzlockeSnapshot | None = None
         self._previous_game_state: NuzlockeSnapshot | None = None
         self._previous_party: NuzlockeSnapshot | None = None
@@ -237,13 +266,90 @@ class NuzlockeEventObserver:
             and snapshot.battle.battle_type
         )
 
+    @classmethod
+    def _battle_lifecycle_is_active(cls, snapshot: NuzlockeSnapshot) -> bool:
+        """Return whether the ROM still reports an active battle lifecycle.
+
+        ``battle_available`` only says that the game-state reader succeeded.
+        The battle reader can temporarily return ``None`` while Emerald is
+        switching party members, so lifecycle state is the authoritative
+        distinction between an indeterminate battle read and a real teardown.
+        """
+
+        return bool(
+            snapshot.game_state_available
+            and getattr(snapshot.game_state, "name", None) in cls._BATTLE_LIFECYCLE_NAMES
+        )
+
+    @staticmethod
+    def _battle_signature(snapshot: NuzlockeSnapshot) -> tuple[tuple[PokemonIdentity | None, str], ...]:
+        """Return the observed opponent identity/species signature."""
+
+        battle = snapshot.battle
+        if battle is None:
+            return ()
+        return tuple((pokemon.identity, pokemon.species) for pokemon in battle.opponent_active)
+
+    @classmethod
+    def _battle_signature_is_complete(cls, snapshot: NuzlockeSnapshot) -> bool:
+        """Return whether every active opponent has usable identity data."""
+
+        battle = snapshot.battle
+        return bool(
+            battle is not None
+            and battle.opponent_active
+            and all(pokemon.identity is not None and pokemon.species for pokemon in battle.opponent_active)
+        )
+
+    @staticmethod
+    def _battle_signature_is_comparable(
+        signature: tuple[tuple[PokemonIdentity | None, str], ...] | None,
+    ) -> bool:
+        """Return whether a prior signature supports stale-buffer detection."""
+
+        return bool(signature) and all(identity is not None and species for identity, species in signature)
+
+    def _battle_start_is_confirmed(self, snapshot: NuzlockeSnapshot) -> bool:
+        """Require a fresh, stable opponent before accepting a battle start.
+
+        The first ready frame after a battle teardown may contain the prior
+        battle's opponent. Compare both stable identity and species, and
+        require the changed signature to survive one additional observation.
+        The species component also protects the boundary if the ROM refreshes
+        species before the identity fields (or vice versa).
+        """
+
+        previous_signature = self._last_ready_battle_signature
+        # Older/partial snapshot producers may not expose opponent identity.
+        # There is no safe freshness comparison in that case, so preserve the
+        # historical boundary behavior; live ROM snapshots normally provide
+        # the identity fields and take the strict path below.
+        if not self._battle_signature_is_comparable(previous_signature):
+            self._battle_start_candidate_signature = None
+            return True
+        if not self._battle_signature_is_complete(snapshot):
+            self._battle_start_candidate_signature = None
+            return False
+
+        signature = self._battle_signature(snapshot)
+        if signature == previous_signature:
+            self._battle_start_candidate_signature = None
+            return False
+        if signature != self._battle_start_candidate_signature:
+            self._battle_start_candidate_signature = signature
+            return False
+
+        self._battle_start_candidate_signature = None
+        return True
+
     def observe(self, snapshot: NuzlockeSnapshot) -> tuple[Event, ...]:
         """Compare one snapshot with the prior baseline and emit transitions."""
 
         previous = self._previous
         self._previous = snapshot
         if previous is None:
-            self._remember_available(snapshot)
+            initial_battle_start = self._battle_is_ready(snapshot)
+            self._remember_available(snapshot, battle_boundary_accepted=initial_battle_start)
             # A process can be restored from a save-state while the ROM is
             # already in a fully materialized battle.  Treat that first
             # complete battle observation as the start boundary; otherwise
@@ -251,7 +357,7 @@ class NuzlockeEventObserver:
             # never get a chance to claim a legal encounter.  An incomplete
             # BATTLE_STARTING snapshot still remains a baseline and will be
             # promoted by the normal ready transition below.
-            if self._battle_is_ready(snapshot):
+            if initial_battle_start:
                 battle = snapshot.battle
                 return (
                     BattleStarted(
@@ -269,15 +375,14 @@ class NuzlockeEventObserver:
             return ()
 
         events: list[Event] = []
-        previous_battle = self._previous_battle
+        battle_boundary_accepted = False
         if (
             self._battle_is_ready(snapshot)
             and self._previous_ready_battle is None
-            and (
-                previous_battle is None or previous_battle.battle is None or not self._battle_is_ready(previous_battle)
-            )
+            and self._battle_start_is_confirmed(snapshot)
         ):
             battle = snapshot.battle
+            battle_boundary_accepted = True
             events.append(
                 BattleStarted(
                     snapshot.frame,
@@ -291,7 +396,13 @@ class NuzlockeEventObserver:
                     opponent_species=tuple(p.species for p in battle.opponent_active),
                 )
             )
-        elif snapshot.battle_available and snapshot.battle is None and self._previous_ready_battle is not None:
+        elif (
+            snapshot.battle is None
+            and snapshot.game_state_available
+            and not self._battle_lifecycle_is_active(snapshot)
+            and getattr(snapshot.game_state, "name", None) in self._BATTLE_TERMINAL_NAMES
+            and self._previous_ready_battle is not None
+        ):
             battle = self._previous_ready_battle.battle
             if (
                 battle is not None
@@ -307,6 +418,10 @@ class NuzlockeEventObserver:
                         battle.opponent_active[0].identity,
                         _map(self._previous_ready_battle),
                         battle.opponent_active[0].species,
+                        _wurmple_evolution_branch(
+                            battle.opponent_active[0].species,
+                            battle.opponent_active[0].identity,
+                        ),
                     )
                 )
             events.append(
@@ -350,18 +465,24 @@ class NuzlockeEventObserver:
             events.extend(self._party_events(self._previous_party, snapshot))
         if snapshot.pc_available and previous is not None and previous.pc_available:
             events.extend(self._storage_events(previous, snapshot))
-        self._remember_available(snapshot)
+        self._remember_available(snapshot, battle_boundary_accepted=battle_boundary_accepted)
         return tuple(events)
 
-    def _remember_available(self, snapshot: NuzlockeSnapshot) -> None:
+    def _remember_available(self, snapshot: NuzlockeSnapshot, *, battle_boundary_accepted: bool = False) -> None:
         """Update only the observation baselines available in this snapshot."""
 
         if snapshot.battle_available:
             self._previous_battle = snapshot
-            if self._battle_is_ready(snapshot):
+            if self._battle_is_ready(snapshot) and (battle_boundary_accepted or self._previous_ready_battle is not None):
                 self._previous_ready_battle = snapshot
-            elif snapshot.battle is None:
+                self._last_ready_battle_signature = self._battle_signature(snapshot)
+            elif (
+                snapshot.battle is None
+                and not self._battle_lifecycle_is_active(snapshot)
+                and getattr(snapshot.game_state, "name", None) in self._BATTLE_TERMINAL_NAMES
+            ):
                 self._previous_ready_battle = None
+                self._battle_start_candidate_signature = None
         if snapshot.player_available:
             self._previous_map = snapshot
         if snapshot.game_state_available:

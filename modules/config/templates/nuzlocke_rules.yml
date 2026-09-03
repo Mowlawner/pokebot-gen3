@@ -5,6 +5,8 @@ enabled_rules:
   - fainting
   - species_clause
   - level_cap
+  # Optional: answer trainer replacement prompts strategically.
+  # - set_battle_style
 
 # Restock only when the bag drops below the lower threshold, then buy back up
 # to the upper target.  This avoids abandoning route progress after every

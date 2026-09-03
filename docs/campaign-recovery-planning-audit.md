@@ -1,6 +1,6 @@
 # Campaign Recovery Planning Audit
 
-Date: 2026-08-30
+Date: 2026-09-03
 
 ## Executive summary
 
@@ -31,6 +31,34 @@ take control at arbitrary frame boundaries. A complete planned waypoint would
 still move that decision into campaign planning and leave dialogue/action
 ownership with the normal execution layers.
 
+## Recovery cleanup implementation status
+
+The requested recovery cleanup is implemented. It is deliberately narrower than
+the long-term ownership migration described later in this document:
+
+1. `recover_before_completion` has been removed from the resource schema,
+   campaign objectives, policy evaluation, and the post-battle recovery latch.
+   Recovery is now governed by the ordinary campaign readiness policy, so the
+   completed objective cannot carry a special recovery instruction across the
+   rival battle handoff.
+2. Recovery candidate validation is bounded. The observer evaluates at most
+   four catalog candidates by default, and each speculative world search is
+   limited to 4,000 expansions and 512 route-cost units. After a candidate is
+   found, later searches receive its lexicographic
+   `(encounter_opportunities, total_route_cost)` ceiling. A budget exhaustion is
+   recorded as a candidate failure and does not stall the controller.
+3. Readiness is mounted from execution shape and campaign readiness, not from
+   the `receive_pokedex` objective ID or objective-specific resource metadata.
+   Tactical goals, destination-bearing capabilities, and targetless capabilities
+   after the Pokédex boundary use the same readiness policy. Targetless
+   capabilities reuse the selected recovery route directly, avoiding a second
+   global route-composition search.
+
+The remaining limitation is architectural rather than a freeze-safety issue:
+the controller still executes a selected recovery stop through its transient
+recovery generator. Moving recovery selection and execution entirely into the
+normal campaign-plan executor remains a separate follow-up.
+
 ## P0 closeout status
 
 The implementation pass closed the deterministic seams needed for P0, but not
@@ -56,9 +84,9 @@ the final live exit criteria:
   `ReturnFromWallyTutorial` completes before the campaign mounts
   `recover_devon_goods`. The Devon Goods completion and first badge have not
   yet been verified live.
-- The full default test suite currently passes 1,088 tests, with 38
-  emulator-tier tests skipped by default. The focused campaign/persistence
-  tier passes 396 tests with 5 emulator-tier tests skipped.
+- The full default test suite passes 1,281 tests, with 38 emulator-tier tests
+  skipped by default. The focused readiness/campaign-recovery tier passes 162
+  tests, and the route-recovery observation tier passes 13 tests.
 - Process restart/resume has deterministic unit coverage but still needs a
   ROM-backed demonstration. The repaired ignored `test_begin_nuzlocke` profile
   now has 18 contiguous events, matching provenance, with `NuzlockeStarted` at
@@ -83,15 +111,18 @@ initialization failure and then settled at roughly 20.6 ms per frame (about
 below 1 ms. This identifies the sleep-based no-audio limiter as the likely
 explanation for the apparent 80% speed, rather than a Route 103 speed setting.
 A working audio device or a more precise fallback limiter is the appropriate
-performance follow-up.
+performance follow-up. Recovery route analysis now has finite expansion and
+route-cost budgets, and candidate searches are pruned by the best incumbent, so
+an unreachable or future healing source cannot monopolize the frame loop.
 
 The immediate closeout phase is therefore a focused ROM-boundary pass: finish
 the Devon-to-Rustboro-to-Roxanne path, produce the authoritative first-badge
 fact, capture that path as a fixture, and then prove restart/resume against the
 fixture. Retained Rustboro checkpoints currently stall inside mGBA's
 `run_frame` before the first runtime update, so they cannot serve as live
-evidence. The planned recovery-envelope work described below is the next
-architectural phase after that evidence is green.
+evidence. The remaining planned recovery-envelope work described below is the
+next architectural phase after that evidence is green; the bounded-search and
+universal-readiness cleanup is already complete.
 
 ## ROM-truth and state-ownership audit
 

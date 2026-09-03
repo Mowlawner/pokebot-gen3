@@ -1185,6 +1185,9 @@ class AgentControlLoop:
     # wait forever on that flag, but give a real movement transition enough
     # frames to advance before treating it as stale.
     _post_battle_stale_movement_limit = 8
+    # A single delayed re-observation absorbs a stale transition/object table
+    # without allowing an unreachable route to spin forever.
+    _terminal_navigation_fallback_wait_frames = 20
 
     def __init__(
         self,
@@ -1248,6 +1251,7 @@ class AgentControlLoop:
         # an unchanged plan cannot reset the failure budget.
         self._movement_failure_count = 0
         self._movement_failure_limit = 4
+        self._terminal_navigation_fallback_used = False
         # A failed movement is evidence of an obstacle even when the ROM's
         # object table has not exposed the object yet. Keep that evidence
         # across the immediate replan so a stale/partial observation cannot
@@ -1934,6 +1938,33 @@ class AgentControlLoop:
         self._pending_transition = None
         self._expected_world_transition = None
         self._release_transition_input(pending)
+
+    def _wait_for_terminal_navigation_fallback(self, reason: str):
+        """Wait once, then allow a terminal route observation to be retried."""
+
+        if self._terminal_navigation_fallback_used:
+            return False
+        self._terminal_navigation_fallback_used = True
+        self._report(
+            "NAVIGATION_FALLBACK: "
+            f"waiting_frames={self._terminal_navigation_fallback_wait_frames} reason={reason!r}"
+        )
+        # Release all controller-owned input before yielding the delay. This
+        # prevents a held direction from continuing to press into the stale
+        # state while the ROM's object/script tables settle.
+        reset_navigation_held_inputs = getattr(self._executor, "reset_navigation_held_inputs", None)
+        if callable(reset_navigation_held_inputs):
+            reset_navigation_held_inputs()
+        else:
+            reset_held_buttons = getattr(getattr(context, "emulator", None), "reset_held_buttons", None)
+            if callable(reset_held_buttons):
+                reset_held_buttons()
+        self._invalidate_plan("terminal_navigation_fallback")
+        state_cache.invalidate_runtime_observations()
+        for _ in range(self._terminal_navigation_fallback_wait_frames):
+            yield
+        self._report("NAVIGATION_FALLBACK: retrying after delayed re-observation")
+        return True
 
     def _diagnostics_enabled(self) -> bool:
         return self._custom_logger or (context.debug and getattr(context, "debug_trace", False))
@@ -3219,14 +3250,20 @@ class AgentControlLoop:
     def run(self) -> Generator:
         try:
             while True:
-                if self._movement_batch is not None:
-                    # The batch owns only the current emulator frame.  If it ends
-                    # or is interrupted, immediately return to the normal loop on
-                    # the next iteration so existing handlers process the cause.
-                    if self._advance_movement_batch():
-                        yield
+                try:
+                    if self._movement_batch is not None:
+                        # The batch owns only the current emulator frame. If it ends
+                        # or is interrupted, immediately return to the normal loop on
+                        # the next iteration so existing handlers process the cause.
+                        if self._advance_movement_batch():
+                            yield
+                            continue
+                    _, _, result = self.step()
+                except NavigationError as error:
+                    retried = yield from self._wait_for_terminal_navigation_fallback(str(error))
+                    if retried:
                         continue
-                _, _, result = self.step()
+                    raise
                 if result.result_type is ActionResultType.GOAL_COMPLETE:
                     return
                 if result.result_type in (ActionResultType.UNREACHABLE, ActionResultType.UNSUPPORTED):
@@ -3235,7 +3272,11 @@ class AgentControlLoop:
                     # terminal navigation failure explicitly so recovery is
                     # marked failed and the interrupted objective remains
                     # available for safe policy-level handling.
-                    raise NavigationError(result.message or result.result_type.name.lower())
+                    reason = result.message or result.result_type.name.lower()
+                    retried = yield from self._wait_for_terminal_navigation_fallback(reason)
+                    if retried:
+                        continue
+                    raise NavigationError(reason)
                 yield
         finally:
             self.dispose()

@@ -14,7 +14,6 @@ class TestBattleStateNuzlockeBoundary(unittest.TestCase):
         runtime.rules_projection._state = NuzlockeCampaignState(
             encounters=(LocationEncounter((0, 16), PENDING, eligible=True),)
         )
-
         battle_state = BattleState.__new__(BattleState)
         battle_state._battle_type = (0).to_bytes(4, "little")
 
@@ -22,8 +21,11 @@ class TestBattleStateNuzlockeBoundary(unittest.TestCase):
         old_runtime = context.nuzlocke_runtime
         context.nuzlocke_runtime = runtime
         try:
-            with patch("modules.battle_state.get_player_avatar", return_value=avatar):
+            with patch("modules.battle_state.get_player_avatar", return_value=avatar), patch.object(
+                runtime, "capture_target_for", return_value=True
+            ) as capture_target:
                 self.assertTrue(battle_state.nuzlocke_capture_target)
+            capture_target.assert_called_once_with((0, 16), is_wild=True, is_trainer=False)
         finally:
             context.nuzlocke_runtime = old_runtime
 

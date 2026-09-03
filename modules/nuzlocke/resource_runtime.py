@@ -37,6 +37,7 @@ from modules.map_path import PathFindingError, Direction
 from modules.player import get_player_location
 from modules.navigation import (
     NavigationError,
+    NavigationSearchLimitExceeded,
     NavigationWorld,
     plan_with_world_navigation,
     transitions_match,
@@ -178,6 +179,11 @@ def _prewarm_interior_map_identity(interior_map_id) -> None:
 # reported instead of leaving the bot motionless forever.
 _MAP_IDENTITY_RESOLUTION_TIMEOUT = 300
 _RECOVERY_CATALOG_CANDIDATE_LIMIT = 4
+# Recovery candidate validation is speculative work performed from the main
+# emulator loop. Keep both a geometric incumbent bound and a hard finite
+# budget so an unreachable/future healing source cannot monopolize a frame.
+_RECOVERY_SEARCH_MAX_EXPANSIONS = 4000
+_RECOVERY_SEARCH_MAX_ROUTE_COST = 512
 
 
 class HealingSourceType(Enum):
@@ -1708,6 +1714,7 @@ def observe_route_recovery(*, candidate_limit: int | None = None) -> RouteRecove
         ordered_sources = ordered_sources[:limit]
         route_candidates = []
         route_errors = []
+        incumbent_prefix = None
         for index, source in ordered_sources:
             destination = center_location if source is None else source.outdoor_location
             navigation_goal = _recovery_navigation_goal(
@@ -1724,7 +1731,15 @@ def observe_route_recovery(*, candidate_limit: int | None = None) -> RouteRecove
                 prefix="CAMPAIGN_RECOVERY_CATALOG_CANDIDATE",
             )
             try:
-                plan, _ = plan_with_world_navigation(world, start, navigation_goal, graph)
+                plan, _ = plan_with_world_navigation(
+                    world,
+                    start,
+                    navigation_goal,
+                    graph,
+                    max_expansions=_RECOVERY_SEARCH_MAX_EXPANSIONS,
+                    max_route_cost=_RECOVERY_SEARCH_MAX_ROUTE_COST,
+                    cost_ceiling=incumbent_prefix,
+                )
                 if getattr(plan, "forced_trainer_exposure", False):
                     raise NavigationError("world recovery route requires trainer exposure")
                 if plan.metrics is None or plan.destination is None:
@@ -1732,22 +1747,52 @@ def observe_route_recovery(*, candidate_limit: int | None = None) -> RouteRecove
                 distance = plan.metrics.total_route_cost
                 if distance is None:
                     raise PathFindingError("world recovery route has no cost")
-                route_candidates.append((distance, index, source, destination, navigation_goal, plan))
+                candidate_prefix = (
+                    # ``NavigationMetrics`` always exposes encounter
+                    # opportunities, but recovery also accepts lightweight
+                    # route-plan adapters used by compatibility callers and
+                    # tests.  Missing exposure data must not make an
+                    # otherwise executable route unusable.
+                    getattr(plan.metrics, "encounter_opportunities", 0),
+                    plan.metrics.total_route_cost,
+                )
+                route_candidates.append((candidate_prefix, index, source, destination, navigation_goal, plan))
+                if incumbent_prefix is None or candidate_prefix < incumbent_prefix:
+                    incumbent_prefix = candidate_prefix
+            except NavigationSearchLimitExceeded as error:
+                route_errors.append(
+                    (
+                        index,
+                        getattr(source, "source_id", None),
+                        "NavigationSearchLimitExceeded",
+                        str(error),
+                    )
+                )
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_RECOVERY_CANDIDATE_PRUNED: "
+                        f"source={getattr(source, 'source_id', None)!r} rank={index!r} "
+                        f"incumbent={incumbent_prefix!r} reason={str(error)!r}"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_RECOVERY_CANDIDATE_PRUNED",
+                )
             except (BotModeError, NavigationError, PathFindingError, TypeError, ValueError) as error:
                 route_errors.append((index, getattr(source, "source_id", None), type(error).__name__, str(error)))
 
         if not route_candidates:
             raise PathFindingError(f"no safe cataloged healing route: {route_errors!r}")
-        distance, _, source, destination, navigation_goal, route = min(
+        incumbent, _, source, destination, navigation_goal, route = min(
             route_candidates,
             key=lambda candidate: (candidate[0], candidate[1]),
         )
+        distance = incumbent[1]
         diagnostic_print(
             lambda: (
                 "CAMPAIGN_RECOVERY_CATALOG_SELECTION: "
                 f"source={location!r} healing_source={getattr(source, 'source_id', None)!r} "
                 f"destination={destination!r} distance={distance!r} "
-                f"candidates={[(item[2].source_id if item[2] is not None else None, item[0]) for item in route_candidates]!r}"
+                f"candidates={[(getattr(item[2], 'source_id', None), item[0]) for item in route_candidates]!r}"
             ),
             trace=True,
             prefix="CAMPAIGN_RECOVERY_CATALOG_SELECTION",
