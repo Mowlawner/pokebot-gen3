@@ -238,7 +238,7 @@ class CampaignExecutionAdapter:
                 tactical_goal=capability_definition.readiness_goal,
             )
 
-        if objective.objective_id in {"confirm_early_pokeballs", "receive_pokeballs"}:
+        if objective.objective_id == "confirm_early_pokeballs":
             goal = objective.tactical_target
             if isinstance(goal, ActivateTrigger) and goal.trigger_id == EARLY_POKEBALL_TRIGGER_ID:
                 return CampaignExecutionResult(

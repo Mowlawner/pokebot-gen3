@@ -7,12 +7,13 @@ from modules.nuzlocke.rules import NuzlockeRulesProjection
 from modules.nuzlocke.events import BattleStarted, NuzlockeStarted
 from modules.nuzlocke.projection import CampaignProjection, reduce_events
 from modules.nuzlocke.snapshots import CampaignObservationSnapshot, NamedFlag, NamedVariable
+from modules.nuzlocke.resource_policy import PokeballRestockPolicy
 from tests.test_nuzlocke_campaign_state import CampaignStateTests
 from tests.utility import BotTestCase, with_frame_timeout, with_save_state
 
 
 class CampaignFactsTests(unittest.TestCase):
-    def state(self, *, flags=(), variables=(), text_speed=2, balls=0, available=True):
+    def state(self, *, flags=(), variables=(), text_speed=2, balls=0, available=True, pokeball_policy=None):
         fixture = CampaignStateTests()
         snapshot, _ = fixture.snapshot()
         snapshot = replace(
@@ -22,7 +23,11 @@ class CampaignFactsTests(unittest.TestCase):
             ),
             campaign_observation=CampaignObservationSnapshot(flags, variables, text_speed, available),
         )
-        return CampaignState.from_runtime_state(snapshot=snapshot, rules_projection=NuzlockeRulesProjection())
+        return CampaignState.from_runtime_state(
+            snapshot=snapshot,
+            rules_projection=NuzlockeRulesProjection(),
+            pokeball_policy=pokeball_policy,
+        )
 
     def test_emerald_flags_and_variables_reduce_to_semantic_facts(self):
         flags = tuple(
@@ -67,6 +72,26 @@ class CampaignFactsTests(unittest.TestCase):
             variables=(NamedVariable("BIRCH_LAB_STATE", 2),),
         ).campaign_facts
         self.assertFalse(facts.starter_obtained.value)
+
+    def test_pokeball_receipt_survives_inventory_depletion(self):
+        facts = self.state(
+            balls=0,
+            variables=(NamedVariable("BIRCH_LAB_STATE", 5),),
+        ).campaign_facts
+
+        self.assertTrue(facts.pokeballs_received.value)
+        self.assertTrue(facts.pokeballs_ready.value)
+        self.assertFalse(facts.pokeballs_available.value)
+        self.assertFalse(facts.pokeballs_sufficient.value)
+
+    def test_pokeball_sufficiency_uses_configured_lower_threshold(self):
+        policy = PokeballRestockPolicy(lower_threshold=3, upper_target=10)
+
+        at_threshold = self.state(balls=3, pokeball_policy=policy).campaign_facts
+        below_threshold = self.state(balls=2, pokeball_policy=policy).campaign_facts
+
+        self.assertTrue(at_threshold.pokeballs_sufficient.value)
+        self.assertFalse(below_threshold.pokeballs_sufficient.value)
 
     def test_intro_rival_completion_accepts_post_scene_hide_flag(self):
         facts = self.state(

@@ -176,12 +176,24 @@ def get_tasks() -> TaskList:
 
 
 def get_task(task_name: str) -> Task | None:
-    return get_tasks()[task_name]
+    try:
+        return get_tasks()[task_name]
+    except KeyError:
+        # During an Emerald script/task handoff the function-pointer symbol
+        # table can be incomplete for one frame.  A missing task is the safe
+        # interpretation at this boundary; callers will retry on the next
+        # observation instead of aborting a campaign capability.
+        return None
 
 
 @profiled("task_state_check_total", "task_state_checks")
 def task_is_active(task_name: str) -> bool:
-    return task_name in get_tasks()
+    try:
+        return task_name in get_tasks()
+    except KeyError:
+        # Keep the membership helper consistent with get_task() across the
+        # same transient task-table replacement window.
+        return False
 
 
 def get_global_script_context() -> ScriptContext:
@@ -251,7 +263,7 @@ def is_field_message_waiting_for_input(field_message_lifecycle_active: bool = Fa
         if script_context is None or script_context.native_function_name != "WaitForAorBPress":
             return False
         return field_message_lifecycle_active or get_text_printer().active
-    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+    except (AttributeError, KeyError, RuntimeError, ValueError, TypeError, IndexError):
         # Emulator state is legitimately incomplete for a frame during a map
         # transition.  Callers should retry, not switch modes or raise.
         return False
@@ -277,7 +289,7 @@ def is_field_message_task_waiting_for_input() -> bool:
             and printer.active
             and printer.raw_state in ("Wait", "Clear", "ScrollStart")
         )
-    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+    except (AttributeError, KeyError, RuntimeError, ValueError, TypeError, IndexError):
         return False
 
 

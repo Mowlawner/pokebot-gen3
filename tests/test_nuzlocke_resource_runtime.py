@@ -14,10 +14,9 @@ from modules.nuzlocke.resource_runtime import (
     execute_campaign_preparation,
     execute_heal_party,
     _preparation_navigation_goal,
+    recover_at_nearest_center,
 )
 from modules.nuzlocke.resource_runtime import _execute_healing_source_interaction
-from modules.nuzlocke.resource_runtime import _resolve_recovery_interaction
-from modules.nuzlocke.resource_runtime import _navigate_recovery_to_center
 from modules.nuzlocke.resource_runtime import _wait_for_center_interior
 from modules.nuzlocke.resource_runtime import execute_planned_recovery
 from modules.agent_control import AgentAction, AgentActionType, ActionDecision
@@ -695,76 +694,49 @@ class CampaignCapabilityTests(unittest.TestCase):
 
         self.assertEqual(decisions[0].action.action_type, AgentActionType.CHOOSE_DIALOGUE_OPTION)
 
-    def test_center_recovery_preserves_location_for_selected_center_lookup(self):
-        location = ("Route101", (15, 10))
-        center = object()
+    def test_campaign_recovery_executes_the_selected_observation_driven_source(self):
+        destination = PokemonCenter.OldaleTown.value
+        planned_route = object()
+        with patch(
+            "modules.nuzlocke.resource_runtime.observe_route_recovery",
+            return_value=RouteRecovery(
+                center_available=True,
+                center_location=destination,
+                safe_to_reach_center=True,
+                route=planned_route,
+            ),
+        ), patch(
+            "modules.nuzlocke.resource_runtime.execute_planned_recovery",
+            return_value=iter(("planned-recovery",)),
+        ) as execute:
+            self.assertEqual(list(execute_campaign_recovery()), ["planned-recovery"])
+        self.assertEqual(execute.call_args.args[0], destination)
+        self.assertEqual(execute.call_args.args[1].source_id, "pokemon_center:oldale")
+        self.assertIs(execute.call_args.kwargs["planned_route"], planned_route)
 
-        def heal(_center, **_kwargs):
-            yield "healed"
-
+    def test_campaign_recovery_rejects_a_route_without_an_executable_source(self):
         with patch(
             "modules.nuzlocke.resource_runtime.observe_route_recovery",
             return_value=RouteRecovery(center_available=True, safe_to_reach_center=True),
-        ), patch("modules.nuzlocke.resource_runtime.get_player_location", return_value=location) as current, patch(
-            "modules.nuzlocke.resource_runtime.find_closest_pokemon_center", return_value=center
-        ) as find, patch(
-            "modules.nuzlocke.resource_runtime._resolve_recovery_interaction", return_value=iter(())
         ), patch(
-            "modules.nuzlocke.resource_runtime._navigate_recovery_to_center", return_value=iter(())
-        ), patch(
-            "modules.nuzlocke.resource_runtime._wait_for_center_interior", return_value=iter(())
-        ), patch(
-            "modules.nuzlocke.resource_runtime.wait_for_player_avatar_to_be_controllable", return_value=iter(())
-        ) as wait, patch(
-            "modules.nuzlocke.resource_runtime.heal_in_pokemon_center", side_effect=heal
-        ), patch(
-            "modules.nuzlocke.resource_runtime.party_is_restored", return_value=True
+            "modules.nuzlocke.resource_runtime.find_closest_pokemon_center",
+            side_effect=AssertionError("campaign recovery must not reopen Center selection"),
         ):
-            self.assertEqual(list(execute_campaign_recovery()), ["healed"])
-        current.assert_called_once_with()
-        find.assert_called_once_with(location)
-        wait.assert_called_once_with()
+            with self.assertRaisesRegex(RuntimeError, "no executable healing source"):
+                list(execute_campaign_recovery())
 
-    def test_recovery_interaction_waits_for_passive_transition(self):
-        observation = AgentObservation(InteractionObservation(GameState.UNKNOWN))
-        decision = ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE))
+    def test_nearest_center_compatibility_entry_point_uses_planned_recovery(self):
         with patch(
-            "modules.nuzlocke.resource_runtime.observe_agent",
-            side_effect=[observation, AgentObservation(InteractionObservation(GameState.OVERWORLD, controllable=True))],
-        ), patch("modules.nuzlocke.resource_runtime.select_action", return_value=decision), patch(
-            "modules.nuzlocke.resource_runtime.AgentActionExecutor"
-        ) as executor:
-            self.assertEqual(list(_resolve_recovery_interaction()), [None])
-        executor.return_value.execute.assert_not_called()
+            "modules.nuzlocke.resource_runtime.execute_planned_recovery",
+            return_value=iter(("planned-recovery",)),
+        ) as execute:
+            self.assertEqual(
+                list(recover_at_nearest_center(selected_center=PokemonCenter.OldaleTown)),
+                ["planned-recovery"],
+            )
 
-    def test_recovery_interaction_advances_actionable_dialogue(self):
-        observation = AgentObservation(InteractionObservation(GameState.OVERWORLD))
-        decision = ActionDecision(AgentAction(AgentActionType.ADVANCE_DIALOGUE))
-        executor = type("Executor", (), {"execute": lambda self, action, observed: None})()
-        controllable = AgentObservation(InteractionObservation(GameState.OVERWORLD, controllable=True))
-        with patch("modules.nuzlocke.resource_runtime.observe_agent", side_effect=[observation, controllable]), patch(
-            "modules.nuzlocke.resource_runtime.select_action",
-            side_effect=[decision, ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE))],
-        ), patch("modules.nuzlocke.resource_runtime.AgentActionExecutor", return_value=executor), patch(
-            "modules.nuzlocke.resource_runtime.wait_for_player_avatar_to_be_controllable", return_value=iter(())
-        ):
-            self.assertEqual(list(_resolve_recovery_interaction()), [None])
-
-    def test_recovery_navigation_uses_observation_driven_location_goal(self):
-        center = type("Center", (), {"value": ("OldaleTown", (6, 16))})()
-
-        class FakeLoop:
-            def run(self):
-                return self
-
-            def __iter__(self):
-                return iter(("navigation",))
-
-        with patch("modules.nuzlocke.resource_runtime.AgentControlLoop", return_value=FakeLoop()) as loop:
-            self.assertEqual(list(_navigate_recovery_to_center(center)), ["navigation"])
-        goal = loop.call_args.kwargs["goal"]
-        self.assertIsInstance(goal, NavigationGoal)
-        self.assertEqual(goal.target.location, ("OldaleTown", (6, 16)))
+        self.assertEqual(execute.call_args.args[0], PokemonCenter.OldaleTown.value)
+        self.assertEqual(execute.call_args.args[1].source_id, "pokemon_center:oldale")
 
     def test_recovery_handoff_waits_for_stable_center_interior(self):
         transient = type(

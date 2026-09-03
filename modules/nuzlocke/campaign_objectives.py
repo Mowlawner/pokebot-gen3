@@ -580,6 +580,64 @@ def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
     )
 
 
+def restock_pokeballs_objective() -> CampaignObjective:
+    """Return the dynamic shopping task used when the capture reserve is low."""
+
+    return CampaignObjective(
+        "restock_pokeballs",
+        "Restock Poké Balls before pursuing another encounter",
+        # Pokédex receipt is the durable post-intro campaign boundary.  The
+        # ``pokeballs_ready`` fact is intentionally reserved for the one-time
+        # Birch handoff and may remain false while a later shop is perfectly
+        # capable of selling balls.
+        (campaign_fact("pokedex_received"),),
+        campaign_fact("pokeballs_sufficient"),
+        execution_id="restock_pokeballs",
+        priority=10,
+    )
+
+
+def _observed_pokeball_count(state: CampaignState) -> int | None:
+    """Return the observed ordinary Poké Ball count for diagnostics.
+
+    The boolean campaign facts intentionally remain the planner contract.  A
+    count alongside the task-discovery trace makes it possible to distinguish
+    a real low-reserve decision from an unavailable or stale inventory read.
+    """
+
+    inventory = state.inventory
+    if not inventory.is_known or inventory.value is None:
+        return None
+    try:
+        return sum(item.quantity for item in inventory.value.poke_balls if item.name.casefold() != "master ball")
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _restock_is_required(state: CampaignState) -> bool:
+    """Return whether the observed campaign reserve requires shopping."""
+
+    # Pokédex receipt enables encounters, while the live inventory is the
+    # authoritative source for the mutable reserve.  The Birch-lab variable
+    # can lag behind the inventory after a save-state or scripted handoff, so
+    # it must not suppress restocking when ordinary balls are visibly present.
+    ready = state.campaign_facts.pokedex_received
+    received = state.campaign_facts.pokeballs_received
+    sufficient = state.campaign_facts.pokeballs_sufficient
+    count = _observed_pokeball_count(state)
+    if ready.status is not FactStatus.KNOWN or ready.value is not True:
+        return False
+    if count is None:
+        return False
+    if sufficient.status is not FactStatus.KNOWN or sufficient.value is not False:
+        return False
+    # A nonzero live reserve proves the opening handoff has already happened,
+    # even if its durable fact is unavailable.  For zero balls, retain the
+    # receipt guard so this dynamic task cannot pre-empt receive_pokeballs at
+    # the start of a run.
+    return received.status is FactStatus.KNOWN and received.value is True or count > 0
+
+
 def encounter_task(
     location: tuple[int, int], *, name: str | None = None, observed: bool | None = None
 ) -> CampaignObjective:
@@ -610,6 +668,10 @@ def encounter_task(
             # Poké Ball capability and mounting a capture route with no way
             # to complete it.
             campaign_fact("pokeballs_ready"),
+            # Inventory is mutable after the initial Birch handoff. An
+            # encounter task must wait for a known reserve check; a false
+            # value is surfaced as the dynamic restock objective instead.
+            campaign_fact("pokeballs_sufficient"),
             CampaignPredicate(
                 f"encounter_accessible:{location}",
                 "location is accessible and unconsumed",
@@ -682,9 +744,24 @@ def measure_route_context(
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return RouteContext(current, progression_destination, task.destination, None, None, None, RouteRelation.UNKNOWN)
     try:
-        direct = route_graph.route(current, progression_destination).estimated_cost
-        to_task = route_graph.route(current, task.destination).estimated_cost
-        onward = route_graph.route(task.destination, progression_destination).estimated_cost
+        try:
+            # One forward and one reverse table answer all three distances for
+            # the full ROM encounter catalog. Calling route() independently
+            # for every location repeats the same Dijkstra work and can make
+            # a post-battle refresh look like a long emulator stall.
+            forward_costs = dict(route_graph.map_costs(current))
+            reverse_costs = dict(route_graph.map_costs_to(progression_destination))
+            direct = forward_costs.get(progression_destination)
+            to_task = forward_costs.get(task.destination)
+            onward = reverse_costs.get(task.destination)
+            if direct is None or to_task is None or onward is None:
+                raise WorldNavigationError("task route is not connected to campaign progression")
+        except AttributeError:
+            # Keep compatibility with lightweight graph doubles supplied by
+            # embedders and older tests that expose only route().
+            direct = route_graph.route(current, progression_destination).estimated_cost
+            to_task = route_graph.route(current, task.destination).estimated_cost
+            onward = route_graph.route(task.destination, progression_destination).estimated_cost
     except WorldNavigationError:
         return RouteContext(
             current, progression_destination, task.destination, None, None, None, RouteRelation.UNREACHABLE
@@ -737,9 +814,21 @@ def evaluate_encounter_opportunity(
         )
     try:
         route_graph = graph or get_world_map_graph()
-        direct = route_graph.route(state.raw_map.value, progression_destination).estimated_cost
-        to_encounter = route_graph.route(state.raw_map.value, opportunity.location).estimated_cost
-        onward = route_graph.route(opportunity.location, progression_destination).estimated_cost
+        try:
+            # Use the cached forward/reverse distance tables when discovering
+            # many future encounter locations. This keeps task generation
+            # complete without repeating a graph search for every task.
+            forward_costs = dict(route_graph.map_costs(state.raw_map.value))
+            reverse_costs = dict(route_graph.map_costs_to(progression_destination))
+            direct = forward_costs.get(progression_destination)
+            to_encounter = forward_costs.get(opportunity.location)
+            onward = reverse_costs.get(opportunity.location)
+            if direct is None or to_encounter is None or onward is None:
+                raise WorldNavigationError("encounter route is not connected to campaign progression")
+        except AttributeError:
+            direct = route_graph.route(state.raw_map.value, progression_destination).estimated_cost
+            to_encounter = route_graph.route(state.raw_map.value, opportunity.location).estimated_cost
+            onward = route_graph.route(opportunity.location, progression_destination).estimated_cost
     except (WorldNavigationError, AttributeError, RuntimeError, TypeError, ValueError):
         return EncounterEvaluation(
             **base,
@@ -853,6 +942,19 @@ def available_campaign_tasks(
     opportunities = ()
     route_graph = None
 
+    # This is intentionally discovered dynamically rather than inserted into
+    # the ordered story list: after the initial Birch handoff, inventory is a
+    # mutable resource and a low-ball observation should create a task only
+    # when it is actually needed.
+    if tasks is None:
+        if _restock_is_required(state):
+            restock = restock_pokeballs_objective()
+            insertion = next(
+                (index for index, candidate in enumerate(candidates) if candidate.objective_id == "reach_petalburg"),
+                len(candidates),
+            )
+            candidates = candidates[:insertion] + (restock,) + candidates[insertion:]
+
     def task_is_available(task: CampaignObjective) -> bool:
         """Return whether one task is complete, safe, and executable now."""
 
@@ -888,16 +990,19 @@ def available_campaign_tasks(
         try:
             catalog_opportunities = encounter_opportunities(state, encounter_locations)
             catalog_count = len(catalog_opportunities)
+            # Discovery should expose every unconsumed executable encounter
+            # location. Route preference belongs to evaluation/selection;
+            # filtering the catalog here made future route encounters vanish
+            # from diagnostics and from the campaign task frontier.
+            opportunities = catalog_opportunities
             if catalog_allowed and encounter_locations is None:
-                route_graph = get_world_map_graph()
-                opportunities = _frontier_encounter_opportunities(
-                    state,
-                    catalog_opportunities,
-                    progression,
-                    graph=route_graph,
-                )
-            else:
-                opportunities = catalog_opportunities
+                try:
+                    route_graph = get_world_map_graph()
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    # Route metadata is optional for discovery. An encounter
+                    # can remain visible with UNKNOWN route evaluation and be
+                    # reconsidered once the graph is available.
+                    route_graph = None
         except (AttributeError, NameError, RuntimeError, TypeError, ValueError) as error:
             opportunities = ()
             encounter_catalog_error = f"{type(error).__name__}: {error}"
@@ -924,6 +1029,11 @@ def available_campaign_tasks(
             f"catalog_count={catalog_count!r} "
             f"opportunity_count={opportunity_count!r} "
             f"catalog_error={encounter_catalog_error!r} "
+            f"pokeball_count={_observed_pokeball_count(state)!r} "
+            f"pokeballs_received={state.campaign_facts.pokeballs_received.value!r} "
+            f"pokeballs_received_status={state.campaign_facts.pokeballs_received.status.value!r} "
+            f"pokeballs_sufficient={state.campaign_facts.pokeballs_sufficient.value!r} "
+            f"pokeballs_sufficient_status={state.campaign_facts.pokeballs_sufficient.status.value!r} "
             f"campaign_methods={tuple(sorted(method.value for method in campaign_encounter_methods(state)))!r} "
             f"early_locations={tuple(item.location for item in opportunities if item.location in {(0, 16), (0, 17), (0, 18), (0, 19)})!r}"
         ),
@@ -1005,6 +1115,14 @@ def _select_available_campaign_tasks(
     def strategic_score(task: CampaignObjective) -> float:
         candidate = strategic_candidate(task)
         return score_encounter(candidate, _capture_policy_context(state)) if candidate is not None else float("-inf")
+
+    # Restocking is an explicit resource interrupt. It must take ownership
+    # immediately when it is available, even if an encounter or story task
+    # was already mounted and would otherwise win the normal required-task
+    # ordering.
+    restock = next((task for task in required if task.objective_id == "restock_pokeballs"), None)
+    if restock is not None:
+        return ObjectiveSelection(restock, ObjectiveStatus.READY, "selected required Poké Ball restock task")
 
     if strategic_optional and required:
         selected_optional = max(strategic_optional, key=lambda item: (strategic_score(item), item.objective_id))
@@ -1378,6 +1496,30 @@ def plan_campaign(
             None,
             ObjectiveStatus.COMPLETE,
             f"campaign goal {target.goal_id} is complete",
+        )
+
+    # Restocking is a mutable-resource interrupt, not a prerequisite encoded
+    # into every future encounter objective.  Campaign Progression mounts this
+    # dependency-aware planner directly, so it must see the interrupt here as
+    # well as through the available-task compatibility selector. Without this
+    # early return the recursive story frontier can keep the bot travelling
+    # while encounter tasks are correctly suppressed by the low reserve.
+    if objectives is None and _restock_is_required(state):
+        restock = restock_pokeballs_objective()
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_RESTOCK_DECISION: "
+                f"selected=True objective={restock.objective_id!r} "
+                f"pokeball_count={_observed_pokeball_count(state)!r} "
+                f"reason='reserve below lower threshold'"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_RESTOCK_DECISION",
+        )
+        return ObjectiveSelection(
+            restock,
+            ObjectiveStatus.READY,
+            "selected required Poké Ball restock task",
         )
 
     visiting: set[str] = set()

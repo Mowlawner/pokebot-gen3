@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from enum import Enum, auto
 from contextlib import nullcontext
 from time import perf_counter_ns
+import traceback
 from typing import Callable, Generator
 
 from modules.context import context
@@ -78,7 +79,7 @@ _last_battle_end_emulator_frame: int | None = None
 _recent_battle_return_window = 120
 
 
-def notify_battle_ended() -> None:
+def notify_battle_ended(*, invalidate_navigation: bool = True) -> None:
     """Publish a battle-end boundary to suspended tactical controllers.
 
     The normal campaign controller is not advanced while ``BattleListener``
@@ -86,11 +87,14 @@ def notify_battle_ended() -> None:
     cached movement route that was composed before a trainer approached or
     moved. A generation counter keeps this notification independent of the
     generator stack and lets the loop invalidate that route on its first
-    post-battle frame.
+    post-battle frame. Ordinary wild battles do not change overworld
+    occupancy, so callers may retain the route and avoid an expensive search
+    after every encounter while still refreshing runtime observations.
     """
 
     global _battle_end_generation, _last_battle_end_emulator_frame
-    _battle_end_generation += 1
+    if invalidate_navigation:
+        _battle_end_generation += 1
     get_frame_count = getattr(getattr(context, "emulator", None), "get_frame_count", None)
     try:
         frame = get_frame_count() if callable(get_frame_count) else None
@@ -290,11 +294,26 @@ def _observe_agent_instrumented(
     overworld_observation: OverworldObservation | None = None,
 ) -> AgentObservation:
     interaction_start = now()
-    interaction = observe_interaction(
-        choice_options=choice_options,
-        menu_options=menu_options,
-        special_interaction=special_interaction,
-    )
+    try:
+        interaction = observe_interaction(
+            choice_options=choice_options,
+            menu_options=menu_options,
+            special_interaction=special_interaction,
+        )
+    except KeyError as error:
+        # A ROM task/map table can be read while its owner is being replaced
+        # by an interaction script. Treat that single incomplete read as a
+        # retryable observation boundary instead of failing a safety loop.
+        diagnostic_print(
+            lambda: (
+                "AGENT_OBSERVATION_RETRY: stage='interaction' "
+                f"exception_type='KeyError' key={error.args!r} "
+                f"traceback={traceback.format_exc()!r}"
+            ),
+            trace=True,
+            prefix="AGENT_OBSERVATION_RETRY",
+        )
+        interaction = InteractionObservation(GameState.UNKNOWN)
     timing("agent_interaction_stage", interaction_start)
     count("agent_interaction_stages")
     classification_start = now()
@@ -318,7 +337,21 @@ def _observe_agent_instrumented(
     if overworld_observation is not None:
         overworld = overworld_observation
     elif should_perceive_overworld:
-        overworld = perceive_overworld()
+        try:
+            overworld = perceive_overworld()
+        except KeyError as error:
+            # Keep transient map/trigger binding gaps inside the observation
+            # boundary. The next frame will rebuild the live world model.
+            diagnostic_print(
+                lambda: (
+                    "AGENT_OBSERVATION_RETRY: stage='overworld' "
+                    f"exception_type='KeyError' key={error.args!r} "
+                    f"traceback={traceback.format_exc()!r}"
+                ),
+                trace=True,
+                prefix="AGENT_OBSERVATION_RETRY",
+            )
+            overworld = None
     else:
         overworld = None
     timing("agent_overworld_perception", perception_start)
@@ -890,6 +923,36 @@ class _MovementBatch:
         return self.actions[self.index]
 
 
+def _is_intermediate_move_location(location, action: NavigationAction) -> bool:
+    """Return whether ``location`` is progress along a skipped move.
+
+    The legacy Emerald pathfinder can represent forced movement (ledges,
+    slopes, and similar tiles) as one cardinal action whose destination is
+    more than one tile away. During that movement the avatar can be observed
+    on a coordinate strictly between the action endpoints. That is a valid
+    in-flight state, not route divergence.
+    """
+
+    if action.action_type is not NavigationActionType.MOVE or action.destination is None:
+        return False
+    source_map, source_coordinates = action.source
+    destination_map, destination_coordinates = action.destination
+    if location[0] != source_map or source_map != destination_map:
+        return False
+    source_x, source_y = source_coordinates
+    destination_x, destination_y = destination_coordinates
+    current_x, current_y = location[1]
+    if action.direction is Direction.North:
+        return current_x == source_x == destination_x and destination_y < current_y < source_y
+    if action.direction is Direction.East:
+        return current_y == source_y == destination_y and source_x < current_x < destination_x
+    if action.direction is Direction.South:
+        return current_x == source_x == destination_x and source_y < current_y < destination_y
+    if action.direction is Direction.West:
+        return current_y == source_y == destination_y and destination_x < current_x < source_x
+    return False
+
+
 class AgentActionExecutor:
     """Translate semantic actions to input only after selection is complete."""
 
@@ -907,6 +970,27 @@ class AgentActionExecutor:
         if callable(release_button):
             release_button("B")
         self._field_message_render_b_held = False
+
+    def reset_navigation_held_inputs(self) -> None:
+        """Clear movement inputs without interrupting an owned text render.
+
+        Plan invalidation normally has to release every held input: a cached
+        movement direction must not leak into a new interaction or route.
+        ``ACCELERATE_DIALOGUE_RENDER`` is different.  Its held B is an
+        executor-owned part of the field-message transaction, and plan
+        invalidation happens on every non-overworld observation while that
+        transaction is active.  Preserve that one input until the executor
+        observes the message's next phase and releases it normally.
+        """
+
+        preserve_render_b = self._field_message_render_b_held
+        reset_held_buttons = getattr(context.emulator, "reset_held_buttons", None)
+        if callable(reset_held_buttons):
+            reset_held_buttons()
+        if preserve_render_b:
+            hold_button = getattr(context.emulator, "hold_button", None)
+            if callable(hold_button):
+                hold_button("B")
 
     @profiled("agent_action_execution", "actions_executed")
     def execute(self, action: AgentAction, observation: AgentObservation) -> ActionResult:
@@ -1042,7 +1126,7 @@ class AgentActionExecutor:
                 self._choose_option(action.option)
             elif observation.interaction.choice_menu_active and observation.interaction.choice_menu_input_ready:
                 if action.option == "YES" and observation.interaction.choice_selected == "NO":
-                    context.emulator.press_button_fresh("UP")
+                    context.emulator.press_button_fresh(Direction.North.button_name)
                 else:
                     context.emulator.press_button_fresh("A")
             else:
@@ -1172,6 +1256,11 @@ class AgentControlLoop:
         self._dialogue_input_in_flight = False
         self._started_interaction_id: str | None = None
         self._interaction_start_waits = 0
+        # Some Emerald object interactions start automatically when the
+        # avatar enters their activation position. Keep that boundary
+        # separate from `_started_interaction_id`, which is only populated
+        # after this loop emits an explicit A input.
+        self._interaction_position_ready = False
         self._last_observed_location: Location | None = None
         self._previous_observed_location: Location | None = None
         self._battle_end_generation_seen = _battle_end_generation
@@ -1698,9 +1787,19 @@ class AgentControlLoop:
                 if callable(reset_held_buttons):
                     reset_held_buttons()
             elif location != action.source:
-                count("cached_route_fast_path_fallback_frames")
-                self._cancel_movement_batch("position_divergence")
-                return False
+                if _is_intermediate_move_location(location, action):
+                    count("cached_route_intermediate_progress")
+                    if trace is not None:
+                        trace.mark(
+                            "route_invalidation_detail",
+                            f"movement_intermediate_progress current={location!r} "
+                            f"expected_destination={action.destination!r} "
+                            f"direction={action.direction.name!r}",
+                        )
+                else:
+                    count("cached_route_fast_path_fallback_frames")
+                    self._cancel_movement_batch("position_divergence")
+                    return False
 
             # The cached batch has no full observation boundary between its
             # actions.  Re-read the compact runtime object table immediately
@@ -1776,7 +1875,7 @@ class AgentControlLoop:
             count("cached_route_goal_evaluations", 0)
             count("cached_route_pathfinding_calls", 0)
             return True
-        except (AttributeError, RuntimeError, TypeError, ValueError):
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
             count("cached_route_fast_path_fallback_frames")
             self._cancel_movement_batch("state_read_failed")
             return False
@@ -2048,9 +2147,9 @@ class AgentControlLoop:
         self._cached_world_signature = None
         self._movement_batch = None
         self._movement_blocked_retries = 0
-        reset_held_buttons = getattr(context.emulator, "reset_held_buttons", None)
-        if callable(reset_held_buttons):
-            reset_held_buttons()
+        reset_navigation_held_inputs = getattr(self._executor, "reset_navigation_held_inputs", None)
+        if callable(reset_navigation_held_inputs):
+            reset_navigation_held_inputs()
 
     def _invalidate_after_battle_return(self) -> bool:
         """Invalidate a route mounted before the battle listener took over."""
@@ -2162,6 +2261,8 @@ class AgentControlLoop:
                             self._cached_evaluation,
                         )
                     if isinstance(_goal_target(self._goal), ReachInteractionPosition):
+                        if not _trigger_requires_input(observation, _goal_target(self._goal).trigger_id):
+                            self._interaction_position_ready = True
                         return ActionDecision(
                             AgentAction(
                                 AgentActionType.WAIT_REOBSERVE,
@@ -2170,6 +2271,7 @@ class AgentControlLoop:
                             self._cached_evaluation,
                         )
                     if not _trigger_requires_input(observation, _goal_target(self._goal).trigger_id):
+                        self._interaction_position_ready = True
                         return ActionDecision(
                             AgentAction(
                                 AgentActionType.WAIT_REOBSERVE,
@@ -2292,6 +2394,64 @@ class AgentControlLoop:
                     f"{observation.interaction.metadata.get('text_printer_state')!r} "
                     f"input_in_flight={self._dialogue_input_in_flight!r}"
                 )
+            )
+        if (
+            self._interaction_position_ready
+            and interaction_type is not InteractionType.OVERWORLD
+            and observation.interaction.script_active
+        ):
+            # A coordinate/object script has claimed the interaction after
+            # the positioning goal was reached. Return ownership to the
+            # caller exactly as we do for an interaction started by our own
+            # A input; otherwise the positioning loop remains mounted while
+            # the nurse/clerk script owns the field.
+            self._interaction_position_ready = False
+            self._invalidate_plan("automatic interaction script started")
+            wait_action = AgentAction(
+                AgentActionType.WAIT_REOBSERVE,
+                reason="automatic interaction script owns the interaction",
+            )
+            wait_decision = ActionDecision(wait_action)
+            return (
+                observation,
+                wait_decision,
+                ActionResult(
+                    ActionResultType.GOAL_COMPLETE,
+                    wait_action,
+                    "automatic interaction script owns the interaction",
+                ),
+            )
+        if (
+            interaction_type is not InteractionType.OVERWORLD
+            and observation.interaction.script_active
+            and isinstance(_goal_target(self._goal), (ActivateTrigger, ReachInteractionPosition))
+            and self._cached_evaluation is not None
+            and self._cached_evaluation.plan is not None
+            and self._cached_action_index >= len(self._cached_actions)
+        ):
+            # A cached movement batch can arrive on an automatic trigger tile
+            # on the same emulator frame that the ROM installs its script.
+            # There is no intervening overworld observation in which
+            # ``_cached_decision`` can set ``_interaction_position_ready``.
+            # The exhausted route plus the active script is nevertheless an
+            # authoritative handoff: return ownership to the capability that
+            # will consume the script's dialogue.
+            self._invalidate_plan("automatic interaction script started after route completion")
+            wait_action = AgentAction(
+                AgentActionType.WAIT_REOBSERVE,
+                reason="automatic interaction script owns the interaction after route completion",
+            )
+            self._report(
+                "INTERACTION_HANDOFF: automatic script started after cached route completion " f"goal={self._goal!r}"
+            )
+            return (
+                observation,
+                ActionDecision(wait_action),
+                ActionResult(
+                    ActionResultType.GOAL_COMPLETE,
+                    wait_action,
+                    "automatic interaction script owns the interaction after route completion",
+                ),
             )
         tactical_trace = isinstance(self._goal, (ReachLocation, ReachWarp))
         if tactical_trace:
@@ -2719,6 +2879,22 @@ class AgentControlLoop:
                 self._movement_failure_count = 0
                 self._in_flight_move = None
                 self._in_flight_move_initial_facing = None
+            elif self._in_flight_move is not None and _is_intermediate_move_location(location, self._in_flight_move):
+                trace = getattr(context, "stutter_trace", None)
+                if trace is not None:
+                    trace.mark(
+                        "route_invalidation_detail",
+                        f"movement_intermediate_progress current={location!r} "
+                        f"expected_destination={self._in_flight_move.destination!r} "
+                        f"direction={self._in_flight_move.direction.name!r}",
+                    )
+                wait_action = AgentAction(
+                    AgentActionType.WAIT_REOBSERVE,
+                    reason="waiting for forced movement destination",
+                )
+                wait_decision = ActionDecision(wait_action)
+                wait_result = self._executor.execute(wait_action, observation)
+                return observation, wait_decision, wait_result
             elif self._in_flight_move is not None:
                 trace = getattr(context, "stutter_trace", None)
                 if trace is not None:

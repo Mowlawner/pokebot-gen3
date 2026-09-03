@@ -20,6 +20,7 @@ from modules.battle_planner import (
     format_planner_decision_diagnostic,
 )
 from modules.battle_strategies.default import DefaultBattleStrategy
+from modules.battle_strategies.catch import CatchStrategy
 from modules.battle_strategies import TurnAction
 
 
@@ -37,6 +38,33 @@ def context(**changes):
 
 
 class BattlePlannerTests(unittest.TestCase):
+    def test_catch_strategy_ignores_empty_ball_slots(self):
+        empty = SimpleNamespace(quantity=0, item=SimpleNamespace(name="Poké Ball", index=4))
+        usable = SimpleNamespace(quantity=2, item=SimpleNamespace(name="Great Ball", index=3))
+        party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
+        with patch(
+            "modules.battle_strategies.catch.get_item_bag",
+            return_value=SimpleNamespace(poke_balls=(empty, usable)),
+        ), patch("modules.battle_strategies.default.get_party", return_value=party), patch.object(
+            CatchStrategy, "_get_poke_ball_catch_rate_multiplier", return_value=1
+        ):
+            selected = CatchStrategy()._get_best_poke_ball(SimpleNamespace())
+        self.assertIs(selected, usable.item)
+
+    def test_catch_strategy_delegates_when_no_ball_exists(self):
+        expected = (TurnAction.UseMove, 0)
+        party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
+        with patch(
+            "modules.battle_strategies.catch.get_item_bag",
+            return_value=SimpleNamespace(poke_balls=(SimpleNamespace(quantity=0, item=SimpleNamespace(index=4)),)),
+        ), patch("modules.battle_strategies.default.get_party", return_value=party), patch(
+            "modules.battle_strategies.default.DefaultBattleStrategy.decide_turn",
+            return_value=expected,
+        ) as ordinary:
+            result = CatchStrategy().decide_turn(SimpleNamespace())
+        self.assertEqual(result, expected)
+        ordinary.assert_called_once()
+
     def test_capture_target_prefers_nonlethal_move_over_guaranteed_ko(self):
         decision = BattlePlanner().plan(
             context(
@@ -77,6 +105,17 @@ class BattlePlannerTests(unittest.TestCase):
             )
         )
         self.assertEqual(decision.action, PlannerAction.UseItem)
+
+    def test_capture_target_without_capture_resources_keeps_attack_policy(self):
+        decision = BattlePlanner().plan(
+            context(
+                opponent_hp=10,
+                moves=(PlannerMove(0, "Strong", 10, 14),),
+                capture_target=True,
+                capture_available=False,
+            )
+        )
+        self.assertEqual(decision.action, PlannerAction.UseMove)
 
     def test_best_available_diagnostic_explains_unknown_response_and_rejected_move(self):
         battle_context = context(

@@ -197,7 +197,7 @@ class BattlePlanner:
             return self._abort("Active or opponent HP is unavailable.")
 
         usable = [move for move in context.moves if self._is_candidate(move)]
-        if context.capture_target and not context.is_trainer:
+        if context.capture_target and context.capture_available and not context.is_trainer:
             # A ball is an observation/action boundary, never proof of a
             # capture. The observer will later emit PokemonCaptured.
             if context.capture_available and (

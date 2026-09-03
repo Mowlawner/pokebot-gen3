@@ -160,6 +160,7 @@ class NuzlockeRuntime:
                     "pokedex_received",
                     "pokeballs_available",
                     "pokeballs_ready",
+                    "pokeballs_received",
                     "visited_petalburg",
                     "petalburg_wally_scene_complete",
                     "petalburg_woods_scene_complete",
@@ -359,7 +360,12 @@ class NuzlockeRuntime:
 
         self._last_frame = current.frame
         inventory_fact = Fact.known(current.inventory) if current.inventory_available else Fact.unavailable()
-        campaign_facts = derive_campaign_facts(current, inventory_fact, Fact.unavailable())
+        campaign_facts = derive_campaign_facts(
+            current,
+            inventory_fact,
+            Fact.unavailable(),
+            pokeball_policy=self._rule_config.pokeball_policy,
+        )
         self._latest_campaign_facts = campaign_facts
         if not self._check_campaign_history(current, campaign_facts):
             diagnostic_print(
@@ -397,6 +403,23 @@ class NuzlockeRuntime:
                     event_encounter_eligible = (
                         self._rules_projection.state.encounter_for(event.location).status == "none"
                     )
+                if (
+                    event_encounter_eligible
+                    and event.is_wild
+                    and not event.is_trainer
+                    and self._rule_config.is_enabled(CampaignRuleId.SPECIES_CLAUSE)
+                    and any(
+                        isinstance(species, str)
+                        and any(
+                            species.casefold() == captured.casefold()
+                            for captured in self._rules_projection.state.captured_species
+                        )
+                        for species in event.opponent_species
+                    )
+                ):
+                    # A duplicate species is still a real battle, but it is
+                    # not the route's eligible encounter under Species Clause.
+                    event_encounter_eligible = False
                 from dataclasses import replace
 
                 event = replace(event, encounter_eligible=event_encounter_eligible)

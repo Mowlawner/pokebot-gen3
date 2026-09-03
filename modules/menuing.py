@@ -27,6 +27,7 @@ from modules.modes._interface import BotModeError
 from modules.player import player_avatar_is_controllable
 from modules.pokemon import get_move_by_name
 from modules.pokemon_party import get_party, get_party_size, PartyPokemon
+from modules.console import diagnostic_print
 from modules.tasks import get_task, task_is_active
 
 
@@ -226,6 +227,7 @@ class StartMenuNavigator(BaseMenuNavigator):
         super().__init__()
         self.desired_option = desired_option
         self.start_menu = parse_start_menu()
+        self.wait_counter = 0
 
     def update_start_menu(self):
         self.start_menu = parse_start_menu()
@@ -252,12 +254,22 @@ class StartMenuNavigator(BaseMenuNavigator):
 
     def open_start_menu(self):
         while not self.start_menu["open"]:
+            if self.wait_counter >= 120:
+                context.message = "Error opening start menu, switching to manual mode..."
+                context.set_manual_mode(enable_video_and_slow_down=False)
+                return
             self.update_start_menu()
             context.emulator.press_button("Start")
+            self.wait_counter += 1
             yield
 
     def navigate_to_option(self):
+        wait_counter = 0
         while self.start_menu["cursor_pos"] != self.start_menu["actions"].index(self.desired_option):
+            if wait_counter >= 120:
+                context.message = "Error navigating start menu, switching to manual mode..."
+                context.set_manual_mode(enable_video_and_slow_down=False)
+                return
             self.update_start_menu()
             if self.start_menu["cursor_pos"] == self.start_menu["actions"].index(self.desired_option):
                 up_presses = 0
@@ -280,12 +292,19 @@ class StartMenuNavigator(BaseMenuNavigator):
                 context.emulator.press_button("Up")
             elif up_presses > down_presses or (up_presses > 0 or down_presses > 0):
                 context.emulator.press_button("Down")
+            wait_counter += 1
             yield
 
     def confirm_option(self):
+        wait_counter = 0
         while self.start_menu["open"]:
+            if wait_counter >= 120:
+                context.message = "Error confirming start menu option, switching to manual mode..."
+                context.set_manual_mode(enable_video_and_slow_down=False)
+                return
             self.update_start_menu()
             context.emulator.press_button("A")
+            wait_counter += 1
             if self.desired_option == "SAVE":
                 break
             else:
@@ -310,7 +329,8 @@ class PokemonPartySubMenuNavigator(BaseMenuNavigator):
         while self.party_menu_internal["numActions"] > 8:
             if self.wait_counter > 30:
                 context.message = "Error navigating menu, switching to manual mode..."
-                context.set_manual_mode()
+                context.set_manual_mode(enable_video_and_slow_down=False)
+                return
             self.update_party_menu()
             self.wait_counter += 1
             yield
@@ -326,14 +346,18 @@ class PokemonPartySubMenuNavigator(BaseMenuNavigator):
             ):
                 return i
         context.message = f"Couldn't find option {self.desired_option}, switching to manual mode..."
-        context.set_manual_mode()
+        context.set_manual_mode(enable_video_and_slow_down=False)
+        return None
 
     def select_desired_option(self):
         if isinstance(self.desired_option, (str, IntEnum)):
             self.desired_option = self.get_index_from_option()
+        if self.desired_option is None:
+            return
         if self.desired_option < 0 or self.desired_option > parse_menu()["maxCursorPos"]:
             context.message = f"Error selecting option {self.desired_option}, switching to manual mode..."
-            context.set_manual_mode()
+            context.set_manual_mode(enable_video_and_slow_down=False)
+            return
         while parse_menu()["cursorPos"] != self.desired_option:
             if parse_menu()["cursorPos"] < self.desired_option:
                 up_presses = parse_menu()["cursorPos"] + self.party_menu_internal["numActions"] - self.desired_option
@@ -758,17 +782,23 @@ class PartyMenuExit(BaseMenuNavigator):
             case "wait_for_start_menu":
                 self.navigator = self.wait_for_start_menu()
 
-    @staticmethod
-    def exit_menu():
+    def exit_menu(self):
+        wait_counter = 0
         while get_game_state() != GameState.OVERWORLD or parse_start_menu()["open"]:
+            if wait_counter >= 120:
+                context.message = "Error closing menu, switching to manual mode..."
+                context.set_manual_mode(enable_video_and_slow_down=False)
+                return
             context.emulator.press_button("B")
+            wait_counter += 1
             yield
 
     def wait_for_start_menu(self):
         while get_game_state() == GameState.OVERWORLD and not parse_start_menu()["open"]:
             if self.counter > 60:
                 context.message = "Error exiting to overworld, switching to manual mode..."
-                context.set_manual_mode()
+                context.set_manual_mode(enable_video_and_slow_down=False)
+                return
             else:
                 context.emulator.press_button("B")
                 self.counter += 1
@@ -971,7 +1001,7 @@ class RotatePokemon(BaseMenuNavigator):
             case "select_second_pokemon":
                 self.navigator = self.select_replacement()
             case "exit_to_overworld":
-                self.navigator = PartyMenuExit().step()
+                self.navigator = self.exit_to_overworld()
 
     def select_replacement(self):
         while get_party_menu_cursor_pos(len(self.party))["slot_id_2"] != self._second_party_index:
@@ -986,3 +1016,86 @@ class RotatePokemon(BaseMenuNavigator):
             yield
         while task_is_active("Task_SlideSelectedSlotsOnscreen") or task_is_active("sub_806D198"):
             yield
+
+    def exit_to_overworld(self):
+        """Close the party menu and the Start menu it was opened from.
+
+        Emerald's field-party callback is ``CB2_ReturnToFieldWithOpenMenu``;
+        after the party menu closes, the ROM briefly returns to the field and
+        then creates ``Task_ShowStartMenu``.  Do not treat that brief gap as a
+        completed rotation or the controller will resume while the Start menu
+        is still opening.  Also use a fresh B pulse for each menu boundary:
+        the party-close B and the Start-menu-close B are separated by the
+        callback gap, but a normal ``press_button`` would otherwise be
+        suppressed as a held input.
+        """
+
+        # The task names and callback timing used below are Emerald-specific.
+        # Retain the established cross-game cleanup sequence for the other
+        # supported Gen 3 titles.
+        if not getattr(getattr(context, "rom", None), "is_emerald", True):
+            yield from PartyMenuExit().step()
+            return
+
+        party_input_task = "Task_HandleChooseMonInput"
+        start_menu_task = "Task_ShowStartMenu"
+        phase = "close_party"
+        wait_counter = 0
+        last_phase = None
+
+        def press_fresh_b():
+            press_button_fresh = getattr(context.emulator, "press_button_fresh", None)
+            if callable(press_button_fresh):
+                press_button_fresh("B")
+            else:
+                context.emulator.press_button("B")
+
+        while phase != "done":
+            if wait_counter >= 180:
+                diagnostic_print(
+                    lambda: (
+                        "BATTLE_POST_ROTATION_MENU: " f"completed=False phase={phase!r} elapsed_frames={wait_counter!r}"
+                    ),
+                    trace=True,
+                )
+                context.message = "Error closing party rotation menu, switching to manual mode..."
+                context.set_manual_mode(enable_video_and_slow_down=False)
+                return
+            wait_counter += 1
+
+            if phase != last_phase:
+                diagnostic_print(
+                    lambda: ("BATTLE_POST_ROTATION_MENU: " f"phase={phase!r} elapsed_frames={wait_counter!r}"),
+                    trace=True,
+                )
+                last_phase = phase
+
+            if phase == "close_party":
+                # Emerald can leave the switch animation in the party input
+                # task for a frame before accepting B. Retry only at this
+                # boundary, using fresh edges so a rejected/held B cannot
+                # strand the navigator.
+                if task_is_active(party_input_task):
+                    press_fresh_b()
+                else:
+                    phase = "wait_for_start_menu"
+                yield
+            elif phase == "wait_for_start_menu":
+                # Do not press B through Emerald's party-close callback and
+                # fade. A held B there can be lost before the reopened Start
+                # menu installs its input task.
+                if task_is_active(start_menu_task):
+                    phase = "close_start_menu"
+                else:
+                    # Force the state read while waiting. Besides being a
+                    # useful synchronization point, this keeps test and
+                    # emulator-backed state caches advancing through the
+                    # callback boundary.
+                    get_game_state()
+                yield
+            elif phase == "close_start_menu":
+                if task_is_active(start_menu_task):
+                    press_fresh_b()
+                elif get_game_state() == GameState.OVERWORLD and not parse_start_menu()["open"]:
+                    return
+                yield

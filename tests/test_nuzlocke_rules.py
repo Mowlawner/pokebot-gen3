@@ -5,12 +5,14 @@ from pathlib import Path
 from modules.nuzlocke.events import BattleEnded, BattleStarted, PokemonCaptured, PokemonFainted, PartyChanged
 from modules.nuzlocke.identity import PokemonIdentity
 from modules.nuzlocke.persistence import JsonEventStore
+from modules.nuzlocke.rule_config import CampaignRuleId, CampaignRulesConfig
 from modules.nuzlocke.rules import (
     CAPTURED,
     FAINTED,
     LOST,
     PENDING,
     UNKNOWN,
+    NuzlockeRulesProjection,
     load_rules,
     reduce_rules,
 )
@@ -22,11 +24,19 @@ class TestNuzlockeRules(unittest.TestCase):
     wild = PokemonIdentity(10, 20, 30)
     player = PokemonIdentity(11, 20, 30)
 
-    def start(self, frame=1, location=None, *, trainer=False, wild=True, identity=None):
+    def start(self, frame=1, location=None, *, trainer=False, wild=True, identity=None, species=()):
         location = self.a if location is None else location
         identity = self.wild if identity is None else identity
         return BattleStarted(
-            frame, ("TRAINER",) if trainer else ("WILD",), trainer, wild, False, (self.player,), (identity,), location
+            frame,
+            ("TRAINER",) if trainer else ("WILD",),
+            trainer,
+            wild,
+            False,
+            (self.player,),
+            (identity,),
+            location,
+            opponent_species=species,
         )
 
     def end(self, frame=2, location=None, outcome="RanAway", *, trainer=False, wild=True):
@@ -95,6 +105,49 @@ class TestNuzlockeRules(unittest.TestCase):
         self.assertTrue(state.legal)
         self.assertEqual(state.encounters[0].status, PENDING)
         self.assertEqual(state.unresolved_encounters[0].location, self.a)
+
+    def test_species_clause_skips_duplicate_without_consuming_new_location(self):
+        captured = PokemonIdentity(99, 20, 30)
+        other_wild = PokemonIdentity(12, 20, 30)
+        events = (
+            self.start(species=("Poochyena",)),
+            PokemonCaptured(2, captured, self.a, "Poochyena"),
+            self.end(),
+            self.start(3, self.b, identity=other_wild, species=("poochyena",)),
+            self.end(4, self.b),
+        )
+
+        state = reduce_rules(events)
+
+        self.assertEqual(state.captured_species, ("Poochyena",))
+        self.assertEqual(len(state.encounters), 1)
+        self.assertEqual(state.encounters[0].location, self.a)
+        self.assertEqual(state.encounters[0].status, CAPTURED)
+
+    def test_species_clause_matching_is_case_insensitive_and_new_species_is_recorded(self):
+        captured = PokemonIdentity(99, 20, 30)
+        state = reduce_rules(
+            (
+                self.start(species=("ZIGZAGOON",)),
+                PokemonCaptured(2, captured, self.a, "zigzagoon"),
+            )
+        )
+
+        self.assertEqual(state.captured_species, ("zigzagoon",))
+        self.assertEqual(state.encounters[0].status, CAPTURED)
+
+    def test_species_clause_can_be_disabled(self):
+        captured = PokemonIdentity(99, 20, 30)
+        projection = NuzlockeRulesProjection(
+            rule_config=CampaignRulesConfig(frozenset({CampaignRuleId.ONE_ENCOUNTER_PER_AREA}))
+        )
+        projection.apply(self.start(species=("Poochyena",)), sequence=1)
+        projection.apply(PokemonCaptured(2, captured, self.a, "Poochyena"), sequence=2)
+        projection.apply(self.end(), sequence=3)
+        projection.apply(self.start(4, self.b, species=("Poochyena",)), sequence=4)
+
+        self.assertEqual(len(projection.state.encounters), 2)
+        self.assertEqual(projection.state.encounters[-1].status, PENDING)
 
     def test_violation_reason_is_deterministic(self):
         events = (self.start(), self.end(), self.start(3))

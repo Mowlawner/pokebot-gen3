@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Literal
 
 from confz import BaseConfig
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, model_validator
 from pydantic.types import Annotated, ClassVar, NonNegativeInt, PositiveInt
 
 
@@ -86,8 +86,21 @@ class NuzlockeRules(BaseConfig):
     enabled_rules: list[Literal["one_encounter_per_area", "fainting", "species_clause", "level_cap"]] = [
         "one_encounter_per_area",
         "fainting",
+        "species_clause",
         "level_cap",
     ]
+    # Restock uses hysteresis: do not leave the current route until the bag is
+    # below the lower threshold, then buy back up to the upper target.
+    pokeball_lower_threshold: Annotated[int, Field(ge=0)] = 5
+    pokeball_upper_target: Annotated[int, Field(gt=0)] = 10
+
+    @model_validator(mode="after")
+    def validate_pokeball_thresholds(self):
+        """Ensure the configured pair expresses a valid restock range."""
+
+        if self.pokeball_upper_target <= self.pokeball_lower_threshold:
+            raise ValueError("pokeball_upper_target must be greater than pokeball_lower_threshold")
+        return self
 
 
 class WallClockTimeMode(str, Enum):

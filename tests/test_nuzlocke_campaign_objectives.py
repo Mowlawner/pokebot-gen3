@@ -35,7 +35,7 @@ from modules.nuzlocke.campaign_state import CampaignFacts, CampaignState, Fact, 
 from modules.nuzlocke.identity import PokemonIdentity
 from modules.nuzlocke.rules import LocationEncounter
 from modules.nuzlocke.encounter_catalog import encounter_opportunities
-from modules.nuzlocke.capture_policy import EncounterMethod
+from modules.nuzlocke.capture_policy import EncounterCandidate, EncounterMethod
 from modules.nuzlocke.campaign_simulation import CampaignCheckpoint, simulate_checkpoint
 from modules.world_navigation import WorldEdge, WorldMapGraph
 from modules.nuzlocke.snapshots import (
@@ -162,6 +162,56 @@ class CampaignObjectiveTests(unittest.TestCase):
             candidates.call_args.kwargs["available_methods"],
             frozenset({EncounterMethod.LAND}),
         )
+
+    def test_default_discovery_keeps_large_detour_encounters_visible(self):
+        state = self.state(
+            campaign_facts=self.facts(
+                text_speed_fast=True,
+                new_game_setup_complete=True,
+                wall_clock_set=True,
+                rival_met=True,
+                birch_rescued=True,
+                starter_obtained=True,
+                intro_rival_battle_complete=True,
+                pokedex_received=True,
+                pokeballs_ready=True,
+            )
+        )
+        near = (0, 16)
+        far = (25, 25)
+        graph = WorldMapGraph(
+            (
+                WorldEdge(
+                    MapRSE.OLDALE_TOWN.value,
+                    MapRSE.PETALBURG_CITY.value,
+                    "connection",
+                    (),
+                    (),
+                    estimated_cost=10,
+                ),
+                WorldEdge(MapRSE.OLDALE_TOWN.value, near, "connection", (), (), estimated_cost=4),
+                WorldEdge(near, MapRSE.PETALBURG_CITY.value, "connection", (), (), estimated_cost=6),
+                WorldEdge(MapRSE.OLDALE_TOWN.value, far, "connection", (), (), estimated_cost=30),
+                WorldEdge(far, MapRSE.PETALBURG_CITY.value, "connection", (), (), estimated_cost=30),
+            )
+        )
+        opportunities = (
+            campaign_objectives_module.EncounterOpportunity(near, False, False, True),
+            campaign_objectives_module.EncounterOpportunity(far, False, False, True),
+        )
+        with (
+            patch.object(campaign_objectives_module, "encounter_opportunities", return_value=opportunities),
+            patch.object(campaign_objectives_module, "_has_current_campaign_encounter", return_value=True),
+            patch.object(campaign_objectives_module, "get_world_map_graph", return_value=graph),
+        ):
+            tasks = available_campaign_tasks(state)
+
+        task_ids = tuple(task.objective_id for task in tasks)
+        self.assertIn("obtain_encounter:0:16", task_ids)
+        self.assertIn("obtain_encounter:25:25", task_ids)
+        far_task = next(task for task in tasks if task.objective_id == "obtain_encounter:25:25")
+        self.assertEqual(far_task.encounter_evaluation.classification, EncounterClassification.LARGE_DETOUR)
+        self.assertEqual(far_task.encounter_evaluation.recommendation, EncounterRecommendation.DEFER)
 
     def test_encounter_diagnostics_report_projection_consumption(self):
         state = replace(
@@ -422,13 +472,23 @@ class CampaignObjectiveTests(unittest.TestCase):
             "devon_corp_3f_state",
             "devon_corp_3f_scene_complete",
             "roxanne_available",
+            "pokeballs_received",
+            "pokeballs_sufficient",
         )
         return CampaignFacts(
             *(
                 Fact.known(
                     values.get(
                         name,
-                        values.get("pokedex_received", False) if name == "nuzlocke_started" else False,
+                        (
+                            values.get("pokedex_received", False)
+                            if name == "nuzlocke_started"
+                            else (
+                                values.get("pokeballs_ready", False)
+                                if name in {"pokeballs_received", "pokeballs_sufficient"}
+                                else False
+                            )
+                        ),
                     )
                 )
                 for name in names
@@ -771,6 +831,124 @@ class CampaignObjectiveTests(unittest.TestCase):
         selection = select_campaign_objective(state)
         self.assertEqual(selection.status, ObjectiveStatus.READY)
         self.assertEqual(selection.objective.objective_id, "reach_petalburg")
+
+    def test_low_ball_inventory_exposes_restock_before_route_progression(self):
+        facts = self.facts(
+            text_speed_fast=True,
+            new_game_setup_complete=True,
+            wall_clock_set=True,
+            rival_met=True,
+            birch_rescued=True,
+            starter_obtained=True,
+            intro_rival_battle_complete=True,
+            pokedex_received=True,
+            pokeballs_available=True,
+            pokeballs_ready=True,
+        )
+        facts = replace(
+            facts,
+            pokeballs_received=Fact.known(True),
+            pokeballs_sufficient=Fact.known(False),
+        )
+        state = self.state(balls=1, campaign_facts=facts)
+
+        selection = select_available_campaign_task(state)
+
+        self.assertEqual(selection.status, ObjectiveStatus.READY)
+        self.assertEqual(selection.objective.objective_id, "restock_pokeballs")
+
+    def test_dependency_aware_planner_exposes_restock_interrupt(self):
+        facts = replace(
+            self.facts(
+                text_speed_fast=True,
+                new_game_setup_complete=True,
+                wall_clock_set=True,
+                rival_met=True,
+                birch_rescued=True,
+                starter_obtained=True,
+                intro_rival_battle_complete=True,
+                pokedex_received=True,
+                pokeballs_available=True,
+                pokeballs_ready=True,
+            ),
+            pokeballs_received=Fact.known(True),
+            pokeballs_sufficient=Fact.known(False),
+        )
+
+        selection = plan_campaign(self.state(balls=1, campaign_facts=facts))
+
+        self.assertEqual(selection.status, ObjectiveStatus.READY)
+        self.assertEqual(selection.objective.objective_id, "restock_pokeballs")
+
+    def test_restock_uses_nonzero_live_inventory_when_receipt_fact_is_unknown(self):
+        facts = replace(
+            self.facts(
+                text_speed_fast=True,
+                new_game_setup_complete=True,
+                wall_clock_set=True,
+                rival_met=True,
+                birch_rescued=True,
+                starter_obtained=True,
+                intro_rival_battle_complete=True,
+                pokedex_received=True,
+                pokeballs_ready=True,
+            ),
+            pokeballs_received=Fact.unknown(),
+            pokeballs_sufficient=Fact.known(False),
+        )
+
+        for balls in (1, 3, 4):
+            selection = select_available_campaign_task(self.state(balls=balls, campaign_facts=facts))
+            self.assertEqual(selection.objective.objective_id, "restock_pokeballs", balls)
+
+        sufficient_facts = replace(facts, pokeballs_sufficient=Fact.known(True))
+        sufficient_selection = select_available_campaign_task(self.state(balls=5, campaign_facts=sufficient_facts))
+        self.assertNotEqual(sufficient_selection.objective.objective_id, "restock_pokeballs")
+
+    def test_zero_ball_restock_requires_opening_receipt_fact(self):
+        facts = self.facts(pokedex_received=True, pokeballs_ready=True)
+        unknown_receipt = replace(
+            facts,
+            pokeballs_received=Fact.unknown(),
+            pokeballs_sufficient=Fact.known(False),
+        )
+        self.assertNotEqual(
+            select_available_campaign_task(self.state(balls=0, campaign_facts=unknown_receipt)).objective.objective_id,
+            "restock_pokeballs",
+        )
+
+        received = replace(unknown_receipt, pokeballs_received=Fact.known(True))
+        self.assertEqual(
+            select_available_campaign_task(self.state(balls=0, campaign_facts=received)).objective.objective_id,
+            "restock_pokeballs",
+        )
+
+    def test_low_ball_reserve_suppresses_encounters_until_restock_is_selected(self):
+        facts = replace(
+            self.facts(pokedex_received=True, pokeballs_ready=True),
+            pokeballs_received=Fact.unknown(),
+            pokeballs_sufficient=Fact.known(False),
+        )
+        state = replace(
+            self.state(balls=3, campaign_facts=facts),
+            encounters=Fact.known((LocationEncounter(MapRSE.ROUTE102.value, "none"),)),
+        )
+
+        available = available_campaign_tasks(state)
+        task_ids = tuple(task.objective_id for task in available)
+
+        self.assertIn("restock_pokeballs", task_ids)
+        self.assertNotIn("obtain_encounter:0:17", task_ids)
+
+    def test_sufficient_ball_inventory_does_not_expose_restock(self):
+        facts = replace(
+            self.facts(pokeballs_ready=True),
+            pokeballs_received=Fact.known(True),
+            pokeballs_sufficient=Fact.known(True),
+        )
+        available = available_campaign_tasks(self.state(balls=5, campaign_facts=facts))
+
+        self.assertNotIn("restock_pokeballs", tuple(task.objective_id for task in available))
 
     def test_pokeballs_available_without_ready_blocks_nuzlocke(self):
         # Test that pokeballs_available=True but pokeballs_ready=False blocks nuzlocke

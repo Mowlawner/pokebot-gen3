@@ -53,6 +53,7 @@ _PROVENANCE_CAMPAIGN_FACTS = (
     "pokedex_received",
     "pokeballs_available",
     "pokeballs_ready",
+    "pokeballs_received",
     "visited_petalburg",
     "petalburg_wally_scene_complete",
     "devon_goods_recovered",

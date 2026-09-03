@@ -51,6 +51,7 @@ from modules.world_navigation import get_world_map_graph
 from modules.modes.util.map import pokemon_center_candidates
 from modules.battle_strategies.nuzlocke_level_balancing import (
     EmeraldIntroRivalBattleStrategy,
+    NuzlockeCaptureStrategy,
     NuzlockeLevelBalancingBattleStrategy,
     RoxanneBattleStrategy,
 )
@@ -119,6 +120,12 @@ class CampaignProgressionMode(BotMode):
         self._campaign_selection = None
         self._campaign_boundary_context_seen = False
         self._last_campaign_boundary_context = None
+        self._active_battle_wild: bool | None = None
+        # A battle can complete its story objective before the ROM has
+        # finished handing control back to the field. Retain the completed
+        # objective's recovery policy across that handoff so a low-HP party is
+        # still evaluated before the next objective takes over.
+        self._post_battle_recovery_policy = None
 
     def _select_campaign(self, state):
         """Reuse map-level planning until a relevant campaign fact changes."""
@@ -164,7 +171,21 @@ class CampaignProgressionMode(BotMode):
             controllable = player_avatar_is_controllable()
         except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
             controllable = None
-        return (state, map_id, controllable)
+        # Runtime already materializes the inventory snapshot once per
+        # emulator frame. Reuse that immutable observation so a Poké Ball
+        # purchase/consumption can invalidate campaign selection without
+        # rereading the bag on the hot path.
+        ball_count = None
+        runtime = getattr(context, "nuzlocke_runtime", None)
+        snapshot = getattr(runtime, "latest_snapshot", None)
+        if snapshot is not None and getattr(snapshot, "inventory_available", False):
+            try:
+                ball_count = sum(
+                    item.quantity for item in snapshot.inventory.poke_balls if item.name.casefold() != "master ball"
+                )
+            except (AttributeError, TypeError, ValueError):
+                ball_count = None
+        return (state, map_id, controllable, ball_count)
 
     @staticmethod
     def _recovery_candidate_goals(current_location, recovery, *, is_rse):
@@ -351,19 +372,53 @@ class CampaignProgressionMode(BotMode):
         # need recovery.  Computing it here on every readiness refresh walks
         # the map synchronously, which stalls the active tactical controller
         # even when the party is healthy and already navigating normally.
-        minimum_hp_ratio = getattr(getattr(objective, "resource_policy", None), "minimum_hp_ratio", 0.5)
-        recovery_needed = (
-            overworld_availability is Availability.KNOWN
+        objective_resource_policy = getattr(objective, "resource_policy", None)
+        # The completed rival battle's recovery policy bridges the transient
+        # story boundary before ``receive_pokedex`` becomes authoritative.
+        # The planner can briefly re-select ``complete_intro_rival`` while
+        # the rival's exit script is still unwinding; clearing the latch on
+        # that observation loses the required return-to-Center decision before
+        # the lab handoff. Retain it through that transient boundary, then
+        # consume it when the next post-lab capability (or an explicit
+        # restock interruption) takes ownership. In particular, do not let it
+        # reach ``restock_pokeballs``: that objective has no healing
+        # requirement, and carrying the policy forward can launch a
+        # synchronous global recovery search at the Mart door while its map
+        # transition is still settling.
+        objective_id = getattr(objective, "objective_id", None)
+        if objective_resource_policy is None and objective_id == "receive_pokedex":
+            objective_resource_policy = getattr(self, "_post_battle_recovery_policy", None)
+        elif objective_id in {"receive_pokeballs", "restock_pokeballs"}:
+            self._post_battle_recovery_policy = None
+        minimum_hp_ratio = getattr(objective_resource_policy, "minimum_hp_ratio", 0.5)
+        critical_recovery_needed = resource_observation_valid and (
+            not resources.usable_party
+            or any(member.fainted for member in resources.party)
+            or resources.worst_hp_ratio < CampaignReadinessPolicy().critical_hp_ratio
+        )
+        # RouteCostAnalyzer is a synchronous world search. Ordinary campaign
+        # objectives do not promise an opportunistic recovery detour, so do
+        # not run that search merely because a battle caused moderate damage.
+        # Explicit resource policies retain the existing minimum-HP behavior;
+        # critical damage remains an unconditional safety boundary below.
+        opportunistic_recovery_needed = (
+            objective_resource_policy is not None
             and resource_observation_valid
             and (
-                not resources.usable_party
-                or any(member.fainted for member in resources.party)
-                or resources.worst_hp_ratio < minimum_hp_ratio
+                resources.worst_hp_ratio < minimum_hp_ratio
                 or resources.worst_hp_ratio <= CampaignReadinessPolicy().opportunistic_hp_ratio
             )
         )
+        recovery_needed = critical_recovery_needed or opportunistic_recovery_needed
+        # Critical recovery is a safety decision, not a detour optimization.
+        # ``observe_route_recovery`` already selected and retained the
+        # executable route to the nearest safe healing source. Running the
+        # full normal-vs-recovery RouteCostAnalyzer here launches additional
+        # world searches immediately after every damaging battle and can make
+        # the emulator appear frozen for many seconds.
         if trace is not None and callable(getattr(trace, "mark", None)):
             trace.mark("campaign_recovery_needed", recovery_needed)
+            trace.mark("campaign_critical_recovery", critical_recovery_needed)
         if overworld_availability is not Availability.KNOWN:
             recovery = RouteRecovery(
                 observation_available=False,
@@ -375,7 +430,15 @@ class CampaignProgressionMode(BotMode):
                 observation_error=resources.observation_error or "resource_observation_unavailable",
             )
         else:
-            recovery = observe_route_recovery() if recovery_needed else RouteRecovery()
+            recovery = (
+                # Critical recovery already selected the nearest safe source
+                # in the recovery observer. A second candidate only repeats
+                # the expensive synchronous route search at the worst
+                # possible time: immediately after a battle.
+                observe_route_recovery(candidate_limit=1 if critical_recovery_needed else None)
+                if recovery_needed
+                else RouteRecovery()
+            )
         recovery_available = (
             recovery.center_available
             or getattr(recovery, "healing_source_available", False)
@@ -418,12 +481,32 @@ class CampaignProgressionMode(BotMode):
                 f"resource_party_available={resource_party_available!r} recovery_needed={recovery_needed!r} "
                 f"recovery_availability={getattr(recovery_availability, 'value', None)!r} center_available={recovery_center_available!r} "
                 f"center_safe={recovery_safe!r} distance_to_center={recovery_distance!r} "
-                "distance_metric='calculate_path step count' "
+                "distance_metric='world navigation route cost' "
                 f"nearest_center={getattr(recovery, 'center_location', None)!r}"
             ),
             trace=True,
         )
         route_analysis = None
+        # ``receive_pokedex`` is a targetless capability at the post-rival
+        # handoff. Its readiness policy intentionally uses the already
+        # selected recovery route and its bounded outdoor distance; composing
+        # a normal route plus recovery outbound/continuation routes here
+        # launches three additional synchronous searches in one application
+        # frame. That is the multi-second post-battle stall this boundary is
+        # meant to avoid.
+        direct_pokedex_recovery = (
+            objective is not None and getattr(objective, "objective_id", None) == "receive_pokedex" and goal is None
+        )
+        if direct_pokedex_recovery and recovery_needed and not critical_recovery_needed:
+            diagnostic_print(
+                lambda: (
+                    "READINESS_ROUTE_ANALYSIS_SKIPPED: "
+                    "reason='receive_pokedex uses selected recovery route directly' "
+                    f"distance_to_center={getattr(recovery, 'distance_to_center', None)!r}"
+                ),
+                trace=True,
+                prefix="READINESS_ROUTE_ANALYSIS_SKIPPED",
+            )
         if overworld is None or readiness_goal is None:
             diagnostic_print(
                 lambda: (
@@ -442,6 +525,8 @@ class CampaignProgressionMode(BotMode):
             )
         if (
             recovery_needed
+            and not critical_recovery_needed
+            and not direct_pokedex_recovery
             and overworld is not None
             and overworld_availability is Availability.KNOWN
             and readiness_goal is not None
@@ -518,6 +603,16 @@ class CampaignProgressionMode(BotMode):
                     trace=True,
                 )
                 route_analysis = None
+        elif recovery_needed and critical_recovery_needed:
+            diagnostic_print(
+                lambda: (
+                    "READINESS_ROUTE_ANALYSIS_SKIPPED: "
+                    "reason='critical recovery uses selected recovery route' "
+                    f"recovery_route_available={getattr(recovery, 'route', None) is not None}"
+                ),
+                trace=True,
+                prefix="READINESS_ROUTE_ANALYSIS_SKIPPED",
+            )
         return build_progression_readiness_diagnostic(
             snapshot,
             objective_id=objective.objective_id if objective is not None else None,
@@ -538,6 +633,7 @@ class CampaignProgressionMode(BotMode):
 
     def on_battle_started(self, encounter) -> BattleAction:
         """Choose campaign battle policy, leaving execution to the listener."""
+        self._active_battle_wild = encounter is not None
         scheduler = getattr(self, "_readiness_scheduler", None)
         if scheduler is not None:
             scheduler.invalidate("battle_started")
@@ -650,7 +746,19 @@ class CampaignProgressionMode(BotMode):
                 )
                 if decision is ResourceDecision.PREFER_RUN:
                     return BattleAction.RunAway
+        # Ordinary campaign-owned battles should rotate the lowest-level
+        # living party member into the lead.  The explicit handlers above
+        # retain their specialized policies, and legal wild captures were
+        # handed to CatchStrategy before reaching this point.  This applies
+        # to trainer battles too, where ``encounter`` is None.
+        if objective is not None:
+            return NuzlockeLevelBalancingBattleStrategy()
         return BattleAction.Fight
+
+    def capture_battle_strategy(self):
+        """Return the campaign capture policy for the battle listener."""
+
+        return NuzlockeCaptureStrategy()
 
     def on_spotted_by_trainer(self) -> None:
         """Recheck campaign readiness when a trainer battle becomes imminent."""
@@ -664,9 +772,28 @@ class CampaignProgressionMode(BotMode):
         """Invalidate readiness after a battle changes party or route state."""
 
         # Campaign tactical loops are suspended while BattleListener owns the
-        # battle. Publish the boundary so a cached recovery/navigation suffix
-        # cannot resume by pressing into a trainer that moved during battle.
-        notify_battle_ended()
+        # battle. Trainer battles can move/defeat an overworld object, so the
+        # cached route must be discarded. Wild battles do not alter route
+        # geometry; retaining their route avoids a synchronous world search
+        # after every encounter. Readiness is still refreshed below in both
+        # cases so HP, party, and Poké Ball changes are observed.
+        wild_battle = getattr(self, "_active_battle_wild", None)
+        self._active_battle_wild = None
+        controller = getattr(self, "controller", None)
+        selection = getattr(controller, "last_selection", None)
+        objective = getattr(selection, "objective", None)
+        resource_policy = getattr(objective, "resource_policy", None)
+        if resource_policy is not None and getattr(resource_policy, "recover_before_completion", False):
+            self._post_battle_recovery_policy = resource_policy
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_POST_BATTLE_RECOVERY_ARMED: "
+                    f"objective={getattr(objective, 'objective_id', None)!r} "
+                    f"minimum_hp_ratio={getattr(resource_policy, 'minimum_hp_ratio', None)!r}"
+                ),
+                trace=True,
+            )
+        notify_battle_ended(invalidate_navigation=wild_battle is not True)
         diagnostic_print(
             lambda: (
                 "CAMPAIGN_BATTLE_ENDED: "
@@ -677,7 +804,6 @@ class CampaignProgressionMode(BotMode):
             trace=True,
         )
         scheduler = getattr(self, "_readiness_scheduler", None)
-        controller = getattr(self, "controller", None)
         request_recheck = getattr(controller, "request_readiness_recheck", None)
         if callable(request_recheck):
             request_recheck("battle_ended")
@@ -710,6 +836,8 @@ class CampaignProgressionMode(BotMode):
                 reason = "game_state_changed"
             elif len(previous) > 2 and len(current) > 2 and previous[2] != current[2]:
                 reason = "control_boundary_changed"
+            elif len(previous) > 3 and len(current) > 3 and previous[3] != current[3]:
+                reason = "pokeball_inventory_changed"
 
         request_recheck = getattr(controller, "request_readiness_recheck", None)
         request_refresh = getattr(controller, "request_refresh", None)

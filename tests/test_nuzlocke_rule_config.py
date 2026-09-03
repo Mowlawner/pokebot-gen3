@@ -8,6 +8,7 @@ from modules.config.schemas_v1 import NuzlockeRules
 from modules.nuzlocke.events import BattleStarted, PokemonFainted, WhiteoutOccurred
 from modules.nuzlocke.identity import PokemonIdentity
 from modules.nuzlocke.rule_config import CampaignRule, CampaignRuleId, CampaignRulesConfig
+from modules.nuzlocke.resource_policy import PokeballRestockPolicy
 from modules.nuzlocke.rules import NuzlockeRulesProjection
 from modules.nuzlocke.runtime import NuzlockeRuntime
 from modules.nuzlocke.snapshots import (
@@ -62,6 +63,7 @@ class CampaignRulesConfigTests(unittest.TestCase):
 
         self.assertTrue(config.is_enabled(CampaignRuleId.ONE_ENCOUNTER_PER_AREA))
         self.assertTrue(config.is_enabled(CampaignRuleId.FAINTING))
+        self.assertTrue(config.is_enabled(CampaignRuleId.SPECIES_CLAUSE))
         self.assertTrue(config.is_enabled(CampaignRuleId.LEVEL_CAP))
 
     def test_unrestricted_config_disables_baseline_rule_reduction(self):
@@ -93,6 +95,19 @@ class CampaignRulesConfigTests(unittest.TestCase):
     def test_profile_schema_rejects_unknown_rule_ids(self):
         with self.assertRaises(ValidationError):
             NuzlockeRules(enabled_rules=["not_a_rule"])
+
+    def test_pokeball_policy_is_carried_into_runtime_configuration(self):
+        config = CampaignRulesConfig.from_names(
+            ["one_encounter_per_area"],
+            pokeball_lower_threshold=3,
+            pokeball_upper_target=12,
+        )
+
+        self.assertEqual(config.pokeball_policy, PokeballRestockPolicy(3, 12))
+
+    def test_profile_schema_rejects_inverted_pokeball_thresholds(self):
+        with self.assertRaises(ValidationError):
+            NuzlockeRules(pokeball_lower_threshold=10, pokeball_upper_target=10)
 
     def test_rule_contract_is_pure_structural_extension_point(self):
         rule = StubRule()

@@ -57,6 +57,7 @@ from .walking import (
 from .._interface import BotModeError
 from ...game import get_symbol_name_before
 from ...items import Item, get_item_bag, ItemPocket, Pokeblock, get_pokeblocks
+from ...state_cache import state_cache
 from ...map import get_map_objects, get_map_data_for_current_position
 from ...map_path import calculate_path, PathFindingError, Direction
 from ...mart import (
@@ -350,6 +351,54 @@ def leave_safari_zone():
     yield from wait_for_player_avatar_to_be_standing_still()
 
 
+_SHOP_WAIT_TIMEOUT_FRAMES = 180
+
+
+def _press_shop_button_fresh(button: str) -> None:
+    """Press a shop button with a new JOY_NEW edge when the emulator supports it."""
+
+    press_fresh = getattr(context.emulator, "press_button_fresh", None)
+    if callable(press_fresh):
+        press_fresh(button)
+    else:
+        context.emulator.press_button(button)
+
+
+def _shop_wait_diagnostic(task_names: tuple[str, ...] = ()) -> str:
+    try:
+        callback = get_game_state_symbol()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        callback = "<unavailable>"
+    active_tasks = []
+    for task_name in task_names:
+        try:
+            if task_is_active(task_name):
+                active_tasks.append(task_name)
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            pass
+    return f"callback={callback!r}, active_tasks={active_tasks!r}"
+
+
+def _wait_for_shop_condition(
+    condition: Callable[[], bool],
+    description: str,
+    *,
+    button_to_press: str | None = None,
+    task_names: tuple[str, ...] = (),
+) -> Generator:
+    """Wait for one shop transition without allowing a missed ROM state to hang forever."""
+
+    for _ in range(_SHOP_WAIT_TIMEOUT_FRAMES):
+        if condition():
+            return
+        if button_to_press is not None:
+            context.emulator.press_button(button_to_press)
+        yield
+    raise RuntimeError(
+        f"Poké Mart operation timed out waiting for {description}; " f"{_shop_wait_diagnostic(task_names)}"
+    )
+
+
 @debug.track
 def buy_in_shop(shopping_list: list[tuple[Item, int]]):
     """
@@ -401,34 +450,64 @@ def buy_in_shop(shopping_list: list[tuple[Item, int]]):
         raise BotModeError(f"This shopping list would total ${total_cost:,}, but player only has ${player_money:,}")
 
     # Scroll to the 'Buy' option
-    while get_mart_main_menu_scroll_position() > 0:
-        context.emulator.press_button("Up")
-        yield
+    yield from _wait_for_shop_condition(
+        lambda: get_mart_main_menu_scroll_position() <= 0,
+        "the Mart Buy option",
+        button_to_press="Up",
+        task_names=(shop_menu_task,),
+    )
 
     # Wait for 'Buy' menu to open
-    context.emulator.press_button("A")
-    while get_game_state_symbol() != buy_menu_cb2:
-        yield
+    # The clerk interaction also uses A.  A normal press here can therefore be
+    # suppressed by the emulator as a repeated input edge, leaving the game in
+    # the Mart menu while this generator yields forever.  Force a neutral frame
+    # when needed so Emerald receives a fresh JOY_NEW event.
+    _press_shop_button_fresh("A")
+    yield from _wait_for_shop_condition(
+        lambda: get_game_state_symbol() == buy_menu_cb2,
+        f"Buy-menu callback {buy_menu_cb2}",
+        task_names=(shop_menu_task,),
+    )
     for _ in range(22):
         yield
 
     for item, quantity in shopping_list:
         slot = buyable_items.index(item)
-        while get_mart_buy_menu_scroll_position() != slot:
-            if get_mart_buy_menu_scroll_position() > slot:
+        for _ in range(_SHOP_WAIT_TIMEOUT_FRAMES):
+            current_slot = get_mart_buy_menu_scroll_position()
+            if current_slot == slot:
+                break
+            if current_slot > slot:
                 context.emulator.press_button("Up")
             else:
                 context.emulator.press_button("Down")
             yield
+        else:
+            raise RuntimeError(
+                f"Poké Mart operation timed out scrolling to item slot {slot}; "
+                f"{_shop_wait_diagnostic((select_quantity_task, buy_menu_task))}"
+            )
 
-        yield from wait_until_task_is_active(select_quantity_task, "A")
+        yield from _wait_for_shop_condition(
+            lambda: task_is_active(select_quantity_task),
+            f"quantity-selection task {select_quantity_task}",
+            button_to_press="A",
+            task_names=(select_quantity_task, shop_menu_task),
+        )
 
         reverse_scroll = quantity > 50
         if reverse_scroll:
             context.emulator.press_button("Down")
             yield
             yield
-        while (current_quantity := get_task(select_quantity_task).data_value(1)) != quantity:
+        for _ in range(_SHOP_WAIT_TIMEOUT_FRAMES):
+            quantity_task = get_task(select_quantity_task)
+            if quantity_task is None:
+                yield
+                continue
+            current_quantity = quantity_task.data_value(1)
+            if current_quantity == quantity:
+                break
             if current_quantity <= quantity - 7:
                 context.emulator.press_button("Right")
             elif current_quantity >= quantity + 7:
@@ -438,13 +517,43 @@ def buy_in_shop(shopping_list: list[tuple[Item, int]]):
             elif current_quantity > quantity:
                 context.emulator.press_button("Down")
             yield
+        else:
+            raise RuntimeError(
+                f"Poké Mart operation timed out selecting quantity {quantity}; "
+                f"{_shop_wait_diagnostic((select_quantity_task, buy_menu_task))}"
+            )
 
-        yield from wait_until_task_is_active(buy_menu_task, "A")
+        yield from _wait_for_shop_condition(
+            lambda: task_is_active(buy_menu_task),
+            f"purchase task {buy_menu_task}",
+            button_to_press="A",
+            task_names=(buy_menu_task, select_quantity_task),
+        )
         yield
         yield
 
-    yield from wait_for_task_to_start_and_finish(return_task, "B")
-    yield from wait_until_task_is_active(shop_menu_task)
+    yield from _wait_for_shop_condition(
+        lambda: task_is_active(return_task),
+        f"return task {return_task} to start",
+        button_to_press="B",
+        task_names=(return_task, shop_menu_task),
+    )
+    yield from _wait_for_shop_condition(
+        lambda: not task_is_active(return_task),
+        f"return task {return_task} to finish",
+        button_to_press="B",
+        task_names=(return_task, shop_menu_task),
+    )
+    yield from _wait_for_shop_condition(
+        lambda: task_is_active(shop_menu_task),
+        f"Mart task {shop_menu_task} after purchase",
+        task_names=(return_task, shop_menu_task),
+    )
+    # The purchase mutates save-block inventory while the shop task may still
+    # be active on the same emulator frame. Force the next campaign/resource
+    # observation to see the new quantities instead of the pre-purchase cache.
+    state_cache.item_bag.invalidate()
+    state_cache.player.invalidate()
     yield
 
 

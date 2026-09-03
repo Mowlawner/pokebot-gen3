@@ -2,6 +2,8 @@ from modules.context import context
 from modules.items import Item, get_item_by_index
 from modules.memory import read_symbol, unpack_uint32, unpack_uint16
 
+_MAX_MART_BUYABLE_ITEMS = 100
+
 
 def get_mart_buyable_items() -> list[Item]:
     if context.rom.is_emerald:
@@ -11,15 +13,20 @@ def get_mart_buyable_items() -> list[Item]:
     else:
         item_list_pointer = unpack_uint32(read_symbol("gMartInfo", offset=4, size=4))
 
-    last_item_index = None
     item_list = []
-    while item_list_pointer and last_item_index != 0:
-        last_item_index = unpack_uint16(context.emulator.read_bytes(item_list_pointer, length=2))
-        if last_item_index != 0:
-            item_list.append(get_item_by_index(last_item_index))
+    for _ in range(_MAX_MART_BUYABLE_ITEMS):
+        if not item_list_pointer:
+            return item_list
+        item_index = unpack_uint16(context.emulator.read_bytes(item_list_pointer, length=2))
+        if item_index == 0:
+            return item_list
+        item_list.append(get_item_by_index(item_index))
         item_list_pointer += 2
 
-    return item_list
+    raise RuntimeError(
+        "Poké Mart item list did not contain an ITEM_NONE terminator after "
+        f"{_MAX_MART_BUYABLE_ITEMS} entries (last address={item_list_pointer:#x})"
+    )
 
 
 def get_mart_main_menu_scroll_position() -> int:

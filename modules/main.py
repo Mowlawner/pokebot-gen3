@@ -91,7 +91,11 @@ def main_loop() -> None:
             )
 
         context.bot_listeners = get_bot_listeners(context.rom)
-        campaign_rules = CampaignRulesConfig.from_names(context.config.nuzlocke_rules.enabled_rules)
+        campaign_rules = CampaignRulesConfig.from_names(
+            context.config.nuzlocke_rules.enabled_rules,
+            pokeball_lower_threshold=context.config.nuzlocke_rules.pokeball_lower_threshold,
+            pokeball_upper_target=context.config.nuzlocke_rules.pokeball_upper_target,
+        )
         context.nuzlocke_runtime = NuzlockeRuntime(
             event_sink=nuzlocke_event_store,
             rule_config=campaign_rules,

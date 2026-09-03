@@ -22,7 +22,15 @@ from modules.agent_control import (
     observe_agent,
     notify_battle_ended,
 )
-from modules.goals import GoalConstraints, NavigationGoal, ReachLocation, ReachWarp, SemanticTarget, TrainerMode
+from modules.goals import (
+    GoalConstraints,
+    NavigationGoal,
+    ReachInteractionPosition,
+    ReachLocation,
+    ReachWarp,
+    SemanticTarget,
+    TrainerMode,
+)
 from modules.interaction_state import InteractionObservation, InteractionPhase
 from modules.map_path import Direction
 from modules.memory import GameState
@@ -457,6 +465,80 @@ class AgentActionSelectionTests(TestCase):
         self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
         self.assertEqual(decision.action.reason, "automatic coordinate trigger fires on tile entry")
 
+    def test_reached_interaction_position_returns_when_rom_starts_script(self):
+        trigger = TriggerObservation(
+            "nurse",
+            frozenset({(MAP, (0, 0))}),
+            activation_locations=frozenset({(MAP, (0, 0))}),
+            requires_input=False,
+        )
+        world = overworld({(0, 0)}, triggers=(trigger,))
+        goal = ReachInteractionPosition("nurse")
+        reached = observation(GameState.OVERWORLD, world=world, goal=goal)
+        loop = AgentControlLoop(lambda: None, goal=goal)
+        loop._cached_goal = goal
+        loop._cached_evaluation = GoalEvaluation(
+            GoalStatus.REACHABLE,
+            plan=NavigationPlan((), (MAP, (0, 0))),
+        )
+        loop._cached_world_signature = loop._world_signature(reached)
+
+        positioning_decision = loop._cached_decision(reached)
+        self.assertEqual(positioning_decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertTrue(loop._interaction_position_ready)
+
+        script_started = AgentObservation(
+            InteractionObservation(
+                GameState.UNKNOWN,
+                controllable=True,
+                script_active=True,
+                script_function="Common_EventScript_PkmnCenterNurse",
+            ),
+            goal=goal,
+        )
+        loop._observe = lambda: script_started
+        with patch("modules.agent_control.context.emulator", Mock()):
+            _, decision, result = loop.step()
+
+        self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(result.result_type, ActionResultType.GOAL_COMPLETE)
+        self.assertFalse(loop._interaction_position_ready)
+
+    def test_route_completion_hands_off_when_automatic_script_starts_before_readiness_observation(self):
+        """A cached route may reach an automatic nurse tile without an intervening overworld frame."""
+        trigger = TriggerObservation(
+            "nurse",
+            frozenset({(MAP, (0, 0))}),
+            activation_locations=frozenset({(MAP, (0, 0))}),
+            requires_input=False,
+        )
+        goal = ReachInteractionPosition("nurse")
+        loop = AgentControlLoop(lambda: None, goal=goal)
+        loop._cached_goal = goal
+        loop._cached_evaluation = GoalEvaluation(
+            GoalStatus.REACHABLE,
+            plan=NavigationPlan((), (MAP, (0, 0))),
+        )
+        loop._cached_actions = ()
+        loop._cached_action_index = 0
+
+        script_started = AgentObservation(
+            InteractionObservation(
+                GameState.UNKNOWN,
+                controllable=True,
+                script_active=True,
+                script_function="Common_EventScript_PkmnCenterNurse",
+            ),
+            goal=goal,
+        )
+        loop._observe = lambda: script_started
+        with patch("modules.agent_control.context.emulator", Mock()):
+            _, decision, result = loop.step()
+
+        self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(result.result_type, ActionResultType.GOAL_COMPLETE)
+        self.assertIn("route completion", result.message)
+
     def test_completed_automatic_trigger_is_complete_when_rom_condition_turns_off(self):
         from modules.goals import ActivateTrigger
 
@@ -696,6 +778,33 @@ class AgentActionSelectionTests(TestCase):
         self.assertEqual(emulator.holds, ["B", "B"])
         self.assertEqual(emulator.releases, ["B"])
 
+    def test_plan_invalidation_preserves_executor_owned_render_b(self):
+        class StatefulEmulator:
+            def __init__(self):
+                self.held = set()
+                self.resets = 0
+                self.holds = []
+
+            def reset_held_buttons(self):
+                self.resets += 1
+                self.held.clear()
+
+            def hold_button(self, button):
+                self.holds.append(button)
+                self.held.add(button)
+
+        emulator = StatefulEmulator()
+        executor = AgentActionExecutor()
+        executor._field_message_render_b_held = True
+        loop = AgentControlLoop(lambda: None, executor=executor)
+
+        with patch("modules.agent_control.context.emulator", emulator):
+            loop._invalidate_plan("non_overworld_interaction")
+
+        self.assertEqual(emulator.resets, 1)
+        self.assertEqual(emulator.holds, ["B"])
+        self.assertEqual(emulator.held, {"B"})
+
     def test_render_rescue_rejects_stale_or_wrong_phase_observations(self):
         emulator = Mock()
         rendering = observation(
@@ -875,6 +984,71 @@ class AgentActionSelectionTests(TestCase):
 
         self.assertEqual(emulator.hold_button.call_args_list, [call("Right"), call("B")])
         emulator.press_direction.assert_not_called()
+
+    def test_batch_accepts_intermediate_coordinate_during_forced_movement(self):
+        from modules.agent_control import _MovementBatch
+
+        action = NavigationAction(
+            NavigationActionType.MOVE,
+            Direction.South,
+            (MAP, (0, 0)),
+            (MAP, (0, 2)),
+        )
+        loop = AgentControlLoop(lambda: None)
+        loop._movement_batch = _MovementBatch((action,))
+        loop._live_object_coordinates = lambda map_id: frozenset()
+        avatar = SimpleNamespace(
+            map_group_and_number=MAP,
+            local_coordinates=(0, 1),
+            facing_direction="Down",
+        )
+        emulator = Mock()
+
+        with patch("modules.agent_control.context.emulator", emulator), patch(
+            "modules.agent_control.get_game_state", return_value=GameState.OVERWORLD
+        ), patch("modules.agent_control.is_field_message_waiting_for_input", return_value=False), patch(
+            "modules.agent_control.get_player_avatar", return_value=avatar
+        ):
+            self.assertTrue(loop._advance_movement_batch())
+
+        emulator.hold_button.assert_called_once_with("Down")
+        self.assertIsNotNone(loop._movement_batch)
+
+    def test_in_flight_move_accepts_intermediate_coordinate_without_replanning(self):
+        goal = ReachLocation((MAP, (0, 3)))
+        action = NavigationAction(
+            NavigationActionType.MOVE,
+            Direction.South,
+            (MAP, (0, 0)),
+            (MAP, (0, 2)),
+        )
+        world = overworld(
+            {(0, 0), (0, 1), (0, 2), (0, 3)},
+            start=(0, 1),
+            facing=Direction.South,
+            movement_state=MovementState.MOVING,
+        )
+        loop = AgentControlLoop(
+            lambda: observation(GameState.OVERWORLD, world=world, goal=goal),
+            goal=goal,
+            use_movement_batch=False,
+        )
+        loop._cached_goal = goal
+        loop._cached_evaluation = GoalEvaluation(
+            GoalStatus.REACHABLE,
+            plan=NavigationPlan((action,), action.destination),
+        )
+        loop._cached_actions = (action,)
+        loop._cached_world_signature = loop._world_signature(observation(GameState.OVERWORLD, world=world, goal=goal))
+        loop._in_flight_move = action
+        loop._in_flight_move_initial_facing = Direction.South
+
+        _, decision, result = loop.step()
+
+        self.assertEqual(decision.action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(result.result_type, ActionResultType.WAITING)
+        self.assertIsNotNone(loop._cached_evaluation)
+        self.assertIs(loop._in_flight_move, action)
 
     def test_batch_rechecks_live_object_before_dispatch(self):
         """A newly occupied route tile must cancel the fast path first."""
@@ -1192,6 +1366,29 @@ class AgentActionSelectionTests(TestCase):
 
 
 class AgentExecutionTests(TestCase):
+    def test_choose_yes_moves_up_from_no_with_canonical_button_name(self):
+        emulator = Mock()
+        prompt = observation(GameState.OVERWORLD, choices=("YES", "NO"))
+        prompt = replace(
+            prompt,
+            interaction=replace(
+                prompt.interaction,
+                choice_menu_active=True,
+                choice_menu_input_ready=True,
+                choice_selected="NO",
+                interaction_phase=InteractionPhase.CHOICE_MENU_INPUT_WAIT,
+            ),
+        )
+
+        with patch("modules.agent_control.context.emulator", emulator):
+            result = AgentActionExecutor().execute(
+                AgentAction(AgentActionType.CHOOSE_DIALOGUE_OPTION, option="YES"),
+                prompt,
+            )
+
+        self.assertEqual(result.result_type, ActionResultType.EXECUTED)
+        emulator.press_button_fresh.assert_called_once_with(Direction.North.button_name)
+
     def test_battle_return_discards_suspended_movement_route(self):
         from modules.agent_control import _MovementBatch
 
@@ -1229,6 +1426,15 @@ class AgentExecutionTests(TestCase):
         with patch("modules.agent_control.context.emulator", emulator):
             notify_battle_ended()
 
+        emulator.reset_held_buttons.assert_called_once_with()
+
+    def test_wild_battle_return_can_refresh_runtime_without_discarding_route(self):
+        emulator = Mock()
+        with patch("modules.agent_control.context.emulator", emulator):
+            before = agent_control._battle_end_generation
+            notify_battle_ended(invalidate_navigation=False)
+
+        self.assertEqual(agent_control._battle_end_generation, before)
         emulator.reset_held_buttons.assert_called_once_with()
 
     def test_battle_return_replans_before_input_into_defeated_trainer(self):

@@ -16,7 +16,14 @@ from typing import Callable, Iterator
 
 from modules.context import context
 from modules.console import diagnostic_print
-from modules.agent_control import AgentControlLoop, ActionResultType, observe_agent
+from modules.agent_control import (
+    AgentActionExecutor,
+    AgentActionType,
+    AgentControlLoop,
+    ActionResultType,
+    observe_agent,
+    select_action,
+)
 from modules.goals import (
     ActivateTrigger,
     NavigationGoal,
@@ -47,7 +54,7 @@ from modules.overworld import (
     shared_overworld_observation_for_current_frame,
     WorldTransition,
 )
-from modules.interaction_state import InteractionType, classify_interaction, observe_interaction
+from modules.interaction_state import InteractionPhase, InteractionType, classify_interaction, observe_interaction
 from modules.player import player_avatar_is_controllable, player_avatar_is_rom_owned_movement
 from modules.player import get_player
 from modules.start_game import resolve_start_game_initialization
@@ -62,10 +69,16 @@ from .emerald_clock import (
     wall_clock_interaction as _wall_clock_interaction,
 )
 from .emerald_opening_state import OpeningSequenceState
+from .emerald_pokeball_catalog import (
+    PokeballSourceRSE,
+    emerald_pokeball_sources,
+    emerald_pokeball_source_entrances,
+)
 from modules.tasks import (
     get_global_script_context,
     get_task,
     get_tasks,
+    task_is_active,
     is_emerald_field_dialogue_advanceable,
     is_field_message_waiting_for_input,
 )
@@ -85,6 +98,7 @@ from .emerald_confirmation import (
 )
 from .emerald_campaign_registry import emerald_capability_definition
 from .emerald_dialogue import advance_dialogue, dialogue_state_snapshot, observe_dialogue
+from .resource_policy import PokeballRestockPolicy
 
 # Compatibility hooks for existing campaign tests and diagnostics.  These
 # names now resolve to the extracted, phase-free dialogue implementation; they
@@ -1356,6 +1370,22 @@ def _observed_interaction_goal(
             matches = matches or any(
                 isinstance(identity, str) and identity.endswith("_EventScript_WallClock") for identity in identities
             )
+        if interaction_id == "pokemart_clerk":
+            # Standard marts use one stable clerk script per map.  Lilycove's
+            # Department Store has two equivalent clerks on its Poké Ball
+            # floor, so accept those ROM-owned symbols through the same
+            # semantic purchase affordance.
+            matches = matches or any(
+                isinstance(identity, str)
+                and (
+                    identity.endswith("_Mart_EventScript_Clerk")
+                    or (
+                        "DepartmentStore_2F_EventScript_Clerk" in identity
+                        and identity.endswith(("ClerkLeft", "ClerkRight"))
+                    )
+                )
+                for identity in identities
+            )
         if matches and trigger.condition_active is not False and trigger.activation_locations:
             matching_triggers.append(trigger)
     if not matching_triggers:
@@ -1861,6 +1891,10 @@ def _emerald_observation(
             else False if defeated_rival is False and hidden_rival is False else None
         )
         facts += (("intro_rival_battle_complete", rival_complete),)
+    if live_context and objective_id == "receive_pokeballs":
+        birch_lab_state = _safe_event_var("BIRCH_LAB_STATE")
+        pokeballs_ready = None if birch_lab_state is None else birch_lab_state >= 5
+        facts += (("pokeballs_ready", pokeballs_ready),)
     if objective_id == "complete_petalburg_wally":
         facts += (
             ("petalburg_city_state", petalburg_city_state),
@@ -2208,6 +2242,269 @@ def _press_confirmation_button(button: str) -> None:
         press_fresh(button)
     else:
         context.emulator.press_button(button)
+
+
+_DEFAULT_POKEBALL_RESTOCK_POLICY = PokeballRestockPolicy()
+_POKEMART_TASK_NAMES = (
+    "Task_ShopMenu",
+    "Task_GoToBuyOrSellMenu",
+    "Task_BuyMenu",
+    "Task_BuyHowManyDialogueHandleInput",
+    "Task_ReturnToItemListAfterItemPurchase",
+    "Task_ExitBuyMenu",
+    "Task_ReturnToShopMenu",
+    "Task_ReturnToMartMenu",
+)
+
+
+def _pokeball_restock_policy() -> PokeballRestockPolicy:
+    """Read the immutable run policy, with a safe compatibility fallback."""
+
+    runtime = getattr(context, "nuzlocke_runtime", None)
+    configured = getattr(getattr(runtime, "rule_config", None), "pokeball_policy", None)
+    if isinstance(configured, PokeballRestockPolicy):
+        return configured
+
+    # Direct capability users and older embedders may not construct a
+    # NuzlockeRuntime.  Honor the loaded config in that case, while retaining
+    # the policy defaults for lightweight tests and integrations.
+    settings = getattr(getattr(context, "config", None), "nuzlocke_rules", None)
+    try:
+        return PokeballRestockPolicy(
+            getattr(settings, "pokeball_lower_threshold", _DEFAULT_POKEBALL_RESTOCK_POLICY.lower_threshold),
+            getattr(settings, "pokeball_upper_target", _DEFAULT_POKEBALL_RESTOCK_POLICY.upper_target),
+        )
+    except (TypeError, ValueError):
+        return _DEFAULT_POKEBALL_RESTOCK_POLICY
+
+
+def _nearest_pokeball_source(current_map) -> PokeballSourceRSE | None:
+    """Select the cheapest static source from the current map."""
+
+    current_map = current_map.value if isinstance(current_map, MapRSE) else current_map
+    sources = emerald_pokeball_sources()
+    local = tuple(source for source in sources if source.interior_map.value == current_map)
+    if local:
+        return local[0]
+    try:
+        from modules.world_navigation import get_world_map_graph
+
+        graph = get_world_map_graph()
+        costs = dict(graph.map_costs(current_map))
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        costs = {}
+    ranked = sorted(
+        enumerate(sources),
+        key=lambda item: (costs.get(item[1].interior_map.value, float("inf")), item[0]),
+    )
+    return ranked[0][1] if ranked else None
+
+
+def _pokeball_source_target(source: PokeballSourceRSE) -> SemanticTarget:
+    """Build the executable interaction target for one catalog source."""
+
+    return SemanticTarget.interaction(source.interior_map.value, source.interaction_id)
+
+
+def _shop_main_menu_is_active() -> bool:
+    """Return whether Emerald is waiting on the Mart Buy/Sell/Leave menu."""
+
+    try:
+        return task_is_active("Task_ShopMenu")
+    except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+        return False
+
+
+def _shop_task_is_active() -> bool:
+    """Return whether any Emerald Poké Mart task owns the current frame."""
+
+    try:
+        return any(task_is_active(task_name) for task_name in _POKEMART_TASK_NAMES)
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+        return False
+
+
+def _leave_shop_menu() -> Iterator[object]:
+    """Close the Mart menu after purchases and wait for overworld control."""
+
+    press_fresh = getattr(context.emulator, "press_button_fresh", None)
+    for _ in range(120):
+        if not _shop_main_menu_is_active():
+            return
+        if callable(press_fresh):
+            press_fresh("B")
+        else:
+            context.emulator.press_button("B")
+        yield
+    raise RuntimeError("Poké Ball restock could not close the Mart menu")
+
+
+def _finish_shop_exit_dialogue() -> Iterator[object]:
+    """Consume the clerk's post-menu farewell before releasing the capability."""
+
+    executor = AgentActionExecutor()
+    dialogue_input_in_flight: tuple[object, ...] | None = None
+    stable_overworld_observations = 0
+    dialogue_input_issued = False
+
+    def interaction_signature(observation) -> tuple[object, ...]:
+        interaction = observation.interaction
+        return (
+            getattr(interaction, "script_active", False),
+            getattr(interaction, "script_function", None),
+            getattr(interaction, "native_function", None),
+            getattr(interaction, "interaction_phase", None),
+            getattr(interaction, "dialogue_waiting", False),
+        )
+
+    def is_stable_overworld(observation) -> bool:
+        interaction = observation.interaction
+        return (
+            observation.interaction_type is InteractionType.OVERWORLD
+            and getattr(interaction, "controllable", False)
+            and not getattr(interaction, "script_active", False)
+            and not getattr(interaction, "dialogue_waiting", False)
+            and getattr(interaction, "interaction_phase", None) in (None, InteractionPhase.NONE)
+        )
+
+    for _ in range(120):
+        observation = observe_agent()
+        input_signature = interaction_signature(observation)
+        if dialogue_input_in_flight is not None:
+            # ``press_button_fresh`` may need a neutral emulator frame before
+            # it can deliver the pulse. Repeatedly selecting A while the ROM
+            # still reports the same message schedules a second pulse, which
+            # can be consumed as a fresh clerk interaction after the script
+            # returns control to the player.
+            if input_signature == dialogue_input_in_flight:
+                yield
+                continue
+            dialogue_input_in_flight = None
+            stable_overworld_observations = 0
+
+        if is_stable_overworld(observation):
+            if not dialogue_input_issued:
+                return
+            stable_overworld_observations += 1
+            if stable_overworld_observations >= 2:
+                return
+            # Keep the capability mounted for one additional clean frame so a
+            # queued input cannot become a new clerk interaction immediately
+            # after the final farewell is dismissed.
+            yield
+            continue
+        stable_overworld_observations = 0
+        decision = select_action(observation)
+        executor.execute(decision.action, observation)
+        action_type = getattr(decision.action, "action_type", None)
+        is_advance_dialogue = (
+            action_type is AgentActionType.ADVANCE_DIALOGUE
+            or getattr(action_type, "name", action_type) == "ADVANCE_DIALOGUE"
+        )
+        if is_advance_dialogue:
+            dialogue_input_in_flight = input_signature
+            dialogue_input_issued = True
+        yield
+    raise RuntimeError("Poké Ball restock could not finish the Mart exit dialogue")
+
+
+def execute_pokeball_restock() -> Iterator[object]:
+    """Navigate to a reachable Emerald shop and restore the capture reserve."""
+
+    from modules.items import get_item_bag, get_item_by_name
+    from modules.mart import get_mart_buyable_items
+    from modules.player import get_player
+
+    execution_cache: dict = {}
+    navigation = None
+    source = None
+    policy = _pokeball_restock_policy()
+    while True:
+        # The clerk interaction hands control to the ROM's shop task. Check
+        # this before rebuilding the broader Emerald observation so the
+        # generic overworld navigator cannot press into an open menu.
+        if _shop_main_menu_is_active():
+            ball = get_item_by_name("Poké Ball")
+            current = get_item_bag().quantity_of(ball)
+            required = policy.quantity_to_buy(current)
+            if required <= 0:
+                yield from _leave_shop_menu()
+                yield from _finish_shop_exit_dialogue()
+                return
+
+            buyable_items = get_mart_buyable_items()
+            if ball not in buyable_items:
+                raise RuntimeError("The current Poké Mart does not sell Poké Balls")
+            price = ball.price
+            money = getattr(get_player(), "money", 0)
+            affordable = policy.affordable_quantity(current, money, price)
+            if affordable <= 0:
+                context.message = "Cannot restock Poké Balls: insufficient money."
+                yield from _leave_shop_menu()
+                yield from _finish_shop_exit_dialogue()
+                return
+
+            from modules.modes.util.higher_level_actions import buy_in_shop
+
+            context.message = f"Restocking Poké Balls ({affordable})"
+            yield from buy_in_shop([(ball, affordable)])
+            yield from _leave_shop_menu()
+            yield from _finish_shop_exit_dialogue()
+            return
+
+        # The clerk installs a short-lived transition task before the main
+        # Buy/Sell/Leave task appears.  Keep the navigation capability paused
+        # across that handoff; invoking the overworld observer here can either
+        # report an UNKNOWN state indefinitely or send a route input into the
+        # newly opened shop UI.  The exact main-menu check above remains the
+        # only branch that starts purchasing.
+        if _shop_task_is_active():
+            yield
+            continue
+
+        # Once the clerk interaction has mounted tactical navigation, let it
+        # advance before rebuilding the higher-level Emerald observation.  A
+        # currently actionable field message intentionally suppresses
+        # ``observation.overworld``; yielding on that suppression would strand
+        # the already-mounted navigator before it can send the dialogue A.
+        if navigation is not None:
+            try:
+                next(navigation)
+            except StopIteration:
+                # Re-observe after a completed or invalidated local route so
+                # the target can be reacquired from the current affordances.
+                navigation = None
+            yield
+            continue
+
+        observation = _emerald_observation(False, "restock_pokeballs")
+        if observation.overworld is None:
+            yield
+            continue
+        if source is None:
+            source = _nearest_pokeball_source(observation.overworld.map_id)
+            if source is None:
+                raise RuntimeError("No Emerald Poké Ball purchase source is registered")
+            semantic_target = _pokeball_source_target(source)
+            execution_cache["pokeball_source"] = source.source_id
+            execution_cache["pokeball_source_entrances"] = emerald_pokeball_source_entrances(source)
+        else:
+            semantic_target = _pokeball_source_target(source)
+        if navigation is None:
+            navigation = observation_driven_overworld_progression(
+                semantic_target=semantic_target,
+                execution_cache=execution_cache,
+                objective_id="restock_pokeballs",
+                initial_observation=observation.overworld,
+            )
+        try:
+            next(navigation)
+        except StopIteration:
+            # The semantic affordance may be absent for a transient frame;
+            # reacquire it from the next observation instead of stranding the
+            # capability or falling back to an unrelated exit.
+            navigation = None
+        yield
 
 
 def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iterator[object]:
@@ -2798,7 +3095,11 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
                         (
                             dict(observation.campaign_facts).get("intro_rival_battle_complete")
                             if objective_id == "complete_intro_rival"
-                            else None
+                            else (
+                                dict(observation.campaign_facts).get("pokeballs_ready")
+                                if objective_id == "receive_pokeballs"
+                                else None
+                            )
                         ),
                         observation.overworld,
                     )
@@ -2827,6 +3128,10 @@ def emerald_campaign_capability(objective_id: str) -> Iterator[object]:
     Every objective intentionally shares a re-observing loop: a new generator
     can begin at any currently observable title/menu/dialogue/overworld state.
     """
+
+    if objective_id == "restock_pokeballs":
+        yield from execute_pokeball_restock()
+        return
 
     # Campaign objectives are executed by a current-observation loop. The
     # legacy opening state machine remains available for its direct callers,

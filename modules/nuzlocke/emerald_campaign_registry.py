@@ -9,7 +9,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from modules.goals import EncounterMode, Goal, GoalConstraints, NavigationGoal, SemanticTarget, TrainerMode
+from modules.goals import (
+    EARLY_POKEBALL_TRIGGER_ID,
+    EncounterMode,
+    Goal,
+    GoalConstraints,
+    NavigationGoal,
+    SemanticTarget,
+    TrainerMode,
+)
 from modules.map_data import MapRSE
 
 from .campaign_state import CampaignFacts, CampaignState, Fact, FactStatus
@@ -119,6 +127,22 @@ EMERALD_CAPABILITY_DEFINITIONS: tuple[EmeraldCapabilityDefinition, ...] = (
     EmeraldCapabilityDefinition(
         "receive_pokedex",
         semantic_target=SemanticTarget.map(MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value),
+    ),
+    EmeraldCapabilityDefinition(
+        "receive_pokeballs",
+        # The Pokédex script immediately hands off to the ROM-owned Poké Ball
+        # dialogue. Keep this capability mounted across that script boundary
+        # so readiness can defer without dropping the executor that advances
+        # the dialogue.
+        semantic_target=SemanticTarget.interaction(
+            MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value,
+            interaction_id=EARLY_POKEBALL_TRIGGER_ID,
+        ),
+    ),
+    EmeraldCapabilityDefinition(
+        "restock_pokeballs",
+        # The executor selects the nearest cataloged source from the current
+        # map, so this capability intentionally has no fixed target.
     ),
     EmeraldCapabilityDefinition(
         "reach_petalburg",

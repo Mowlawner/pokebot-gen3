@@ -26,6 +26,7 @@ from modules.goals import (
 )
 from modules.map_path import Direction
 from modules.map_data import MapRSE
+from modules.interaction_state import InteractionPhase, InteractionType
 from modules.overworld import (
     MapConnectionObservation,
     OverworldObservation,
@@ -323,6 +324,182 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             progression = capabilities.observation_driven_overworld_progression(semantic_target=target)
             with self.assertRaises(StopIteration):
                 next(progression)
+
+    def test_pokeball_restock_buys_to_the_upper_target(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        ball = SimpleNamespace(name="Poké Ball", price=200)
+        bag = SimpleNamespace(quantity_of=Mock(return_value=1))
+        player = SimpleNamespace(money=2000)
+        buy = Mock(return_value=iter((None,)))
+        with (
+            patch.object(capabilities, "task_is_active", side_effect=(True, False)),
+            patch("modules.items.get_item_by_name", return_value=ball),
+            patch("modules.items.get_item_bag", return_value=bag),
+            patch("modules.player.get_player", return_value=player),
+            patch("modules.mart.get_mart_buyable_items", return_value=[ball]),
+            patch("modules.modes.util.higher_level_actions.buy_in_shop", buy),
+            patch.object(capabilities, "_finish_shop_exit_dialogue", return_value=iter(())),
+        ):
+            restock = capabilities.execute_pokeball_restock()
+            next(restock)
+            with self.assertRaises(StopIteration):
+                next(restock)
+
+        buy.assert_called_once_with([(ball, 9)])
+
+    def test_pokeball_restock_recognizes_shop_transition_tasks(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        with patch.object(
+            capabilities,
+            "task_is_active",
+            side_effect=lambda task_name: task_name == "Task_GoToBuyOrSellMenu",
+        ):
+            self.assertTrue(capabilities._shop_task_is_active())
+
+    def test_pokeball_restock_waits_for_shop_transition_before_observing_overworld(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        with (
+            patch.object(capabilities, "_shop_main_menu_is_active", return_value=False),
+            patch.object(capabilities, "_shop_task_is_active", return_value=True),
+            patch.object(capabilities, "_emerald_observation") as observe,
+        ):
+            restock = capabilities.execute_pokeball_restock()
+            next(restock)
+
+        observe.assert_not_called()
+
+    def test_shop_exit_dialogue_is_finished_before_restock_returns(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        ball = SimpleNamespace(name="Poké Ball", price=200)
+        player = SimpleNamespace(money=2000)
+        finish_dialogue = Mock(return_value=iter(()))
+        with (
+            patch.object(capabilities, "task_is_active", side_effect=(True, False)),
+            patch("modules.items.get_item_by_name", return_value=ball),
+            patch("modules.items.get_item_bag", return_value=SimpleNamespace(quantity_of=Mock(return_value=1))),
+            patch("modules.player.get_player", return_value=player),
+            patch("modules.mart.get_mart_buyable_items", return_value=[ball]),
+            patch("modules.modes.util.higher_level_actions.buy_in_shop", return_value=iter((None,))),
+            patch.object(capabilities, "_finish_shop_exit_dialogue", finish_dialogue),
+        ):
+            restock = capabilities.execute_pokeball_restock()
+            next(restock)
+            with self.assertRaises(StopIteration):
+                next(restock)
+
+        finish_dialogue.assert_called_once_with()
+
+    def test_shop_exit_dialogue_uses_shared_dialogue_executor(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        dialogue = SimpleNamespace(
+            interaction_type=InteractionType.DIALOGUE,
+            interaction=SimpleNamespace(script_active=True, controllable=False),
+        )
+        overworld = SimpleNamespace(
+            interaction_type=InteractionType.OVERWORLD,
+            interaction=SimpleNamespace(script_active=False, controllable=True),
+        )
+        overworld_after_settle = SimpleNamespace(
+            interaction_type=InteractionType.OVERWORLD,
+            interaction=SimpleNamespace(script_active=False, controllable=True),
+        )
+        decision = SimpleNamespace(action=SimpleNamespace(action_type="ADVANCE_DIALOGUE"))
+        executor = Mock()
+        with (
+            patch.object(
+                capabilities,
+                "observe_agent",
+                side_effect=(dialogue, overworld, overworld_after_settle),
+            ) as observe,
+            patch.object(capabilities, "select_action", return_value=decision) as select,
+            patch.object(capabilities, "AgentActionExecutor", return_value=executor),
+        ):
+            list(capabilities._finish_shop_exit_dialogue())
+
+        select.assert_called_once_with(dialogue)
+        executor.execute.assert_called_once_with(decision.action, dialogue)
+        self.assertEqual(observe.call_count, 3)
+
+    def test_shop_exit_dialogue_does_not_repeat_a_for_unchanged_message(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        dialogue = SimpleNamespace(
+            interaction_type=InteractionType.DIALOGUE,
+            interaction=SimpleNamespace(
+                script_active=True,
+                script_function="Std_MsgboxDefault",
+                native_function="WaitForAorBPress",
+                interaction_phase=InteractionPhase.FIELD_MESSAGE_INPUT_WAIT,
+                dialogue_waiting=True,
+                controllable=False,
+            ),
+        )
+        overworld = SimpleNamespace(
+            interaction_type=InteractionType.OVERWORLD,
+            interaction=SimpleNamespace(
+                script_active=False,
+                interaction_phase=InteractionPhase.NONE,
+                dialogue_waiting=False,
+                controllable=True,
+            ),
+        )
+        decision = SimpleNamespace(action=SimpleNamespace(action_type="ADVANCE_DIALOGUE"))
+        executor = Mock()
+        with (
+            patch.object(
+                capabilities,
+                "observe_agent",
+                side_effect=(dialogue, dialogue, dialogue, overworld, overworld),
+            ) as observe,
+            patch.object(capabilities, "select_action", return_value=decision) as select,
+            patch.object(capabilities, "AgentActionExecutor", return_value=executor),
+        ):
+            list(capabilities._finish_shop_exit_dialogue())
+
+        select.assert_called_once_with(dialogue)
+        executor.execute.assert_called_once_with(decision.action, dialogue)
+        self.assertEqual(observe.call_count, 5)
+
+    def test_pokeball_restock_advances_existing_navigation_during_dialogue(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        class CountingNavigation:
+            def __init__(self):
+                self.steps = 0
+
+            def __next__(self):
+                self.steps += 1
+                return None
+
+        navigation = CountingNavigation()
+        source = SimpleNamespace(source_id="petalburg_mart", interior_map=MapRSE.PETALBURG_CITY)
+        overworld = SimpleNamespace(map_id=MapRSE.PETALBURG_CITY.value)
+        first_observation = SimpleNamespace(overworld=overworld)
+        actionable_dialogue_observation = SimpleNamespace(overworld=None)
+
+        with (
+            patch.object(capabilities, "_shop_main_menu_is_active", return_value=False),
+            patch.object(
+                capabilities,
+                "_emerald_observation",
+                side_effect=(first_observation, actionable_dialogue_observation),
+            ) as observe,
+            patch.object(capabilities, "_nearest_pokeball_source", return_value=source),
+            patch.object(capabilities, "_pokeball_source_target", return_value=SemanticTarget.map((1, 0))),
+            patch.object(capabilities, "emerald_pokeball_source_entrances", return_value=()),
+            patch.object(capabilities, "observation_driven_overworld_progression", return_value=navigation),
+        ):
+            restock = capabilities.execute_pokeball_restock()
+            next(restock)
+            next(restock)
+
+        self.assertEqual(navigation.steps, 2)
+        observe.assert_called_once_with(False, "restock_pokeballs")
 
     def test_post_gender_name_prompt_is_a_single_transition_input(self):
         action = choose_emerald_campaign_action(
@@ -1492,6 +1669,35 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             )
         )
 
+    def test_pokemart_clerk_alias_resolves_concrete_emerald_clerk_script(self):
+        map_id = MapRSE.OLDALE_TOWN_MART.value
+        trigger = TriggerObservation(
+            "object:clerk",
+            frozenset({(map_id, (4, 3))}),
+            frozenset({(map_id, (4, 4))}),
+            kind="object_interaction",
+            script_symbol="OldaleTown_Mart_EventScript_Clerk",
+            affordance_id="OldaleTown_Mart_EventScript_Clerk",
+        )
+        world = OverworldObservation(
+            map_id,
+            (4, 4),
+            Direction.North,
+            True,
+            (TileObservation((map_id, (4, 4)), False, frozenset(Direction)),),
+            (),
+            (),
+            (trigger,),
+        )
+
+        self.assertEqual(
+            _observed_interaction_goal(
+                world,
+                SemanticTarget.interaction(map_id, "pokemart_clerk"),
+            ),
+            ActivateTrigger("object:clerk"),
+        )
+
     def test_current_map_semantic_interaction_uses_static_affordance_during_spawn_gap(self):
         map_id = MapRSE.ROUTE103.value
         trigger = TriggerObservation(
@@ -1561,6 +1767,34 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             _observed_interaction_goal(
                 static_only,
                 SemanticTarget.interaction(map_id, "Route103_EventScript_Rival"),
+                completion_observed=True,
+            )
+        )
+
+    def test_pokeball_interaction_does_not_reopen_after_receipt(self):
+        map_id = MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value
+        trigger = TriggerObservation(
+            "early_pokeballs",
+            frozenset({(map_id, (6, 4))}),
+            frozenset({(map_id, (6, 5))}),
+            kind="semantic_object",
+            affordance_id="LittlerootTown_ProfessorBirchsLab_EventScript_Birch",
+        )
+        world = OverworldObservation(
+            map_id,
+            (6, 5),
+            Direction.North,
+            True,
+            (TileObservation((map_id, (6, 5)), False, frozenset(Direction)),),
+            (),
+            (),
+            (trigger,),
+        )
+
+        self.assertIsNone(
+            _observed_interaction_goal(
+                world,
+                SemanticTarget.interaction(map_id, "early_pokeballs"),
                 completion_observed=True,
             )
         )

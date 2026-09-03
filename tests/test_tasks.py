@@ -7,6 +7,19 @@ from modules.memory import GameState
 
 
 class TestIsWaitingForInput(unittest.TestCase):
+    def test_task_lookup_treats_transient_symbol_gap_as_missing(self):
+        from modules.tasks import get_task, task_is_active
+
+        with patch("modules.tasks.get_tasks", side_effect=KeyError("Task_DrawFieldMessage")):
+            self.assertIsNone(get_task("Task_DrawFieldMessage"))
+            self.assertFalse(task_is_active("Task_DrawFieldMessage"))
+
+    def test_field_message_task_readiness_treats_transient_symbol_gap_as_not_ready(self):
+        from modules.tasks import is_field_message_task_waiting_for_input
+
+        with patch("modules.tasks.task_is_active", side_effect=KeyError("Task_DrawFieldMessage")):
+            self.assertFalse(is_field_message_task_waiting_for_input())
+
     def test_emerald_dialogue_predicate_accepts_native_message_handoff(self):
         from modules.tasks import is_emerald_field_dialogue_advanceable
 

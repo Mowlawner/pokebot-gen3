@@ -93,6 +93,11 @@ def _canonical_campaign_objective_ranks() -> dict[str, int]:
 def _retention_order_allows(active_id: str, selected_id: str) -> bool:
     """Return whether a newly selected objective may replace the active one."""
 
+    # A resource shortfall is a genuine interruption, not a transient story
+    # regression. Do not retain an already-mounted route objective over the
+    # dynamically-created restock task.
+    if selected_id == "restock_pokeballs":
+        return False
     ranks = _canonical_campaign_objective_ranks()
     active_rank = ranks.get(active_id)
     selected_rank = ranks.get(selected_id)
@@ -125,6 +130,11 @@ _TRANSIENT_READINESS_REASONS = frozenset(
         ReadinessReason.RECOVERY_CAPABILITY_UNKNOWN,
     }
 )
+
+# Recovery reads several ROM-owned structures immediately after a battle or
+# map transition.  A partially replaced table can raise KeyError for a frame,
+# but blindly retrying forever would recreate the original stuck safety loop.
+_RECOVERY_KEYERROR_RETRY_LIMIT = 3
 
 
 def _readiness_requires_recheck(readiness: ProgressionReadinessDiagnostic) -> bool:
@@ -221,6 +231,7 @@ class CampaignController:
         self._readiness_policy = readiness_policy or CampaignReadinessPolicy()
         self._execution_phase = "CAMPAIGN"
         self._recovery_status: str | None = None
+        self._recovery_keyerror_retries = 0
         self.interrupted_objective_id: str | None = None
         # A readiness check can land on the same frame as battle/script
         # teardown.  Keep the recheck obligation separate from the scheduler
@@ -228,6 +239,7 @@ class CampaignController:
         # boundary.
         self._readiness_recheck_pending = False
         self._pending_readiness_objective_id: str | None = None
+        self._deferred_handoff_requires_refresh = False
         # Campaign selection and adaptation are boundary work.  Keep the
         # mounted tactical generator on the hot path and only rebuild the
         # campaign envelope when an event invalidates it.
@@ -629,6 +641,22 @@ class CampaignController:
                         and (prerequisites_safe or not spatial_observation_coherent)
                         and failure_safe
                     )
+                    or (
+                        # Emerald can publish an objective's completion fact
+                        # while its capability is still consuming the final
+                        # script/dialogue sequence. Keep that capability's
+                        # ownership until its generator returns; otherwise a
+                        # downstream objective can be selected and readiness
+                        # can defer before the old loop is replaced, leaving
+                        # the controller with mismatched selected/mounted
+                        # objectives. Explicit restocking remains an
+                        # interrupt and may pre-empt a completed capability.
+                        active_completion.status is FactStatus.KNOWN
+                        and active_completion.value is True
+                        and self.last_execution is not None
+                        and self.last_execution.capability is not None
+                        and selection.objective.objective_id != "restock_pokeballs"
+                    )
                 )
             ):
                 diagnostic_print(
@@ -959,7 +987,37 @@ class CampaignController:
                     "Waiting / readiness temporarily unavailable",
                 )
                 targetless_capability_boundary = execution.capability is not None and execution.tactical_goal is None
+                self._deferred_handoff_requires_refresh = False
                 if not targetless_capability_boundary:
+                    # The planner may advance to a new tactical objective at
+                    # the same frame that the ROM still hides the overworld
+                    # behind a script transition.  Do not leave the prior
+                    # generator executable in that state: ``step()`` would
+                    # otherwise advance the old capability while
+                    # ``last_selection`` and the GUI already describe the
+                    # new one.  This is especially visible at Birch's lab,
+                    # where the Pokédex capability can still be mounted while
+                    # the Poké Ball objective becomes authoritative.
+                    stale_loop = self._tactical_loop is not None and (
+                        self.current_objective_id != objective_id or self._tactical_loop_objective_id != objective_id
+                    )
+                    if stale_loop:
+                        self._deferred_handoff_requires_refresh = True
+                        old_loop_id = id(self._tactical_loop)
+                        old_loop_objective = self._tactical_loop_objective_id
+                        self._tactical_loop = None
+                        self._tactical_loop_objective_id = None
+                        self.current_objective_id = objective_id
+                        self.current_tactical_goal = execution.tactical_goal
+                        diagnostic_print(
+                            lambda: (
+                                "CAMPAIGN_TACTICAL_LOOP_INVALIDATED: "
+                                f"controller_id={id(self)!r} frame={getattr(context, 'frame', None)!r} "
+                                f"loop_id={old_loop_id!r} old_objective={old_loop_objective!r} "
+                                f"new_objective={objective_id!r} reason='readiness_deferred_handoff'"
+                            ),
+                            trace=True,
+                        )
                     self.status = CampaignControllerStatus.READY
                     self._execution_phase = "CAMPAIGN"
                     self.transition_reason = f"readiness deferred: {evaluated.readiness_reason.value}"
@@ -1076,6 +1134,7 @@ class CampaignController:
                     return self.state
                 self._execution_phase = "RECOVERY"
                 self._recovery_status = "ACTIVE"
+                self._recovery_keyerror_retries = 0
                 self.current_objective_id = objective_id
                 self.current_tactical_goal = execution.tactical_goal
                 self._tactical_loop_objective_id = objective_id
@@ -1118,6 +1177,7 @@ class CampaignController:
                 else self._tactical_loop_factory(execution.tactical_goal)
             )
             self._tactical_loop_objective_id = objective_id
+            self._deferred_handoff_requires_refresh = False
             diagnostic_print(
                 lambda: (
                     "CAMPAIGN_TACTICAL_LOOP_BOUNDARY: "
@@ -1140,6 +1200,86 @@ class CampaignController:
             self.transition_reason = f"selected {objective_id}"
         self.status = CampaignControllerStatus.READY
         return self.state
+
+    def _retry_recovery_after_keyerror(self, error: KeyError) -> bool:
+        """Remount the planner-owned recovery stop after a transient read.
+
+        Recovery generators are deliberately discarded after an exception:
+        resuming one could replay an input after the ROM has moved to a new
+        interaction state.  The immutable CampaignPlan supplies the exact
+        destination again, so this retry does not reopen recovery selection or
+        choose a different healing source.
+        """
+        if (
+            self._recovery_keyerror_retries >= _RECOVERY_KEYERROR_RETRY_LIMIT
+            or self._campaign_plan is None
+            or self._campaign_plan.recovery_stop is None
+            or self._recovery_factory is None
+        ):
+            return False
+
+        failed_loop = self._tactical_loop
+        failed_loop_id = id(failed_loop) if failed_loop is not None else None
+        stop = self._campaign_plan.recovery_stop
+        self._recovery_keyerror_retries += 1
+        if failed_loop is not None:
+            close = getattr(failed_loop, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as close_error:
+                    diagnostic_print(
+                        lambda: (
+                            "CAMPAIGN_RECOVERY_RETRY_CLOSE_FAILURE: "
+                            f"controller_id={id(self)!r} loop_id={failed_loop_id!r} "
+                            f"exception_type={type(close_error).__name__!r} exception={close_error!r}"
+                        ),
+                        trace=True,
+                        prefix="CAMPAIGN_RECOVERY_RETRY_CLOSE_FAILURE",
+                    )
+        try:
+            self._tactical_loop = self._recovery_factory(stop)
+        except Exception as remount_error:
+            self._tactical_loop = None
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_RECOVERY_RETRY_MOUNT_FAILURE: "
+                    f"controller_id={id(self)!r} attempt={self._recovery_keyerror_retries!r} "
+                    f"exception_type={type(remount_error).__name__!r} exception={remount_error!r} "
+                    f"traceback={traceback.format_exc()!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_RECOVERY_RETRY_MOUNT_FAILURE",
+            )
+            return False
+
+        self._execution_phase = "RECOVERY"
+        self._recovery_status = "ACTIVE"
+        self.status = CampaignControllerStatus.READY
+        self._tactical_loop_objective_id = self.current_objective_id
+        retry_intent = (
+            "Recovery retrying after transient KeyError "
+            f"({self._recovery_keyerror_retries}/{_RECOVERY_KEYERROR_RETRY_LIMIT})"
+        )
+        context.campaign_status = recovery_status(None, retry_intent)
+        self.transition_reason = (
+            "recovery observation raised transient KeyError; "
+            f"remounted attempt {self._recovery_keyerror_retries}/{_RECOVERY_KEYERROR_RETRY_LIMIT}"
+        )
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_RECOVERY_RETRY: "
+                f"frame={getattr(context, 'frame', None)!r} "
+                f"controller_id={id(self)!r} failed_loop_id={failed_loop_id!r} "
+                f"new_loop_id={id(self._tactical_loop)!r} "
+                f"attempt={self._recovery_keyerror_retries!r} "
+                f"limit={_RECOVERY_KEYERROR_RETRY_LIMIT!r} "
+                f"key={error.args!r} traceback={traceback.format_exc()!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_RECOVERY_RETRY",
+        )
+        return True
 
     def step(self) -> CampaignControllerState:
         """Advance one mounted capability and return its current status."""
@@ -1187,6 +1327,7 @@ class CampaignController:
                 self._refresh_required_reason = "recovery_completed"
                 self._execution_phase = "CAMPAIGN"
                 self._recovery_status = "COMPLETED"
+                self._recovery_keyerror_retries = 0
                 if self._campaign_plan is not None:
                     self._campaign_plan = self._campaign_plan.complete_active_stop()
                 scheduler = getattr(self._readiness_provider, "__self__", None)
@@ -1212,9 +1353,12 @@ class CampaignController:
                         f"exception_repr={error!r} phase={self._execution_phase!r} "
                         f"status={self.status.value!r} recovery_status={self._recovery_status!r} "
                         f"objective={self.current_objective_id!r} transition_reason={self.transition_reason!r}"
+                        f" traceback={traceback.format_exc()!r}"
                     ),
                     trace=True,
                 )
+                if isinstance(error, KeyError) and self._retry_recovery_after_keyerror(error):
+                    return self.state
                 self._tactical_loop = None
                 self._execution_phase = "BLOCKED"
                 self._recovery_status = "FAILED"
@@ -1244,8 +1388,21 @@ class CampaignController:
                     CampaignControllerStatus.COMPLETE,
                     CampaignControllerStatus.FAILED,
                 }:
-                    self._refresh_required = False
-                    self._refresh_required_reason = None
+                    # A readiness-deferred handoff can intentionally leave no
+                    # loop mounted after invalidating the previous objective.
+                    # Keep refreshing until the new objective can be mounted;
+                    # otherwise the controller would settle with a READY
+                    # state and no executable loop after one transient ROM
+                    # transition.
+                    deferred_handoff_without_loop = (
+                        current.status is CampaignControllerStatus.READY
+                        and self._tactical_loop is None
+                        and self.transition_reason.startswith("readiness deferred:")
+                        and self._deferred_handoff_requires_refresh
+                    )
+                    if not deferred_handoff_without_loop:
+                        self._refresh_required = False
+                        self._refresh_required_reason = None
                 diagnostic_print(
                     lambda: (
                         "CAMPAIGN_REFRESH_BOUNDARY: "
@@ -1329,6 +1486,29 @@ class CampaignController:
                 CampaignControllerStatus.FAILED,
             )
         except Exception as error:
+            if self._execution_phase == "RECOVERY":
+                if isinstance(error, KeyError) and self._retry_recovery_after_keyerror(error):
+                    return self.state
+                self._tactical_loop = None
+                self._execution_phase = "BLOCKED"
+                self._recovery_status = "FAILED"
+                self.status = CampaignControllerStatus.BLOCKED
+                context.campaign_status = CampaignStatus(
+                    None,
+                    None,
+                    f"Recovery failed: {type(error).__name__}",
+                )
+                self.transition_reason = f"recovery failed: {error}"
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_RECOVERY_EXCEPTION: "
+                        f"frame={getattr(context, 'frame', None)!r} "
+                        f"exception_type={type(error).__name__!r} exception={error!r} "
+                        f"traceback={traceback.format_exc()!r} phase={self._execution_phase!r}"
+                    ),
+                    trace=True,
+                )
+                return self.state
             # A failed generator cannot be resumed safely. Clear it and leave
             # the controller recoverable so a later Campaign-mode entry can
             # select the current objective and rebuild fresh execution state.
@@ -1392,6 +1572,7 @@ def runtime_campaign_state() -> CampaignState:
         observed_projection=runtime.observed_projection if history_ready and runtime is not None else None,
         rules_projection=runtime.rules_projection if history_ready and runtime is not None else None,
         canonical_area=canonical_area,
+        pokeball_policy=(runtime.rule_config.pokeball_policy if runtime is not None else None),
     )
 
 
