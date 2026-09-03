@@ -45,6 +45,54 @@ class ResourceObservationStatus(Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class PokeballRestockPolicy:
+    """Hysteresis policy for the autonomous Poké Ball reserve.
+
+    The lower threshold controls whether a shopping detour is warranted;
+    the upper target controls how many balls the detour should buy.  Keeping
+    these values separate prevents the campaign from repeatedly returning to
+    a shop after every small expenditure.
+    """
+
+    lower_threshold: int = 5
+    upper_target: int = 10
+
+    def __post_init__(self) -> None:
+        """Reject a threshold pair that cannot express hysteresis."""
+
+        if isinstance(self.lower_threshold, bool) or not isinstance(self.lower_threshold, int):
+            raise ValueError("Poké Ball lower threshold must be an integer")
+        if isinstance(self.upper_target, bool) or not isinstance(self.upper_target, int):
+            raise ValueError("Poké Ball upper target must be an integer")
+        if self.lower_threshold < 0:
+            raise ValueError("Poké Ball lower threshold must be non-negative")
+        if self.upper_target <= self.lower_threshold:
+            raise ValueError("Poké Ball upper target must be greater than the lower threshold")
+
+    def needs_restock(self, count: int) -> bool:
+        """Return whether ``count`` is strictly below the lower threshold."""
+
+        return count < self.lower_threshold
+
+    def quantity_to_buy(self, count: int) -> int:
+        """Return the number needed to reach the upper target."""
+
+        return max(0, self.upper_target - count)
+
+    def affordable_quantity(self, count: int, money: int, unit_price: int) -> int:
+        """Cap the desired purchase at what the observed wallet can afford."""
+
+        if money < 0:
+            raise ValueError("money must be non-negative")
+        if unit_price < 0:
+            raise ValueError("Poké Ball price must be non-negative")
+        desired = self.quantity_to_buy(count)
+        if unit_price == 0:
+            return desired
+        return min(desired, money // unit_price)
+
+
+@dataclass(frozen=True, slots=True)
 class PartyResource:
     """Observed health and status information for one party member."""
 

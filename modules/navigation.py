@@ -1083,11 +1083,22 @@ def plan_with_world_navigation(
         global_goal = replace(navigation_goal, target=normalized_target)
         if normalized_target.location is not None:
             global_goal = replace(navigation_goal, target=ReachLocation(normalized_target.location))
+    # Cross-map semantic searches are the expensive case.  The heuristic is
+    # conservative for this search: encounter exposure remains the primary
+    # zero lower bound, while movement cost is bounded by the distance to an
+    # executable transition plus map-hop count.  Keep an explicitly supplied
+    # algorithm authoritative for benchmark and diagnostic callers, but use
+    # the admissible A* path for the normal production default.
+    search_algorithm = (
+        "astar"
+        if algorithm == "dijkstra" and isinstance(global_goal.target, (SemanticTarget, ReachWarp))
+        else algorithm
+    )
     try:
         plan = GoalAwareNavigator(global_world).plan(
             start,
             global_goal,
-            algorithm=algorithm,
+            algorithm=search_algorithm,
             # Semantic campaign routes expose the crossing input as the action
             # from the executable approach state.  Preserve the legacy boundary
             # source representation for exact ReachLocation callers.
@@ -1805,6 +1816,12 @@ def navigation_diagnostics(world: NavigationWorld, start: Location, goal: Goal) 
 class GoalAwareNavigator:
     def __init__(self, world: NavigationWorld):
         self.world = world
+        # Cross-map semantic goals used to have a zero heuristic because a
+        # warp can invalidate a local Manhattan estimate.  That is safe but
+        # makes Dijkstra explore every equally encounter-free branch before
+        # it reaches the requested map.  Cache the map-hop lower bounds used
+        # by the conservative cross-map heuristic below.
+        self._map_hops_to_target: dict[MapId, tuple[tuple[MapId, int], ...]] = {}
 
     @profiled("navigation_pathfinding", "pathfinding_calls")
     @traced("individual_pathfinding")
@@ -2188,6 +2205,102 @@ class GoalAwareNavigator:
             )
         return results
 
+    def _map_hop_distances_to(self, target_map: MapId) -> dict[MapId, int]:
+        """Return a reverse map-hop lower bound for a semantic target.
+
+        Every executable transition costs at least one route-cost unit and
+        ordinary movement/turns add non-negative cost.  Counting transitions
+        therefore remains a lower bound even when a transition teleports
+        across the map graph.  The table is built from the already-materialized
+        transition overlay and never loads additional ROM map data.
+        """
+
+        cached = self._map_hops_to_target.get(target_map)
+        if cached is not None:
+            return dict(cached)
+
+        incoming: dict[MapId, set[MapId]] = {}
+        for transition in self.world.transitions or self.world.warps:
+            destination = getattr(transition, "destination", None)
+            entry = getattr(transition, "entry", None)
+            if destination is None or entry is None:
+                continue
+            incoming.setdefault(destination[0], set()).add(entry[0])
+
+        distances = {target_map: 0}
+        queue = [target_map]
+        for current in queue:
+            for previous in incoming.get(current, ()):
+                if previous in distances:
+                    continue
+                distances[previous] = distances[current] + 1
+                queue.append(previous)
+        self._map_hops_to_target[target_map] = tuple(distances.items())
+        return distances
+
+    @staticmethod
+    def _transition_source_locations(transition: WorldTransition) -> tuple[tuple[int, int], ...]:
+        """Return all local source coordinates an observed transition accepts."""
+
+        sources = getattr(transition, "activation_locations", ())
+        if sources:
+            return tuple(source[1] for source in sources)
+        if transition.kind == "map_connection":
+            approach = transition_approach_position(transition)
+            if approach is not None:
+                return (approach[1],)
+        return (transition.entry[1],)
+
+    def _cross_map_heuristic(
+        self,
+        location: Location,
+        target_map: MapId,
+        target: Goal,
+    ) -> int:
+        """Return a conservative movement-cost bound to a cross-map goal.
+
+        The bound is the Manhattan distance to an executable transition plus
+        one for that transition and the minimum number of remaining map
+        transitions.  Manhattan is only used within the current map, so a
+        warp cannot make it overestimate the cost.  If the transition overlay
+        is incomplete, return zero rather than guessing.
+        """
+
+        if location[0] == target_map:
+            return 0
+        map_hops = self._map_hop_distances_to(target_map)
+        if not map_hops:
+            return 0
+
+        allowed_transitions = self.world.transitions or self.world.warps
+        if isinstance(target, ReachWarp):
+            if target.warps:
+                allowed_transitions = tuple(
+                    transition
+                    for transition in allowed_transitions
+                    if any(transitions_match(transition, allowed) for allowed in target.warps)
+                )
+            elif target.warp is not None:
+                allowed_transitions = tuple(
+                    transition for transition in allowed_transitions if transitions_match(transition, target.warp)
+                )
+
+        best: int | None = None
+        for transition in allowed_transitions:
+            destination = getattr(transition, "destination", None)
+            entry = getattr(transition, "entry", None)
+            if destination is None or entry is None or entry[0] != location[0]:
+                continue
+            remaining_hops = map_hops.get(destination[0])
+            if remaining_hops is None:
+                continue
+            for source in self._transition_source_locations(transition):
+                bound = abs(location[1][0] - source[0]) + abs(location[1][1] - source[1])
+                bound += 1 + remaining_hops
+                if best is None or bound < best:
+                    best = bound
+        return best or 0
+
     def _heuristic(self, location: Location, target: Goal, encounter_mode: EncounterMode) -> tuple[int, ...]:
         """Conservative lexicographic lower bound for experimental A*.
 
@@ -2199,6 +2312,14 @@ class GoalAwareNavigator:
         interaction targets with no explicit positions keeps the heuristic
         admissible when the target's geometry is incomplete.
         """
+        target_map = None
+        if isinstance(target, SemanticTarget):
+            target_map = target.target_map
+        elif isinstance(target, ReachWarp):
+            target_map = target.destination_map
+        if target_map is not None and location[0] != target_map:
+            return (0, self._cross_map_heuristic(location, target_map, target), 0, 0, 0, 0)
+
         positions: list[Location] = []
         if isinstance(target, ReachLocation):
             positions = [target.location]

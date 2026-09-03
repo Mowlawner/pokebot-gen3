@@ -194,6 +194,37 @@ class CampaignRecoveryIntegrationTests(unittest.TestCase):
         finally:
             context.campaign_status = previous_status
 
+    def test_recovery_keyerror_retry_is_bounded(self):
+        objective = CampaignObjective("reach_generic", "generic", (), SimpleNamespace(evaluate=lambda _: None))
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "ready")
+        execution = CampaignExecutionResult(objective, CampaignExecutionStatus.READY, "ready", tactical_goal=Goal())
+        attempts = []
+
+        def recovery(_stop):
+            attempts.append(1)
+
+            def failed_recovery():
+                raise KeyError("persistent map table")
+                yield
+
+            return failed_recovery()
+
+        controller = CampaignController(
+            lambda: object(),
+            selector=lambda _: selection,
+            adapter=lambda _: execution,
+            readiness_provider=lambda *_: readiness(),
+            recovery_factory=recovery,
+        )
+
+        states = [controller.step() for _ in range(5)]
+
+        self.assertEqual(states[-1].status, CampaignControllerStatus.BLOCKED)
+        self.assertEqual(states[-1].execution_phase, "BLOCKED")
+        self.assertEqual(states[-1].recovery_status, "FAILED")
+        self.assertEqual(attempts, [1, 1, 1, 1])
+        self.assertEqual(controller.step().status, CampaignControllerStatus.BLOCKED)
+
     def test_unknown_defers_without_recovery_or_losing_campaign_ownership(self):
         objective = CampaignObjective("reach_generic", "generic", (), SimpleNamespace(evaluate=lambda _: None))
         selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "ready")

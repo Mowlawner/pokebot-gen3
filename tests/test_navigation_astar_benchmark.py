@@ -18,6 +18,7 @@ from modules.navigation import (
     NavigationWorld,
     NavigableTile,
     NavigationMetrics,
+    clear_semantic_cross_map_plan_cache,
     navigation_candidate_key,
     plan_with_world_navigation,
 )
@@ -187,6 +188,31 @@ class TestAStarComparison(unittest.TestCase):
             self.assertEqual(records[0]["goal_type"], "SemanticTarget")
             self.assertTrue(records[0]["path_found"])
             self.assertEqual(cross_map_goal_evaluations(), ())
+        finally:
+            context.debug_profile = previous
+
+    def test_default_cross_map_semantic_planning_uses_astar(self):
+        source = (991, 0)
+        target = (992, 0)
+        transition = WarpObservation((source, (4, 0)), (target, (0, 0)))
+        world = NavigationWorld(
+            tiles={(source, (x, 0)): NavigableTile((source, (x, 0))) for x in range(5)},
+            transitions=(transition,),
+            facing=Direction.East,
+        )
+        graph = WorldMapGraph((WorldEdge(source, target, "warp", ((4, 0),), ((0, 0),)),))
+        previous = getattr(context, "debug_profile", False)
+        context.debug_profile = True
+        try:
+            clear_semantic_cross_map_plan_cache()
+            from modules.profiler import clear_pathfinding_searches
+
+            clear_pathfinding_searches()
+            plan_with_world_navigation(world, (source, (0, 0)), ReachLocation((target, (0, 0))), graph)
+            records = pathfinding_searches()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["algorithm"], "astar")
+            self.assertTrue(records[0]["path_found"])
         finally:
             context.debug_profile = previous
 

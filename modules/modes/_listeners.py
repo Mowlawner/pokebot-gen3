@@ -12,7 +12,6 @@ def clear_transient_battle_message() -> None:
 
 from modules.debug import debug
 from modules.encounter import handle_encounter, EncounterInfo, log_encounter
-from modules.map import get_map_objects
 from modules.map_data import MapFRLG, MapRSE, is_safari_map
 from modules.memory import (
     GameState,
@@ -59,6 +58,7 @@ from ..battle_state import (
 )
 from ..battle_strategies import DefaultBattleStrategy, BattleStrategy
 from ..battle_strategies.catch import CatchStrategy
+from ..battle_strategies.nuzlocke_level_balancing import NuzlockeLevelBalancingBattleStrategy
 from ..battle_strategies.run_away import RunAwayStrategy
 from ..fishing import FishingAttempt, FishingRod, FishingResult
 from ..keyboard import handle_naming_screen
@@ -72,6 +72,7 @@ from ..plugins import (
     plugin_should_nickname_pokemon,
     plugin_picked_up_items,
 )
+from ..state_cache import state_cache
 from ..text_printer import get_text_printer, TextPrinterState
 
 
@@ -98,28 +99,20 @@ def _battle_return_to_field_complete(frame: FrameInfo) -> bool:
     """Whether the ROM has finished its battle-to-field transition.
 
     Avatar motion is deliberately not part of this boundary.  The return
-    callback/tasks are the synchronization points owned by the battle engine,
-    but the battle's post-return field script is also part of that ownership.
-    Releasing the battle controller while that script is waiting in a native
-    movement callback strands the campaign controller between battle and
-    overworld ownership.
+    callback/tasks are the synchronization points owned by the battle engine.
+    A script may still be active after those signals clear: Emerald commonly
+    starts a post-battle movement or dialogue script on the same handoff. That
+    script belongs to the overworld/campaign controller, so it must not keep
+    the battle controller parked until the whole scene finishes.
     """
     callback_ok = get_game_state_symbol() not in ("CB2_RETURNTOFIELD", "CB2_RETURNTOFIELDLOCAL")
     battle_start_absent = "Task_BattleStart" not in frame.active_tasks
     no_script_absent = "Task_ReturnToFieldNoScript" not in frame.active_tasks
     continue_music_absent = "Task_ReturnToFieldContinueScriptPlayMapMusic" not in frame.active_tasks
     mpl_absent = "task_mpl_807E3C8" not in frame.active_tasks
-    map_objects = len(get_map_objects())
     script_context = get_global_script_context()
     script_active = bool(script_context is not None and script_context.is_active)
-    complete = (
-        callback_ok
-        and no_script_absent
-        and continue_music_absent
-        and mpl_absent
-        and map_objects > 0
-        and not script_active
-    )
+    complete = callback_ok and no_script_absent and continue_music_absent and mpl_absent
     diagnostic_print(
         lambda: (
             "BATTLE_RETURN_GATE: "
@@ -127,7 +120,7 @@ def _battle_return_to_field_complete(frame: FrameInfo) -> bool:
             f"game_state={get_game_state().name!r} game_state_symbol={get_game_state_symbol()!r} "
             f"task_battle_start={not battle_start_absent!r} return_no_script={not no_script_absent!r} "
             f"return_continue_music={not continue_music_absent!r} task_mpl={not mpl_absent!r} "
-            f"map_objects={map_objects} script_active={script_active!r}"
+            f"script_active={script_active!r}"
         ),
         trace=True,
     )
@@ -135,6 +128,16 @@ def _battle_return_to_field_complete(frame: FrameInfo) -> bool:
 
 
 class BattleListener(BotListener):
+    # A normal Emerald party rotation completes well within this window. A
+    # watchdog is still necessary because menu navigators depend on ROM task
+    # transitions and must not be allowed to retain the campaign controller
+    # forever after a malformed/stale battle handoff.
+    # Opening the party menu, switching the two slots, closing it, and
+    # waiting through Emerald's fade before the reopened Start menu becomes
+    # input-ready can take a little over 180 application frames. Keep this
+    # bounded, but leave room for the ROM-owned callback/fade sequence.
+    _POST_BATTLE_ROTATION_TIMEOUT_FRAMES = 300
+
     battle_states = (
         GameState.BATTLE,
         GameState.BATTLE_STARTING,
@@ -151,6 +154,10 @@ class BattleListener(BotListener):
         self._current_action: BattleAction | None = None
         self._post_battle_wait_frames = 0
         self._post_battle_message_input_issued = False
+        # ``rotate_lead_pokemon`` owns the party menu after a battle.  The
+        # stale-menu recovery below must not interpret its intentional
+        # ``Task_HandleChooseMonInput`` as a leftover replacement prompt.
+        self._post_battle_rotation_active = False
         # 0 = no stale-menu cleanup, 1 = party menu closed, waiting for the
         # owning start menu to appear, 2 = start menu appeared and needs one
         # task tick before input, 3 = start-menu close requested.
@@ -390,6 +397,11 @@ class BattleListener(BotListener):
         the outcome is terminal.  Dismiss it once so campaign execution can
         resume from the overworld boundary.
         """
+        # A normal battle rotation uses exactly the same ROM task as the
+        # stale-menu case.  Rotation owns this boundary, so let its menu
+        # controller consume the task rather than injecting a recovery B.
+        if self._post_battle_rotation_active:
+            return False
         stale_task = frame.game_state is GameState.PARTY_MENU and frame.task_is_active("Task_HandleChooseMonInput")
         if not stale_task:
             if self._stale_party_menu_cleanup_stage == 1:
@@ -584,12 +596,23 @@ class BattleListener(BotListener):
                 or (should_check_for_pickup() and context.bot_mode_instance.on_pickup_threshold_reached())
             ):
                 yield from self.retrieve_held_items(result)
-            if strategy.choose_new_lead_after_battle() is not None:
-                if context.bot_mode != "Manual":
-                    yield from self.rotate_lead_pokemon(
-                        strategy.choose_new_lead_after_battle(),
-                        first_non_fainted_lead_before_battle,
-                    )
+        if isinstance(strategy, NuzlockeLevelBalancingBattleStrategy):
+            yield from self._post_battle_rotation(strategy, first_non_fainted_lead_before_battle)
+        elif (
+            get_game_state() != GameState.BATTLE
+            and not get_global_script_context().is_active
+            and player_avatar_is_standing_still()
+            and context.bot_mode != "Manual"
+        ):
+            # Preserve the existing one-shot behavior for non-campaign
+            # strategies; only the campaign level-balancing policy needs the
+            # deferred handoff window.
+            new_lead_index = strategy.choose_new_lead_after_battle()
+            if new_lead_index is not None:
+                yield from self.rotate_lead_pokemon(
+                    new_lead_index,
+                    first_non_fainted_lead_before_battle,
+                )
 
         diagnostic_print(
             lambda: "BATTLE_FIGHT_GENERATOR: fight returning " + self._controller_boundary_snapshot(),
@@ -624,14 +647,149 @@ class BattleListener(BotListener):
 
     @debug.track
     def rotate_lead_pokemon(self, new_lead_index: int, old_lead_index: int):
-        yield from MenuWrapper(RotatePokemon(new_lead_index, old_lead_index)).step()
+        self._post_battle_rotation_active = True
+        try:
+            menu_controller = MenuWrapper(RotatePokemon(new_lead_index, old_lead_index)).step()
+            for elapsed_frames in range(self._POST_BATTLE_ROTATION_TIMEOUT_FRAMES):
+                try:
+                    next(menu_controller)
+                except StopIteration:
+                    diagnostic_print(
+                        lambda: (
+                            "BATTLE_POST_ROTATION_MENU: "
+                            f"completed=True elapsed_frames={elapsed_frames!r} "
+                            f"new_lead={new_lead_index!r} old_lead={old_lead_index!r}"
+                        ),
+                        trace=True,
+                    )
+                    return
+                yield
+
+            diagnostic_print(
+                lambda: (
+                    "BATTLE_POST_ROTATION_MENU: "
+                    f"completed=False elapsed_frames={self._POST_BATTLE_ROTATION_TIMEOUT_FRAMES!r} "
+                    f"new_lead={new_lead_index!r} old_lead={old_lead_index!r}"
+                ),
+                trace=True,
+            )
+            if context.bot_mode != "Manual":
+                context.message = "Post-battle party rotation stalled; switching to manual mode."
+                context.set_manual_mode(enable_video_and_slow_down=False)
+        finally:
+            self._post_battle_rotation_active = False
+
+    def _post_battle_rotation(self, strategy: BattleStrategy, old_lead_index: int):
+        """Rotate the lead after the field handoff becomes actionable.
+
+        Battle completion and avatar control are not published on the same
+        frame in Emerald. A one-shot check can therefore observe a valid
+        terminal battle but miss the rotation window forever. Wait only for a
+        short, bounded handoff window; the campaign controller resumes
+        normally if the ROM is still busy after that window.
+        """
+
+        for wait_frame in range(30):
+            try:
+                script_context = get_global_script_context()
+                ready = (
+                    get_game_state() != GameState.BATTLE
+                    and not (script_context is not None and script_context.is_active)
+                    and player_avatar_is_standing_still()
+                    and context.bot_mode != "Manual"
+                )
+            except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+                ready = False
+            if ready:
+                try:
+                    new_lead_index = strategy.choose_new_lead_after_battle()
+                except (AttributeError, RuntimeError, TypeError, ValueError, IndexError, NotImplementedError) as error:
+                    diagnostic_print(
+                        lambda: (
+                            "BATTLE_POST_ROTATION: "
+                            f"candidate_error={type(error).__name__!r} wait_frame={wait_frame!r}"
+                        ),
+                        trace=True,
+                    )
+                    return
+                diagnostic_print(
+                    lambda: (
+                        "BATTLE_POST_ROTATION: "
+                        f"candidate={new_lead_index!r} old_lead={old_lead_index!r} "
+                        f"wait_frame={wait_frame!r} ready=True"
+                    ),
+                    trace=True,
+                )
+                if new_lead_index is not None:
+                    yield from self.rotate_lead_pokemon(new_lead_index, old_lead_index)
+                    diagnostic_print(
+                        lambda: (
+                            "BATTLE_POST_ROTATION: "
+                            f"rotated=True new_lead={new_lead_index!r} old_lead={old_lead_index!r}"
+                        ),
+                        trace=True,
+                    )
+                return
+            yield
+        diagnostic_print(
+            lambda: (
+                "BATTLE_POST_ROTATION: " f"candidate=None old_lead={old_lead_index!r} ready=False timeout_frames=30"
+            ),
+            trace=True,
+        )
 
     @isolate_inputs
     @debug.track
     def catch(self):
+        # CatchStrategy owns the turns, but a completed capture can add a new
+        # low-level party member. Keep the post-battle leveling policy the
+        # same as ordinary campaign battles, including the zero-ball fallback
+        # where CatchStrategy fights or runs instead of throwing an item.
+        first_non_fainted_lead_before_battle = get_party().first_non_fainted.index
+        try:
+            party_size_before_battle = len(get_party())
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            party_size_before_battle = None
         yield from plugin_battle_started(self._active_wild_encounter)
-        yield from handle_battle(CatchStrategy())
+        capture_factory = getattr(getattr(context, "bot_mode_instance", None), "capture_battle_strategy", None)
+        capture_strategy = capture_factory() if callable(capture_factory) else CatchStrategy()
+        yield from handle_battle(capture_strategy)
         yield from self._wait_until_battle_is_over()
+        # The battle engine mutates both structures while returning control
+        # to the field. Do not let a same-frame cache hide a newly caught
+        # party member or the ball consumed by the attempt.
+        state_cache.party.invalidate()
+        state_cache.item_bag.invalidate()
+        # Emerald can finish the battle-return callback before the newly
+        # caught Pokémon has been committed to gPlayerParty.  Do not let the
+        # balancing policy inspect that transient one-Pokémon view and decide
+        # that no rotation is needed.  This wait is bounded and only applies
+        # to captures while the party still has room; failed captures and
+        # zero-ball fallback battles retain their normal return latency.
+        try:
+            capture_succeeded = get_last_battle_outcome() is BattleOutcome.Caught
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            capture_succeeded = False
+        if capture_succeeded and party_size_before_battle is not None and party_size_before_battle < 6:
+            for _ in range(30):
+                try:
+                    party_size_after_battle = len(get_party())
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    party_size_after_battle = None
+                if party_size_after_battle is not None and party_size_after_battle > party_size_before_battle:
+                    diagnostic_print(
+                        lambda: (
+                            "CAMPAIGN_CAPTURE_PARTY_SYNC: "
+                            f"before={party_size_before_battle} after={party_size_after_battle} synchronized=True"
+                        ),
+                        trace=True,
+                    )
+                    break
+                yield
+        yield from self._post_battle_rotation(
+            NuzlockeLevelBalancingBattleStrategy(),
+            first_non_fainted_lead_before_battle,
+        )
         if context.config.battle.save_after_catching and get_last_battle_outcome() is BattleOutcome.Caught:
             if is_safari_map():
                 # Saving is not possible inside the Safari Zone, so we need to leave it first.
@@ -648,11 +806,19 @@ class BattleListener(BotListener):
     @isolate_inputs
     @debug.track
     def run_away_from_battle(self):
+        first_non_fainted_lead_before_battle = get_party().first_non_fainted.index
         while get_game_state() != GameState.BATTLE:
             yield
         yield from plugin_battle_started(self._active_wild_encounter)
         yield from handle_battle(RunAwayStrategy())
         yield from self._wait_until_battle_is_over()
+        # Running is also a normal campaign battle exit. If the encounter
+        # was skipped because of resource pressure, give the weakest living
+        # member the next opportunity to receive experience.
+        yield from self._post_battle_rotation(
+            NuzlockeLevelBalancingBattleStrategy(),
+            first_non_fainted_lead_before_battle,
+        )
 
 
 class TrainerApproachListener(BotListener):

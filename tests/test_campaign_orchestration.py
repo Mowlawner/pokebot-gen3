@@ -56,12 +56,15 @@ class CampaignOrchestrationTests(unittest.TestCase):
         )
         self.assertEqual(local, (ReachLocation((MapRSE.RUSTBORO_CITY, (16, 38))),))
 
-        with patch(
-            "modules.modes.campaign.emerald_healing_sources_for_map",
-            return_value=(),
-        ), patch(
-            "modules.modes.campaign.pokemon_center_candidates",
-            return_value=(PokemonCenter.RustboroCity,),
+        with (
+            patch(
+                "modules.modes.campaign.emerald_healing_sources_for_map",
+                return_value=(),
+            ),
+            patch(
+                "modules.modes.campaign.pokemon_center_candidates",
+                return_value=(PokemonCenter.RustboroCity,),
+            ),
         ):
             selected = CampaignProgressionMode._recovery_candidate_goals(
                 (MapRSE.ROUTE104, (1, 1)),
@@ -88,20 +91,19 @@ class CampaignOrchestrationTests(unittest.TestCase):
             objective_id="test_objective",
             resource_policy=SimpleNamespace(minimum_hp_ratio=0.5),
         )
-        with patch(
-            "modules.modes.campaign.perceive_overworld",
-            return_value=OverworldObservationResult(
-                OverworldObservationStatus.UNAVAILABLE,
-                reason="player_avatar_unavailable",
+        with (
+            patch(
+                "modules.modes.campaign.perceive_overworld",
+                return_value=OverworldObservationResult(
+                    OverworldObservationStatus.UNAVAILABLE,
+                    reason="player_avatar_unavailable",
+                ),
             ),
-        ), patch("modules.modes.campaign.get_nuzlocke_snapshot", return_value=snapshot), patch(
-            "modules.modes.campaign.get_game_state", return_value=None
-        ), patch(
-            "modules.modes.campaign.observe_resource_snapshot", return_value=resources
-        ), patch(
-            "modules.modes.campaign.observe_route_recovery"
-        ) as observe_recovery, patch(
-            "modules.modes.campaign.build_progression_readiness_diagnostic", return_value=object()
+            patch("modules.modes.campaign.get_nuzlocke_snapshot", return_value=snapshot),
+            patch("modules.modes.campaign.get_game_state", return_value=None),
+            patch("modules.modes.campaign.observe_resource_snapshot", return_value=resources),
+            patch("modules.modes.campaign.observe_route_recovery") as observe_recovery,
+            patch("modules.modes.campaign.build_progression_readiness_diagnostic", return_value=object()),
         ):
             mode._readiness_input(objective, None)
 
@@ -134,27 +136,27 @@ class CampaignOrchestrationTests(unittest.TestCase):
             destination=(0, 7),
             resource_policy=SimpleNamespace(minimum_hp_ratio=0.5),
         )
-        with patch(
-            "modules.modes.campaign.perceive_overworld",
-            return_value=overworld,
-        ), patch(
-            "modules.modes.campaign.publish_shared_overworld_observation"
-        ), patch("modules.modes.campaign.get_nuzlocke_snapshot", return_value=snapshot), patch(
-            "modules.modes.campaign.get_game_state", return_value=GameState.OVERWORLD
-        ), patch(
-            "modules.modes.campaign.observe_interaction",
-            return_value=SimpleNamespace(
-                interaction_phase=SimpleNamespace(),
-                script_active=False,
-                dialogue_waiting=False,
-                field_message_lifecycle_active=False,
-                native_function=None,
+        with (
+            patch(
+                "modules.modes.campaign.perceive_overworld",
+                return_value=overworld,
             ),
-        ), patch(
-            "modules.modes.campaign.observe_resource_snapshot", return_value=resources
-        ), patch(
-            "modules.modes.campaign.observe_route_recovery"
-        ) as observe_recovery:
+            patch("modules.modes.campaign.publish_shared_overworld_observation"),
+            patch("modules.modes.campaign.get_nuzlocke_snapshot", return_value=snapshot),
+            patch("modules.modes.campaign.get_game_state", return_value=GameState.OVERWORLD),
+            patch(
+                "modules.modes.campaign.observe_interaction",
+                return_value=SimpleNamespace(
+                    interaction_phase=SimpleNamespace(),
+                    script_active=False,
+                    dialogue_waiting=False,
+                    field_message_lifecycle_active=False,
+                    native_function=None,
+                ),
+            ),
+            patch("modules.modes.campaign.observe_resource_snapshot", return_value=resources),
+            patch("modules.modes.campaign.observe_route_recovery") as observe_recovery,
+        ):
             diagnostic = mode._readiness_input(objective, None)
 
         observe_recovery.assert_not_called()
@@ -186,7 +188,7 @@ class CampaignOrchestrationTests(unittest.TestCase):
         objective = SimpleNamespace(
             objective_id="obtain_encounter:24:11",
             destination=(24, 11),
-            resource_policy=None,
+            resource_policy=SimpleNamespace(minimum_hp_ratio=0.5),
         )
         goal = SimpleNamespace()
         route_analysis = SimpleNamespace(normal_cost=10, candidates=())
@@ -197,49 +199,122 @@ class CampaignOrchestrationTests(unittest.TestCase):
             distance_to_center=10,
             safe_to_reach_center=True,
         )
-        with patch(
-            "modules.modes.campaign.context",
-            SimpleNamespace(rom=SimpleNamespace(is_rse=True), stutter_trace=None),
-        ), patch(
-            "modules.modes.campaign.perceive_overworld",
-            return_value=overworld,
-        ), patch(
-            "modules.modes.campaign.publish_shared_overworld_observation"
-        ), patch(
-            "modules.modes.campaign.get_nuzlocke_snapshot",
-            return_value=snapshot,
-        ), patch(
-            "modules.modes.campaign.observe_interaction",
-            return_value=SimpleNamespace(
-                interaction_phase=SimpleNamespace(),
-                script_active=False,
-                dialogue_waiting=False,
-                field_message_lifecycle_active=False,
-                native_function=None,
+        with (
+            patch(
+                "modules.modes.campaign.context",
+                SimpleNamespace(rom=SimpleNamespace(is_rse=True), stutter_trace=None),
             ),
-        ), patch(
-            "modules.modes.campaign.observe_resource_snapshot",
-            return_value=resources,
-        ), patch(
-            "modules.modes.campaign.observe_route_recovery",
-            return_value=recovery,
-        ), patch(
-            "modules.modes.campaign.emerald_healing_sources_for_map",
-            return_value=(),
-        ), patch(
-            "modules.modes.campaign.NavigationWorld.from_overworld",
-            return_value=object(),
-        ), patch(
-            "modules.modes.campaign.get_world_map_graph",
-            return_value=object(),
-        ), patch(
-            "modules.modes.campaign.RouteCostAnalyzer",
-            return_value=analyzer,
+            patch(
+                "modules.modes.campaign.perceive_overworld",
+                return_value=overworld,
+            ),
+            patch("modules.modes.campaign.publish_shared_overworld_observation"),
+            patch(
+                "modules.modes.campaign.get_nuzlocke_snapshot",
+                return_value=snapshot,
+            ),
+            patch(
+                "modules.modes.campaign.observe_interaction",
+                return_value=SimpleNamespace(
+                    interaction_phase=SimpleNamespace(),
+                    script_active=False,
+                    dialogue_waiting=False,
+                    field_message_lifecycle_active=False,
+                    native_function=None,
+                ),
+            ),
+            patch(
+                "modules.modes.campaign.observe_resource_snapshot",
+                return_value=resources,
+            ),
+            patch(
+                "modules.modes.campaign.observe_route_recovery",
+                return_value=recovery,
+            ),
+            patch(
+                "modules.modes.campaign.emerald_healing_sources_for_map",
+                return_value=(),
+            ),
+            patch(
+                "modules.modes.campaign.NavigationWorld.from_overworld",
+                return_value=object(),
+            ),
+            patch(
+                "modules.modes.campaign.get_world_map_graph",
+                return_value=object(),
+            ),
+            patch(
+                "modules.modes.campaign.RouteCostAnalyzer",
+                return_value=analyzer,
+            ),
         ):
             diagnostic = mode._readiness_input(objective, goal)
 
         analyzer.analyze.assert_called_once()
         assert diagnostic.route_analysis is route_analysis
+
+    def test_critical_readiness_skips_detour_route_analysis(self):
+        mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
+        mode._readiness_evaluated = False
+        snapshot = SimpleNamespace(
+            frame=1,
+            game_state=SimpleNamespace(name="OVERWORLD"),
+            party=(),
+            party_available=False,
+            player_available=False,
+            player=SimpleNamespace(map_group=0, map_number=18, coordinates=(10, 3)),
+        )
+        resources = ResourceSnapshot(
+            (PartyResource(1, 10),),
+            observation_status=ResourceObservationStatus.VALID,
+        )
+        overworld = SimpleNamespace(
+            map_id=MapRSE.ROUTE102.value,
+            player_coordinates=(10, 3),
+            controllable=True,
+            transition_in_progress=False,
+            objects=(),
+        )
+        objective = SimpleNamespace(
+            objective_id="reach_petalburg",
+            destination=MapRSE.PETALBURG_CITY.value,
+            resource_policy=SimpleNamespace(minimum_hp_ratio=0.5),
+        )
+        recovery = RouteRecovery(
+            center_available=True,
+            center_location=(MapRSE.OLDALE_TOWN, (6, 6)),
+            distance_to_center=4,
+            safe_to_reach_center=True,
+            route=object(),
+        )
+        analyzer = Mock()
+        with (
+            patch(
+                "modules.modes.campaign.context",
+                SimpleNamespace(rom=SimpleNamespace(is_rse=True), stutter_trace=None),
+            ),
+            patch("modules.modes.campaign.perceive_overworld", return_value=overworld),
+            patch("modules.modes.campaign.publish_shared_overworld_observation"),
+            patch("modules.modes.campaign.get_nuzlocke_snapshot", return_value=snapshot),
+            patch("modules.modes.campaign.get_game_state", return_value=GameState.OVERWORLD),
+            patch(
+                "modules.modes.campaign.observe_interaction",
+                return_value=SimpleNamespace(
+                    interaction_phase=SimpleNamespace(),
+                    script_active=False,
+                    dialogue_waiting=False,
+                    field_message_lifecycle_active=False,
+                    native_function=None,
+                ),
+            ),
+            patch("modules.modes.campaign.observe_resource_snapshot", return_value=resources),
+            patch("modules.modes.campaign.observe_route_recovery", return_value=recovery),
+            patch("modules.modes.campaign.RouteCostAnalyzer", return_value=analyzer),
+        ):
+            diagnostic = mode._readiness_input(objective, SimpleNamespace())
+
+        analyzer.analyze.assert_not_called()
+        assert diagnostic.route_analysis is None
 
     def test_targetless_milestone_projects_declared_destination_for_readiness(self):
         mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
@@ -280,38 +355,229 @@ class CampaignOrchestrationTests(unittest.TestCase):
             distance_to_center=2,
             safe_to_reach_center=True,
         )
-        with patch(
-            "modules.modes.campaign.context",
-            SimpleNamespace(rom=SimpleNamespace(is_rse=True), stutter_trace=None),
-        ), patch("modules.modes.campaign.perceive_overworld", return_value=overworld), patch(
-            "modules.modes.campaign.publish_shared_overworld_observation"
-        ), patch(
-            "modules.modes.campaign.get_nuzlocke_snapshot", return_value=snapshot
-        ), patch(
-            "modules.modes.campaign.observe_interaction",
-            return_value=SimpleNamespace(
-                interaction_phase=SimpleNamespace(),
-                script_active=False,
-                dialogue_waiting=False,
-                field_message_lifecycle_active=False,
-                native_function=None,
+        with (
+            patch(
+                "modules.modes.campaign.context",
+                SimpleNamespace(rom=SimpleNamespace(is_rse=True), stutter_trace=None),
             ),
-        ), patch(
-            "modules.modes.campaign.observe_resource_snapshot", return_value=resources
-        ), patch(
-            "modules.modes.campaign.observe_route_recovery", return_value=recovery
-        ), patch(
-            "modules.modes.campaign.NavigationWorld.from_overworld", return_value=object()
-        ), patch(
-            "modules.modes.campaign.get_world_map_graph", return_value=object()
-        ), patch(
-            "modules.modes.campaign.RouteCostAnalyzer", return_value=analyzer
+            patch("modules.modes.campaign.perceive_overworld", return_value=overworld),
+            patch("modules.modes.campaign.publish_shared_overworld_observation"),
+            patch("modules.modes.campaign.get_nuzlocke_snapshot", return_value=snapshot),
+            patch(
+                "modules.modes.campaign.observe_interaction",
+                return_value=SimpleNamespace(
+                    interaction_phase=SimpleNamespace(),
+                    script_active=False,
+                    dialogue_waiting=False,
+                    field_message_lifecycle_active=False,
+                    native_function=None,
+                ),
+            ),
+            patch("modules.modes.campaign.observe_resource_snapshot", return_value=resources),
+            patch("modules.modes.campaign.observe_route_recovery", return_value=recovery),
+            patch("modules.modes.campaign.NavigationWorld.from_overworld", return_value=object()),
+            patch("modules.modes.campaign.get_world_map_graph", return_value=object()),
+            patch("modules.modes.campaign.RouteCostAnalyzer", return_value=analyzer),
         ):
             diagnostic = mode._readiness_input(objective, None)
 
         analyzer.analyze.assert_called_once()
         self.assertEqual(diagnostic.navigation_goal.target.target_map, MapRSE.PETALBURG_CITY_GYM.value)
         self.assertIs(diagnostic.route_analysis, route_analysis)
+
+    def test_post_battle_recovery_policy_is_retained_for_next_objective(self):
+        mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
+        mode._readiness_evaluated = False
+        policy = SimpleNamespace(minimum_hp_ratio=0.5, recover_before_completion=True)
+        mode._post_battle_recovery_policy = policy
+        snapshot = SimpleNamespace(
+            frame=1,
+            game_state=SimpleNamespace(name="OVERWORLD"),
+            party=(),
+            party_available=False,
+            player_available=True,
+            player=SimpleNamespace(map_group=0, map_number=18, coordinates=(10, 3)),
+        )
+        resources = ResourceSnapshot(
+            (PartyResource(8, 25),),
+            observation_status=ResourceObservationStatus.VALID,
+        )
+        overworld = SimpleNamespace(
+            map_id=MapRSE.ROUTE103,
+            player_coordinates=(10, 3),
+            controllable=True,
+            transition_in_progress=False,
+            objects=(),
+        )
+        recovery = RouteRecovery(
+            center_available=True,
+            center_location=(MapRSE.OLDALE_TOWN, (6, 6)),
+            distance_to_center=38,
+            safe_to_reach_center=True,
+        )
+        analyzer = SimpleNamespace(analyze=Mock(return_value=SimpleNamespace(normal_cost=10, candidates=())))
+        objective = SimpleNamespace(
+            objective_id="receive_pokedex",
+            destination=MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value,
+            resource_policy=None,
+        )
+
+        with (
+            patch(
+                "modules.modes.campaign.context",
+                SimpleNamespace(rom=SimpleNamespace(is_rse=True), stutter_trace=None),
+            ),
+            patch("modules.modes.campaign.perceive_overworld", return_value=overworld),
+            patch("modules.modes.campaign.publish_shared_overworld_observation"),
+            patch("modules.modes.campaign.get_nuzlocke_snapshot", return_value=snapshot),
+            patch("modules.modes.campaign.get_game_state", return_value=GameState.OVERWORLD),
+            patch(
+                "modules.modes.campaign.observe_interaction",
+                return_value=SimpleNamespace(
+                    interaction_phase=SimpleNamespace(),
+                    script_active=False,
+                    dialogue_waiting=False,
+                    field_message_lifecycle_active=False,
+                    native_function=None,
+                ),
+            ),
+            patch("modules.modes.campaign.observe_resource_snapshot", return_value=resources),
+            patch("modules.modes.campaign.observe_route_recovery", return_value=recovery) as observe_recovery,
+            patch("modules.modes.campaign.NavigationWorld.from_overworld", return_value=object()),
+            patch("modules.modes.campaign.get_world_map_graph", return_value=object()),
+            patch("modules.modes.campaign.RouteCostAnalyzer", return_value=analyzer),
+        ):
+            diagnostic = mode._readiness_input(objective, None)
+
+        observe_recovery.assert_called_once_with(candidate_limit=None)
+        analyzer.analyze.assert_not_called()
+        self.assertEqual(diagnostic.lowest_hp_ratio, 8 / 25)
+        self.assertIs(diagnostic.recovery, recovery)
+
+    def test_post_battle_recovery_policy_does_not_leak_into_restock(self):
+        mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
+        mode._readiness_evaluated = False
+        mode._post_battle_recovery_policy = SimpleNamespace(minimum_hp_ratio=0.5, recover_before_completion=True)
+        snapshot = SimpleNamespace(
+            frame=1,
+            game_state=SimpleNamespace(name="OVERWORLD"),
+            party=(),
+            party_available=False,
+            player_available=True,
+            player=SimpleNamespace(map_group=0, map_number=10, coordinates=(14, 6)),
+        )
+        resources = ResourceSnapshot(
+            (PartyResource(8, 25),),
+            observation_status=ResourceObservationStatus.VALID,
+        )
+        overworld = SimpleNamespace(
+            map_id=MapRSE.OLDALE_TOWN,
+            player_coordinates=(14, 6),
+            controllable=True,
+            transition_in_progress=False,
+            objects=(),
+        )
+        objective = SimpleNamespace(objective_id="restock_pokeballs", resource_policy=None)
+
+        with (
+            patch(
+                "modules.modes.campaign.context",
+                SimpleNamespace(rom=SimpleNamespace(is_rse=True), stutter_trace=None),
+            ),
+            patch("modules.modes.campaign.perceive_overworld", return_value=overworld),
+            patch("modules.modes.campaign.publish_shared_overworld_observation"),
+            patch("modules.modes.campaign.get_nuzlocke_snapshot", return_value=snapshot),
+            patch("modules.modes.campaign.get_game_state", return_value=GameState.OVERWORLD),
+            patch(
+                "modules.modes.campaign.observe_interaction",
+                return_value=SimpleNamespace(
+                    interaction_phase=SimpleNamespace(),
+                    script_active=False,
+                    dialogue_waiting=False,
+                    field_message_lifecycle_active=False,
+                    native_function=None,
+                ),
+            ),
+            patch("modules.modes.campaign.observe_resource_snapshot", return_value=resources),
+            patch("modules.modes.campaign.observe_route_recovery") as observe_recovery,
+        ):
+            diagnostic = mode._readiness_input(objective, None)
+
+        observe_recovery.assert_not_called()
+        self.assertIsNone(mode._post_battle_recovery_policy)
+        self.assertEqual(diagnostic.lowest_hp_ratio, 8 / 25)
+
+    def test_post_battle_recovery_policy_survives_transient_rival_selection(self):
+        mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
+        mode._readiness_evaluated = False
+        policy = SimpleNamespace(minimum_hp_ratio=0.5, recover_before_completion=True)
+        mode._post_battle_recovery_policy = policy
+        snapshot = SimpleNamespace(
+            frame=1,
+            game_state=SimpleNamespace(name="OVERWORLD"),
+            party=(),
+            party_available=False,
+            player_available=True,
+            player=SimpleNamespace(map_group=0, map_number=18, coordinates=(9, 3)),
+        )
+        resources = ResourceSnapshot(
+            (PartyResource(8, 25),),
+            observation_status=ResourceObservationStatus.VALID,
+        )
+        overworld = SimpleNamespace(
+            map_id=MapRSE.ROUTE103,
+            player_coordinates=(9, 3),
+            controllable=True,
+            transition_in_progress=False,
+            objects=(),
+        )
+        objective = SimpleNamespace(
+            objective_id="complete_intro_rival",
+            resource_policy=policy,
+        )
+
+        with (
+            patch(
+                "modules.modes.campaign.context",
+                SimpleNamespace(rom=SimpleNamespace(is_rse=True), stutter_trace=None),
+            ),
+            patch("modules.modes.campaign.perceive_overworld", return_value=overworld),
+            patch("modules.modes.campaign.publish_shared_overworld_observation"),
+            patch("modules.modes.campaign.get_nuzlocke_snapshot", return_value=snapshot),
+            patch("modules.modes.campaign.get_game_state", return_value=GameState.OVERWORLD),
+            patch(
+                "modules.modes.campaign.observe_interaction",
+                return_value=SimpleNamespace(
+                    interaction_phase=SimpleNamespace(),
+                    script_active=False,
+                    dialogue_waiting=False,
+                    field_message_lifecycle_active=False,
+                    native_function=None,
+                ),
+            ),
+            patch("modules.modes.campaign.observe_resource_snapshot", return_value=resources),
+            patch("modules.modes.campaign.observe_route_recovery") as observe_recovery,
+        ):
+            diagnostic = mode._readiness_input(objective, None)
+
+        observe_recovery.assert_called_once_with(candidate_limit=None)
+        self.assertIs(mode._post_battle_recovery_policy, policy)
+        self.assertEqual(diagnostic.lowest_hp_ratio, 8 / 25)
+
+    def test_battle_end_arms_completed_objective_recovery_policy(self):
+        mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
+        policy = SimpleNamespace(recover_before_completion=True, minimum_hp_ratio=0.5)
+        objective = SimpleNamespace(objective_id="complete_intro_rival", resource_policy=policy)
+        mode._active_battle_wild = False
+        mode.controller = SimpleNamespace(
+            last_selection=SimpleNamespace(objective=objective),
+            request_readiness_recheck=Mock(),
+        )
+
+        with patch("modules.modes.campaign.notify_battle_ended"), patch("modules.modes.campaign.diagnostic_print"):
+            mode.on_battle_ended(object())
+
+        self.assertIs(mode._post_battle_recovery_policy, policy)
 
     def test_controller_is_constructed_during_mode_initialization(self):
         with patch("modules.modes.campaign.CampaignController") as controller_factory:
@@ -322,10 +588,30 @@ class CampaignOrchestrationTests(unittest.TestCase):
     def test_cheap_readiness_context_excludes_walking_coordinates(self):
         mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
         avatar = SimpleNamespace(map_group_and_number=(1, 2), local_coordinates=(3, 4))
-        with patch("modules.modes.campaign.get_player_avatar", return_value=avatar), patch(
-            "modules.modes.campaign.get_game_state", return_value=GameState.OVERWORLD
+        with (
+            patch("modules.modes.campaign.get_player_avatar", return_value=avatar),
+            patch("modules.modes.campaign.get_game_state", return_value=GameState.OVERWORLD),
         ):
-            self.assertEqual(mode._cheap_readiness_context(), ("OVERWORLD", (1, 2), None))
+            self.assertEqual(mode._cheap_readiness_context(), ("OVERWORLD", (1, 2), None, None))
+
+    def test_ball_inventory_change_requests_campaign_refresh(self):
+        refresh_reasons = []
+        controller = SimpleNamespace(
+            request_readiness_recheck=lambda reason: refresh_reasons.append(reason),
+        )
+        mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
+        mode.controller = controller
+        mode._campaign_boundary_context_seen = True
+        mode._last_campaign_boundary_context = ("OVERWORLD", (1, 2), True, 5)
+
+        with patch.object(
+            CampaignProgressionMode,
+            "_cheap_readiness_context",
+            return_value=("OVERWORLD", (1, 2), True, 4),
+        ):
+            mode._observe_campaign_boundary(controller)
+
+        self.assertEqual(refresh_reasons, ["pokeball_inventory_changed"])
 
     def test_run_delegates_startup_observation_to_controller(self):
         mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
@@ -400,6 +686,34 @@ class CampaignOrchestrationTests(unittest.TestCase):
         mode.on_spotted_by_trainer()
 
         self.assertEqual(reasons, ["trainer_spotted"])
+
+    def test_wild_battle_end_retains_navigation_route(self):
+        mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
+        mode._active_battle_wild = True
+        mode.controller = SimpleNamespace(request_readiness_recheck=Mock())
+
+        with (
+            patch("modules.modes.campaign.notify_battle_ended") as notify,
+            patch("modules.modes.campaign.diagnostic_print"),
+        ):
+            mode.on_battle_ended(object())
+
+        notify.assert_called_once_with(invalidate_navigation=False)
+        mode.controller.request_readiness_recheck.assert_called_once_with("battle_ended")
+        self.assertIsNone(mode._active_battle_wild)
+
+    def test_trainer_battle_end_invalidates_navigation_route(self):
+        mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
+        mode._active_battle_wild = False
+        mode.controller = SimpleNamespace(request_readiness_recheck=Mock())
+
+        with (
+            patch("modules.modes.campaign.notify_battle_ended") as notify,
+            patch("modules.modes.campaign.diagnostic_print"),
+        ):
+            mode.on_battle_ended(object())
+
+        notify.assert_called_once_with(invalidate_navigation=True)
 
     def test_battle_callback_remains_execution_policy(self):
         mode = CampaignProgressionMode.__new__(CampaignProgressionMode)

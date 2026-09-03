@@ -46,7 +46,10 @@ class CatchStrategy(DefaultBattleStrategy):
         ball_to_throw = self._get_best_poke_ball(battle_state)
         if ball_to_throw is None:
             context.message = "Player does not have any Poké Balls, cannot catch."
-            return TurnAction.switch_to_manual()
+            # An empty capture inventory is a normal encounter outcome.  Do
+            # not hand control to a human here: continue with the ordinary
+            # battle policy so the encounter can be defeated or escaped.
+            return super().decide_turn(battle_state)
 
         # The chance of a Pokémon being caught increases if it has a status condition (sleeping,
         # paralysed, poisoned, burned, frozen.) If possible, we will try to inflict a status
@@ -253,6 +256,8 @@ class CatchStrategy(DefaultBattleStrategy):
         best_poke_ball: Item | None = None
         best_catch_rate_multiplier: float = 0
         for ball in get_item_bag().poke_balls:
+            if ball.quantity <= 0:
+                continue
             catch_rate_multiplier = self._get_poke_ball_catch_rate_multiplier(battle_state, ball.item)
 
             if best_catch_rate_multiplier < catch_rate_multiplier:

@@ -48,6 +48,36 @@ class RouteRecoveryObservationTests(unittest.TestCase):
         self.assertTrue(result.center_available)
         self.assertTrue(result.observation_available)
 
+    def test_live_emerald_recovery_uses_catalog_and_world_plan(self):
+        location = (MapRSE.ROUTE103, (9, 3))
+        plan = SimpleNamespace(metrics=SimpleNamespace(total_route_cost=12), destination=(MapRSE.OLDALE_TOWN, (6, 16)))
+        with patch(
+            "modules.nuzlocke.resource_runtime.context",
+            SimpleNamespace(
+                rom=SimpleNamespace(is_rse=True),
+                testing=False,
+                stutter_trace=None,
+            ),
+        ), patch("modules.nuzlocke.resource_runtime.get_player_location", return_value=location), patch(
+            "modules.nuzlocke.resource_runtime.perceive_overworld", return_value=object()
+        ), patch(
+            "modules.nuzlocke.resource_runtime.NavigationWorld.from_overworld", return_value=object()
+        ), patch(
+            "modules.nuzlocke.resource_runtime.get_world_map_graph", return_value=object()
+        ), patch(
+            "modules.nuzlocke.resource_runtime.plan_with_world_navigation", return_value=(plan, object())
+        ) as world_plan:
+            result = observe_route_recovery(candidate_limit=1)
+
+        world_plan.assert_called_once()
+        self.assertTrue(result.center_available)
+        self.assertIsNotNone(result.route)
+        self.assertEqual(result.distance_to_center, 12)
+        self.assertEqual(
+            result.navigation_goal.target.destination_map,
+            MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value,
+        )
+
     def test_valid_location_retains_world_plan_as_executable_route(self):
         location = (MapRSE.ROUTE101, (3, 4))
         action = NavigationAction(
@@ -88,8 +118,28 @@ class RouteRecoveryObservationTests(unittest.TestCase):
         self.assertFalse(result.observation_available)
         self.assertIn("between maps", result.observation_error)
 
+    def test_transient_keyerror_in_overworld_observation_is_unavailable(self):
+        with patch(
+            "modules.nuzlocke.resource_runtime.get_player_location",
+            return_value=(MapRSE.ROUTE101, (3, 4)),
+        ), patch(
+            "modules.nuzlocke.resource_runtime.find_closest_pokemon_center",
+            return_value=PokemonCenter.OldaleTown,
+        ), patch(
+            "modules.nuzlocke.resource_runtime.perceive_overworld",
+            side_effect=KeyError("map object table"),
+        ):
+            result = observe_route_recovery()
+
+        self.assertFalse(result.observation_available)
+        self.assertIn("KeyError", result.observation_error)
+        self.assertFalse(result.center_available)
+
     def test_malformed_center_is_explicitly_unavailable(self):
         with patch(
+            "modules.nuzlocke.resource_runtime.context",
+            SimpleNamespace(rom=SimpleNamespace(is_rse=False), stutter_trace=None),
+        ), patch(
             "modules.nuzlocke.resource_runtime.get_player_location", return_value=(MapRSE.ROUTE101, (3, 4))
         ), patch(
             "modules.nuzlocke.resource_runtime.find_closest_pokemon_center",
@@ -117,24 +167,19 @@ class RouteRecoveryObservationTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 observe_route_recovery()
 
-    def test_cross_map_recovery_uses_world_navigation_when_legacy_pathfinder_cannot(self):
+    def test_cross_map_recovery_uses_world_navigation(self):
         location = (MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB, (6, 5))
         plan = SimpleNamespace(metrics=SimpleNamespace(total_route_cost=84), destination=(MapRSE.OLDALE_TOWN, (6, 16)))
         with patch("modules.nuzlocke.resource_runtime.get_player_location", return_value=location), patch(
             "modules.nuzlocke.resource_runtime.find_closest_pokemon_center", return_value=PokemonCenter.OldaleTown
-        ), patch(
-            "modules.nuzlocke.resource_runtime.calculate_path",
-            side_effect=PathFindingError("warps are not supported"),
-        ), patch(
-            "modules.nuzlocke.resource_runtime.perceive_overworld", return_value=object()
-        ), patch(
+        ), patch("modules.nuzlocke.resource_runtime.perceive_overworld", return_value=object()), patch(
             "modules.nuzlocke.resource_runtime.NavigationWorld.from_overworld", return_value=object()
         ), patch(
             "modules.nuzlocke.resource_runtime.plan_with_world_navigation", return_value=(plan, object())
         ) as world_plan, patch(
             "modules.nuzlocke.resource_runtime.get_world_map_graph", return_value=object()
         ):
-            result = observe_route_recovery()
+            result = observe_route_recovery(candidate_limit=1)
         self.assertEqual(result.distance_to_center, 84)
         self.assertTrue(result.center_available)
         world_plan.assert_called_once()

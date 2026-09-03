@@ -4,6 +4,7 @@ from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from enum import Enum
+import traceback
 
 from modules.items import InvalidItemIndexError, get_item_bag, get_item_storage, get_item_by_name
 from modules.context import context
@@ -30,17 +31,12 @@ from modules.goals import (
 )
 from modules.map_data import MapFRLG, PokemonCenter
 from modules.map import get_map_all_tiles, get_map_data, get_map_metadata
-from modules.modes.util.higher_level_actions import heal_in_pokemon_center
 from modules.modes.util.items import use_item_from_bag
 from modules.modes.util.map import find_closest_pokemon_center
-from modules.modes.util.walking import wait_for_player_avatar_to_be_controllable
-from modules.map_path import calculate_path, PathFindingError, Direction
+from modules.map_path import PathFindingError, Direction
 from modules.player import get_player_location
 from modules.navigation import (
-    NavigationAction,
-    NavigationActionType,
     NavigationError,
-    NavigationPlan,
     NavigationWorld,
     plan_with_world_navigation,
     transitions_match,
@@ -156,43 +152,6 @@ def _recovery_navigation_goal(destination, source=None):
     # Recovery is safety-critical: the route must avoid undefeated trainer
     # sight lines whenever the observed world exposes them.
     return NavigationGoal(target, constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID))
-
-
-def _navigation_plan_from_legacy_path(start, waypoints) -> NavigationPlan | None:
-    """Adapt an already-computed legacy path for the tactical navigator.
-
-    ``calculate_path`` predates the goal-aware navigator and returns waypoints
-    rather than ``NavigationAction`` objects. Recovery only needs to retain
-    the route it just measured, so re-searching the same path merely to change
-    representations would recreate the frame-time stall this adapter avoids.
-    Invalid/mock waypoint collections remain deliberately unsupported and
-    fall back to normal planning.
-    """
-    if not isinstance(start, tuple) or len(start) != 2 or not isinstance(waypoints, (tuple, list)):
-        return None
-    current = start
-    actions = []
-    for waypoint in waypoints:
-        map_id = getattr(waypoint, "map", None)
-        coordinates = getattr(waypoint, "coordinates", None)
-        direction = getattr(waypoint, "direction", None)
-        if map_id is None or not isinstance(coordinates, tuple) or len(coordinates) != 2 or direction is None:
-            return None
-        destination = (map_id, coordinates)
-        is_warp = bool(getattr(waypoint, "is_warp", False)) or destination[0] != current[0]
-        actions.append(
-            NavigationAction(
-                NavigationActionType.WARP if is_warp else NavigationActionType.MOVE,
-                direction,
-                current,
-                destination,
-                transition_kind="warp" if is_warp else None,
-            )
-        )
-        current = destination
-    if not actions:
-        return None
-    return NavigationPlan(tuple(actions), current)
 
 
 def _prewarm_interior_map_identity(interior_map_id) -> None:
@@ -325,97 +284,6 @@ def execute_existing_tactical_goal(goal: Goal) -> Iterator[object]:
         # policy explicit at the observation-driven execution boundary.
         goal = NavigationGoal(goal, encounter_mode=EncounterMode.AVOID)
     return AgentControlLoop(lambda: observe_agent(goal=goal), goal=goal).run()
-
-
-def _resolve_recovery_interaction() -> Iterator[object]:
-    """Advance ordinary actionable interaction before recovery navigation.
-
-    A non-controllable avatar is not necessarily waiting for input.  Reuse the
-    observation/action boundary used by normal campaign control so dialogue is
-    advanced, while passive transitions are left for the existing controllability
-    wait below.
-    """
-    executor = AgentActionExecutor()
-    iteration = 0
-    previous_signature = None
-    while True:
-        iteration += 1
-        diagnostic_print(
-            lambda: f"RECOVERY_PREFLIGHT_LIFECYCLE: phase=resume iteration={iteration} frame={getattr(context, 'frame', None)!r}",
-            trace=True,
-            prefix="RECOVERY_PREFLIGHT_LIFECYCLE",
-        )
-        observation = observe_agent()
-        decision = select_action(observation)
-        interaction = observation.interaction
-        overworld = observation.overworld
-        signature = (
-            getattr(interaction.game_state, "name", repr(interaction.game_state)),
-            interaction.dialogue_waiting,
-            interaction.field_message_lifecycle_active,
-            interaction.field_message_advance_ready,
-            interaction.controllable,
-            getattr(overworld, "map_id", None),
-            getattr(overworld, "player_coordinates", None),
-        )
-        diagnostic_print(
-            lambda: (
-                "RECOVERY_INTERACTION_PREFLIGHT: "
-                f"iteration={iteration} frame={getattr(getattr(context, 'emulator', None), 'frame_count', None)!r} "
-                f"location={(getattr(overworld, 'map_id', None), getattr(overworld, 'player_coordinates', None))!r} "
-                f"game_state={getattr(interaction.game_state, 'name', repr(interaction.game_state))!r} "
-                f"controllable={interaction.controllable!r} dialogue_waiting={interaction.dialogue_waiting!r} "
-                f"field_message_lifecycle_active={interaction.field_message_lifecycle_active!r} "
-                f"field_message_advance_ready={interaction.field_message_advance_ready!r} "
-                f"interaction_type={observation.interaction_type.name!r} "
-                f"selected_action={decision.action.action_type.name!r} "
-                f"observation_changed={previous_signature is None or signature != previous_signature!r}"
-            ),
-            trace=True,
-            prefix="RECOVERY_INTERACTION_PREFLIGHT",
-        )
-        previous_signature = signature
-        if decision.action.action_type in (
-            AgentActionType.ADVANCE_DIALOGUE,
-            AgentActionType.ACCELERATE_DIALOGUE_RENDER,
-        ):
-            result = executor.execute(decision.action, observation)
-            diagnostic_print(
-                lambda: (
-                    "RECOVERY_INTERACTION_ACTION: "
-                    f"action={decision.action.action_type.name!r} executed={getattr(result.result_type, 'name', None)!r} "
-                    f"message={getattr(result, 'message', None)!r}"
-                ),
-                trace=True,
-                prefix="RECOVERY_INTERACTION_ACTION",
-            )
-            diagnostic_print(
-                lambda: f"RECOVERY_PREFLIGHT_LIFECYCLE: phase=yield iteration={iteration} frame={getattr(context, 'frame', None)!r}",
-                trace=True,
-                prefix="RECOVERY_PREFLIGHT_LIFECYCLE",
-            )
-            yield
-            continue
-        if decision.action.action_type is AgentActionType.WAIT_REOBSERVE and not interaction.controllable:
-            diagnostic_print(
-                lambda: (
-                    "RECOVERY_INTERACTION_PREFLIGHT: "
-                    f"iteration={iteration} decision=yield_wait={decision.action.action_type.name!r}"
-                ),
-                trace=True,
-                prefix="RECOVERY_INTERACTION_PREFLIGHT",
-            )
-            yield
-            continue
-        diagnostic_print(
-            lambda: (
-                "RECOVERY_INTERACTION_PREFLIGHT: "
-                f"iteration={iteration} decision=return_waiting={decision.action.action_type.name!r}"
-            ),
-            trace=True,
-            prefix="RECOVERY_INTERACTION_PREFLIGHT",
-        )
-        return
 
 
 def observe_resource_snapshot() -> ResourceSnapshot:
@@ -1713,15 +1581,25 @@ def _execute_healing_source_interaction(source: HealingSource) -> Iterator[objec
         yield
 
 
-def observe_route_recovery() -> RouteRecovery:
+def observe_route_recovery(*, candidate_limit: int | None = None) -> RouteRecovery:
     """Observe recovery routing without turning transient avatar gaps into crashes."""
     trace = getattr(context, "stutter_trace", None)
     started = trace.now() if trace is not None else 0
     try:
         location = get_player_location()
-    except RuntimeError as error:
+    except (KeyError, RuntimeError) as error:
         # get_player_location documents RuntimeError for inactive/corrupt
         # avatar data during transitions.  Do not mask pathfinding errors.
+        if isinstance(error, KeyError):
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_RECOVERY_OBSERVATION_RETRY: "
+                    "stage='player_location' exception_type='KeyError' "
+                    f"key={error.args!r} traceback={traceback.format_exc()!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_RECOVERY_OBSERVATION_RETRY",
+            )
         result = RouteRecovery(observation_available=False, observation_error=str(error))
         if trace is not None:
             trace.duration("campaign_route_recovery_observation_duration_ms", started)
@@ -1741,15 +1619,21 @@ def observe_route_recovery() -> RouteRecovery:
             return result
         center = None
         center_lookup_error = None
-        try:
-            center = find_closest_pokemon_center(location)
-        except (BotModeError, PathFindingError) as error:
-            # The legacy table is intentionally incomplete: it contains
-            # route-level Center hints, not every map that can lead to one.
-            # In particular, Petalburg Woods has no direct table entry.  Keep
-            # that failure as a diagnostic and fall through to the ROM
-            # healing catalog below.
-            center_lookup_error = error
+        is_rse = bool(getattr(getattr(context, "rom", None), "is_rse", False))
+        # Emerald recovery is defined by the ROM healing catalog.  The old
+        # Center lookup performed an unrelated local path search and could
+        # disagree with the executable source selected below, especially
+        # across map warps.  Non-Emerald callers retain the lookup only as a
+        # compatibility boundary; Campaign Progression is Emerald-only.
+        if not is_rse:
+            try:
+                center = find_closest_pokemon_center(location)
+            except (BotModeError, PathFindingError) as error:
+                # The legacy table is intentionally incomplete: it contains
+                # route-level Center hints, not every map that can lead to
+                # one. Keep that failure as a diagnostic and fall through to
+                # the ROM healing catalog below.
+                center_lookup_error = error
         center_location = getattr(center, "value", None)
         diagnostic_print(
             lambda: (
@@ -1773,16 +1657,14 @@ def observe_route_recovery() -> RouteRecovery:
                 trace.duration("campaign_route_recovery_observation_duration_ms", started)
             return result
 
-        # A valid legacy Center remains the first choice for compatibility,
-        # but Emerald's catalog supplies the executable interior target.  If
-        # the legacy map table has no candidate, probe cataloged sources and
-        # retain the first safe route after ranking by the actual tactical
-        # route cost.  This covers interior maps and outdoor areas such as
-        # Petalburg Woods without inventing a Center coordinate.
+        # Non-Emerald compatibility callers may still provide only a Center
+        # destination.  Emerald always selects from the executable catalog,
+        # including maps such as Petalburg Woods that have no legacy Center
+        # table entry.
         if center is not None:
             source = emerald_healing_source_for_destination(center_location)
             sources = (source,) if source is not None else (None,)
-        elif getattr(getattr(context, "rom", None), "is_rse", False):
+        elif is_rse:
             source_map = location[0]
             local_sources = tuple(
                 source
@@ -1822,7 +1704,8 @@ def observe_route_recovery() -> RouteRecovery:
         # while the bounded alternates preserve a chance to route around a
         # temporary trainer/occupancy hazard without monopolizing the frame
         # loop with eighteen global searches.
-        ordered_sources = ordered_sources[:_RECOVERY_CATALOG_CANDIDATE_LIMIT]
+        limit = _RECOVERY_CATALOG_CANDIDATE_LIMIT if candidate_limit is None else max(1, candidate_limit)
+        ordered_sources = ordered_sources[:limit]
         route_candidates = []
         route_errors = []
         for index, source in ordered_sources:
@@ -1881,6 +1764,27 @@ def observe_route_recovery() -> RouteRecovery:
         if trace is not None:
             trace.duration("campaign_route_recovery_observation_duration_ms", started)
         return result
+    except KeyError as error:
+        # Map/object tables are replaced asynchronously around battle return
+        # and map entry.  A missing key here means this frame is incomplete,
+        # not that recovery has been proven impossible. Let readiness defer
+        # and let the next frame rebuild the observation.
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_RECOVERY_OBSERVATION_RETRY: "
+                "stage='route' exception_type='KeyError' "
+                f"key={error.args!r} traceback={traceback.format_exc()!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_RECOVERY_OBSERVATION_RETRY",
+        )
+        result = RouteRecovery(
+            observation_available=False,
+            observation_error=f"KeyError: {error}",
+        )
+        if trace is not None:
+            trace.duration("campaign_route_recovery_observation_duration_ms", started)
+        return result
     except (BotModeError, NavigationError, PathFindingError) as error:
         # A valid observation with no usable route is known, not transient.
         local_catalog_source = next(
@@ -1910,43 +1814,18 @@ def observe_route_recovery() -> RouteRecovery:
 
 
 def recover_at_nearest_center(current_location=None, selected_center=None) -> Iterator[object]:
-    """Perform an existing Center healing flow and verify its result."""
-    yield from _resolve_recovery_interaction()
-    yield from wait_for_player_avatar_to_be_controllable()
-    # Reuse the same current location representation required by Center
-    # pathfinding; omitting it makes the helper rediscover from None and
-    # causes calculate_path(None, ...).
+    """Compatibility entry point that delegates to planned recovery.
+
+    Older callers may still provide only a Center enum.  Convert that value
+    into the Emerald healing catalog, then use the same destination, warp,
+    source discovery, and dialogue executor as campaign-planned recovery.
+    """
     center = selected_center or find_closest_pokemon_center(current_location or get_player_location())
-    yield from _navigate_recovery_to_center(center)
-    yield from _wait_for_center_interior(center)
-    diagnostic_print(
-        lambda: f"CENTER_EXIT_HEAL_CALL: phase=before frame={getattr(context, 'frame', None)!r} emulator_frame={context.emulator.get_frame_count()!r} center={center!r}",
-        trace=True,
-        prefix="CAMPAIGN_RECOVERY_HANDOFF",
-    )
-    diagnostic_print(
-        lambda: f"CENTER_HEAL_BEGIN: frame={getattr(context, 'frame', None)!r} emulator_frame={context.emulator.get_frame_count()!r} center={center!r}",
-        trace=True,
-    )
-    yield from heal_in_pokemon_center(center, navigate_to_destination=False)
-    diagnostic_print(
-        lambda: f"CENTER_EXIT_HEAL_CALL: phase=after frame={getattr(context, 'frame', None)!r} emulator_frame={context.emulator.get_frame_count()!r} center={center!r}",
-        trace=True,
-    )
-    diagnostic_print(
-        lambda: f"CENTER_HEAL_RETURN: frame={getattr(context, 'frame', None)!r} emulator_frame={context.emulator.get_frame_count()!r} center={center!r}",
-        trace=True,
-    )
-    if not party_is_restored():
-        raise RuntimeError("Pokémon Center interaction completed without restoring the party")
-
-
-def _navigate_recovery_to_center(center) -> Iterator[object]:
-    """Reach a selected Center through the normal observation-driven loop."""
-    location = (center.value[0], center.value[1])
-    navigation_goal = _recovery_navigation_goal(location)
-    loop = AgentControlLoop(lambda: observe_agent(goal=navigation_goal), goal=navigation_goal).run()
-    yield from loop
+    destination = getattr(center, "value", center)
+    source = emerald_healing_source_for_destination(destination)
+    if source is None:
+        raise RuntimeError(f"No cataloged healing source is available for {destination!r}")
+    yield from execute_planned_recovery(destination, source)
 
 
 def _wait_for_center_interior(center) -> Iterator[object]:
@@ -2125,7 +2004,14 @@ def withdraw_best_pc_healing_item() -> Iterator[object]:
 
 
 def execute_campaign_recovery() -> Iterator[object]:
-    """Use the existing recovery primitives and verify the resulting party."""
+    """Execute the route observer's selected recovery source.
+
+    Recovery selection and execution must agree on both destination and
+    source.  In particular, do not fall back to the coordinate-based Center
+    helper when the selected route is missing metadata: that helper has a
+    separate hard-coded nurse dialogue path and cannot safely cross the same
+    observed map/warp boundaries as planned recovery.
+    """
     route = observe_route_recovery()
     diagnostic_print(
         lambda: (
@@ -2136,20 +2022,21 @@ def execute_campaign_recovery() -> Iterator[object]:
         trace=True,
     )
     if route.center_available and route.safe_to_reach_center:
-        # The legacy helper navigates to the nurse's object tile itself
-        # (behind the counter).  That can leave the avatar stationary at the
-        # Center entrance while the helper continues issuing inputs.  Use the
-        # observed healing-source path so navigation terminates on the
-        # counter's activation tile before interacting.
-        current_location = get_player_location()
-        center = find_closest_pokemon_center(current_location)
-        if hasattr(center, "value"):
-            yield from execute_planned_recovery(center.value)
-        else:
-            # Keep lightweight capability fixtures and third-party center
-            # providers compatible until they expose a concrete destination.
-            yield from recover_at_nearest_center(current_location, center)
-        diagnostic_print("CAMPAIGN_RECOVERY_EXECUTION: completed=True method=center", trace=True)
+        selected_destination = getattr(route, "center_location", None)
+        selected_source = (
+            emerald_healing_source_for_destination(selected_destination) if selected_destination is not None else None
+        )
+        if selected_destination is None or selected_source is None:
+            raise RuntimeError("selected recovery route has no executable healing source")
+        # ``observe_route_recovery`` already paid for and selected this exact
+        # source. Reusing its destination, source, and route keeps execution
+        # aligned with readiness and avoids a second route selection.
+        yield from execute_planned_recovery(
+            selected_destination,
+            selected_source,
+            planned_route=getattr(route, "route", None),
+        )
+        diagnostic_print("CAMPAIGN_RECOVERY_EXECUTION: completed=True method=planned_source", trace=True)
         return
     snapshot = observe_resource_snapshot()
     if snapshot.bag_healing_items:

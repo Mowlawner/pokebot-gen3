@@ -39,6 +39,10 @@ class BattleStarted:
     # events carry the decision made from the same frame's campaign facts so
     # rules replay does not have to reconstruct emulator state.
     encounter_eligible: bool | None = None
+    # Species is kept separately from stable Pokémon identity because a wild
+    # battler's identity is not necessarily the identity of the Pokémon that
+    # is eventually added to the party.
+    opponent_species: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +72,7 @@ class PokemonCaptured:
     frame: int
     identity: PokemonIdentity
     location: tuple[int, int] | None = None
+    species: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +263,7 @@ class NuzlockeEventObserver:
                         tuple(p.identity for p in battle.own_active if p.identity is not None),
                         tuple(p.identity for p in battle.opponent_active if p.identity is not None),
                         _map(snapshot),
+                        opponent_species=tuple(p.species for p in battle.opponent_active),
                     ),
                 )
             return ()
@@ -282,6 +288,7 @@ class NuzlockeEventObserver:
                     tuple(p.identity for p in battle.own_active if p.identity is not None),
                     tuple(p.identity for p in battle.opponent_active if p.identity is not None),
                     _map(snapshot),
+                    opponent_species=tuple(p.species for p in battle.opponent_active),
                 )
             )
         elif snapshot.battle_available and snapshot.battle is None and self._previous_ready_battle is not None:
@@ -299,6 +306,7 @@ class NuzlockeEventObserver:
                         snapshot.frame,
                         battle.opponent_active[0].identity,
                         _map(self._previous_ready_battle),
+                        battle.opponent_active[0].species,
                     )
                 )
             events.append(

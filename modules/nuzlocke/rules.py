@@ -43,6 +43,7 @@ class LocationEncounter:
     pokemon_identity: PokemonIdentity | None = None
     frame: int | None = None
     eligible: bool = True
+    species: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +74,9 @@ class NuzlockeCampaignState:
     violations: tuple[RuleViolation, ...] = ()
     run_lost: bool = False
     last_event_sequence: int = 0
+    # Species caught under an eligible encounter.  Keep the original spelling
+    # for diagnostics, while comparisons use case-folded values.
+    captured_species: tuple[str, ...] = ()
 
     @property
     def legal(self) -> bool:
@@ -176,8 +180,11 @@ class OneEncounterPerAreaRule:
             existing = next((e for e in state.encounters if e.location == location), None)
             if existing is None:
                 identity = event.opponent_pokemon_identities[0] if len(event.opponent_pokemon_identities) == 1 else None
+                species = event.opponent_species[0] if len(event.opponent_species) == 1 else None
                 state = replace(
-                    state, encounters=state.encounters + (LocationEncounter(location, PENDING, identity, event.frame),)
+                    state,
+                    encounters=state.encounters
+                    + (LocationEncounter(location, PENDING, identity, event.frame, True, species),),
                 )
             elif existing.status not in (PENDING, UNKNOWN):
                 identity = event.opponent_pokemon_identities[0] if len(event.opponent_pokemon_identities) == 1 else None
@@ -244,6 +251,72 @@ class OneEncounterPerAreaRule:
         )
 
 
+def _normalize_species(species: str | None) -> str | None:
+    """Return a stable, case-insensitive species key."""
+
+    if not isinstance(species, str):
+        return None
+    value = species.strip().casefold()
+    return value or None
+
+
+def _species_is_captured(state: NuzlockeCampaignState, species: tuple[str, ...]) -> bool:
+    """Return whether any observed opponent species is already captured."""
+
+    captured = {_normalize_species(item) for item in state.captured_species}
+    return any(normalized in captured for item in species if (normalized := _normalize_species(item)) is not None)
+
+
+class SpeciesClauseRule:
+    """Skip eligible encounters for species already captured in the run."""
+
+    rule_id = CampaignRuleId.SPECIES_CLAUSE
+
+    def apply(
+        self,
+        state: NuzlockeCampaignState,
+        event: Event,
+        *,
+        encounter_eligible: bool,
+        active_wild: dict[tuple[int, int], tuple[PokemonIdentity, ...]],
+    ) -> NuzlockeCampaignState:
+        """Record only species captured from a pending eligible encounter."""
+
+        if not isinstance(event, PokemonCaptured):
+            return state
+
+        locations = (event.location,) if event.location is not None else tuple(active_wild)
+        for location in locations:
+            encounter = next(
+                (item for item in state.encounters if item.location == location and item.eligible),
+                None,
+            )
+            if encounter is None or encounter.status != PENDING:
+                continue
+            species = _normalize_species(event.species) or _normalize_species(encounter.species)
+            if species is None:
+                # Old capture records have no species and cannot safely
+                # establish Species Clause history.
+                return state
+            if species in {_normalize_species(item) for item in state.captured_species}:
+                return state
+            stored = (
+                event.species.strip() if isinstance(event.species, str) and event.species.strip() else encounter.species
+            )
+            return replace(state, captured_species=state.captured_species + (stored or species,))
+        return state
+
+    def evaluate(self, state: NuzlockeCampaignState) -> RuleAssessment:
+        """Species Clause is a legality constraint, not a violation detector."""
+
+        return RuleAssessment(self.rule_id, True)
+
+    def constrain(self, state: NuzlockeCampaignState, candidate):
+        """Leave tactical candidate selection to the battle policy."""
+
+        return candidate
+
+
 class NuzlockeRulesProjection:
     """Reduce an ordered event stream into immutable Nuzlocke state."""
 
@@ -261,7 +334,9 @@ class NuzlockeRulesProjection:
         self._encounters_active = encounters_active
         self._rule_config = rule_config or CampaignRulesConfig()
         self._rules = tuple(
-            rule for rule in (OneEncounterPerAreaRule(), FaintingRule()) if self._rule_config.is_enabled(rule.rule_id)
+            rule
+            for rule in (SpeciesClauseRule(), OneEncounterPerAreaRule(), FaintingRule())
+            if self._rule_config.is_enabled(rule.rule_id)
         )
 
     @property
@@ -326,6 +401,18 @@ class NuzlockeRulesProjection:
             # its observation boundary.  This takes precedence over the
             # caller's current runtime state during replay.
             eligible_now = event.encounter_eligible
+        if (
+            isinstance(event, BattleStarted)
+            and eligible_now
+            and event.is_wild
+            and not event.is_trainer
+            and self._rule_config.is_enabled(CampaignRuleId.SPECIES_CLAUSE)
+            and _species_is_captured(state, event.opponent_species)
+        ):
+            # Species Clause changes encounter ownership, not battle legality:
+            # the duplicate may still be fought or fled from, but it cannot
+            # claim the area's first encounter.
+            eligible_now = False
         for rule in self._rules:
             state = rule.apply(
                 state,

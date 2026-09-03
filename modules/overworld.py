@@ -411,6 +411,79 @@ def static_trainer_observations(
     return tuple(result)
 
 
+def _is_pokemart_clerk_script(script: object) -> bool:
+    """Return whether a ROM script identifies an ordinary Poké Mart clerk."""
+
+    return isinstance(script, str) and (
+        script.endswith("_Mart_EventScript_Clerk")
+        or ("DepartmentStore_2F_EventScript_Clerk" in script and script.endswith(("ClerkLeft", "ClerkRight")))
+    )
+
+
+def static_pokemart_clerk_observations(
+    map_id: MapId,
+    map_metadata,
+    runtime_objects: tuple[ObjectObservation, ...] | list[ObjectObservation] = (),
+) -> tuple[ObjectObservation, ...]:
+    """Describe Mart clerks that have not spawned in the runtime table yet.
+
+    Emerald lazily populates object events based on camera proximity. A shop
+    clerk can therefore be absent while the player is navigating toward the
+    shop, even though the static map template already proves that the
+    purchase affordance exists. This fallback contributes only an
+    interaction trigger; runtime objects remain authoritative for collision.
+    """
+
+    runtime_ids = {
+        object_observation.local_id
+        for object_observation in runtime_objects
+        if object_observation.location[0] == map_id
+    }
+    runtime_scripts = {
+        object_observation.script for object_observation in runtime_objects if object_observation.location[0] == map_id
+    }
+    result: list[ObjectObservation] = []
+    for template in getattr(map_metadata, "objects", ()):
+        try:
+            if getattr(template, "kind", "normal") != "normal":
+                continue
+            local_id = template.local_id
+            script = template.script_symbol
+            if not _is_pokemart_clerk_script(script):
+                continue
+            # Prefer the runtime object whenever either ROM identity is
+            # already present. This avoids publishing a static duplicate
+            # while a camera-boundary observation is being refreshed.
+            if local_id in runtime_ids or script in runtime_scripts:
+                continue
+            flag_id = getattr(template, "flag_id", 0) or 0
+            if flag_id:
+                try:
+                    if get_event_flag_by_number(flag_id):
+                        continue
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+                    # Unknown visibility is not evidence that the affordance
+                    # is absent. Retain the static interaction conservatively.
+                    pass
+            result.append(
+                ObjectObservation(
+                    local_id=local_id,
+                    location=(map_id, template.local_coordinates),
+                    script=script,
+                    previous_location=(map_id, template.local_coordinates),
+                    movement_type=str(getattr(template, "movement_type", "")),
+                    visibility_flag_id=flag_id or None,
+                    interactable=True,
+                    elevation=getattr(template, "elevation", None),
+                )
+            )
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+            # Partial map metadata is common during a map transition. Omit
+            # only the unresolved template and preserve other observations.
+            continue
+    return tuple(result)
+
+
 def evaluate_trigger_condition(trigger: TriggerObservation, current_value: int | None) -> bool | None:
     """Evaluate a normalized trigger condition without interpreting its script."""
     if trigger.condition_required_value is None:
@@ -1024,6 +1097,7 @@ def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservatio
     # trigger binding before Emerald has spawned the object event.
     runtime_objects = objects
     static_trainers = static_trainer_observations(map_id, map_data, runtime_objects)
+    static_clerks = static_pokemart_clerk_observations(map_id, map_data, runtime_objects)
     object_locations = {object_observation.location[1] for object_observation in runtime_objects}
 
     # Conditions belong to the live observation, not the static cache.
@@ -1110,6 +1184,30 @@ def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservatio
             )
         )
 
+    # A Mart clerk may not exist in gObjectEvents until the player is close
+    # enough for the camera to load it. Publish the static interaction with
+    # the same resolver as a live object so Emerald's counter continuation
+    # tile is honored. Do not merge these objects into the runtime object
+    # list: static metadata must never become collision occupancy.
+    for clerk in static_clerks:
+        activation_requirements = resolve_object_activation_positions(
+            clerk,
+            tuple(runtime_objects) + static_trainers + static_clerks,
+            tiles,
+            (map_width, map_height),
+        )
+        triggers.append(
+            TriggerObservation(
+                trigger_id=f"static_object:{clerk.local_id}:{clerk.script}",
+                locations=frozenset({clerk.location}),
+                activation_locations=frozenset(location for location, _ in activation_requirements),
+                kind="object_interaction",
+                activation_requirements=activation_requirements,
+                affordance_id=clerk.script,
+                requires_input=True,
+            )
+        )
+
     timing("perception_active_runtime_objects", runtime_start)
     if trace is not None:
         trace.duration("overworld_runtime_object_scan_duration_ms", trace_runtime_start)
@@ -1139,25 +1237,23 @@ def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservatio
         trace.duration("overworld_trigger_binding_duration_ms", trace_binding_start)
     for resolution in bindings:
         binding = resolution.binding
-        activation_requirements = tuple(
-            (
-                (map_id, (candidate_x, candidate_y)),
-                {
-                    (object_x, object_y - 1): Direction.South,
-                    (object_x + 1, object_y): Direction.West,
-                    (object_x, object_y + 1): Direction.North,
-                    (object_x - 1, object_y): Direction.East,
-                }[(candidate_x, candidate_y)],
-            )
-            for object_x, object_y in resolution.runtime_locations
-            for candidate_x, candidate_y in (
-                (object_x, object_y - 1),
-                (object_x + 1, object_y),
-                (object_x, object_y + 1),
-                (object_x - 1, object_y),
-            )
-            if (candidate_x, candidate_y) in resolution.interaction_positions
-        )
+        activation_requirements = []
+        for object_x, object_y in resolution.runtime_locations:
+            adjacent_requirements = {
+                (object_x, object_y - 1): Direction.South,
+                (object_x + 1, object_y): Direction.West,
+                (object_x, object_y + 1): Direction.North,
+                (object_x - 1, object_y): Direction.East,
+            }
+            for candidate in adjacent_requirements:
+                if candidate not in resolution.interaction_positions:
+                    continue
+                # Binding geometry can be stale for one frame while an
+                # object moves or a counter continuation is being resolved.
+                # An unrecognized position must not abort the complete
+                # overworld observation with a KeyError.
+                activation_requirements.append(((map_id, candidate), adjacent_requirements[candidate]))
+        activation_requirements = tuple(activation_requirements)
         triggers.append(
             TriggerObservation(
                 trigger_id=binding.trigger_id,

@@ -70,6 +70,7 @@ class InteractionObservation:
 _field_message_lifecycle_active = False
 _field_message_advance_ready = False
 _field_message_render_rescue_pulses = 0
+_field_message_mart_fallback_pulses = 0
 
 # A fresh B pulse is safe for Emerald's ordinary field-message rendering: it
 # can accelerate the printer without being accepted as an overworld object
@@ -89,6 +90,20 @@ _FIELD_MESSAGE_RENDER_RESCUE_SCRIPTS = frozenset(
 )
 _FIELD_MESSAGE_RENDER_RESCUE_SCRIPT_PREFIX = "EventScript_PkmnCenterNurse_"
 _POKEMON_CENTER_NURSE_SCRIPT_SUFFIX = "_PokemonCenter_1F_EventScript_Nurse"
+_POKEMART_CLERK_SCRIPT_SUFFIX = "_Mart_EventScript_Clerk"
+_POKEMART_TASK_NAMES = frozenset(
+    {
+        "Task_ShopMenu",
+        "Task_GoToBuyOrSellMenu",
+        "Task_BuyMenu",
+        "Task_BuyHowManyDialogueHandleInput",
+        "Task_ReturnToItemListAfterItemPurchase",
+        "Task_ExitBuyMenu",
+        "Task_ReturnToShopMenu",
+        "Task_ReturnToMartMenu",
+    }
+)
+_FIELD_MESSAGE_MART_FALLBACK_LIMIT = 4
 _FIELD_MESSAGE_RENDER_RESCUE_WRAPPER = "Std_MsgboxYesNo"
 _POKEMON_CENTER_NURSE_STACK_MARKERS = frozenset(
     {
@@ -97,14 +112,37 @@ _POKEMON_CENTER_NURSE_STACK_MARKERS = frozenset(
 )
 
 
+def _is_pokemart_clerk_script(script_name: Any) -> bool:
+    """Return whether a script is an Emerald Poké Mart clerk script."""
+
+    return isinstance(script_name, str) and (
+        script_name.endswith(_POKEMART_CLERK_SCRIPT_SUFFIX)
+        or ("DepartmentStore_2F_EventScript_Clerk" in script_name and script_name.endswith(("ClerkLeft", "ClerkRight")))
+    )
+
+
+def _pokemart_task_is_active() -> bool:
+    """Return whether the ROM has already handed control to a shop task."""
+
+    try:
+        return any(
+            isinstance(getattr(task, "symbol", None), str) and getattr(task, "symbol") in _POKEMART_TASK_NAMES
+            for task in (get_tasks() or ())
+        )
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+        return False
+
+
 def _field_message_render_rescue_applies(script_context: Any) -> bool:
-    """Identify the nurse-owned field-message render boundary.
+    """Identify a known Emerald field-message render boundary.
 
     The initial nurse prompt runs through the shared ``Std_MsgboxYesNo``
     wrapper, so its current script function is not nurse-specific.  Require
     the ROM script stack to contain the nurse helper before extending the
     bounded B-pulse rescue to that wrapper; the closing return script remains
-    directly identified by its own symbol.
+    directly identified by its own symbol. Poké Mart clerks use the same
+    field-message printer boundary for their opening greeting, but do not use
+    the nurse wrapper, so their concrete clerk script is also safe to match.
     """
     script_name = getattr(script_context, "script_function_name", None)
     if script_name in _FIELD_MESSAGE_RENDER_RESCUE_SCRIPTS or (
@@ -112,6 +150,7 @@ def _field_message_render_rescue_applies(script_context: Any) -> bool:
         and (
             script_name.startswith(_FIELD_MESSAGE_RENDER_RESCUE_SCRIPT_PREFIX)
             or script_name.endswith(_POKEMON_CENTER_NURSE_SCRIPT_SUFFIX)
+            or _is_pokemart_clerk_script(script_name)
         )
     ):
         return True
@@ -131,7 +170,7 @@ def _field_message_render_rescue_applies(script_context: Any) -> bool:
         return any(marker in stack for marker in _POKEMON_CENTER_NURSE_STACK_MARKERS) or any(
             isinstance(marker, str) and "GiveRunningShoesTrigger" in marker for marker in stack
         )
-    except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
         return False
 
 
@@ -155,7 +194,7 @@ def is_emerald_field_message_rendering() -> bool:
             and _field_message_render_rescue_applies(script_context)
             and task is not None
         )
-    except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
         return False
 
 
@@ -181,7 +220,7 @@ def _observe_field_message_waiting(state: GameState | Any) -> bool:
                 _field_message_lifecycle_active = True
                 _field_message_advance_ready = False
                 return True
-        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+        except (AttributeError, KeyError, RuntimeError, ValueError, TypeError, IndexError):
             pass
         _field_message_lifecycle_active = False
         _field_message_advance_ready = False
@@ -239,7 +278,7 @@ def _observe_field_message_waiting(state: GameState | Any) -> bool:
         ):
             _field_message_advance_ready = True
         return waiting
-    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+    except (AttributeError, KeyError, RuntimeError, ValueError, TypeError, IndexError):
         _field_message_advance_ready = False
         return False
 
@@ -292,7 +331,7 @@ def observe_interaction(
     callers can enrich this observation with their parsed options.
     """
 
-    global _field_message_advance_ready, _field_message_render_rescue_pulses
+    global _field_message_advance_ready, _field_message_render_rescue_pulses, _field_message_mart_fallback_pulses
     interaction_start = now()
     state_start = now()
     state = get_game_state()
@@ -320,28 +359,11 @@ def observe_interaction(
     choice_selected = confirmation.selected.name if confirmation is not None and confirmation.selected else None
     observed_choice_options = choice_options or (confirmation.options if confirmation is not None else ())
     # ``Std_MsgboxYesNo`` first displays an ordinary field message, then
-    # installs the Yes/No menu.  Its script identity alone is therefore not
-    # an actionable choice boundary: classifying the initial message as a
-    # choice would suppress the A input that advances it and prevents the
-    # menu task from ever being created.  The generic confirmation observer
-    # recognizes ``Task_HandleYesNoInput`` once it exists.  Retain this
-    # fallback only for the verified task/printer boundary used by field
-    # prompts that expose their ready state through ``Task_DrawFieldMessage``.
-    if (
-        confirmation is None
-        and script_context is not None
-        and getattr(script_context, "script_function_name", None) == "Std_MsgboxYesNo"
-        and script_active
-    ):
-        choice_menu_input_ready = is_field_message_task_waiting_for_input()
-        if choice_menu_input_ready:
-            choice_menu_active = True
-            observed_choice_options = choice_options or ("YES", "NO")
-            try:
-                cursor = read_symbol("sMenu", offset=0x02, size=1)[0]
-                choice_selected = ("YES", "NO")[cursor]
-            except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
-                choice_selected = None
+    # installs the Yes/No menu.  Its script identity and the draw-task
+    # printer boundary are not enough to identify a choice: the initial
+    # message still needs an A edge before Emerald creates
+    # ``Task_HandleYesNoInput``.  The generic confirmation observer is the
+    # sole choice owner and recognizes the menu only once that task exists.
     if choice_menu_active:
         interaction_phase = InteractionPhase.CHOICE_MENU_INPUT_WAIT
     elif (
@@ -376,8 +398,42 @@ def observe_interaction(
                 text_printer_current_char = int.from_bytes(text_printer_struct[0:4], byteorder="little")
                 text_printer_delay_counter = text_printer_struct[0x1E]
             text_printers_disabled = read_symbol("gDisableTextPrinters", size=1)[0]
-    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
+    except (AttributeError, KeyError, RuntimeError, ValueError, TypeError, IndexError):
         pass
+    # A Mart clerk can leave Emerald in IsFieldMessageBoxHidden for a short
+    # handoff window after the draw task has been removed.  In that window the
+    # ordinary printer predicates have no actionable signal, even though the
+    # clerk script is waiting for the input that starts the shop task.  Bound
+    # this fallback to the concrete clerk script, require an inactive printer,
+    # and refuse it once any shop task exists so it cannot press A into the
+    # shop UI or into an unrelated field interaction.
+    mart_render_fallback = (
+        bool(getattr(getattr(context, "rom", None), "is_emerald", False))
+        and script_active
+        and native_function == "IsFieldMessageBoxHidden"
+        and _is_pokemart_clerk_script(getattr(script_context, "script_function_name", None))
+        and _field_message_lifecycle_active
+        and not field_message_task_active
+        and printer_active == 0
+        and not _pokemart_task_is_active()
+    )
+    if mart_render_fallback:
+        _field_message_mart_fallback_pulses += 1
+    else:
+        _field_message_mart_fallback_pulses = 0
+    if mart_render_fallback and _field_message_mart_fallback_pulses >= _FIELD_MESSAGE_MART_FALLBACK_LIMIT:
+        _field_message_advance_ready = True
+        interaction_phase = InteractionPhase.FIELD_MESSAGE_INPUT_WAIT
+        diagnostic_print(
+            lambda: (
+                "MART_DIALOGUE_FALLBACK: action=ADVANCE_DIALOGUE "
+                f"frame={getattr(context, 'frame', None)!r} "
+                f"pulses={_field_message_mart_fallback_pulses!r} "
+                f"script={getattr(script_context, 'script_function_name', None)!r}"
+            ),
+            trace=True,
+            prefix="MART_DIALOGUE_FALLBACK",
+        )
     if (
         script_context is not None
         and getattr(script_context, "script_function_name", None)
@@ -444,6 +500,7 @@ def observe_interaction(
         trace.mark("interaction_field_message_lifecycle", _field_message_lifecycle_active)
         trace.mark("interaction_field_message_ready", _field_message_advance_ready)
         trace.mark("interaction_field_message_render_rescue", field_message_render_rescue_available)
+        trace.mark("interaction_mart_fallback_pulses", _field_message_mart_fallback_pulses)
         trace.mark("interaction_controllable", controllable)
         trace.mark("interaction_phase", interaction_phase.name)
         trace.mark("interaction_choice_active", choice_menu_active)
@@ -479,5 +536,6 @@ def observe_interaction(
             "text_printer_delay_counter": text_printer_delay_counter,
             "text_printers_disabled": text_printers_disabled,
             "field_message_render_rescue_pulses": _field_message_render_rescue_pulses,
+            "field_message_mart_fallback_pulses": _field_message_mart_fallback_pulses,
         },
     )

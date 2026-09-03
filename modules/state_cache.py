@@ -123,6 +123,8 @@ class StateCache:
 
         invalidate_shared_overworld_observation()
         for item in (
+            self._party,
+            self._item_bag,
             self._player,
             self._player_avatar,
             self._game_state,

@@ -18,6 +18,7 @@ from modules.overworld import (
     OverworldObservationResult,
     OverworldObservationStatus,
     static_trainer_observations,
+    static_pokemart_clerk_observations,
 )
 
 
@@ -122,6 +123,34 @@ class TestOverworldPerception(unittest.TestCase):
             static_trainer_observations(map_id, SimpleNamespace(objects=(template,)), (runtime,)),
             (),
         )
+
+    def test_static_pokemart_clerk_fallback_preserves_counter_activation_geometry(self):
+        map_id = (4, 4)
+        template = SimpleNamespace(
+            kind="normal",
+            local_id=8,
+            local_coordinates=(2, 2),
+            script_symbol="OldaleTown_Mart_EventScript_Clerk",
+            flag_id=0,
+            movement_type="FACE_DOWN",
+            elevation=3,
+        )
+        clerks = static_pokemart_clerk_observations(map_id, SimpleNamespace(objects=(template,)), ())
+        self.assertEqual(len(clerks), 1)
+        tiles = tuple(
+            TileObservation(
+                (map_id, (x, y)),
+                False,
+                frozenset(Direction),
+                metatile_behavior=0x80 if (x, y) == (2, 3) else None,
+            )
+            for x in range(5)
+            for y in range(5)
+        )
+        from modules.overworld import resolve_object_activation_positions
+
+        requirements = resolve_object_activation_positions(clerks[0], clerks, tiles, (5, 5))
+        self.assertEqual(dict(requirements)[(map_id, (2, 4))], Direction.North)
 
     def test_missing_avatar_is_explicitly_unavailable(self):
         with patch("modules.overworld.get_player_avatar", return_value=None):

@@ -1,6 +1,7 @@
 from modules.nuzlocke.resource_policy import (
     EncounterPolicy,
     HealingResource,
+    PokeballRestockPolicy,
     PartyResource,
     ReadinessImportance,
     ResourceDecision,
@@ -21,6 +22,33 @@ IMPORTANT = ResourceObjective(
     mandatory_battle=True,
     recover_before_completion=True,
 )
+
+
+def test_pokeball_restock_policy_uses_lower_threshold_for_detours():
+    policy = PokeballRestockPolicy(lower_threshold=5, upper_target=10)
+
+    assert policy.needs_restock(4)
+    assert not policy.needs_restock(5)
+    assert not policy.needs_restock(8)
+    assert policy.quantity_to_buy(4) == 6
+    assert policy.quantity_to_buy(10) == 0
+    assert policy.quantity_to_buy(12) == 0
+
+
+def test_pokeball_restock_policy_caps_purchase_at_available_money():
+    policy = PokeballRestockPolicy(lower_threshold=5, upper_target=10)
+
+    assert policy.affordable_quantity(2, money=700, unit_price=200) == 3
+    assert policy.affordable_quantity(2, money=0, unit_price=200) == 0
+
+
+def test_pokeball_restock_policy_rejects_malformed_ranges():
+    import pytest
+
+    with pytest.raises(ValueError):
+        PokeballRestockPolicy(lower_threshold=-1, upper_target=10)
+    with pytest.raises(ValueError):
+        PokeballRestockPolicy(lower_threshold=10, upper_target=10)
 
 
 def party(hp, maximum=20):

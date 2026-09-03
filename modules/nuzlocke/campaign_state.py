@@ -24,6 +24,7 @@ from .snapshots import (
     PartyPokemonSnapshot,
     StoragePokemonSnapshot,
 )
+from .resource_policy import PokeballRestockPolicy
 
 T = TypeVar("T")
 MapId = tuple[int, int]
@@ -117,6 +118,11 @@ class CampaignFacts:
     devon_corp_3f_state: Fact[int] = dataclass_field(default_factory=Fact.unavailable)
     devon_corp_3f_scene_complete: Fact[bool] = dataclass_field(default_factory=Fact.unavailable)
     roxanne_available: Fact[bool] = dataclass_field(default_factory=Fact.unavailable)
+    # ``pokeballs_ready`` is the durable Birch-receipt boundary. These two
+    # facts separate that milestone from the mutable inventory used to decide
+    # whether a restock task is needed.
+    pokeballs_received: Fact[bool] = dataclass_field(default_factory=Fact.unavailable)
+    pokeballs_sufficient: Fact[bool] = dataclass_field(default_factory=Fact.unavailable)
 
     def __getitem__(self, name: str) -> Fact[bool]:
         """Access a named campaign fact using attribute-style semantics."""
@@ -146,6 +152,8 @@ def derive_campaign_facts(
     snapshot: NuzlockeSnapshot,
     inventory: Fact[InventorySnapshot],
     nuzlocke_started: Fact[bool],
+    *,
+    pokeball_policy: PokeballRestockPolicy | None = None,
 ) -> CampaignFacts:
     """Derive semantic campaign facts from one snapshot and inventory fact.
 
@@ -156,6 +164,7 @@ def derive_campaign_facts(
     """
 
     observation = snapshot.campaign_observation
+    pokeball_policy = pokeball_policy or PokeballRestockPolicy()
     available = observation.available
     text_speed = (
         Fact.unavailable()
@@ -207,16 +216,25 @@ def derive_campaign_facts(
                 None,
                 defeated_rival.status if not defeated_rival.is_known else hidden_rival.status,
             )
-    balls = (
-        Fact.known(sum(item.quantity for item in inventory.value.poke_balls) > 0)
+    ball_count = (
+        sum(
+            item.quantity
+            for item in inventory.value.poke_balls
+            # The battle policy intentionally reserves Master Ball for manual
+            # use, so it cannot satisfy the autonomous capture reserve.
+            if item.name.casefold() != "master ball"
+        )
+        if inventory.is_known
+        else None
+    )
+    balls = Fact.known(ball_count > 0) if inventory.is_known else Fact(None, inventory.status)
+    received = Fact.known(lab.value >= 5) if lab.is_known else Fact(None, lab.status)
+    sufficient = (
+        Fact.known(not pokeball_policy.needs_restock(ball_count))
         if inventory.is_known
         else Fact(None, inventory.status)
     )
-    ready = (
-        Fact.known(balls.value and lab.value >= 5)
-        if balls.is_known and lab.is_known
-        else Fact(None, balls.status if balls.status is not FactStatus.KNOWN else lab.status)
-    )
+    ready = received if received.is_known else Fact(None, received.status)
     petalburg_city_state = _var(observation.variables, "PETALBURG_CITY_STATE", available)
     petalburg_gym_state = _var(observation.variables, "PETALBURG_GYM_STATE", available)
     # The city state reaches 3 immediately before the ROM warps back into the
@@ -297,6 +315,8 @@ def derive_campaign_facts(
         devon_corp_3f_state,
         devon_corp_3f_scene,
         roxanne_available,
+        received,
+        sufficient,
     )
 
 
@@ -357,6 +377,7 @@ class CampaignState:
         observed_projection: CampaignProjection | ObservedCampaignState | None = None,
         rules_projection: NuzlockeRulesProjection | NuzlockeCampaignState | None = None,
         canonical_area: str | None = None,
+        pokeball_policy: PokeballRestockPolicy | None = None,
     ) -> "CampaignState":
         """Construct a facade from already-normalized/projected values."""
 
@@ -436,7 +457,7 @@ class CampaignState:
             last_battle,
             session_id,
             session_ids,
-            _campaign_facts_for_runtime(snapshot, inventory, observed),
+            _campaign_facts_for_runtime(snapshot, inventory, observed, pokeball_policy=pokeball_policy),
             observation_lifecycle,
         )
 
@@ -514,9 +535,16 @@ def _campaign_facts_for_runtime(
     snapshot: NuzlockeSnapshot,
     inventory: Fact[InventorySnapshot],
     observed: ObservedCampaignState | None,
+    *,
+    pokeball_policy: PokeballRestockPolicy | None = None,
 ) -> CampaignFacts:
     """Combine current-save facts with durable rules/history projections."""
-    current = derive_campaign_facts(snapshot, inventory, Fact.unavailable())
+    current = derive_campaign_facts(
+        snapshot,
+        inventory,
+        Fact.unavailable(),
+        pokeball_policy=pokeball_policy,
+    )
     # Pokédex receipt is the ROM-owned default Nuzlocke boundary.  The legacy
     # NuzlockeStarted event remains replayable for old stores, but it cannot
     # create, delay, or override this current-save fact.

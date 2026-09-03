@@ -236,7 +236,9 @@ The relevant implementation points are:
 - `modules/nuzlocke/resource_runtime.py`: `execute_planned_recovery()` now
   receives the selected destination and healing source, navigates to that
   destination, discovers the interior interaction, and verifies restoration.
-  The older nearest-Center recovery path remains for compatibility.
+  The former nearest-Center compatibility entry point now delegates to this
+  same planned executor; the hard-coded nurse helper is outside Campaign
+  Progression and remains only for non-campaign modes.
 - `modules/navigation.py`: already models intermediate route analysis through
   `RouteCostAnalyzer` and returns first/continuation plans.
 
@@ -247,10 +249,10 @@ script, so readiness returned `UNKNOWN / OVERWORLD_UNAVAILABLE`. The tactical
 objective continued across that boundary, and no recovery waypoint was queued.
 
 The later Lab case exposed a second independent problem: legacy
-`calculate_path()` cannot cross warps. The world planner can now find the Lab
-to Oldale route, and the recovery observation fallback uses that world planner
-when the legacy pathfinder raises. This route-discovery fix is separate from
-the still-incomplete planning/ownership integration.
+`calculate_path()` cannot cross warps. Campaign recovery now uses the world
+planner for the Lab-to-Oldale route, including the final Center door warp.
+This route-discovery fix is separate from the still-incomplete
+planning/ownership integration.
 
 ## Feasibility assessment
 
@@ -301,17 +303,18 @@ avoid pressing A during `WaitForAorBPress`.
 
 ### Recovery execution: medium feasibility, partially implemented
 
-The planned recovery runtime now receives the selected destination and healing
-source, so it does not reselect a different Center during its route phase. It
-still discovers the interior interaction from a fresh observation and does not
-consume the planned `RecoveryStop.route` directly; the route is recomputed by
-the normal navigation executor. The older nearest-Center runtime remains in
-use for compatibility paths.
+The planned recovery runtime receives the selected destination, healing source,
+and (when available) the executable `RecoveryStop.route`, so it does not
+reselect a different Center during its route phase. It discovers the interior
+interaction from a fresh observation and executes it through the shared
+observation/action boundary. The former nearest-Center runtime entry point
+delegates to this same path; non-campaign modes may still use the older generic
+Center helper.
 
 The Lab-to-Oldale route also shows why all recovery route validation and
-execution should use one world-navigation abstraction. Validation now falls
-back to the world planner when the legacy pathfinder cannot cross a warp, but
-the two paths still coexist and can produce mismatched assumptions.
+execution should use one world-navigation abstraction. Campaign recovery now
+uses the world planner for cross-map warps and the final Center door, so route
+selection and execution share the same navigation model.
 
 ### Performance: medium risk, manageable
 

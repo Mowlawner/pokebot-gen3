@@ -55,7 +55,7 @@ class InteractionStateTests(unittest.TestCase):
         self.assertEqual(observation.interaction_phase, InteractionPhase.FIELD_MESSAGE_RENDER_WAIT)
         self.assertFalse(observation.dialogue_waiting)
 
-    def test_emerald_render_rescue_is_limited_to_nurse_rendering_boundary(self):
+    def test_emerald_render_rescue_covers_known_rendering_boundaries(self):
         import modules.interaction_state as interaction_state
 
         runtime = {"printer_active": 1, "printer_state": 0}
@@ -126,6 +126,17 @@ class InteractionStateTests(unittest.TestCase):
             script.script_function_name = "OldaleTown_PokemonCenter_1F_EventScript_Nurse"
             script.stack = ("Common_EventScript_PkmnCenterNurse",)
             self.assertTrue(observe_interaction().field_message_render_rescue_available)
+            # Mart clerks use the same printer/render boundary for their
+            # opening greeting. Without the rescue, the campaign remains in
+            # IsFieldMessageBoxHidden and repeatedly waits forever before the
+            # shop task can be created.
+            script.script_function_name = "PetalburgCity_Mart_EventScript_Clerk"
+            script.stack = ()
+            self.assertTrue(observe_interaction().field_message_render_rescue_available)
+            script.script_function_name = "LilycoveCity_DepartmentStore_2F_EventScript_ClerkLeft"
+            self.assertTrue(observe_interaction().field_message_render_rescue_available)
+            script.script_function_name = "PetalburgCity_Mart_EventScript_Man"
+            self.assertFalse(observe_interaction().field_message_render_rescue_available)
             script.script_function_name = "EventScript_PkmnCenterNurse_ReturnPkmn"
             interaction_state._field_message_render_rescue_pulses = 0
             observations = [observe_interaction() for _ in range(12)]
@@ -178,6 +189,104 @@ class InteractionStateTests(unittest.TestCase):
         self.assertEqual(observation.interaction_phase, InteractionPhase.FIELD_MESSAGE_INPUT_WAIT)
         self.assertTrue(observation.dialogue_waiting)
 
+    def test_mart_opening_dialogue_has_bounded_fallback_when_draw_task_is_missing(self):
+        import modules.interaction_state as interaction_state
+
+        script = SimpleNamespace(
+            is_active=True,
+            native_function_name="IsFieldMessageBoxHidden",
+            script_function_name="PetalburgCity_Mart_EventScript_Clerk",
+            stack=(),
+        )
+
+        def read_runtime_symbol(symbol, *args, **kwargs):
+            if symbol == "sTextPrinters" and kwargs.get("offset") == 0x1B:
+                return bytes((0, 0))
+            if symbol == "gDisableTextPrinters":
+                return bytes((0,))
+            return bytes(0x24)
+
+        fake_context = SimpleNamespace(
+            rom=SimpleNamespace(is_emerald=True, is_rs=False),
+            frame=0,
+            stutter_trace=None,
+        )
+        with (
+            patch.object(interaction_state, "_field_message_lifecycle_active", True),
+            patch.object(interaction_state, "_field_message_advance_ready", False),
+            patch.object(interaction_state, "_field_message_mart_fallback_pulses", 0),
+            patch("modules.interaction_state.context", fake_context),
+            patch("modules.interaction_state.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.interaction_state.get_global_script_context", return_value=script),
+            patch("modules.interaction_state.is_field_message_waiting_for_input", return_value=False),
+            patch("modules.interaction_state.task_is_active", return_value=False),
+            patch("modules.interaction_state.is_field_message_task_waiting_for_input", return_value=False),
+            patch("modules.interaction_state.get_task", return_value=None),
+            patch("modules.interaction_state.get_tasks", return_value=[]),
+            patch("modules.interaction_state.player_avatar_is_controllable", return_value=True),
+            patch("modules.interaction_state.read_symbol", side_effect=read_runtime_symbol),
+            patch("modules.nuzlocke.emerald_confirmation.observe_emerald_confirmation", return_value=None),
+        ):
+            observations = [observe_interaction() for _ in range(interaction_state._FIELD_MESSAGE_MART_FALLBACK_LIMIT)]
+
+        self.assertTrue(
+            all(item.interaction_phase is InteractionPhase.FIELD_MESSAGE_RENDER_WAIT for item in observations[:-1])
+        )
+        self.assertEqual(observations[-1].interaction_phase, InteractionPhase.FIELD_MESSAGE_INPUT_WAIT)
+        self.assertTrue(observations[-1].field_message_advance_ready)
+        self.assertEqual(
+            observations[-1].metadata["field_message_mart_fallback_pulses"],
+            interaction_state._FIELD_MESSAGE_MART_FALLBACK_LIMIT,
+        )
+
+    def test_mart_opening_fallback_stops_once_shop_task_exists(self):
+        import modules.interaction_state as interaction_state
+
+        script = SimpleNamespace(
+            is_active=True,
+            native_function_name="IsFieldMessageBoxHidden",
+            script_function_name="PetalburgCity_Mart_EventScript_Clerk",
+            stack=(),
+        )
+
+        def read_runtime_symbol(symbol, *args, **kwargs):
+            if symbol == "sTextPrinters" and kwargs.get("offset") == 0x1B:
+                return bytes((0, 0))
+            return bytes(0x24)
+
+        fake_context = SimpleNamespace(
+            rom=SimpleNamespace(is_emerald=True, is_rs=False),
+            frame=0,
+            stutter_trace=None,
+        )
+        with (
+            patch.object(interaction_state, "_field_message_lifecycle_active", True),
+            patch.object(interaction_state, "_field_message_advance_ready", False),
+            patch.object(interaction_state, "_field_message_mart_fallback_pulses", 0),
+            patch("modules.interaction_state.context", fake_context),
+            patch("modules.interaction_state.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.interaction_state.get_global_script_context", return_value=script),
+            patch("modules.interaction_state.is_field_message_waiting_for_input", return_value=False),
+            patch("modules.interaction_state.task_is_active", return_value=False),
+            patch("modules.interaction_state.is_field_message_task_waiting_for_input", return_value=False),
+            patch("modules.interaction_state.get_task", return_value=None),
+            patch(
+                "modules.interaction_state.get_tasks",
+                return_value=[SimpleNamespace(symbol="Task_ShopMenu")],
+            ),
+            patch("modules.interaction_state.player_avatar_is_controllable", return_value=True),
+            patch("modules.interaction_state.read_symbol", side_effect=read_runtime_symbol),
+            patch("modules.nuzlocke.emerald_confirmation.observe_emerald_confirmation", return_value=None),
+        ):
+            observations = [
+                observe_interaction() for _ in range(interaction_state._FIELD_MESSAGE_MART_FALLBACK_LIMIT + 1)
+            ]
+
+        self.assertTrue(all(not item.field_message_advance_ready for item in observations))
+        self.assertTrue(
+            all(item.interaction_phase is InteractionPhase.FIELD_MESSAGE_RENDER_WAIT for item in observations)
+        )
+
     def test_wait_for_a_or_b_without_lifecycle_is_script_wait(self):
         observation = self._observe(native="WaitForAorBPress", lifecycle=False, waiting=False)
         self.assertEqual(observation.interaction_phase, InteractionPhase.SCRIPT_NATIVE_WAIT)
@@ -224,7 +333,7 @@ class InteractionStateTests(unittest.TestCase):
         self.assertEqual(classify_interaction(observation), InteractionType.DIALOGUE)
 
     def test_yes_no_script_printer_wait_remains_dialogue(self):
-        """Emerald keeps Std_MsgboxYesNo at IsFieldMessageBoxHidden for its A wait."""
+        """The draw-task wait is dialogue until Task_HandleYesNoInput exists."""
         import modules.interaction_state as interaction_state
 
         script = SimpleNamespace(
@@ -237,7 +346,7 @@ class InteractionStateTests(unittest.TestCase):
         ), patch("modules.interaction_state.get_global_script_context", return_value=script), patch(
             "modules.interaction_state.is_field_message_waiting_for_input", return_value=True
         ), patch(
-            "modules.interaction_state.is_field_message_task_waiting_for_input", return_value=False
+            "modules.interaction_state.is_field_message_task_waiting_for_input", return_value=True
         ), patch(
             "modules.interaction_state.task_is_active", return_value=True
         ), patch(
@@ -252,6 +361,7 @@ class InteractionStateTests(unittest.TestCase):
             observation = observe_interaction()
 
         self.assertEqual(observation.interaction_phase, InteractionPhase.FIELD_MESSAGE_INPUT_WAIT)
+        self.assertFalse(observation.choice_menu_active)
         self.assertEqual(classify_interaction(observation), InteractionType.DIALOGUE)
 
     def test_other_script_native_wait_is_not_dialogue(self):

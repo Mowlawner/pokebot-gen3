@@ -95,6 +95,12 @@ from .emerald_healing_catalog import (
     emerald_healing_sources_for_map,
     emerald_healing_source_for_destination,
 )
+from .emerald_pokeball_catalog import (
+    PokeballSourceRSE,
+    emerald_pokeball_sources,
+    emerald_pokeball_sources_for_map,
+    emerald_pokeball_source_entrances,
+)
 from .campaign_simulation import CampaignCheckpoint, CampaignSimulation, simulate_checkpoint, simulate_checkpoints
 from .fixture_state import (
     FixtureStateUnavailable,
@@ -134,6 +140,7 @@ from .campaign_execution import (
 from .resource_policy import (
     EncounterPolicy,
     HealingResource,
+    PokeballRestockPolicy,
     PartyResource,
     ReadinessImportance,
     ResourceDecision,
@@ -257,6 +264,10 @@ __all__ = [
     "emerald_healing_sources",
     "emerald_healing_sources_for_map",
     "emerald_healing_source_for_destination",
+    "PokeballSourceRSE",
+    "emerald_pokeball_sources",
+    "emerald_pokeball_sources_for_map",
+    "emerald_pokeball_source_entrances",
     "CampaignCheckpoint",
     "CampaignSimulation",
     "simulate_checkpoint",
@@ -281,6 +292,7 @@ __all__ = [
     "CampaignExecutionResult",
     "CampaignExecutionStatus",
     "adapt_campaign_execution",
+    "PokeballRestockPolicy",
     "CampaignController",
     "CampaignControllerState",
     "CampaignControllerStatus",

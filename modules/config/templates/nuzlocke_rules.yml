@@ -3,4 +3,11 @@
 enabled_rules:
   - one_encounter_per_area
   - fainting
+  - species_clause
   - level_cap
+
+# Restock only when the bag drops below the lower threshold, then buy back up
+# to the upper target.  This avoids abandoning route progress after every
+# individual Poké Ball use.
+pokeball_lower_threshold: 5
+pokeball_upper_target: 10

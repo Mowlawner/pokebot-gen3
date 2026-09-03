@@ -13,6 +13,107 @@ from modules.battle_state import BattleOutcome, EncounterType
 
 
 class BattleListenerLifecycleTests(unittest.TestCase):
+    def test_post_battle_rotation_waits_for_standing_field(self):
+        listener = BattleListener()
+        strategy = SimpleNamespace(choose_new_lead_after_battle=Mock(return_value=1))
+        fake_context = SimpleNamespace(bot_mode="Campaign Progression", controller_stack=[])
+
+        with (
+            patch("modules.modes._listeners.context", fake_context),
+            patch("modules.modes._listeners.get_game_state", side_effect=(GameState.OVERWORLD,) * 3),
+            patch(
+                "modules.modes._listeners.get_global_script_context",
+                side_effect=(
+                    SimpleNamespace(is_active=True),
+                    SimpleNamespace(is_active=False),
+                    SimpleNamespace(is_active=False),
+                ),
+            ),
+            patch("modules.modes._listeners.player_avatar_is_standing_still", side_effect=(False, True)),
+            patch.object(listener, "rotate_lead_pokemon", return_value=iter(())) as rotate,
+            patch("modules.modes._listeners.diagnostic_print"),
+        ):
+            list(listener._post_battle_rotation(strategy, 0))
+
+        strategy.choose_new_lead_after_battle.assert_called_once_with()
+        rotate.assert_called_once_with(1, 0)
+
+    def test_capture_completion_applies_level_balancing_rotation(self):
+        listener = BattleListener()
+        emulator = SimpleNamespace(reset_held_buttons=Mock(), press_button=Mock())
+        capture_strategy = object()
+        capture_factory = Mock(return_value=capture_strategy)
+        fake_context = SimpleNamespace(
+            bot_mode="Campaign Progression",
+            controller_stack=[],
+            emulator=emulator,
+            bot_mode_instance=SimpleNamespace(capture_battle_strategy=capture_factory),
+            config=SimpleNamespace(battle=SimpleNamespace(save_after_catching=False)),
+        )
+        party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
+        strategy = SimpleNamespace(choose_new_lead_after_battle=Mock(return_value=1))
+
+        with (
+            patch("modules.modes._listeners.context", fake_context),
+            patch("modules.modes.util._util_helper.context", fake_context),
+            patch("modules.modes._listeners.get_party", return_value=party),
+            patch("modules.battle_strategies.default.get_party", return_value=party),
+            patch("modules.modes._listeners.plugin_battle_started", return_value=iter(())),
+            patch("modules.modes._listeners.CatchStrategy") as default_capture_strategy,
+            patch("modules.modes._listeners.handle_battle", return_value=iter(())) as handle_battle,
+            patch.object(listener, "_wait_until_battle_is_over", return_value=iter(())),
+            patch(
+                "modules.modes._listeners.get_game_state",
+                side_effect=(GameState.BATTLE, GameState.OVERWORLD),
+            ),
+            patch(
+                "modules.modes._listeners.get_global_script_context",
+                return_value=SimpleNamespace(is_active=False),
+            ),
+            patch("modules.modes._listeners.player_avatar_is_standing_still", return_value=True),
+            patch("modules.modes._listeners.NuzlockeLevelBalancingBattleStrategy", return_value=strategy),
+            patch.object(listener, "rotate_lead_pokemon", return_value=iter(())) as rotate,
+            patch("modules.modes._listeners.diagnostic_print"),
+        ):
+            list(listener.catch())
+
+        rotate.assert_called_once_with(1, 0)
+        capture_factory.assert_called_once_with()
+        default_capture_strategy.assert_not_called()
+        handle_battle.assert_called_once_with(capture_strategy)
+
+    def test_run_away_completion_applies_level_balancing_rotation(self):
+        listener = BattleListener()
+        emulator = SimpleNamespace(reset_held_buttons=Mock(), press_button=Mock())
+        fake_context = SimpleNamespace(bot_mode="Campaign Progression", controller_stack=[], emulator=emulator)
+        party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
+        strategy = SimpleNamespace(choose_new_lead_after_battle=Mock(return_value=1))
+
+        with (
+            patch("modules.modes._listeners.context", fake_context),
+            patch("modules.modes.util._util_helper.context", fake_context),
+            patch("modules.modes._listeners.get_party", return_value=party),
+            patch("modules.battle_strategies.default.get_party", return_value=party),
+            patch("modules.modes._listeners.plugin_battle_started", return_value=iter(())),
+            patch("modules.modes._listeners.handle_battle", return_value=iter(())),
+            patch.object(listener, "_wait_until_battle_is_over", return_value=iter(())),
+            patch(
+                "modules.modes._listeners.get_game_state",
+                side_effect=(GameState.BATTLE, GameState.OVERWORLD),
+            ),
+            patch(
+                "modules.modes._listeners.get_global_script_context",
+                return_value=SimpleNamespace(is_active=False),
+            ),
+            patch("modules.modes._listeners.player_avatar_is_standing_still", return_value=True),
+            patch("modules.modes._listeners.NuzlockeLevelBalancingBattleStrategy", return_value=strategy),
+            patch.object(listener, "rotate_lead_pokemon", return_value=iter(())) as rotate,
+            patch("modules.modes._listeners.diagnostic_print"),
+        ):
+            list(listener.run_away_from_battle())
+
+        rotate.assert_called_once_with(1, 0)
+
     def test_tutorial_battle_honors_explicit_fight_request(self):
         listener = BattleListener()
         bot_mode = SimpleNamespace(on_battle_started=lambda _encounter: BattleAction.Fight)
@@ -106,6 +207,28 @@ class BattleListenerLifecycleTests(unittest.TestCase):
 
         emulator.press_button.assert_called_once_with("B")
 
+    def test_stale_party_menu_cleanup_yields_to_post_battle_rotation(self):
+        listener = BattleListener()
+        listener._post_battle_rotation_active = True
+        emulator = SimpleNamespace(press_button=Mock())
+        fake_context = SimpleNamespace(emulator=emulator, frame=1)
+        frame = FrameInfo(
+            1,
+            GameState.PARTY_MENU,
+            [],
+            ["task_handlechoosemoninput"],
+            [],
+            None,
+        )
+
+        with (
+            patch("modules.modes._listeners.context", fake_context),
+            patch("modules.modes._listeners.diagnostic_print"),
+        ):
+            self.assertFalse(listener._dismiss_stale_completed_battle_party_menu(frame))
+
+        emulator.press_button.assert_not_called()
+
     def test_stale_party_menu_cleanup_closes_owning_start_menu(self):
         listener = BattleListener()
         emulator = SimpleNamespace(press_button=Mock())
@@ -165,12 +288,11 @@ class BattleListenerLifecycleTests(unittest.TestCase):
 
         self.assertEqual(emulator.press_button.call_args_list, [call("B"), call("B")])
 
-    def test_return_to_field_gate_does_not_require_avatar_to_be_standing_still(self):
+    def test_return_to_field_gate_does_not_require_map_objects_or_avatar(self):
         frame = SimpleNamespace(active_tasks=[])
 
         with (
             patch("modules.modes._listeners.get_game_state_symbol", return_value="CB2_OVERWORLD"),
-            patch("modules.modes._listeners.get_map_objects", return_value=[object()]),
             patch("modules.modes._listeners.get_global_script_context", return_value=None),
         ):
             self.assertTrue(_battle_return_to_field_complete(frame))
@@ -180,7 +302,6 @@ class BattleListenerLifecycleTests(unittest.TestCase):
 
         with (
             patch("modules.modes._listeners.get_game_state_symbol", return_value="CB2_RETURNTOFIELD"),
-            patch("modules.modes._listeners.get_map_objects", return_value=[object()]),
             patch("modules.modes._listeners.get_global_script_context", return_value=None),
         ):
             self.assertFalse(_battle_return_to_field_complete(frame))
@@ -190,21 +311,19 @@ class BattleListenerLifecycleTests(unittest.TestCase):
 
         with (
             patch("modules.modes._listeners.get_game_state_symbol", return_value="CB2_OVERWORLD"),
-            patch("modules.modes._listeners.get_map_objects", return_value=[object()]),
             patch("modules.modes._listeners.get_global_script_context", return_value=None),
         ):
             self.assertFalse(_battle_return_to_field_complete(frame))
 
-    def test_return_to_field_gate_waits_for_post_battle_script(self):
+    def test_return_to_field_gate_releases_before_post_battle_script_finishes(self):
         frame = SimpleNamespace(active_tasks=[])
         script = SimpleNamespace(is_active=True, native_function_name="WaitForMovementFinish")
 
         with (
             patch("modules.modes._listeners.get_game_state_symbol", return_value="CB2_OVERWORLD"),
-            patch("modules.modes._listeners.get_map_objects", return_value=[object()]),
             patch("modules.modes._listeners.get_global_script_context", return_value=script),
         ):
-            self.assertFalse(_battle_return_to_field_complete(frame))
+            self.assertTrue(_battle_return_to_field_complete(frame))
 
     def test_post_battle_wait_does_not_press_b_in_overworld_field_script(self):
         listener = BattleListener()

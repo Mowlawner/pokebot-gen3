@@ -23,6 +23,7 @@ from modules.nuzlocke.campaign_objectives import (
     ObjectiveSelection,
     ObjectiveStatus,
     initial_emerald_campaign,
+    restock_pokeballs_objective,
 )
 from modules.nuzlocke.campaign_state import Fact
 
@@ -42,12 +43,31 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
         self.assertEqual(result.tactical_goal, ActivateTrigger("introductory_rival"))
         self.assertEqual(result.capability.tactical_goal, ActivateTrigger("introductory_rival"))
 
-    def test_pokeball_objective_translates_to_professor_birch_goal(self):
+    def test_pokeball_objective_mounts_observation_capability(self):
         result = adapt_campaign_execution(self.ready(self.objectives["receive_pokeballs"]))
         self.assertEqual(result.status, CampaignExecutionStatus.READY)
         self.assertEqual(result.execution_id, "receive_pokeballs")
-        self.assertEqual(result.tactical_goal, ActivateTrigger(EARLY_POKEBALL_TRIGGER_ID))
-        self.assertIn("Professor Birch", result.reason)
+        self.assertIsNone(result.tactical_goal)
+        self.assertIsNotNone(result.capability)
+
+    def test_pokeball_objective_uses_birch_interaction_target(self):
+        from modules.nuzlocke.emerald_capabilities import _semantic_target_for_objective
+
+        target = _semantic_target_for_objective("receive_pokeballs")
+        self.assertEqual(
+            target,
+            SemanticTarget.interaction(
+                MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value,
+                EARLY_POKEBALL_TRIGGER_ID,
+            ),
+        )
+
+    def test_pokeball_restock_translates_to_mart_capability(self):
+        objective = restock_pokeballs_objective()
+        result = adapt_campaign_execution(self.ready(objective))
+        self.assertEqual(result.status, CampaignExecutionStatus.READY)
+        self.assertEqual(result.execution_id, "restock_pokeballs")
+        self.assertIsNotNone(result.capability)
 
     def test_opening_objectives_mount_capabilities(self):
         supported = {
@@ -76,7 +96,7 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
             if objective_id in supported:
                 result = adapt_campaign_execution(self.ready(objective))
                 self.assertEqual(result.status, CampaignExecutionStatus.READY, objective_id)
-                if objective_id not in {"complete_intro_rival", "receive_pokeballs"}:
+                if objective_id != "complete_intro_rival":
                     self.assertIsNotNone(result.capability, objective_id)
                 continue
             result = adapt_campaign_execution(self.ready(objective))
@@ -298,6 +318,24 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
             ):
                 self.assertIs(mode.on_battle_started(None), selected)
             factory.assert_called_once_with()
+
+    def test_campaign_mode_balances_ordinary_campaign_battles(self):
+        from modules.modes.campaign import CampaignProgressionMode
+
+        mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
+        objective = SimpleNamespace(objective_id="reach_petalburg", resource_policy=None)
+        mode.controller = SimpleNamespace(last_selection=SimpleNamespace(objective=objective))
+        selected = object()
+        with (
+            patch("modules.modes.campaign.get_party", return_value=()),
+            patch(
+                "modules.modes.campaign.runtime_campaign_state", return_value=SimpleNamespace(campaign_facts=object())
+            ),
+            patch("modules.modes.campaign.evaluate_battle_entry", return_value=SimpleNamespace(allowed=True)),
+            patch("modules.modes.campaign.NuzlockeLevelBalancingBattleStrategy", return_value=selected) as factory,
+        ):
+            self.assertIs(mode.on_battle_started(None), selected)
+        factory.assert_called_once_with()
 
     def test_battle_end_requests_a_fresh_readiness_observation(self):
         from modules.modes.campaign import CampaignProgressionMode
