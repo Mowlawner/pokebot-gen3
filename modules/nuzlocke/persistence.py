@@ -558,8 +558,12 @@ class JsonEventStore:
 
         temporary = self._provenance_path.with_name(self._provenance_path.name + ".tmp")
         try:
-            temporary.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
-            with temporary.open("rb") as handle:
+            # Keep the file writable while flushing and syncing it.  Windows
+            # rejects fsync() on a read-only descriptor with Errno 9, which
+            # otherwise makes the first save-boundary provenance commit fail.
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.write(json.dumps(value, sort_keys=True) + "\n")
+                handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, self._provenance_path)
             self._fsync_directory()
