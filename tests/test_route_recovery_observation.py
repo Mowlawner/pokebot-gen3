@@ -12,12 +12,64 @@ from modules.navigation import (
     NavigationSearchLimitExceeded,
 )
 from modules.nuzlocke.resource_policy import RouteRecovery
-from modules.nuzlocke.resource_runtime import observe_route_recovery
+from modules.nuzlocke.resource_runtime import observe_route_recovery, prepare_route_recovery
 from modules.nuzlocke.emerald_healing_catalog import HealingSourceRSE
 from modules.modes.util.map import find_closest_pokemon_center, pokemon_center_candidates
 
 
 class RouteRecoveryObservationTests(unittest.TestCase):
+    def test_route_102_recovery_keeps_both_nearby_centers_as_candidates(self):
+        location = (MapRSE.ROUTE102, (16, 20))
+        graph = SimpleNamespace(route=lambda _source, _target: SimpleNamespace(estimated_cost=10))
+        with patch(
+            "modules.nuzlocke.resource_runtime.context",
+            SimpleNamespace(rom=SimpleNamespace(is_rse=True), stutter_trace=None),
+        ), patch(
+            "modules.nuzlocke.resource_runtime.get_player_location", return_value=location
+        ), patch(
+            "modules.nuzlocke.resource_runtime.find_closest_pokemon_center", return_value=PokemonCenter.PetalburgCity
+        ), patch(
+            "modules.nuzlocke.resource_runtime.perceive_overworld", return_value=object()
+        ), patch(
+            "modules.nuzlocke.resource_runtime.NavigationWorld.from_overworld", return_value=object()
+        ), patch(
+            "modules.nuzlocke.resource_runtime.get_world_map_graph", return_value=graph
+        ):
+            request = prepare_route_recovery()
+
+        self.assertEqual(
+            {source.source_id for _, source in request.ordered_sources},
+            {"pokemon_center:oldale", "pokemon_center:petalburg"},
+        )
+        self.assertNotIn("pokemon_center:slateport", {source.source_id for _, source in request.ordered_sources})
+
+    def test_route_104_recovery_normalizes_catalog_maps_and_prefers_petalburg(self):
+        location = (MapRSE.ROUTE104, (8, 18))
+        costs = {
+            MapRSE.PETALBURG_CITY.value: 12,
+            MapRSE.RUSTBORO_CITY.value: 31,
+        }
+        graph = SimpleNamespace(
+            estimate_location_cost=lambda _start, target: costs[target[0]],
+        )
+        with patch(
+            "modules.nuzlocke.resource_runtime.context",
+            SimpleNamespace(rom=SimpleNamespace(is_rse=True), stutter_trace=None),
+        ), patch(
+            "modules.nuzlocke.resource_runtime.get_player_location", return_value=location
+        ), patch(
+            "modules.nuzlocke.resource_runtime.perceive_overworld", return_value=object()
+        ), patch(
+            "modules.nuzlocke.resource_runtime.NavigationWorld.from_overworld", return_value=object()
+        ), patch(
+            "modules.nuzlocke.resource_runtime.get_world_map_graph", return_value=graph
+        ):
+            request = prepare_route_recovery()
+
+        ordered = [source.source_id for _, source in request.ordered_sources]
+        assert ordered[:2] == ["pokemon_center:petalburg", "pokemon_center:rustboro"]
+        assert "pokemon_center:oldale" not in ordered
+
     def test_indoor_map_uses_registered_outdoor_parent_for_recovery(self):
         self.assertEqual(
             pokemon_center_candidates(MapRSE.PETALBURG_CITY_GYM),

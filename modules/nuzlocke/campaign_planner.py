@@ -127,6 +127,7 @@ def build_campaign_plan(
         ReadinessReason.CRITICAL_PARTY_HP.value,
         ReadinessReason.NO_USABLE_POKEMON.value,
         ReadinessReason.FAINTED_PARTY_MEMBER.value,
+        ReadinessReason.POISONED_PARTY.value,
     }
     candidates = tuple(
         candidate

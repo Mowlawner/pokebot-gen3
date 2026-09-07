@@ -12,6 +12,20 @@ from enum import Enum
 from modules.map_data import MapRSE, PokemonCenter
 
 
+def _map_id_value(map_id):
+    """Return the tuple form used by live map observations and world graphs."""
+
+    return getattr(map_id, "value", map_id)
+
+
+def _normalized_location(location):
+    """Normalize catalog locations without changing the public enum API."""
+
+    if not isinstance(location, tuple) or len(location) != 2:
+        return location
+    return _map_id_value(location[0]), location[1]
+
+
 class HealingSourceRSE(Enum):
     """Emerald full-party healing sources verified against pret/pokeemerald."""
 
@@ -157,10 +171,17 @@ def emerald_healing_sources() -> tuple[HealingSourceRSE, ...]:
 
 def emerald_healing_sources_for_map(map_id) -> tuple[HealingSourceRSE, ...]:
     """Return catalog sources whose outdoor entrance is on ``map_id``."""
-    return tuple(source for source in HealingSourceRSE if source.outdoor_location[0] == map_id)
+    normalized_map = _map_id_value(map_id)
+    return tuple(
+        source for source in HealingSourceRSE if _normalized_location(source.outdoor_location)[0] == normalized_map
+    )
 
 
 def emerald_healing_source_for_destination(destination) -> HealingSourceRSE | None:
     """Return the source whose outdoor destination exactly matches ``destination``."""
 
-    return next((source for source in HealingSourceRSE if source.outdoor_location == destination), None)
+    normalized_destination = _normalized_location(destination)
+    return next(
+        (source for source in HealingSourceRSE if _normalized_location(source.outdoor_location) == normalized_destination),
+        None,
+    )

@@ -1,10 +1,11 @@
 from typing import Generator, TYPE_CHECKING
 
-from modules.battle_action_selection import handle_battle_action_selection
+from modules.battle_action_selection import battle_action_selection_is_ready, handle_battle_action_selection
 from modules.battle_evolution_scene import handle_evolution_scene
 from modules.battle_move_replacing import handle_move_replacement_dialogue
 from modules.battle_state import (
     battle_is_active,
+    get_battle_controller_callback,
     get_main_battle_callback,
     get_current_battle_script_instruction,
     BattlePokemon,
@@ -18,10 +19,12 @@ from modules.battle_strategies import BattleStrategy
 from modules.context import context
 from modules.console import diagnostic_print
 from modules.debug import debug
+from modules.game import decode_string
 from modules.items import Item, get_item_by_index
 from modules.keyboard import handle_naming_screen
 from modules.memory import get_game_state, GameState, read_symbol, unpack_uint16
 from modules.menuing import get_current_party_menu_index, scroll_to_party_menu_index
+from modules.menu_parsers import switch_requested
 from modules.player import get_player
 from modules.plugins import plugin_should_nickname_pokemon
 from modules.pokemon import StatusCondition
@@ -34,6 +37,102 @@ if TYPE_CHECKING:
 
 
 _last_handled_battle_result: HandledBattleResult | None = None
+_last_battle_prompt_trace_signature = None
+
+
+def _trace_battle_prompt_state(event: str) -> None:
+    """Record the ROM evidence around a possible trainer replacement prompt.
+
+    This is intentionally diagnostic-only.  In particular, it records the
+    displayed replacement text separately from the controller callback and
+    party-menu task, because those signals do not necessarily change on the
+    same frame.
+    """
+
+    global _last_battle_prompt_trace_signature
+    if not getattr(context, "debug", False) or not getattr(context, "debug_trace", False):
+        return
+    try:
+        battle_state = get_battle_state()
+        controller_callbacks = tuple(get_battle_controller_callback(index) for index in range(4))
+        displayed_string_raw = read_symbol("gDisplayedStringBattle", size=0x12C)
+        displayed_string = decode_string(displayed_string_raw)
+        forced_replacement_text = read_symbol("sText_UseNextPkmn")
+        trainer_replacement_text = read_symbol("sText_EnemyAboutToSwitchPkmn")
+        forced_replacement_text_decoded = decode_string(forced_replacement_text)
+        trainer_replacement_text_decoded = decode_string(trainer_replacement_text)
+        displayed_replacement_prompt = bool(switch_requested())
+        displayed_forced_replacement_text = forced_replacement_text in displayed_string_raw
+        displayed_trainer_replacement_text = trainer_replacement_text in displayed_string_raw
+        displayed_trainer_replacement_prompt = (
+            "is about to use " in displayed_string and "change POK" in displayed_string
+        )
+        choose_mon_task = task_is_active("Task_HandleChooseMonInput")
+        selection_menu_task = task_is_active("Task_HandleSelectionMenuInput")
+        active_battler = read_symbol("gActiveBattler", size=1)[0]
+        main_callback_pointer = read_symbol("gBattleMainFunc", size=4).hex()
+        script_pointer = read_symbol("gBattleScriptCurrInstr", size=4).hex()
+        controller_pointers = tuple(
+            read_symbol("gBattlerControllerFuncs", offset=4 * index, size=4).hex() for index in range(4)
+        )
+        battle_buffer_a = read_symbol("gBattleBufferA", size=8).hex()
+        battle_communication = read_symbol("gBattleCommunication", size=8).hex()
+        signature = (
+            get_main_battle_callback(),
+            get_current_battle_script_instruction(),
+            controller_callbacks,
+            get_game_state(),
+            displayed_replacement_prompt,
+            displayed_string,
+            displayed_forced_replacement_text,
+            displayed_trainer_replacement_text,
+            displayed_trainer_replacement_prompt,
+            forced_replacement_text_decoded,
+            trainer_replacement_text_decoded,
+            choose_mon_task,
+            selection_menu_task,
+            active_battler,
+            main_callback_pointer,
+            script_pointer,
+            controller_pointers,
+            battle_buffer_a,
+            battle_communication,
+        )
+        if signature == _last_battle_prompt_trace_signature:
+            return
+        _last_battle_prompt_trace_signature = signature
+        diagnostic_print(
+            lambda: (
+                "BATTLE_PROMPT_STATE: "
+                f"event={event!r} "
+                f"context_frame={getattr(context, 'frame', None)!r} "
+                f"emulator_frame={context.emulator.get_frame_count()!r} "
+                f"main_callback={signature[0]!r} script={signature[1]!r} "
+                f"controller_callbacks={controller_callbacks!r} "
+                f"game_state={signature[3]!r} "
+                f"displayed_string={displayed_string!r} "
+                f"displayed_replacement_prompt={displayed_replacement_prompt!r} "
+                f"displayed_forced_replacement_text={displayed_forced_replacement_text!r} "
+                f"displayed_trainer_replacement_text={displayed_trainer_replacement_text!r} "
+                f"displayed_trainer_replacement_prompt={displayed_trainer_replacement_prompt!r} "
+                f"forced_replacement_text_decoded={forced_replacement_text_decoded!r} "
+                f"trainer_replacement_text_decoded={trainer_replacement_text_decoded!r} "
+                f"choose_mon_task={choose_mon_task!r} "
+                f"selection_menu_task={selection_menu_task!r} "
+                f"active_battler={active_battler!r} "
+                f"main_callback_pointer={main_callback_pointer!r} "
+                f"script_pointer={script_pointer!r} "
+                f"controller_pointers={controller_pointers!r} "
+                f"gBattleBufferA_head={battle_buffer_a!r} "
+                f"gBattleCommunication={battle_communication!r} "
+                f"is_trainer={getattr(battle_state, 'is_trainer_battle', None)!r} "
+                f"is_double={getattr(battle_state, 'is_double_battle', None)!r}"
+            ),
+            trace=True,
+            prefix="BATTLE_PROMPT_STATE:",
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError, IndexError, KeyError):
+        return
 
 
 @debug.track
@@ -61,10 +160,8 @@ def handle_battle(
         # strategy/action-selection callback.
         observe_current_battle()
         instruction = get_current_battle_script_instruction()
-        if get_main_battle_callback() in (
-            "HandleTurnActionSelectionState",
-            "sub_8012324",
-        ):
+        _trace_battle_prompt_state("handler_loop")
+        if battle_action_selection_is_ready():
             yield from handle_battle_action_selection(strategy)
         elif get_current_battle_script_instruction() == "BattleScript_ItemSteal":
             result = yield from handle_item_stealing()
@@ -90,6 +187,23 @@ def handle_battle(
         ):
             yield from handle_nickname_caught_pokemon(context.stats.last_encounter)
         else:
+            diagnostic_print(
+                lambda: (
+                    "BATTLE_HANDLER_FALLBACK_INPUT: "
+                    f"context_frame={getattr(context, 'frame', None)!r} "
+                    f"emulator_frame={context.emulator.get_frame_count()!r} "
+                    f"strategy={type(strategy).__name__!r} "
+                    f"main_callback={get_main_battle_callback()!r} "
+                    f"script={get_current_battle_script_instruction()!r} "
+                    f"controller_0={get_battle_controller_callback(0)!r} "
+                    f"game_state={get_game_state()!r} "
+                    f"is_trainer={getattr(get_battle_state(), 'is_trainer_battle', None)!r} "
+                    f"is_double={getattr(get_battle_state(), 'is_double_battle', None)!r} "
+                    "reason='unhandled_battle_handler_branch'"
+                ),
+                trace=True,
+                prefix="BATTLE_HANDLER_FALLBACK_INPUT:",
+            )
             context.emulator.press_button("B")
             yield
 

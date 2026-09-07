@@ -162,6 +162,54 @@ class WorldMapGraph:
 
         return self._costs(target_map, reverse=True)
 
+    @staticmethod
+    def _manhattan(left: Coordinate, right: Coordinate) -> int:
+        return abs(left[0] - right[0]) + abs(left[1] - right[1])
+
+    @lru_cache(maxsize=16384)
+    @traced("world_location_route_estimate")
+    def estimate_location_cost(
+        self,
+        source: tuple[MapId, Coordinate],
+        target: tuple[MapId, Coordinate],
+    ) -> int | None:
+        """Estimate tile work between two locations using the static graph.
+
+        This is deliberately a cheap ranking heuristic, not a replacement for
+        live collision-aware navigation.  It accounts for the walk from the
+        current position to the chosen map exit, the walk from each map
+        entrance to its next exit, and the final walk to the destination.
+        Consequently a geographically nearby center behind a long dungeon is
+        not ranked as though the dungeon were one free warp.
+        """
+        source_map, source_coordinate = source
+        target_map, target_coordinate = target
+        if source_map == target_map:
+            return self._manhattan(source_coordinate, target_coordinate)
+        try:
+            route = self.route(source_map, target_map)
+        except WorldNavigationError:
+            return None
+        frontier: dict[Coordinate, int] = {source_coordinate: 0}
+        for edge in route.edges:
+            pairs = tuple(zip(edge.source_coordinates, edge.destination_coordinates))
+            if not pairs:
+                return None
+            next_frontier: dict[Coordinate, int] = {}
+            for current, current_cost in frontier.items():
+                for entry, destination in pairs:
+                    candidate = current_cost + self._manhattan(current, entry) + 1
+                    previous = next_frontier.get(destination)
+                    if previous is None or candidate < previous:
+                        next_frontier[destination] = candidate
+            if not next_frontier:
+                return None
+            frontier = next_frontier
+        return min(
+            (cost + self._manhattan(coordinate, target_coordinate) for coordinate, cost in frontier.items()),
+            default=None,
+        )
+
     def _costs(self, source_map: MapId, *, reverse: bool) -> tuple[tuple[MapId, int], ...]:
         """Run one Dijkstra search over outgoing or reversed static edges."""
 

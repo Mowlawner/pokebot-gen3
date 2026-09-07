@@ -236,6 +236,37 @@ def print_stats(stats: "GlobalStats", encounter: "EncounterInfo") -> None:
 
 console = Console(theme=theme)
 
+
+def print_campaign_frontier(
+    completed: tuple[str, ...],
+    available: tuple[str, ...],
+    *,
+    selected: str | None = None,
+    status: str | None = None,
+    reason: str | None = None,
+) -> None:
+    """Render the campaign planner's current objective frontier.
+
+    Objective transitions are useful normal run output, just like the Rich
+    encounter reports. The campaign controller calls this only when its
+    planning signature changes, so this helper is not part of the per-frame
+    hot path.
+    """
+
+    def render_ids(objective_ids: tuple[str, ...]) -> str:
+        return "\n".join(f"• {objective_id}" for objective_id in objective_ids) or "[dim]None[/]"
+
+    frontier = Table(show_header=False, box=None, padding=(0, 1))
+    frontier.add_column("Field", style="bold", width=12)
+    frontier.add_column("Objectives", overflow="fold")
+    frontier.add_row("Completed", render_ids(completed))
+    frontier.add_row("Available", render_ids(available))
+    frontier.add_row("Selected", selected or "[dim]None[/]")
+    frontier.add_row("Status", status or "[dim]unknown[/]")
+    if reason:
+        frontier.add_row("Reason", reason)
+    console.print(Panel.fit(frontier, border_style="cyan", title="[bold cyan]Campaign Objective Frontier[/]"))
+
 _DIAGNOSTIC_LOG_WHITELIST = (
     # Keep the timing-sensitive recovery experiment small: retain recovery
     # lifecycle records, post-observation coordinates, ROM transitions, and
@@ -251,6 +282,11 @@ _DIAGNOSTIC_LOG_WHITELIST = (
     "CAMPAIGN_RECOVERY_ROUTE_FAILURE",
     "CAMPAIGN_RECOVERY_CATALOG_SELECTION",
     "CAMPAIGN_RECOVERY_CATALOG_CANDIDATE",
+    "CAMPAIGN_RECOVERY_CALCULATION",
+    "CAMPAIGN_RECOVERY_PREPARATION_FAILURE",
+    "CAMPAIGN_RECOVERY_ROUTE_ANALYSIS",
+    "BACKGROUND_ROUTE_JOB",
+    "CAMPAIGN_READINESS_CALCULATION_PENDING",
     "READINESS_ROUTE_ANALYSIS",
     "CAMPAIGN_WORLD_ROUTE_DEBUG",
     "recovery_center_candidate_discovery:",
@@ -264,6 +300,8 @@ _DIAGNOSTIC_LOG_WHITELIST = (
     "CAMPAIGN_ENCOUNTER_ACQUISITION:",
     "CAMPAIGN_WILD_CAPTURE_HANDOFF",
     "CAMPAIGN_STATUS_BOUNDARY",
+    "CAMPAIGN_FACT_STABILIZED",
+    "CAMPAIGN_OBJECTIVE_FRONTIER",
     "CAMPAIGN_TASK_DISCOVERY",
     "CAMPAIGN_BATTLE_ENDED",
     "CAMPAIGN_CAPABILITY_BOUNDARY",
@@ -285,6 +323,7 @@ _DIAGNOSTIC_LOG_WHITELIST = (
     "CAMPAIGN_READINESS_DECISION:",
     "CAMPAIGN_READINESS_LIFECYCLE:",
     "CAMPAIGN_READINESS_DEFERRED:",
+    "CAMPAIGN_READINESS_UNKNOWN_DIAGNOSTIC",
     "READINESS_SCHEDULER_REFRESH",
     "CAMPAIGN_REFRESH_REQUEST",
     "CAMPAIGN_REFRESH_BOUNDARY",
@@ -299,6 +338,20 @@ _DIAGNOSTIC_LOG_WHITELIST = (
     "AGENT_DIALOGUE_RENDER_RESCUE",
     "AGENT_DIALOGUE_INPUT",
     "WARP_INPUT",
+    "BATTLE_REPLACEMENT_TRACE:",
+    "BATTLE_REPLACEMENT_INPUT:",
+    "BATTLE_REPLACEMENT_DISPATCH:",
+    "BATTLE_HANDLER_FALLBACK_INPUT:",
+    "BATTLE_PROMPT_STATE:",
+    "TRAINER_REPLACEMENT_POLICY:",
+    "BATTLE_DECISION_DETAIL",
+    "BATTLE_ACTION_EVALUATION",
+    "BATTLE_ACTION_CHOSEN:",
+    "BATTLE_SWITCH_CANDIDATE:",
+    "BATTLE_CAPTURE_CANDIDATE:",
+    "BATTLE_CAPTURE_DECISION:",
+    "NUZLOCKE_SWITCH_EVALUATION:",
+    "NUZLOCKE_ACTION_EVALUATION",
 )
 
 
@@ -310,8 +363,9 @@ def diagnostic_print(message: str | Callable[[], str], *, trace: bool = False, p
     separate from normal debug output because they can be emitted every frame.
     """
     from modules.context import context
+    from modules.stutter_trace import background_work_suppressed
 
-    if not context.debug or (trace and not getattr(context, "debug_trace", False)):
+    if background_work_suppressed() or not context.debug or (trace and not getattr(context, "debug_trace", False)):
         return
     # Callers with lazy messages should provide the prefix explicitly. This
     # lets a filtered trace return before evaluating expensive state reads and

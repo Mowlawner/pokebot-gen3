@@ -1,7 +1,7 @@
 """Deterministic goal-aware navigation over a small abstract world model."""
 
 import heapq
-from time import perf_counter_ns
+from time import perf_counter_ns, sleep
 from itertools import count
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
@@ -33,7 +33,7 @@ from modules.overworld import (
 )
 from modules.trigger_bindings import BindingResolution
 from modules.world_navigation import WorldMapGraph, WorldNavigationError, WorldRoute, get_world_map_graph
-from modules.stutter_trace import traced
+from modules.stutter_trace import background_work_suppressed, traced
 from modules.context import context
 from modules.console import diagnostic_print
 from modules.profiler import profiled
@@ -57,6 +57,10 @@ class TransitionRelevance(Enum):
     IRRELEVANT = auto()
     UNKNOWN = auto()
     BLOCKED = auto()
+
+
+class NavigationSearchCancelled(RuntimeError):
+    """Raised when a background route search is superseded or times out."""
 
 
 def classify_transition_relevance(
@@ -146,10 +150,7 @@ def _semantic_plan_cache_key(world: "NavigationWorld", start: Location, goal: Na
     world remains unchanged, and the controller still refuses to execute
     navigation outside the overworld.
     """
-    transitions = tuple(
-        sorted((t.kind, t.entry, t.destination, t.required_facing) for t in (world.transitions or world.warps))
-    )
-    blocked = tuple(sorted(location[1] for location, tile in world.tiles.items() if tile.blocked))
+    blocked, transitions = world.revision_key()
     hazards = tuple(sorted(location for trigger in world.triggers for location in trigger.hazard_locations))
     constraints = goal.constraints
     return (
@@ -387,6 +388,11 @@ class NavigationWorld:
     running_shoes: bool = False
     player_elevation: int | None = None
     surfing: bool = False
+    # These revisions are produced while the live observation is assembled.
+    # Keeping them on the immutable world avoids scanning a potentially large
+    # static tile mapping every time a background request is polled.
+    dynamic_blocked_revision: tuple | None = None
+    transition_revision: tuple | None = None
     _transitions_by_source: dict[Location, tuple[WorldTransition, ...]] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -410,6 +416,37 @@ class NavigationWorld:
             "_transitions_by_source",
             {source: tuple(transitions) for source, transitions in indexed.items()},
         )
+
+    def revision_key(self) -> tuple[tuple, tuple]:
+        """Return compact dynamic-world revisions for cache/request keys.
+
+        Synthetic worlds constructed by tests may not provide revisions.  The
+        fallback preserves their historical behavior; live worlds always set
+        both values in :meth:`from_overworld`, so production polling never
+        iterates the complete tile mapping.
+        """
+        if self.dynamic_blocked_revision is None:
+            blocked = tuple(sorted((location[1] for location, tile in self.tiles.items() if tile.blocked), key=repr))
+        else:
+            blocked = self.dynamic_blocked_revision
+        if self.transition_revision is None:
+            transitions = tuple(
+                sorted(
+                    tuple(
+                        (
+                            getattr(t, "kind", None),
+                            getattr(t, "entry", None),
+                            getattr(t, "destination", None),
+                            getattr(t, "required_facing", None),
+                        )
+                        for t in (self.transitions or self.warps)
+                    ),
+                    key=repr,
+                )
+            )
+        else:
+            transitions = self.transition_revision
+        return blocked, transitions
 
     @classmethod
     @traced("NavigationWorld_construction")
@@ -450,6 +487,24 @@ class NavigationWorld:
                 else getattr(observation, "player_elevation", None)
             ),
             surfing=getattr(observation, "surfing", False),
+            dynamic_blocked_revision=tuple(sorted(blocked_coordinates, key=repr)),
+            transition_revision=tuple(
+                sorted(
+                    tuple(
+                        (
+                            getattr(t, "kind", None),
+                            getattr(t, "entry", None),
+                            getattr(t, "destination", None),
+                            getattr(t, "required_facing", None),
+                        )
+                        for t in tuple(
+                            effective_transition(t)
+                            for t in (getattr(observation, "transitions", ()) or observation.warps)
+                        )
+                    ),
+                    key=repr,
+                )
+            ),
         )
 
     def _elevation_allows_step(self, source: Location, destination: Location) -> bool:
@@ -752,6 +807,7 @@ class RouteCostAnalyzer:
         intermediate_destinations: tuple[Goal, ...] = (),
         *,
         algorithm: str = "dijkstra",
+        cancel_check=None,
     ) -> RouteAnalysis:
         """Return the normal route and independently composed candidate routes."""
 
@@ -761,6 +817,8 @@ class RouteCostAnalyzer:
                 kwargs["max_expansions"] = self._max_expansions
             if self._max_route_cost is not None:
                 kwargs["max_route_cost"] = self._max_route_cost
+            if cancel_check is not None:
+                kwargs["cancel_check"] = cancel_check
             result = self._planner(world, origin, target, self.graph, **kwargs)
             return result[0] if isinstance(result, tuple) else result
 
@@ -1052,6 +1110,7 @@ def plan_with_world_navigation(
     max_expansions: int | None = None,
     max_route_cost: int | None = None,
     cost_ceiling: tuple[int, ...] | int | None = None,
+    cancel_check=None,
 ) -> tuple[NavigationPlan, WorldRoute | None]:
     """Plan one local segment, appending one generic map transition if needed.
 
@@ -1089,6 +1148,7 @@ def plan_with_world_navigation(
                 max_expansions=max_expansions,
                 max_route_cost=max_route_cost,
                 cost_ceiling=cost_ceiling,
+                cancel_check=cancel_check,
             ),
             None,
         )
@@ -1101,6 +1161,7 @@ def plan_with_world_navigation(
                 max_expansions=max_expansions,
                 max_route_cost=max_route_cost,
                 cost_ceiling=cost_ceiling,
+                cancel_check=cancel_check,
             ),
             None,
         )
@@ -1215,6 +1276,7 @@ def plan_with_world_navigation(
             max_expansions=max_expansions,
             max_route_cost=max_route_cost,
             cost_ceiling=cost_ceiling,
+            cancel_check=cancel_check,
             # Semantic campaign routes expose the crossing input as the action
             # from the executable approach state.  Preserve the legacy boundary
             # source representation for exact ReachLocation callers.
@@ -1671,6 +1733,7 @@ def plan_observed_warp_locally(
     max_expansions: int | None = None,
     max_route_cost: int | None = None,
     cost_ceiling: tuple[int, ...] | int | None = None,
+    cancel_check=None,
 ) -> NavigationPlan:
     """Plan to an exact observed warp without consulting the map graph."""
     navigation_goal = goal if isinstance(goal, NavigationGoal) else NavigationGoal(goal)
@@ -1703,6 +1766,7 @@ def plan_observed_warp_locally(
             max_expansions=max_expansions,
             max_route_cost=max_route_cost,
             cost_ceiling=cost_ceiling,
+            cancel_check=cancel_check,
         )
         result = NavigationPlan(
             local_plan.actions,
@@ -1736,6 +1800,7 @@ def plan_observed_warp_locally(
                 max_expansions=max_expansions,
                 max_route_cost=max_route_cost,
                 cost_ceiling=cost_ceiling,
+                cancel_check=cancel_check,
             )
             boundary_move = NavigationAction(
                 NavigationActionType.MOVE,
@@ -1765,6 +1830,7 @@ def plan_observed_warp_locally(
         max_expansions=max_expansions,
         max_route_cost=max_route_cost,
         cost_ceiling=cost_ceiling,
+        cancel_check=cancel_check,
     )
     # A recovery handoff can arrive on a step-on door tile via a
     # ReachLocation goal.  In that case the local planner may regard the
@@ -1965,6 +2031,17 @@ class GoalAwareNavigator:
         # by the conservative cross-map heuristic below.
         self._map_hops_to_target: dict[MapId, tuple[tuple[MapId, int], ...]] = {}
 
+    @staticmethod
+    def _yield_to_frame_loop(expanded: int) -> None:
+        """Give the emulator thread a scheduling window during worker A*."""
+
+        if background_work_suppressed() and expanded > 0 and expanded % 4 == 0:
+            # Route searches are intentionally off the frame loop, but they
+            # still share a Python process with mGBA. A short cooperative
+            # yield prevents a CPU-bound speculative search from starving the
+            # emulator core on low-core machines.
+            sleep(0.001)
+
     @profiled("navigation_pathfinding", "pathfinding_calls")
     @traced("individual_pathfinding")
     def plan(
@@ -1977,6 +2054,7 @@ class GoalAwareNavigator:
         max_expansions: int | None = None,
         max_route_cost: int | None = None,
         cost_ceiling: tuple[int, ...] | int | None = None,
+        cancel_check=None,
     ) -> NavigationPlan:
         navigation_goal = goal if isinstance(goal, NavigationGoal) else NavigationGoal(goal)
         _validate_search_limit(max_expansions, "max_expansions")
@@ -2080,6 +2158,8 @@ class GoalAwareNavigator:
             queue[0] = (priority(initial_cost, initial_state), queue[0][1], initial_state, initial_cost)
         generated = 1
         while queue:
+            if cancel_check is not None:
+                cancel_check()
             if max_expansions is not None and expanded >= max_expansions:
                 record(False)
                 raise NavigationSearchLimitExceeded(
@@ -2099,6 +2179,7 @@ class GoalAwareNavigator:
                 limit_pruned = True
                 continue
             expanded += 1
+            self._yield_to_frame_loop(expanded)
             frontier_max = max(frontier_max, len(queue))
             diagnostic_maps.add(current[0])
             diagnostic_goal_checks += 1
@@ -2265,6 +2346,7 @@ class GoalAwareNavigator:
                 max_expansions=max_expansions,
                 max_route_cost=max_route_cost,
                 cost_ceiling=cost_ceiling,
+                cancel_check=cancel_check,
             )
             record(False)
             return replace(fallback, forced_trainer_exposure=True)
@@ -2338,6 +2420,7 @@ class GoalAwareNavigator:
             if max_route_cost is not None and current_cost[1] > max_route_cost:
                 continue
             expanded += 1
+            self._yield_to_frame_loop(expanded)
             frontier_max = max(frontier_max, len(queue))
             current, facing = state
             if current in requested:

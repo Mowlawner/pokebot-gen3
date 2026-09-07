@@ -7,16 +7,53 @@ from modules.modes import FrameInfo
 from modules.modes import BattleAction
 from modules.modes._listeners import _battle_return_to_field_complete
 from modules.modes._listeners import BattleListener
+from modules.modes.util.lead_rotation import ensure_campaign_field_lead
 from modules.battle_handler import _advance_after_party_wipe
 from modules.battle_handler import handle_fainted_pokemon
 from modules.battle_state import BattleOutcome, EncounterType
 
 
 class BattleListenerLifecycleTests(unittest.TestCase):
+    def test_campaign_field_lead_handoff_rotates_only_at_a_stable_boundary(self):
+        emulator = SimpleNamespace()
+        fake_context = SimpleNamespace(bot_mode="Campaign Progression", emulator=emulator)
+        party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
+        strategy = SimpleNamespace(
+            choose_field_lead=Mock(return_value=SimpleNamespace(selected_index=1, reason="test"))
+        )
+        field_context = SimpleNamespace(source="test", objective_id="reach_petalburg", route_maps=((0, 10), (0, 17)))
+        menu_steps = iter(())
+
+        with (
+            patch("modules.modes.util.lead_rotation.context", fake_context),
+            patch("modules.modes.util.lead_rotation.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.modes.util.lead_rotation.battle_is_active", return_value=False),
+            patch(
+                "modules.modes.util.lead_rotation.get_last_battle_outcome",
+                return_value=BattleOutcome.Won,
+            ),
+            patch(
+                "modules.modes.util.lead_rotation.get_global_script_context",
+                return_value=SimpleNamespace(is_active=False),
+            ),
+            patch("modules.modes.util.lead_rotation.player_avatar_is_standing_still", return_value=True),
+            patch("modules.modes.util.lead_rotation.get_party", return_value=party),
+            patch("modules.menuing.get_party", return_value=(object(), object())),
+            patch(
+                "modules.modes.util.lead_rotation.MenuWrapper",
+                return_value=SimpleNamespace(step=lambda: menu_steps),
+            ) as menu,
+            patch("modules.modes.util.lead_rotation.diagnostic_print"),
+        ):
+            list(ensure_campaign_field_lead(strategy, field_context, reason="recovery_completed"))
+
+        strategy.choose_field_lead.assert_called_once_with(field_context)
+        menu.assert_called_once()
+
     def test_post_battle_rotation_waits_for_standing_field(self):
         listener = BattleListener()
-        strategy = SimpleNamespace(choose_new_lead_after_battle=Mock(return_value=1))
         fake_context = SimpleNamespace(bot_mode="Campaign Progression", controller_stack=[])
+        strategy = SimpleNamespace(choose_new_lead_after_battle=Mock(return_value=1))
 
         with (
             patch("modules.modes._listeners.context", fake_context),
@@ -51,7 +88,6 @@ class BattleListenerLifecycleTests(unittest.TestCase):
             config=SimpleNamespace(battle=SimpleNamespace(save_after_catching=False)),
         )
         party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
-        strategy = SimpleNamespace(choose_new_lead_after_battle=Mock(return_value=1))
 
         with (
             patch("modules.modes._listeners.context", fake_context),
@@ -71,13 +107,12 @@ class BattleListenerLifecycleTests(unittest.TestCase):
                 return_value=SimpleNamespace(is_active=False),
             ),
             patch("modules.modes._listeners.player_avatar_is_standing_still", return_value=True),
-            patch("modules.modes._listeners.NuzlockeLevelBalancingBattleStrategy", return_value=strategy),
             patch.object(listener, "rotate_lead_pokemon", return_value=iter(())) as rotate,
             patch("modules.modes._listeners.diagnostic_print"),
         ):
             list(listener.catch())
 
-        rotate.assert_called_once_with(1, 0)
+        rotate.assert_not_called()
         capture_factory.assert_called_once_with()
         default_capture_strategy.assert_not_called()
         handle_battle.assert_called_once_with(capture_strategy)
@@ -87,7 +122,6 @@ class BattleListenerLifecycleTests(unittest.TestCase):
         emulator = SimpleNamespace(reset_held_buttons=Mock(), press_button=Mock())
         fake_context = SimpleNamespace(bot_mode="Campaign Progression", controller_stack=[], emulator=emulator)
         party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
-        strategy = SimpleNamespace(choose_new_lead_after_battle=Mock(return_value=1))
 
         with (
             patch("modules.modes._listeners.context", fake_context),
@@ -106,13 +140,12 @@ class BattleListenerLifecycleTests(unittest.TestCase):
                 return_value=SimpleNamespace(is_active=False),
             ),
             patch("modules.modes._listeners.player_avatar_is_standing_still", return_value=True),
-            patch("modules.modes._listeners.NuzlockeLevelBalancingBattleStrategy", return_value=strategy),
             patch.object(listener, "rotate_lead_pokemon", return_value=iter(())) as rotate,
             patch("modules.modes._listeners.diagnostic_print"),
         ):
             list(listener.run_away_from_battle())
 
-        rotate.assert_called_once_with(1, 0)
+        rotate.assert_not_called()
 
     def test_tutorial_battle_honors_explicit_fight_request(self):
         listener = BattleListener()

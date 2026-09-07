@@ -360,6 +360,53 @@ class EmeraldObservationDispatchTests(unittest.TestCase):
         )
         self.assertIs(choose_emerald_observation_action(observation), EmeraldCampaignAction.ADVANCE_TEXT_SPEED)
 
+    def test_set_battle_style_rule_advances_style_after_fast_text(self):
+        menu = EmeraldMenuObservation(
+            EmeraldMenuKind.OPTIONS_MENU,
+            3,
+            None,
+            True,
+            "Task_OptionMenuProcessInput",
+            3,
+            raw_option_values=(2, 0, 0, 0, 0, 0),
+        )
+        self.assertIs(
+            choose_emerald_observation_action(
+                self.observation(
+                    game_state=GameState.OPTIONS_MENU,
+                    menu=menu,
+                    campaign_facts=(
+                        ("text_speed_fast", False),
+                        ("set_battle_style_required", True),
+                    ),
+                )
+            ),
+            EmeraldCampaignAction.ADVANCE_BATTLE_STYLE,
+        )
+
+        configured_menu = EmeraldMenuObservation(
+            EmeraldMenuKind.OPTIONS_MENU,
+            3,
+            None,
+            True,
+            "Task_OptionMenuProcessInput",
+            3,
+            raw_option_values=(2, 0, 1, 0, 0, 0),
+        )
+        self.assertIs(
+            choose_emerald_observation_action(
+                self.observation(
+                    game_state=GameState.OPTIONS_MENU,
+                    menu=configured_menu,
+                    campaign_facts=(
+                        ("text_speed_fast", True),
+                        ("set_battle_style_required", True),
+                    ),
+                )
+            ),
+            EmeraldCampaignAction.EXIT_OPTIONS,
+        )
+
     def test_options_ready_configuration_returns_to_menu_from_fresh_observation(self):
         menu = EmeraldMenuObservation(
             EmeraldMenuKind.OPTIONS_MENU,

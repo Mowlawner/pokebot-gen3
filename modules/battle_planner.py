@@ -63,6 +63,31 @@ class PlannerEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class PlannerCandidate:
+    """One action considered by the battle planner.
+
+    ``available`` describes whether the action is legally selectable from the
+    current battle state.  ``safety`` is deliberately separate: an attack can
+    be selectable while still being unsafe, and a switch can be selectable
+    while being a strategically invalid replacement (for example, a Pokémon
+    with no effective move against the opponent).
+    """
+
+    action: PlannerAction
+    target: Any = None
+    label: str = ""
+    available: bool = False
+    safety: PlannerSafety = PlannerSafety.UNSAFE_OR_UNCERTAIN
+    risk: PlannerRisk = PlannerRisk.CRITICAL
+    reason: str = ""
+    score: tuple = ()
+
+    @property
+    def is_safe(self) -> bool:
+        return self.available and self.safety is PlannerSafety.SAFE
+
+
+@dataclass(frozen=True, slots=True)
 class PlannerDecision:
     action: PlannerAction
     target: Any = None
@@ -74,6 +99,9 @@ class PlannerDecision:
     primary_rejection_reason: str | None = None
     classification: PlannerDecisionClass = PlannerDecisionClass.ABORT
     risk: PlannerRisk = PlannerRisk.CRITICAL
+    candidate_evaluations: tuple[PlannerCandidate, ...] = ()
+    best_safe_candidate: PlannerCandidate | None = None
+    best_available_candidate: PlannerCandidate | None = None
 
     def __post_init__(self):
         if self.classification is PlannerDecisionClass.ABORT and self.safety is PlannerSafety.SAFE:
@@ -120,6 +148,7 @@ class PlannerOpponentMove:
     mechanics_supported: bool = True
     source: str = "known"
     critical_damage_max: int | None = None
+    critical_hit_chance: float = 1 / 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +159,7 @@ class PlannerSwitch:
     max_hp: int
     incoming_damage_max: int | None
     offensive_damage_max: int = 0
+    incoming_critical_damage_max: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +197,7 @@ class PlannerContext:
     capture_available: bool = False
     capture_appropriate_hp: int | None = None
     capture_attempted: bool = False
+    opponent_critical_damage_max: int | None = None
 
 
 class BattlePlanner:
@@ -199,6 +230,45 @@ class BattlePlanner:
     }
 
     def plan(self, context: PlannerContext) -> PlannerDecision:
+        """Plan an action and retain the complete candidate evaluation.
+
+        The original planner returned only its selected decision.  That made
+        an ``ABORT`` result indistinguishable from a battle with no legal
+        action, and it also hid why a switch or move had been rejected.  Keep
+        selection and explanation as one operation so every caller receives
+        the same action inventory.
+        """
+
+        decision = self._plan(context)
+        candidates = self._evaluate_candidates(context, decision)
+        autonomous = tuple(candidate for candidate in candidates if candidate.action is not PlannerAction.AbortForSafety)
+        safe = tuple(candidate for candidate in autonomous if candidate.is_safe)
+        available = tuple(candidate for candidate in autonomous if candidate.available)
+        selected = next(
+            (
+                candidate
+                for candidate in autonomous
+                if candidate.action is decision.action and candidate.target == decision.target
+            ),
+            None,
+        )
+        # When the planner has selected a legal action, preserve that policy
+        # choice as the reported best action.  If it aborted, rank the
+        # remaining candidates comparatively for diagnostics only.
+        best_safe = selected if selected is not None and selected.is_safe else max(
+            safe, key=lambda candidate: candidate.score, default=None
+        )
+        best_available = selected if selected is not None and selected.available else max(
+            available, key=lambda candidate: candidate.score, default=None
+        )
+        return replace(
+            decision,
+            candidate_evaluations=candidates,
+            best_safe_candidate=best_safe,
+            best_available_candidate=best_available,
+        )
+
+    def _plan(self, context: PlannerContext) -> PlannerDecision:
         if context.active_max_hp <= 0 or context.opponent_hp <= 0:
             return self._abort("Active or opponent HP is unavailable.")
 
@@ -318,6 +388,10 @@ class BattlePlanner:
                 and candidate.max_hp > 0
                 and candidate.incoming_damage_max is not None
                 and candidate.incoming_damage_max < candidate.hp
+                and (
+                    candidate.incoming_critical_damage_max is None
+                    or candidate.incoming_critical_damage_max < candidate.hp
+                )
                 # A switch is a battle replacement, not merely a way to put
                 # an arbitrary party member on the field.  EXP-tag switches
                 # need an explicit continuation plan and are handled by the
@@ -389,15 +463,53 @@ class BattlePlanner:
             )
 
         if safe_switches:
-            replacement = max(
-                safe_switches, key=lambda candidate: (candidate.offensive_damage_max, candidate.hp / candidate.max_hp)
+            # Import lazily because the strategy package's public exports
+            # include DefaultBattleStrategy, which itself imports this
+            # planner. Keeping the shared evaluator out of module import time
+            # avoids that package initialization cycle.
+            from modules.battle_strategies.switch_evaluator import (
+                SwitchCandidateFacts,
+                SwitchEvaluationContext,
+                evaluate_switch_candidate,
+            )
+
+            scored_switches = []
+            for candidate in safe_switches:
+                evaluation = evaluate_switch_candidate(
+                    SwitchCandidateFacts(
+                        party_index=candidate.party_index,
+                        hp=candidate.hp,
+                        max_hp=candidate.max_hp,
+                        opponent_hp=context.opponent_hp,
+                        damage_max=candidate.offensive_damage_max,
+                        incoming_damage_max=candidate.incoming_damage_max,
+                        incoming_critical_damage_max=candidate.incoming_critical_damage_max,
+                        response_facts_known=candidate.incoming_damage_max is not None,
+                        survival_probability=1.0,
+                        strict_safe=True,
+                    ),
+                    SwitchEvaluationContext.PLANNER,
+                )
+                if evaluation.eligible:
+                    scored_switches.append((evaluation.score, candidate, evaluation))
+            if not scored_switches:
+                # The explicit safe-switch gate above should make this
+                # unreachable, but preserve the planner's conservative
+                # behavior if a future fact adapter becomes inconsistent.
+                scored_switches = [(0.0, candidate, None) for candidate in safe_switches]
+            _, replacement, replacement_evaluation = max(scored_switches, key=lambda item: item[0])
+            evaluation_reason = (
+                f"; weighted switch score {replacement_evaluation.score:.2f}"
+                if replacement_evaluation is not None
+                else ""
             )
             return PlannerDecision(
                 PlannerAction.SwitchPokemon,
                 replacement.party_index,
                 PlannerConfidence.MEDIUM,
                 f"{context.active_name} is at {context.active_hp}/{context.active_max_hp} HP; "
-                f"{replacement.name} is expected to survive the known response and has the best available matchup.",
+                f"{replacement.name} is expected to survive the known response and has the best available matchup"
+                f"{evaluation_reason}.",
                 PlannerSafety.SAFE,
                 (
                     PlannerEvidence(
@@ -458,9 +570,22 @@ class BattlePlanner:
             )
 
         healing = [item for item in context.items if item.quantity > 0 and item.heal_amount > 0]
-        if healing and context.opponent_damage_max is not None:
+        if healing and (context.opponent_damage_max is not None or context.opponent_moves):
             item = max(healing, key=lambda candidate: candidate.heal_amount)
-            if min(context.active_max_hp, context.active_hp + item.heal_amount) > context.opponent_damage_max:
+            response_ceiling = max(
+                context.opponent_damage_max or 0,
+                context.opponent_critical_damage_max or 0,
+                max(
+                    (
+                        candidate.critical_damage_max
+                        if candidate.critical_damage_max is not None
+                        else candidate.damage_max
+                        for candidate in context.opponent_moves
+                    ),
+                    default=0,
+                ),
+            )
+            if min(context.active_max_hp, context.active_hp + item.heal_amount) > response_ceiling:
                 return PlannerDecision(
                     PlannerAction.UseItem,
                     (item.item, 0),
@@ -470,7 +595,8 @@ class BattlePlanner:
                     PlannerSafety.SAFE,
                     (
                         PlannerEvidence(
-                            PlannerEvidenceKind.DERIVED, "healing places HP above known maximum incoming damage"
+                        PlannerEvidenceKind.DERIVED,
+                        "healing places HP above the normal and critical response ceilings",
                         ),
                     ),
                 )
@@ -500,6 +626,273 @@ class BattlePlanner:
         if failed_attacks:
             reason += " " + " ".join(failed_attacks[:2])
         return self._abort(reason, tuple(failed_attacks))
+
+    def _evaluate_candidates(
+        self, context: PlannerContext, decision: PlannerDecision
+    ) -> tuple[PlannerCandidate, ...]:
+        """Describe every action visible to the planner at this boundary.
+
+        This is intentionally a report over the same normalized facts used by
+        ``_plan``.  It does not invent opponent moves or treat emulator-only
+        facts as certainty.  An action may therefore be ``available`` but
+        ``unsafe`` when its outcome depends on an unknown response.
+        """
+
+        candidates: list[PlannerCandidate] = []
+        for move in context.moves:
+            if not self._is_candidate(move):
+                if not move.mechanics_supported:
+                    reason = "unsupported move mechanics"
+                elif move.damage_max <= 0 and move.effect not in self._STAT_EFFECTS and move.stat_delta == 0:
+                    reason = "move has no effective damaging move outcome against the observed opponent"
+                else:
+                    reason = "move is not usable under the planner's action model"
+                candidates.append(
+                    PlannerCandidate(
+                        PlannerAction.UseMove,
+                        move.index,
+                        move.name,
+                        True,
+                        PlannerSafety.UNSAFE_OR_UNCERTAIN,
+                        PlannerRisk.CRITICAL,
+                        reason,
+                        (move.damage_max, move.damage_min, move.accuracy, -move.index),
+                    )
+                )
+                continue
+
+            # A lethal move is still selectable by the game, but is not an
+            # eligible action while a legal capture target is being preserved.
+            if (
+                context.capture_target
+                and context.capture_available
+                and not context.is_trainer
+                and move.damage_max >= context.opponent_hp
+                and not context.capture_attempted
+                and (context.capture_appropriate_hp is None or context.opponent_hp > context.capture_appropriate_hp)
+            ):
+                candidates.append(
+                    PlannerCandidate(
+                        PlannerAction.UseMove,
+                        move.index,
+                        move.name,
+                        True,
+                        PlannerSafety.UNSAFE_OR_UNCERTAIN,
+                        PlannerRisk.CRITICAL,
+                        "would KO the legal capture target before capture is attempted",
+                        (move.damage_max, move.damage_min, move.accuracy, -move.index),
+                    )
+                )
+                continue
+
+            evaluated = self._evaluate_attack(context, move)
+            if evaluated is not None:
+                confidence, rationale = evaluated
+                safety = PlannerSafety.SAFE
+                risk = PlannerRisk.LOW if confidence is PlannerConfidence.HIGH else PlannerRisk.MODERATE
+                reason = rationale
+            elif decision.action is PlannerAction.UseMove and decision.target == move.index and decision.is_best_available:
+                safety = PlannerSafety.UNSAFE_OR_UNCERTAIN
+                risk = decision.risk
+                reason = decision.primary_rejection_reason or decision.rationale
+            else:
+                safety = PlannerSafety.UNSAFE_OR_UNCERTAIN
+                risk = PlannerRisk.HIGH
+                reason = self._attack_failure_reason(context, move)
+            candidates.append(
+                PlannerCandidate(
+                    PlannerAction.UseMove,
+                    move.index,
+                    move.name,
+                    True,
+                    safety,
+                    risk,
+                    reason,
+                    (move.damage_min * move.accuracy, move.damage_min, move.damage_max, -move.index),
+                )
+            )
+
+        if not context.moves:
+            candidates.append(
+                PlannerCandidate(
+                    PlannerAction.UseMove,
+                    None,
+                    "move selection",
+                    False,
+                    PlannerSafety.UNSAFE_OR_UNCERTAIN,
+                    PlannerRisk.CRITICAL,
+                    "no usable player moves were observed",
+                )
+            )
+
+        for switch in context.switches:
+            if not context.can_switch:
+                candidates.append(
+                    PlannerCandidate(
+                        PlannerAction.SwitchPokemon,
+                        switch.party_index,
+                        f"switch to {switch.name} (slot {switch.party_index})",
+                        False,
+                        PlannerSafety.UNSAFE_OR_UNCERTAIN,
+                        PlannerRisk.CRITICAL,
+                        "switching is not legal at this battle boundary",
+                    )
+                )
+                continue
+            if switch.hp <= 0 or switch.max_hp <= 0:
+                reason = "party member is fainted or has unavailable HP"
+                safe = False
+            elif switch.offensive_damage_max <= 0:
+                reason = "replacement has no effective damaging move against the opponent"
+                safe = False
+            elif switch.incoming_damage_max is None:
+                reason = "opponent response damage is unknown, so switch survival cannot be proven"
+                safe = False
+            elif switch.incoming_damage_max >= switch.hp:
+                reason = (
+                    f"known response can deal {switch.incoming_damage_max} damage to {switch.hp} HP; "
+                    "replacement may faint immediately"
+                )
+                safe = False
+            elif switch.incoming_critical_damage_max is not None and switch.incoming_critical_damage_max >= switch.hp:
+                reason = (
+                    f"ordinary response is survivable ({switch.incoming_damage_max} < {switch.hp}), but a "
+                    f"critical-hit ceiling of {switch.incoming_critical_damage_max} can KO; "
+                    "estimated critical chance is 6.25% per response"
+                )
+                safe = False
+            else:
+                reason = (
+                    f"replacement survives known maximum response ({switch.incoming_damage_max} < {switch.hp}) "
+                    f"and can deal up to {switch.offensive_damage_max} damage"
+                )
+                safe = True
+            candidates.append(
+                PlannerCandidate(
+                    PlannerAction.SwitchPokemon,
+                    switch.party_index,
+                    f"switch to {switch.name} (slot {switch.party_index})",
+                    True,
+                    PlannerSafety.SAFE if safe else PlannerSafety.UNSAFE_OR_UNCERTAIN,
+                    PlannerRisk.LOW if safe else PlannerRisk.CRITICAL,
+                    reason,
+                    (switch.offensive_damage_max, switch.hp, -switch.party_index),
+                )
+            )
+
+        healing = [item for item in context.items if item.quantity > 0 and item.heal_amount > 0]
+        for item in healing:
+            healed_hp = min(context.active_max_hp, context.active_hp + item.heal_amount)
+            response_ceiling = max(
+                context.opponent_damage_max or 0,
+                context.opponent_critical_damage_max or 0,
+                max(
+                    (
+                        candidate.critical_damage_max
+                        if candidate.critical_damage_max is not None
+                        else candidate.damage_max
+                        for candidate in context.opponent_moves
+                    ),
+                    default=0,
+                ),
+            )
+            if context.opponent_damage_max is None and not context.opponent_moves:
+                safe = False
+                reason = "opponent response damage is unknown, so healing cannot prove survival"
+            elif healed_hp <= response_ceiling:
+                safe = False
+                reason = (
+                    f"healing reaches {healed_hp} HP but known response can deal "
+                    f"up to {response_ceiling} damage"
+                )
+            else:
+                safe = True
+                reason = f"healing reaches {healed_hp} HP above normal and critical response ceilings"
+            candidates.append(
+                PlannerCandidate(
+                    PlannerAction.UseItem,
+                    (item.item, 0),
+                    f"use {getattr(item.item, 'name', item.item)}",
+                    True,
+                    PlannerSafety.SAFE if safe else PlannerSafety.UNSAFE_OR_UNCERTAIN,
+                    PlannerRisk.LOW if safe else PlannerRisk.HIGH,
+                    reason,
+                    (item.heal_amount, 0),
+                )
+            )
+
+        if context.capture_target and context.capture_available and not context.is_trainer:
+            for item in context.items:
+                if not item.is_capture_ball or item.quantity <= 0:
+                    continue
+                capture_ready = context.capture_attempted or context.capture_appropriate_hp is None or context.opponent_hp <= context.capture_appropriate_hp
+                candidates.append(
+                    PlannerCandidate(
+                        PlannerAction.UseItem,
+                        (item.item, 0),
+                        f"throw {getattr(item.item, 'name', item.item)}",
+                        True,
+                        PlannerSafety.SAFE if capture_ready else PlannerSafety.UNSAFE_OR_UNCERTAIN,
+                        PlannerRisk.LOW if capture_ready else PlannerRisk.MODERATE,
+                        "capture state is ready" if capture_ready else "target has not reached the capture threshold",
+                        (item.quantity, 0),
+                    )
+                )
+
+        if context.is_wild and not context.is_trainer:
+            if not context.can_run:
+                candidates.append(
+                    PlannerCandidate(
+                        PlannerAction.RunAway,
+                        None,
+                        "flee",
+                        False,
+                        PlannerSafety.UNSAFE_OR_UNCERTAIN,
+                        PlannerRisk.CRITICAL,
+                        "escape is not currently available",
+                    )
+                )
+            else:
+                safe = context.escape_confidence in (PlannerConfidence.HIGH, PlannerConfidence.MEDIUM)
+                candidates.append(
+                    PlannerCandidate(
+                        PlannerAction.RunAway,
+                        None,
+                        "flee",
+                        True,
+                        PlannerSafety.SAFE if safe else PlannerSafety.UNSAFE_OR_UNCERTAIN,
+                        PlannerRisk.LOW if safe else PlannerRisk.HIGH,
+                        "escape confidence meets the safety threshold" if safe else "escape success is uncertain",
+                        (1, 0),
+                    )
+                )
+        else:
+            candidates.append(
+                PlannerCandidate(
+                    PlannerAction.RunAway,
+                    None,
+                    "flee",
+                    False,
+                    PlannerSafety.UNSAFE_OR_UNCERTAIN,
+                    PlannerRisk.CRITICAL,
+                    "flee is unavailable in trainer battles",
+                )
+            )
+
+        # Manual mode is always a safe control outcome, but it is deliberately
+        # excluded from best-safe/best-available autonomous action ranking.
+        candidates.append(
+            PlannerCandidate(
+                PlannerAction.AbortForSafety,
+                None,
+                "manual stop",
+                True,
+                PlannerSafety.SAFE,
+                PlannerRisk.LOW,
+                "pause rather than execute an unproven autonomous action",
+            )
+        )
+        return tuple(candidates)
 
     @staticmethod
     def _capture_item(context: PlannerContext):
@@ -705,7 +1098,15 @@ class BattlePlanner:
     def _risk_note(state, risk, context):
         if risk is PlannerRisk.CRITICAL:
             if state.get("critical_incoming", state["incoming"]) >= context.active_hp:
-                return "A modeled critical-hit ceiling can be lethal before the line completes."
+                probability = state.get("critical_probability")
+                if probability is None:
+                    probability = BattlePlanner._critical_exposure_probability(context, state.get("turns", 0))
+                probability_note = (
+                    f" The modeled critical-only lethal probability is approximately {probability:.1%}."
+                    if probability is not None
+                    else ""
+                )
+                return f"A modeled critical-hit ceiling can be lethal before the line completes.{probability_note}"
             return "The modeled response can KO before the line completes."
         if risk is PlannerRisk.HIGH:
             if state.get("accuracy", 1.0) < BattlePlanner._MIN_SEQUENCE_ACCURACY:
@@ -730,6 +1131,7 @@ class BattlePlanner:
             },
             context,
         )
+        critical_probability = cls._critical_exposure_probability(context, max(0, turns))
         risk_rank = {
             PlannerRisk.LOW: 3,
             PlannerRisk.MODERATE: 2,
@@ -743,6 +1145,7 @@ class BattlePlanner:
             risk_rank,
             int(hp),
             -incoming,
+            -critical_probability,
             -turns,
             accuracy,
             sum(m.damage_max == 0 for m in sequence),
@@ -781,6 +1184,7 @@ class BattlePlanner:
         incoming_exchanges = max(0, hits - 1) if player_first else hits
         projected_incoming = incoming * incoming_exchanges
         projected_critical_incoming = critical_incoming * incoming_exchanges
+        critical_probability = self._critical_exposure_probability(context, incoming_exchanges)
         if context.active_hp <= projected_incoming or context.active_hp <= projected_critical_incoming:
             return None
         order_note = "player acts first" if player_first else "opponent may act before each attack"
@@ -793,7 +1197,8 @@ class BattlePlanner:
             f"{move.name}: {move.damage_min}-{move.damage_max} damage; estimated {hits} hits to KO; "
             f"{action_turns} action turns; sequence accuracy {sequence_accuracy:.0%}; "
             f"projected incoming damage {projected_incoming}; "
-            f"{order_note}; critical-hit ceiling {projected_critical_incoming}; safe sequence established."
+            f"{order_note}; critical-hit ceiling {projected_critical_incoming}; "
+            f"critical exposure probability {critical_probability:.1%}; safe sequence established."
         )
 
     @staticmethod
@@ -806,6 +1211,28 @@ class BattlePlanner:
         if context.active_speed is not None and context.opponent_speed is not None:
             return context.active_speed > context.opponent_speed
         return False
+
+    @staticmethod
+    def _critical_exposure_probability(context, response_count: int) -> float:
+        """Approximate the chance of at least one critical response.
+
+        Damage ceilings remain conservative because the planner does not know
+        the opponent's move choice or full damage-roll distribution. It can
+        still account for Gen III's standard 1/16 critical-hit chance when
+        comparing otherwise similar lines.
+        """
+
+        if response_count <= 0 or not context.opponent_moves:
+            return 0.0
+        per_response = max(
+            (
+                max(0.0, min(1.0, candidate.critical_hit_chance))
+                for candidate in context.opponent_moves
+                if candidate.damage_max > 0
+            ),
+            default=0.0,
+        )
+        return 1 - (1 - per_response) ** response_count
 
     @staticmethod
     def _attack_failure_reason(context: PlannerContext, move: PlannerMove) -> str:
@@ -890,13 +1317,42 @@ def format_planner_decision_diagnostic(decision: PlannerDecision, context: Plann
     reason = decision.rationale
     if decision.classification is PlannerDecisionClass.BEST_AVAILABLE:
         reason = "No fully safe line established; selecting best available legal action. " + reason
-    return (
+    decision_line = (
         f"BATTLE_DECISION_DETAIL: {decision.classification.name}: {selected}; action={decision.action.value}; "
         f"confidence={decision.confidence.value}; player_hp={context.active_hp}/{context.active_max_hp}; "
         f"opponent_hp={context.opponent_hp}/{context.opponent_max_hp or 'unknown'}; damage={damage}; "
         f"hits_to_ko={hits if hits is not None else 'n/a'}; known_opponent_moves={known_moves!r}; "
         f"opponent_response_unknown={unknown}; risk={decision.risk.value}; setup_line={setup}; "
         f"fallback={fallback}; primary_reason={reason}; strongest_rejected_alternative={rejected}"
+    )
+    return decision_line + "\n" + format_action_evaluation_diagnostic(decision)
+
+
+def format_action_evaluation_diagnostic(decision: PlannerDecision) -> str:
+    """Format the full action inventory and its safety explanations.
+
+    The line is intentionally deterministic and compact enough for a trace,
+    while retaining the distinction between an action that cannot be selected,
+    one that can be selected but is unsafe, and one that is safe.
+    """
+
+    def describe(candidate: PlannerCandidate) -> str:
+        if not candidate.available:
+            status = "unavailable"
+        elif candidate.is_safe:
+            status = "safe"
+        else:
+            status = "unsafe/uncertain"
+        return f"{candidate.label}={status} ({candidate.reason})"
+
+    best_safe = decision.best_safe_candidate
+    best_available = decision.best_available_candidate
+    safe_label = best_safe.label if best_safe is not None else "none"
+    available_label = best_available.label if best_available is not None else "none"
+    candidates = "; ".join(describe(candidate) for candidate in decision.candidate_evaluations)
+    return (
+        f"BATTLE_ACTION_EVALUATION: best_safe={safe_label}; best_available={available_label}; "
+        f"candidates=[{candidates}]"
     )
 
 
@@ -991,6 +1447,7 @@ def plan_battle_state(battle_state: Any, knowledge: BattleKnowledge | None = Non
                     _mechanics_supported(move),
                     "observed" if name in observed else "known",
                     critical_damage_max,
+                    1 / 16,
                 )
             )
         except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
@@ -1030,6 +1487,20 @@ def plan_battle_state(battle_state: Any, knowledge: BattleKnowledge | None = Non
         if party_index == active.party_index or pokemon.is_egg or pokemon.current_hp <= 0:
             continue
         incoming = [value for name in opponent_moves if (value := damage(opponent, pokemon, name)) is not None]
+        incoming_critical = []
+        for name in opponent_moves:
+            try:
+                move = get_move_by_name(name)
+                incoming_critical.append(
+                    util.calculate_move_damage_range(
+                        move,
+                        opponent,
+                        pokemon,
+                        is_critical_hit=True,
+                    ).max
+                )
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                continue
         offensive = []
         for learned in pokemon.moves:
             if (
@@ -1049,6 +1520,7 @@ def plan_battle_state(battle_state: Any, knowledge: BattleKnowledge | None = Non
                 pokemon.total_hp,
                 max(incoming) if incoming else None,
                 max(offensive, default=0),
+                max(incoming_critical) if incoming_critical else None,
             )
         )
 
@@ -1096,6 +1568,15 @@ def plan_battle_state(battle_state: Any, knowledge: BattleKnowledge | None = Non
         any(item.is_capture_ball and item.quantity > 0 for item in items),
         int(getattr(battle_state, "capture_appropriate_hp", 1) or 1),
         bool(getattr(battle_state, "capture_attempted", False)),
+        max(
+            (
+                candidate.critical_damage_max
+                if candidate.critical_damage_max is not None
+                else candidate.damage_max
+                for candidate in opponent_moves
+            ),
+            default=None,
+        ),
     )
     diagnostic_print(
         lambda: (

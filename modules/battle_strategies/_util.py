@@ -1,4 +1,5 @@
 import math
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from modules.battle_state import (
@@ -20,6 +21,12 @@ from modules.pokemon import (
     get_ability_by_name,
 )
 from modules.pokemon_party import get_party
+from modules.battle_strategies.switch_evaluator import (
+    SwitchCandidateFacts,
+    SwitchEvaluationContext,
+    get_switch_policy,
+    rank_switch_candidates,
+)
 
 if TYPE_CHECKING:
     from modules.pokemon import Move, Type
@@ -280,31 +287,56 @@ class BattleStrategyUtil:
         strongest_move = move_strengths.index(max_strength)
         return strongest_move
 
-    def calculate_catch_success_chance(self, battle_state: "BattleState", ball_multiplier: float = 1) -> float:
+    def calculate_catch_success_chance(
+        self,
+        battle_state: "BattleState",
+        ball_multiplier: float = 1,
+        *,
+        current_hp: int | None = None,
+        status: StatusCondition | None = None,
+    ) -> float:
+        """Estimate one-ball capture probability for the current or a hypothetical state.
+
+        Capture action selection uses this same Gen III-style calculation for
+        each possible post-move HP state.  Keeping the hypothetical values
+        here prevents the strategy from approximating catch odds with an
+        unrelated threshold.
+        """
         opponent = battle_state.opponent.active_battler
 
-        if opponent.status_permanent in (StatusCondition.Sleep, StatusCondition.Freeze):
+        total_hp = max(0, int(getattr(opponent, "total_hp", opponent.current_hp)))
+        current_hp = opponent.current_hp if current_hp is None else max(0, current_hp)
+        status = getattr(opponent, "status_permanent", StatusCondition.Healthy) if status is None else status
+        if current_hp <= 0 or total_hp <= 0:
+            return 0.0
+
+        if status in (StatusCondition.Sleep, StatusCondition.Freeze):
             status_multiplier = 2
-        elif opponent.status_permanent in (
+        elif status in (
             StatusCondition.Paralysis,
             StatusCondition.Poison,
             StatusCondition.Burn,
         ):
             status_multiplier = 1.5
-        elif opponent.status_permanent is StatusCondition.BadPoison and not context.rom.is_rs:
+        elif status is StatusCondition.BadPoison and not context.rom.is_rs:
             # Due to a programming oversight in Ruby/Sapphire, the BadPoison state (which inflicts higher
             # damage compared to 'regular' poison) is not considered for the status multiplier when catching.
             status_multiplier = 1.5
         else:
             status_multiplier = 1
 
-        odds = opponent.species.catch_rate
+        catch_rate = getattr(getattr(opponent, "species", None), "catch_rate", None)
+        if catch_rate is None or catch_rate <= 0:
+            return 0.0
+        odds = catch_rate
         odds *= ball_multiplier * 10
         odds //= 10
-        odds *= 3 * opponent.total_hp - 2 * opponent.current_hp
-        odds //= 3 * opponent.total_hp
+        odds *= 3 * total_hp - 2 * current_hp
+        odds //= 3 * total_hp
         odds *= status_multiplier * 10
         odds //= 10
+        if odds <= 0:
+            return 0.0
 
         shake_success_probability = (1048560 // int(math.sqrt(int(math.sqrt(16711680 // odds))))) / 65536
         return shake_success_probability**4
@@ -579,35 +611,55 @@ class BattleStrategyUtil:
             return None
 
         party = get_party()
-        values = []
+        opponent = (
+            getattr(getattr(battle_state, "opponent", None), "active_battler", None)
+            if battle_state is not None
+            else None
+        )
+        low_level = context.config.battle.switch_strategy == "lowest_level"
+        policy = get_switch_policy(SwitchEvaluationContext.FALLBACK)
+        if low_level:
+            policy = replace(policy, training_priority=4.0, health_ratio=0.5)
+        else:
+            policy = replace(policy, training_priority=0.0, health_ratio=3.0)
+
+        candidates = []
         for index in indices:
             pokemon = party[index]
-            if context.config.battle.switch_strategy == "lowest_level":
-                value = 100 - pokemon.level
-            else:
-                value = pokemon.current_hp
-                if pokemon.status_condition in (
-                    StatusCondition.Sleep,
-                    StatusCondition.Freeze,
-                ):
-                    value *= 0.25
-                elif pokemon.status_condition == StatusCondition.BadPoison:
-                    value *= 0.5
-                elif pokemon.status_condition in (
-                    StatusCondition.BadPoison,
-                    StatusCondition.Poison,
-                    StatusCondition.Burn,
-                ):
-                    value *= 0.65
-                elif pokemon.status_condition == StatusCondition.Paralysis:
-                    value *= 0.8
+            damage_min = damage_max = 1
+            opponent_hp = getattr(opponent, "current_hp", 1) if opponent is not None else 1
+            if opponent is not None:
+                try:
+                    move_index = self.get_strongest_move_against(pokemon, opponent)
+                    if move_index is not None:
+                        damage_range = self.calculate_move_damage_range(
+                            pokemon.moves[move_index].move,
+                            pokemon,
+                            opponent,
+                        )
+                        damage_min = getattr(damage_range, "min", 1)
+                        damage_max = getattr(damage_range, "max", damage_min)
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+                    pass
+            status = getattr(pokemon, "status_condition", None)
+            healthy = status in (None, StatusCondition.Healthy)
+            candidates.append(
+                SwitchCandidateFacts(
+                    party_index=index,
+                    hp=getattr(pokemon, "current_hp", 0),
+                    max_hp=getattr(pokemon, "total_hp", getattr(pokemon, "current_hp", 0)),
+                    opponent_hp=opponent_hp,
+                    damage_min=damage_min,
+                    damage_max=damage_max,
+                    response_facts_known=False,
+                    training_priority=max(0.0, 1.0 - (getattr(pokemon, "level", 0) / 100)),
+                    healthy=healthy,
+                    active_party_indices=frozenset(active_party_indices),
+                )
+            )
 
-            values.append(value)
-
-        best_value = max(values)
-        index = indices[values.index(best_value)]
-
-        return index
+        evaluations = rank_switch_candidates(candidates, policy)
+        return evaluations[0].party_index if evaluations else None
 
     def move_is_usable(self, move: LearnedMove):
         return (
@@ -616,6 +668,34 @@ class BattleStrategyUtil:
             and move.pp > 0
             and move.move.name not in context.config.battle.banned_moves
         )
+
+    @staticmethod
+    def is_poisoned(pokemon: Pokemon | BattlePokemon) -> bool:
+        """Return whether a party/battle Pokémon has a poison status."""
+
+        status = getattr(pokemon, "status_condition", None)
+        if status is None:
+            status = getattr(pokemon, "status_permanent", None)
+        value = getattr(status, "value", status)
+        return value in {StatusCondition.Poison.value, StatusCondition.BadPoison.value}
+
+    @staticmethod
+    def move_may_inflict_poison(move: "Move") -> bool:
+        """Return whether a Gen III move has a poison secondary effect."""
+
+        return getattr(move, "effect", None) in {
+            "POISON",
+            "TOXIC",
+            "POISON_HIT",
+            "POISON_FANG",
+            "POISON_TAIL",
+        }
+
+    @staticmethod
+    def critical_hit_chance(move: "Move") -> float:
+        """Return the modeled Gen III critical-hit chance for a move."""
+
+        return 1 / 8 if getattr(move, "effect", None) == "HIGH_CRITICAL" else 1 / 16
 
     def pokemon_has_enough_hp(self, pokemon: Pokemon | BattlePokemon):
         return pokemon.current_hp_percentage > context.config.battle.hp_threshold

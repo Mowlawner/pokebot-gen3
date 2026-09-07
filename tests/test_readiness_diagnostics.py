@@ -174,6 +174,18 @@ def test_policy_healthy_and_low_hp_without_imminent_trainer_continue():
     assert result == type(result)(ReadinessDecision.RECOVER, ReadinessReason.CRITICAL_PARTY_HP)
 
 
+def test_policy_recovers_a_poisoned_party_before_overworld_steps_drain_hp():
+    value = build_progression_readiness_diagnostic(
+        snapshot((mon(0, 20, 20, status="poisoned"),)),
+        overworld=SimpleNamespace(map_id=(1, 2), player_coordinates=(3, 4), objects=()),
+        recovery=RouteRecovery(center_available=True, distance_to_center=8, safe_to_reach_center=True),
+        recovery_availability=Availability.KNOWN,
+        overworld_availability=Availability.KNOWN,
+    )
+    result = CampaignReadinessPolicy().evaluate(value)
+    assert result == type(result)(ReadinessDecision.RECOVER, ReadinessReason.POISONED_PARTY)
+
+
 def test_policy_critical_hp_at_or_below_threshold_before_trainer_recovers():
     policy = CampaignReadinessPolicy()
     trainer = ((4, 4), 4, False)  # distance 1, within range
@@ -345,3 +357,71 @@ def test_policy_does_not_fallback_to_absolute_distance_without_route_analysis():
         recovery_availability=Availability.KNOWN,
     )
     assert CampaignReadinessPolicy().evaluate(value).decision is ReadinessDecision.UNKNOWN
+
+
+def test_policy_uses_completed_nearby_recovery_route_when_detour_analysis_is_unavailable():
+    value = build_progression_readiness_diagnostic(
+        snapshot((mon(0, 12, 20),)),
+        overworld=SimpleNamespace(map_id=(1, 2), player_coordinates=(3, 4), objects=()),
+        recovery=RouteRecovery(
+            center_available=True,
+            distance_to_center=12,
+            safe_to_reach_center=True,
+            route=object(),
+        ),
+        recovery_availability=Availability.KNOWN,
+        overworld_availability=Availability.KNOWN,
+    )
+
+    result = CampaignReadinessPolicy().evaluate(value)
+
+    assert result.decision is ReadinessDecision.RECOVER
+    assert result.reason is ReadinessReason.OPPORTUNISTIC_RECOVERY
+
+
+def test_policy_uses_recovery_route_when_route_composition_has_no_reachable_candidate():
+    value = build_progression_readiness_diagnostic(
+        snapshot((mon(0, 12, 20),)),
+        overworld=SimpleNamespace(map_id=(1, 2), player_coordinates=(3, 4), objects=()),
+        recovery=RouteRecovery(
+            center_available=True,
+            distance_to_center=12,
+            safe_to_reach_center=True,
+            route=object(),
+        ),
+        recovery_availability=Availability.KNOWN,
+        overworld_availability=Availability.KNOWN,
+        route_analysis=RouteAnalysis(ReachLocation(((1, 2), (8, 8))), object(), 100, ()),
+    )
+
+    result = CampaignReadinessPolicy().evaluate(value)
+
+    assert result.decision is ReadinessDecision.RECOVER
+    assert result.reason is ReadinessReason.OPPORTUNISTIC_RECOVERY
+
+
+def test_policy_keeps_moving_or_recovers_when_route_analysis_times_out():
+    world = SimpleNamespace(map_id=(1, 2), player_coordinates=(3, 4), objects=())
+    near = build_progression_readiness_diagnostic(
+        snapshot((mon(0, 12, 20),)),
+        overworld=world,
+        recovery=RouteRecovery(center_available=True, distance_to_center=8, safe_to_reach_center=True),
+        recovery_availability=Availability.KNOWN,
+        overworld_availability=Availability.KNOWN,
+        route_analysis_timed_out=True,
+    )
+    result = CampaignReadinessPolicy().evaluate(near)
+    assert result.decision is ReadinessDecision.RECOVER
+    assert result.reason is ReadinessReason.OPPORTUNISTIC_RECOVERY
+
+    far = build_progression_readiness_diagnostic(
+        snapshot((mon(0, 12, 20),)),
+        overworld=world,
+        recovery=RouteRecovery(center_available=True, distance_to_center=80, safe_to_reach_center=True),
+        recovery_availability=Availability.KNOWN,
+        overworld_availability=Availability.KNOWN,
+        route_analysis_timed_out=True,
+    )
+    result = CampaignReadinessPolicy().evaluate(far)
+    assert result.decision is ReadinessDecision.CONTINUE
+    assert result.reason is ReadinessReason.OPPORTUNISTIC_ROUTE_UNAVAILABLE

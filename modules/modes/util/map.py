@@ -13,6 +13,9 @@ _closest_pokemon_centers: dict[MapFRLG | MapRSE, list[PokemonCenter]] = {
     MapRSE.ROUTE102: [PokemonCenter.OldaleTown, PokemonCenter.PetalburgCity],
     MapRSE.ROUTE103: [PokemonCenter.OldaleTown],
     MapRSE.ROUTE104: [PokemonCenter.PetalburgCity, PokemonCenter.RustboroCity],
+    # The Woods are a separate dungeon map rather than a child of Route 104,
+    # so name-prefix parent discovery cannot infer their nearby source.
+    MapRSE.PETALBURG_WOODS: [PokemonCenter.PetalburgCity],
     MapRSE.ROUTE105: [PokemonCenter.PetalburgCity, PokemonCenter.DewfordTown],
     MapRSE.ROUTE106: [PokemonCenter.DewfordTown],
     MapRSE.ROUTE107: [PokemonCenter.DewfordTown],

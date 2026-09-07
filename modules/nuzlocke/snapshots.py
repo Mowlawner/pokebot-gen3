@@ -198,6 +198,10 @@ class CampaignObservationSnapshot:
     text_speed: int | None = None
     available: bool = False
     lifecycle: CampaignObservationLifecycle = CampaignObservationLifecycle.UNAVAILABLE
+    # Emerald stores the Set battle-style bit in the same options byte as
+    # text speed. Keep this separate from text speed so an optional startup
+    # rule can require both settings without inferring from battle prompts.
+    battle_style_set: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +234,10 @@ class NuzlockeSnapshot:
     pc_available: bool = True
     battle_available: bool = True
     campaign_observation: CampaignObservationSnapshot = dataclass_field(default_factory=CampaignObservationSnapshot)
+    # Compact semantic revision for event-driven readiness caching. It changes
+    # when party health/status/composition or relevant inventory quantities
+    # change, not merely because another emulator frame elapsed.
+    readiness_revision: object | None = None
 
 
 def _moves(pokemon) -> tuple[MoveSnapshot, ...]:
@@ -517,7 +525,11 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
                 "DEVON_CORP_3F_STATE",
             )
         )
-        text_speed = unpack_uint16(get_save_block(2, offset=0x14, size=2)) & 0x07
+        options = unpack_uint16(get_save_block(2, offset=0x14, size=2))
+        text_speed = options & 0x07
+        # SaveBlock2.optionsBattleStyle is bit 4 in Emerald's packed options
+        # byte: 0 is Shift and 1 is Set.
+        battle_style_set = bool(options & 0x10)
         # ``get_game_state()`` is also non-None on the title and main-menu
         # callbacks.  Those callbacks can expose an uninitialised save block
         # (typically all 0xff after mGBA opens an empty save file), which
@@ -540,29 +552,51 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
             text_speed,
             save_backed,
             lifecycle,
+            battle_style_set,
         )
     except (AttributeError, ImportError, KeyError, IndexError, RuntimeError, TypeError, ValueError):
         pass
     if trace is not None:
         trace.duration("nuzlocke_progression_duration_ms", stage)
+    party_snapshots = tuple(
+        PartyPokemonSnapshot(
+            **{field: getattr(snapshot, field) for field in PokemonSnapshot.__dataclass_fields__},
+            party_index=p.index,
+        )
+        for p in party or ()
+        for snapshot in (_pokemon(p),)
+    )
+    inventory_snapshot = InventorySnapshot(
+        _items(bag.items) if bag is not None else (),
+        _items(bag.poke_balls) if bag is not None else (),
+        _items(bag.key_items) if bag is not None else (),
+    )
+    readiness_revision = (
+        tuple(
+            (
+                pokemon.party_index,
+                pokemon.species,
+                pokemon.level,
+                pokemon.current_hp,
+                pokemon.max_hp,
+                pokemon.status,
+                pokemon.fainted,
+                pokemon.egg,
+            )
+            for pokemon in party_snapshots
+        ),
+        tuple((item.name, item.quantity) for item in inventory_snapshot.items),
+        tuple((item.name, item.quantity) for item in inventory_snapshot.poke_balls),
+        tuple((item.name, item.quantity) for item in inventory_snapshot.key_items),
+        campaign_observation.lifecycle.value,
+    )
     return NuzlockeSnapshot(
         frame=context.emulator.get_frame_count(),
         game_id=getattr(context.rom, "game_name", None),
         game_state=game_state,
         player=player,
-        party=tuple(
-            PartyPokemonSnapshot(
-                **{field: getattr(snapshot, field) for field in PokemonSnapshot.__dataclass_fields__},
-                party_index=p.index,
-            )
-            for p in party or ()
-            for snapshot in (_pokemon(p),)
-        ),
-        inventory=InventorySnapshot(
-            _items(bag.items) if bag is not None else (),
-            _items(bag.poke_balls) if bag is not None else (),
-            _items(bag.key_items) if bag is not None else (),
-        ),
+        party=party_snapshots,
+        inventory=inventory_snapshot,
         battle=battle,
         pc=_storage_snapshot(storage),
         progression=ProgressionSnapshot(progression),
@@ -573,4 +607,5 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
         pc_available=storage is not None,
         battle_available=game_state is not None,
         campaign_observation=campaign_observation,
+        readiness_revision=readiness_revision,
     )

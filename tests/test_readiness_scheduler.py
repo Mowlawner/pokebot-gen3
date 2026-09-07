@@ -8,6 +8,7 @@ from modules.nuzlocke.readiness_diagnostics import (
     ReadinessReason,
     ReadinessObservationScheduler,
 )
+from modules.nuzlocke.resource_policy import RouteRecovery
 
 
 class ReadinessSchedulerTests(unittest.TestCase):
@@ -115,6 +116,64 @@ class ReadinessSchedulerTests(unittest.TestCase):
         result = CampaignReadinessPolicy().evaluate(readiness)
         self.assertEqual(result.decision, ReadinessDecision.UNKNOWN)
         self.assertEqual(result.reason, ReadinessReason.RESOURCE_INFORMATION_UNKNOWN)
+
+    def test_pending_route_observation_is_polled_until_completion(self):
+        calls = []
+        pending = SimpleNamespace(route_analysis_pending=True)
+        complete = SimpleNamespace(route_analysis_pending=False)
+        scheduler = ReadinessObservationScheduler(
+            lambda *_: calls.append(1) or (pending if len(calls) == 1 else complete),
+            lambda: "same",
+        )
+
+        self.assertIs(scheduler.observe("objective", "goal"), pending)
+        self.assertIs(scheduler.observe("objective", "goal"), complete)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(scheduler.state.status, "fresh")
+
+    def test_timed_out_route_is_retried_after_cooldown(self):
+        calls = []
+        timed_out = SimpleNamespace(
+            recovery=RouteRecovery(calculation_timed_out=True),
+            route_analysis_pending=False,
+        )
+        complete = SimpleNamespace(
+            recovery=RouteRecovery(),
+            route_analysis_pending=False,
+        )
+        scheduler = ReadinessObservationScheduler(
+            lambda *_: calls.append(1) or (timed_out if len(calls) == 1 else complete),
+            lambda: "same",
+        )
+
+        self.assertIs(scheduler.observe("objective", "goal"), timed_out)
+        for _ in range(59):
+            self.assertIs(scheduler.observe("objective", "goal"), timed_out)
+        self.assertIs(scheduler.observe("objective", "goal"), complete)
+        self.assertEqual(len(calls), 2)
+
+    def test_timed_out_route_analysis_is_retried_after_cooldown(self):
+        calls = []
+        timed_out = SimpleNamespace(
+            recovery=RouteRecovery(),
+            route_analysis_timed_out=True,
+            route_analysis_pending=False,
+        )
+        complete = SimpleNamespace(
+            recovery=RouteRecovery(),
+            route_analysis_timed_out=False,
+            route_analysis_pending=False,
+        )
+        scheduler = ReadinessObservationScheduler(
+            lambda *_: calls.append(1) or (timed_out if len(calls) == 1 else complete),
+            lambda: "same",
+        )
+
+        self.assertIs(scheduler.observe("objective", "goal"), timed_out)
+        for _ in range(59):
+            self.assertIs(scheduler.observe("objective", "goal"), timed_out)
+        self.assertIs(scheduler.observe("objective", "goal"), complete)
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

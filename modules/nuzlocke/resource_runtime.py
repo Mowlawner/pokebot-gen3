@@ -32,7 +32,7 @@ from modules.goals import (
 from modules.map_data import MapFRLG, PokemonCenter
 from modules.map import get_map_all_tiles, get_map_data, get_map_metadata
 from modules.modes.util.items import use_item_from_bag
-from modules.modes.util.map import find_closest_pokemon_center
+from modules.modes.util.map import find_closest_pokemon_center, pokemon_center_candidates
 from modules.map_path import PathFindingError, Direction
 from modules.player import get_player_location
 from modules.navigation import (
@@ -140,6 +140,14 @@ def _map_id_value(map_id):
     return getattr(map_id, "value", map_id)
 
 
+def _normalized_location(location):
+    """Normalize a map/coordinate pair for graph and catalog comparisons."""
+
+    if not isinstance(location, tuple) or len(location) != 2:
+        return location
+    return _map_id_value(location[0]), location[1]
+
+
 def _recovery_navigation_goal(destination, source=None):
     """Return the executable goal for a cataloged healing destination."""
     source = source or emerald_healing_source_for_destination(destination)
@@ -179,11 +187,57 @@ def _prewarm_interior_map_identity(interior_map_id) -> None:
 # reported instead of leaving the bot motionless forever.
 _MAP_IDENTITY_RESOLUTION_TIMEOUT = 300
 _RECOVERY_CATALOG_CANDIDATE_LIMIT = 4
-# Recovery candidate validation is speculative work performed from the main
-# emulator loop. Keep both a geometric incumbent bound and a hard finite
-# budget so an unreachable/future healing source cannot monopolize a frame.
+# Recovery candidate validation is bounded speculative work. Keep both a
+# geometric incumbent bound and a hard finite budget so an unreachable/future
+# healing source cannot monopolize the route worker.
 _RECOVERY_SEARCH_MAX_EXPANSIONS = 4000
 _RECOVERY_SEARCH_MAX_ROUTE_COST = 512
+
+
+@dataclass(frozen=True, slots=True)
+class RouteRecoveryRequest:
+    """Frozen inputs for the expensive portion of recovery observation.
+
+    The request is assembled while the emulator is owned by the frame loop.
+    Route search can then run against this immutable snapshot without reading
+    emulator memory or publishing frame-scoped diagnostics.
+    """
+
+    location: object
+    world: NavigationWorld
+    graph: object
+    ordered_sources: tuple[tuple[int, object], ...]
+    center_location: object | None
+    candidate_limit: int
+    critical: bool = False
+
+    @property
+    def key(self) -> tuple:
+        """Return the dynamic-world identity used to reject stale results."""
+        # NavigationWorld computes these revisions while the live observation
+        # is assembled.  Do not walk the full static tile mapping here: this
+        # property is polled once per frame while a worker is pending.
+        blocked, transitions = self.world.revision_key()
+        sources = tuple(
+            (
+                getattr(source, "source_id", None),
+                getattr(source, "outdoor_location", None),
+                getattr(source, "interior_map", None),
+            )
+            for _, source in self.ordered_sources
+        )
+        return (
+            self.location,
+            self.candidate_limit,
+            getattr(self.world, "facing", None),
+            getattr(self.world, "running_shoes", None),
+            getattr(self.world, "player_elevation", None),
+            getattr(self.world, "surfing", None),
+            transitions,
+            blocked,
+            sources,
+            self.critical,
+        )
 
 
 class HealingSourceType(Enum):
@@ -1587,15 +1641,14 @@ def _execute_healing_source_interaction(source: HealingSource) -> Iterator[objec
         yield
 
 
-def observe_route_recovery(*, candidate_limit: int | None = None) -> RouteRecovery:
-    """Observe recovery routing without turning transient avatar gaps into crashes."""
-    trace = getattr(context, "stutter_trace", None)
-    started = trace.now() if trace is not None else 0
+def prepare_route_recovery(
+    *, candidate_limit: int | None = None, critical: bool = False
+) -> RouteRecoveryRequest | RouteRecovery:
+    """Read live route inputs without executing any candidate path searches."""
+
     try:
         location = get_player_location()
     except (KeyError, RuntimeError) as error:
-        # get_player_location documents RuntimeError for inactive/corrupt
-        # avatar data during transitions.  Do not mask pathfinding errors.
         if isinstance(error, KeyError):
             diagnostic_print(
                 lambda: (
@@ -1606,214 +1659,269 @@ def observe_route_recovery(*, candidate_limit: int | None = None) -> RouteRecove
                 trace=True,
                 prefix="CAMPAIGN_RECOVERY_OBSERVATION_RETRY",
             )
-        result = RouteRecovery(observation_available=False, observation_error=str(error))
-        if trace is not None:
-            trace.duration("campaign_route_recovery_observation_duration_ms", started)
-        return result
-    try:
-        if (
-            not isinstance(location, tuple)
-            or len(location) != 2
-            or location[0] is None
-            or not isinstance(location[1], tuple)
-            or len(location[1]) != 2
-            or any(coordinate is None for coordinate in location[1])
-        ):
-            result = RouteRecovery(observation_available=False, observation_error="player_location_unavailable")
-            if trace is not None:
-                trace.duration("campaign_route_recovery_observation_duration_ms", started)
-            return result
-        center = None
-        center_lookup_error = None
-        is_rse = bool(getattr(getattr(context, "rom", None), "is_rse", False))
-        # Emerald recovery is defined by the ROM healing catalog.  The old
-        # Center lookup performed an unrelated local path search and could
-        # disagree with the executable source selected below, especially
-        # across map warps.  Non-Emerald callers retain the lookup only as a
-        # compatibility boundary; Campaign Progression is Emerald-only.
-        if not is_rse:
-            try:
-                center = find_closest_pokemon_center(location)
-            except (BotModeError, PathFindingError) as error:
-                # The legacy table is intentionally incomplete: it contains
-                # route-level Center hints, not every map that can lead to
-                # one. Keep that failure as a diagnostic and fall through to
-                # the ROM healing catalog below.
-                center_lookup_error = error
-        center_location = getattr(center, "value", None)
-        diagnostic_print(
-            lambda: (
-                "CAMPAIGN_RECOVERY_ROUTE_SELECTED: "
-                f"source={location!r} center={center!r} destination={center_location!r} "
-                f"legacy_error={center_lookup_error!r}"
-            ),
-            trace=True,
-            prefix="CAMPAIGN_RECOVERY_ROUTE_SELECTED",
-        )
-        if center is not None and (
-            not isinstance(center_location, tuple)
-            or len(center_location) != 2
-            or center_location[0] is None
-            or not isinstance(center_location[1], tuple)
-            or len(center_location[1]) != 2
-            or any(coordinate is None for coordinate in center_location[1])
-        ):
-            result = RouteRecovery(observation_available=False, observation_error="center_location_unavailable")
-            if trace is not None:
-                trace.duration("campaign_route_recovery_observation_duration_ms", started)
-            return result
+        return RouteRecovery(observation_available=False, observation_error=str(error))
 
-        # Non-Emerald compatibility callers may still provide only a Center
-        # destination.  Emerald always selects from the executable catalog,
-        # including maps such as Petalburg Woods that have no legacy Center
-        # table entry.
-        if center is not None:
-            source = emerald_healing_source_for_destination(center_location)
-            sources = (source,) if source is not None else (None,)
-        elif is_rse:
-            source_map = location[0]
-            local_sources = tuple(
+    if (
+        not isinstance(location, tuple)
+        or len(location) != 2
+        or location[0] is None
+        or not isinstance(location[1], tuple)
+        or len(location[1]) != 2
+        or any(coordinate is None for coordinate in location[1])
+    ):
+        return RouteRecovery(observation_available=False, observation_error="player_location_unavailable")
+
+    center = None
+    center_lookup_error = None
+    is_rse = bool(getattr(getattr(context, "rom", None), "is_rse", False))
+    if is_rse:
+        # The legacy helper performs two synchronous full-map path searches
+        # per candidate. That work used to happen before the background
+        # planner was even submitted and was the source of multi-second (and
+        # occasionally tens-of-seconds) recovery stalls. For Emerald, the
+        # catalog is already the authoritative candidate set; route distance
+        # and reachability are validated by ``plan_route_recovery`` in the
+        # worker below.
+        map_centers = pokemon_center_candidates(location)
+        center = map_centers[0] if map_centers else None
+    else:
+        try:
+            center = find_closest_pokemon_center(location)
+        except (BotModeError, PathFindingError) as error:
+            center_lookup_error = error
+    center_location = getattr(center, "value", None)
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_RECOVERY_ROUTE_SELECTED: "
+            f"source={location!r} center={center!r} destination={center_location!r} "
+            f"legacy_error={center_lookup_error!r}"
+        ),
+        trace=True,
+        prefix="CAMPAIGN_RECOVERY_ROUTE_SELECTED",
+    )
+    if center is not None and (
+        not isinstance(center_location, tuple)
+        or len(center_location) != 2
+        or center_location[0] is None
+        or not isinstance(center_location[1], tuple)
+        or len(center_location[1]) != 2
+        or any(coordinate is None for coordinate in center_location[1])
+    ):
+        return RouteRecovery(observation_available=False, observation_error="center_location_unavailable")
+
+    if center is not None:
+        if is_rse:
+            # Keep every catalog source registered for this map so a nearby
+            # alternative (Route 102 -> Petalburg, for example) survives a
+            # stale/failed first route search. Static graph ranking below
+            # accounts for entrance/exit traversal within that bounded local
+            # candidate set.
+            map_centers = pokemon_center_candidates(location)
+            sources = tuple(
                 source
                 for source in emerald_healing_sources()
-                if source.outdoor_location[0] == source_map or source.interior_map == source_map
+                if any(
+                    _normalized_location(source.outdoor_location) == _normalized_location(candidate.value)
+                    for candidate in map_centers
+                )
             )
-            sources = local_sources or emerald_healing_sources()
+            if not sources:
+                # A known local candidate set is authoritative. Falling back
+                # to the global catalog here makes future centers compete
+                # with the actually nearby sources when a representation
+                # mismatch occurs (for example Route 104 selecting Oldale).
+                source_map = _map_id_value(location[0])
+                sources = tuple(
+                    source
+                    for source in emerald_healing_sources()
+                    if _normalized_location(source.outdoor_location)[0] == source_map
+                    or _map_id_value(source.interior_map) == source_map
+                )
+                if not sources:
+                    source = emerald_healing_source_for_destination(_normalized_location(center_location))
+                    sources = (source,) if source is not None else ()
         else:
-            sources = ()
-
-        if not sources:
-            raise center_lookup_error or BotModeError("no cataloged healing source is available")
-
-        overworld = perceive_overworld()
-        if isinstance(overworld, OverworldObservationResult):
-            raise PathFindingError("overworld observation unavailable")
-        world = NavigationWorld.from_overworld(overworld)
-        graph = get_world_map_graph()
-        start = (_map_id_value(location[0]), location[1])
-
-        # The static graph gives a cheap ordering for the catalog.  Every
-        # candidate is still validated by the live-world planner, because a
-        # trainer sight line or a dynamic obstacle can make the map-level
-        # nearest source unsafe or temporarily unreachable.
-        def estimated_map_cost(source):
-            if source is None:
-                return 0
-            try:
-                return graph.route(start[0], _map_id_value(source.interior_map)).estimated_cost
-            except (AttributeError, RuntimeError, TypeError, ValueError):
-                return float("inf")
-
-        ordered_sources = tuple(sorted(enumerate(sources), key=lambda item: (estimated_map_cost(item[1]), item[0])))
-        # The static graph is an avenue selector, not a reason to probe every
-        # healing source in Hoenn.  Keep a small nearest-source frontier: the
-        # first candidate normally identifies Petalburg Center from Woods,
-        # while the bounded alternates preserve a chance to route around a
-        # temporary trainer/occupancy hazard without monopolizing the frame
-        # loop with eighteen global searches.
-        limit = _RECOVERY_CATALOG_CANDIDATE_LIMIT if candidate_limit is None else max(1, candidate_limit)
-        ordered_sources = ordered_sources[:limit]
-        route_candidates = []
-        route_errors = []
-        incumbent_prefix = None
-        for index, source in ordered_sources:
-            destination = center_location if source is None else source.outdoor_location
-            navigation_goal = _recovery_navigation_goal(
-                destination,
-                source,
+            source = emerald_healing_source_for_destination(center_location)
+            sources = (source,) if source is not None else (None,)
+    elif is_rse:
+        source_map = location[0]
+        map_centers = pokemon_center_candidates(location)
+        mapped_sources = tuple(
+            source
+            for source in emerald_healing_sources()
+            if any(
+                _normalized_location(source.outdoor_location) == _normalized_location(candidate.value)
+                for candidate in map_centers
             )
-            diagnostic_print(
-                lambda: (
-                    "CAMPAIGN_RECOVERY_CATALOG_CANDIDATE: "
-                    f"source={location!r} healing_source={getattr(source, 'source_id', None)!r} "
-                    f"destination={destination!r} rank={index!r}"
-                ),
-                trace=True,
-                prefix="CAMPAIGN_RECOVERY_CATALOG_CANDIDATE",
-            )
-            try:
-                plan, _ = plan_with_world_navigation(
-                    world,
-                    start,
-                    navigation_goal,
-                    graph,
-                    max_expansions=_RECOVERY_SEARCH_MAX_EXPANSIONS,
-                    max_route_cost=_RECOVERY_SEARCH_MAX_ROUTE_COST,
-                    cost_ceiling=incumbent_prefix,
-                )
-                if getattr(plan, "forced_trainer_exposure", False):
-                    raise NavigationError("world recovery route requires trainer exposure")
-                if plan.metrics is None or plan.destination is None:
-                    raise PathFindingError("world recovery route has no executable metrics")
-                distance = plan.metrics.total_route_cost
-                if distance is None:
-                    raise PathFindingError("world recovery route has no cost")
-                candidate_prefix = (
-                    # ``NavigationMetrics`` always exposes encounter
-                    # opportunities, but recovery also accepts lightweight
-                    # route-plan adapters used by compatibility callers and
-                    # tests.  Missing exposure data must not make an
-                    # otherwise executable route unusable.
-                    getattr(plan.metrics, "encounter_opportunities", 0),
-                    plan.metrics.total_route_cost,
-                )
-                route_candidates.append((candidate_prefix, index, source, destination, navigation_goal, plan))
-                if incumbent_prefix is None or candidate_prefix < incumbent_prefix:
-                    incumbent_prefix = candidate_prefix
-            except NavigationSearchLimitExceeded as error:
-                route_errors.append(
-                    (
-                        index,
-                        getattr(source, "source_id", None),
-                        "NavigationSearchLimitExceeded",
-                        str(error),
-                    )
-                )
-                diagnostic_print(
-                    lambda: (
-                        "CAMPAIGN_RECOVERY_CANDIDATE_PRUNED: "
-                        f"source={getattr(source, 'source_id', None)!r} rank={index!r} "
-                        f"incumbent={incumbent_prefix!r} reason={str(error)!r}"
-                    ),
-                    trace=True,
-                    prefix="CAMPAIGN_RECOVERY_CANDIDATE_PRUNED",
-                )
-            except (BotModeError, NavigationError, PathFindingError, TypeError, ValueError) as error:
-                route_errors.append((index, getattr(source, "source_id", None), type(error).__name__, str(error)))
-
-        if not route_candidates:
-            raise PathFindingError(f"no safe cataloged healing route: {route_errors!r}")
-        incumbent, _, source, destination, navigation_goal, route = min(
-            route_candidates,
-            key=lambda candidate: (candidate[0], candidate[1]),
         )
-        distance = incumbent[1]
+        local_sources = tuple(
+            source
+            for source in emerald_healing_sources()
+            if _normalized_location(source.outdoor_location)[0] == _map_id_value(source_map)
+            or _map_id_value(source.interior_map) == _map_id_value(source_map)
+        )
+        # A map absent from the legacy center table still gets its local
+        # catalog source first, then the bounded global catalog fallback.
+        sources = local_sources or mapped_sources or emerald_healing_sources()
+    else:
+        sources = ()
+
+    if not sources:
+        raise center_lookup_error or BotModeError("no cataloged healing source is available")
+
+    overworld = perceive_overworld()
+    if isinstance(overworld, OverworldObservationResult):
+        raise PathFindingError("overworld observation unavailable")
+    world = NavigationWorld.from_overworld(overworld)
+    graph = get_world_map_graph()
+    start = (_map_id_value(location[0]), location[1])
+
+    def estimated_map_cost(source):
+        if source is None:
+            return 0
+        try:
+            # Rank by estimated tile work, including the entrance-to-exit
+            # traversal on every intermediate map. Exact dynamic routing is
+            # still performed in the background worker.
+            estimate = graph.estimate_location_cost(start, _normalized_location(source.outdoor_location))
+            return float("inf") if estimate is None else estimate
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return float("inf")
+
+    ordered_sources = tuple(
+        sorted(
+            enumerate(sources),
+            key=lambda item: (
+                estimated_map_cost(item[1]),
+                item[0],
+            ),
+        )
+    )
+    limit = _RECOVERY_CATALOG_CANDIDATE_LIMIT if candidate_limit is None else max(1, candidate_limit)
+    return RouteRecoveryRequest(
+        location=location,
+        world=world,
+        graph=graph,
+        ordered_sources=ordered_sources[:limit],
+        center_location=center_location,
+        candidate_limit=limit,
+        critical=critical,
+    )
+
+
+def plan_route_recovery(request: RouteRecoveryRequest, *, cancel_check=None) -> RouteRecovery:
+    """Validate the prepared healing candidates using only frozen inputs."""
+
+    route_candidates = []
+    route_errors = []
+    incumbent_prefix = None
+    start = (_map_id_value(request.location[0]), request.location[1])
+    for index, source in request.ordered_sources:
+        destination = request.center_location if source is None else source.outdoor_location
+        navigation_goal = _recovery_navigation_goal(destination, source)
         diagnostic_print(
             lambda: (
-                "CAMPAIGN_RECOVERY_CATALOG_SELECTION: "
-                f"source={location!r} healing_source={getattr(source, 'source_id', None)!r} "
-                f"destination={destination!r} distance={distance!r} "
-                f"candidates={[(getattr(item[2], 'source_id', None), item[0]) for item in route_candidates]!r}"
+                "CAMPAIGN_RECOVERY_CATALOG_CANDIDATE: "
+                f"source={request.location!r} healing_source={getattr(source, 'source_id', None)!r} "
+                f"destination={destination!r} rank={index!r}"
             ),
             trace=True,
-            prefix="CAMPAIGN_RECOVERY_CATALOG_SELECTION",
+            prefix="CAMPAIGN_RECOVERY_CATALOG_CANDIDATE",
         )
-        result = RouteRecovery(
-            center_available=True,
-            center_location=destination,
-            distance_to_center=distance,
-            safe_to_reach_center=True,
-            healing_source_available=True,
-            route=route,
-            navigation_goal=navigation_goal,
-        )
-        if trace is not None:
-            trace.duration("campaign_route_recovery_observation_duration_ms", started)
-        return result
+        try:
+            plan, _ = plan_with_world_navigation(
+                request.world,
+                start,
+                navigation_goal,
+                request.graph,
+                max_expansions=_RECOVERY_SEARCH_MAX_EXPANSIONS,
+                max_route_cost=_RECOVERY_SEARCH_MAX_ROUTE_COST,
+                cost_ceiling=incumbent_prefix,
+                cancel_check=cancel_check,
+            )
+            if getattr(plan, "forced_trainer_exposure", False):
+                raise NavigationError("world recovery route requires trainer exposure")
+            if plan.metrics is None or plan.destination is None:
+                raise PathFindingError("world recovery route has no executable metrics")
+            distance = plan.metrics.total_route_cost
+            if distance is None:
+                raise PathFindingError("world recovery route has no cost")
+            # Exact route comparison retains the established safety ordering
+            # (encounter exposure first, then tile cost). Static candidate
+            # ranking above already accounts for entrance/exit traversal so a
+            # critical request can accept the first safe executable result.
+            candidate_prefix = (getattr(plan.metrics, "encounter_opportunities", 0), distance)
+            route_candidates.append((candidate_prefix, index, source, destination, navigation_goal, plan))
+            if request.critical:
+                # Static graph ranking has already accounted for the cheap
+                # entrance/exit traversal estimate. For critical recovery,
+                # the first exact route that is executable and trainer-safe
+                # is the correct bounded decision; do not search speculative
+                # future centers after safety has been established.
+                return RouteRecovery(
+                    center_available=True,
+                    center_location=destination,
+                    distance_to_center=distance,
+                    safe_to_reach_center=True,
+                    healing_source_available=True,
+                    route=plan,
+                    navigation_goal=navigation_goal,
+                )
+            if incumbent_prefix is None or candidate_prefix < incumbent_prefix:
+                incumbent_prefix = candidate_prefix
+        except NavigationSearchLimitExceeded as error:
+            route_errors.append((index, getattr(source, "source_id", None), "NavigationSearchLimitExceeded", str(error)))
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_RECOVERY_CANDIDATE_PRUNED: "
+                    f"source={getattr(source, 'source_id', None)!r} rank={index!r} "
+                    f"incumbent={incumbent_prefix!r} reason={str(error)!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_RECOVERY_CANDIDATE_PRUNED",
+            )
+        except (BotModeError, NavigationError, PathFindingError, TypeError, ValueError) as error:
+            route_errors.append((index, getattr(source, "source_id", None), type(error).__name__, str(error)))
+
+    if not route_candidates:
+        raise PathFindingError(f"no safe cataloged healing route: {route_errors!r}")
+    incumbent, _, source, destination, navigation_goal, route = min(
+        route_candidates,
+        key=lambda candidate: (candidate[0], candidate[1]),
+    )
+    distance = incumbent[1]
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_RECOVERY_CATALOG_SELECTION: "
+            f"source={request.location!r} healing_source={getattr(source, 'source_id', None)!r} "
+            f"destination={destination!r} distance={distance!r} "
+            f"candidates={[(getattr(item[2], 'source_id', None), item[0]) for item in route_candidates]!r}"
+        ),
+        trace=True,
+        prefix="CAMPAIGN_RECOVERY_CATALOG_SELECTION",
+    )
+    return RouteRecovery(
+        center_available=True,
+        center_location=destination,
+        distance_to_center=distance,
+        safe_to_reach_center=True,
+        healing_source_available=True,
+        route=route,
+        navigation_goal=navigation_goal,
+    )
+
+
+def observe_route_recovery(*, candidate_limit: int | None = None) -> RouteRecovery:
+    """Observe and synchronously validate recovery routing for compatibility callers."""
+
+    trace = getattr(context, "stutter_trace", None)
+    started = trace.now() if trace is not None else 0
+    try:
+        prepared = prepare_route_recovery(candidate_limit=candidate_limit)
+        if isinstance(prepared, RouteRecovery):
+            return prepared
+        return plan_route_recovery(prepared)
     except KeyError as error:
-        # Map/object tables are replaced asynchronously around battle return
-        # and map entry.  A missing key here means this frame is incomplete,
-        # not that recovery has been proven impossible. Let readiness defer
-        # and let the next frame rebuild the observation.
         diagnostic_print(
             lambda: (
                 "CAMPAIGN_RECOVERY_OBSERVATION_RETRY: "
@@ -1823,39 +1931,28 @@ def observe_route_recovery(*, candidate_limit: int | None = None) -> RouteRecove
             trace=True,
             prefix="CAMPAIGN_RECOVERY_OBSERVATION_RETRY",
         )
-        result = RouteRecovery(
-            observation_available=False,
-            observation_error=f"KeyError: {error}",
-        )
-        if trace is not None:
-            trace.duration("campaign_route_recovery_observation_duration_ms", started)
-        return result
+        return RouteRecovery(observation_available=False, observation_error=f"KeyError: {error}")
     except (BotModeError, NavigationError, PathFindingError) as error:
-        # A valid observation with no usable route is known, not transient.
-        local_catalog_source = next(
-            (
-                source
-                for source in emerald_healing_sources()
-                if source.outdoor_location[0] == location[0] or source.interior_map == location[0]
-            ),
-            None,
-        )
         diagnostic_print(
             lambda: (
                 "CAMPAIGN_RECOVERY_ROUTE_FAILURE: "
-                f"source={location!r} error_type={type(error).__name__!r} error={str(error)!r} "
-                f"catalog_source={getattr(local_catalog_source, 'source_id', None)!r}"
+                f"error_type={type(error).__name__!r} error={str(error)!r} route_available=False"
             ),
             trace=True,
             prefix="CAMPAIGN_RECOVERY_ROUTE_FAILURE",
         )
-        result = RouteRecovery(
-            healing_source_available=local_catalog_source is not None,
+        # A valid world observation with no safe route is known to be
+        # unavailable, not a usable recovery capability. The existence of a
+        # catalog entry must not manufacture a later RECOVER decision that
+        # CampaignPlan cannot execute.
+        return RouteRecovery(
+            observation_available=True,
+            healing_source_available=False,
             observation_error=str(error),
         )
+    finally:
         if trace is not None:
             trace.duration("campaign_route_recovery_observation_duration_ms", started)
-        return result
 
 
 def recover_at_nearest_center(current_location=None, selected_center=None) -> Iterator[object]:

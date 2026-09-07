@@ -158,6 +158,21 @@ class TestWorldMapGraph(unittest.TestCase):
         self.assertEqual(route.maps, ((0, 0), (0, 1)))
         self.assertEqual(route.edges[0].source_coordinates, ((0, 0),))
 
+    def test_location_estimate_includes_intermediate_map_traversal(self):
+        graph = WorldMapGraph(
+            (
+                edge((0, 0), (0, 1), source_coordinate=(9, 1), destination_coordinate=(0, 5)),
+                edge((0, 1), (0, 2), source_coordinate=(8, 5), destination_coordinate=(2, 0)),
+            )
+        )
+
+        # 9 tiles to the first exit, one transition, 8 tiles across the
+        # intermediate map, one transition, then two tiles to the destination.
+        self.assertEqual(
+            graph.estimate_location_cost(((0, 0), (0, 1)), ((0, 2), (4, 0))),
+            21,
+        )
+
     def test_multi_map_route_and_shortest_branch(self):
         graph = WorldMapGraph(
             (

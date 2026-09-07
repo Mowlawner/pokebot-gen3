@@ -596,10 +596,11 @@ class BattleListener(BotListener):
                 or (should_check_for_pickup() and context.bot_mode_instance.on_pickup_threshold_reached())
             ):
                 yield from self.retrieve_held_items(result)
-        if isinstance(strategy, NuzlockeLevelBalancingBattleStrategy):
+        if isinstance(strategy, NuzlockeLevelBalancingBattleStrategy) and context.bot_mode != "Campaign Progression":
             yield from self._post_battle_rotation(strategy, first_non_fainted_lead_before_battle)
         elif (
             get_game_state() != GameState.BATTLE
+            and not battle_is_active()
             and not get_global_script_context().is_active
             and player_avatar_is_standing_still()
             and context.bot_mode != "Manual"
@@ -647,6 +648,42 @@ class BattleListener(BotListener):
 
     @debug.track
     def rotate_lead_pokemon(self, new_lead_index: int, old_lead_index: int):
+        # This navigator opens the field party menu.  A battle callback can
+        # release GameState.BATTLE one frame before the battle main callback
+        # releases ownership; entering the menu in that gap makes Emerald
+        # answer every SHIFT with "already in battle". Treat the rotation as
+        # stale and let campaign selection re-evaluate instead of opening a
+        # menu that cannot succeed.
+        try:
+            if (
+                battle_is_active()
+                or get_game_state() in self.battle_states
+                or get_last_battle_outcome() is BattleOutcome.InProgress
+                or new_lead_index == old_lead_index
+                or new_lead_index < 0
+                or old_lead_index < 0
+                or new_lead_index >= len(get_party())
+                or old_lead_index >= len(get_party())
+            ):
+                diagnostic_print(
+                    lambda: (
+                        "BATTLE_POST_ROTATION_SKIP: "
+                        f"new_lead={new_lead_index!r} old_lead={old_lead_index!r} "
+                        f"battle_active={battle_is_active()!r} game_state={get_game_state()!r} "
+                        f"outcome={get_last_battle_outcome()!r}"
+                    ),
+                    trace=True,
+                )
+                return
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            diagnostic_print(
+                lambda: (
+                    "BATTLE_POST_ROTATION_SKIP: "
+                    f"new_lead={new_lead_index!r} old_lead={old_lead_index!r} reason='state unavailable'"
+                ),
+                trace=True,
+            )
+            return
         self._post_battle_rotation_active = True
         try:
             menu_controller = MenuWrapper(RotatePokemon(new_lead_index, old_lead_index)).step()
@@ -786,10 +823,11 @@ class BattleListener(BotListener):
                     )
                     break
                 yield
-        yield from self._post_battle_rotation(
-            NuzlockeLevelBalancingBattleStrategy(),
-            first_non_fainted_lead_before_battle,
-        )
+        if context.bot_mode != "Campaign Progression":
+            yield from self._post_battle_rotation(
+                NuzlockeLevelBalancingBattleStrategy(),
+                first_non_fainted_lead_before_battle,
+            )
         if context.config.battle.save_after_catching and get_last_battle_outcome() is BattleOutcome.Caught:
             if is_safari_map():
                 # Saving is not possible inside the Safari Zone, so we need to leave it first.
@@ -815,10 +853,11 @@ class BattleListener(BotListener):
         # Running is also a normal campaign battle exit. If the encounter
         # was skipped because of resource pressure, give the weakest living
         # member the next opportunity to receive experience.
-        yield from self._post_battle_rotation(
-            NuzlockeLevelBalancingBattleStrategy(),
-            first_non_fainted_lead_before_battle,
-        )
+        if context.bot_mode != "Campaign Progression":
+            yield from self._post_battle_rotation(
+                NuzlockeLevelBalancingBattleStrategy(),
+                first_non_fainted_lead_before_battle,
+            )
 
 
 class TrainerApproachListener(BotListener):

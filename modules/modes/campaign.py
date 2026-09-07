@@ -1,6 +1,10 @@
 """Autonomous execution of the small ordered Emerald campaign."""
 
 from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import inspect
+import time
 from typing import Generator
 import traceback
 
@@ -24,6 +28,8 @@ from modules.nuzlocke.resource_runtime import (
     execute_planned_recovery,
     observe_resource_snapshot,
     observe_route_recovery,
+    plan_route_recovery,
+    prepare_route_recovery,
 )
 from modules.nuzlocke.emerald_healing_catalog import emerald_healing_sources_for_map
 from modules.nuzlocke.emerald_healing_catalog import emerald_healing_source_for_destination
@@ -47,6 +53,7 @@ from modules.memory import GameState, get_game_state
 from modules.pokemon_party import get_party
 from modules.goals import EncounterMode, GoalConstraints, NavigationGoal, ReachLocation, SemanticTarget, TrainerMode
 from modules.navigation import NavigationWorld, RouteCostAnalyzer
+from modules.stutter_trace import suppress_background_instrumentation
 from modules.world_navigation import get_world_map_graph
 from modules.modes.util.map import pokemon_center_candidates
 from modules.battle_strategies.nuzlocke_level_balancing import (
@@ -55,9 +62,181 @@ from modules.battle_strategies.nuzlocke_level_balancing import (
     NuzlockeLevelBalancingBattleStrategy,
     RoxanneBattleStrategy,
 )
+from modules.modes.util.lead_rotation import ensure_campaign_field_lead
+from modules.nuzlocke.field_lead import build_campaign_field_lead_context
 
 
 _RECOVERY_ROUTE_ANALYSIS_MAX_EXPANSIONS = 4000
+
+
+class _RoutePlanningBudget:
+    """Cooperative wall-clock budget shared by a background route job."""
+
+    def __init__(self, timeout_seconds: float):
+        self.deadline = time.monotonic() + timeout_seconds
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def check(self) -> None:
+        if self.cancelled:
+            raise TimeoutError("background route search was superseded")
+        if time.monotonic() >= self.deadline:
+            self.cancelled = True
+            raise TimeoutError("background route search exceeded 10 second budget")
+
+
+class _SingleFlightBackgroundPlanner:
+    """Run prioritized, cancellable route jobs without blocking frames.
+
+    The name is retained for compatibility with existing tests/callers. The
+    planner now permits one critical and one speculative job to overlap, which
+    means a stale analysis cannot prevent urgent recovery from starting.
+    """
+
+    DEFAULT_TIMEOUT_SECONDS = 10.0
+
+    def __init__(self):
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nuzbot-route")
+        self._jobs = {}
+        self._completed = {}
+
+    @staticmethod
+    def _run(operation, budget):
+        # Navigation's trace/profiler hooks refer to the mutable frame trace
+        # and process-wide timing state. Suppress those hooks only on this
+        # worker; the route calculation itself remains unchanged.
+        with suppress_background_instrumentation():
+            budget.check()
+            try:
+                accepts_budget = bool(inspect.signature(operation).parameters)
+            except (TypeError, ValueError):
+                accepts_budget = False
+            return operation(budget) if accepts_budget else operation()
+
+    @staticmethod
+    def _key_digest(key) -> str:
+        """Return a compact stable identifier for route-job diagnostics."""
+
+        return hashlib.sha1(repr(key).encode("utf-8", errors="replace")).hexdigest()[:12]
+
+    @classmethod
+    def _key_domain(cls, key) -> str:
+        domain = cls._job_domain(key)
+        return domain or "unknown"
+
+    def poll(self, key, operation, *, priority: int = 1, timeout_seconds: float | None = None):
+        """Return ``pending``/``complete``/``error`` for the requested job."""
+
+        cached = self._completed.get(key)
+        if cached is not None:
+            value, error = cached
+            return "error" if error is not None else "complete", value, error
+
+        job = self._jobs.get(key)
+        if job is not None:
+            if job["future"].done():
+                return self._harvest(key, job)
+            if time.monotonic() >= job["budget"].deadline:
+                job["budget"].cancel()
+                error = TimeoutError("background route search exceeded 10 second budget")
+                # A running thread cannot be force-killed safely. Retain it
+                # until it observes cancellation, but make the timeout a
+                # terminal result for this request immediately.
+                self._completed[key] = (None, error)
+                if job["future"].cancel():
+                    self._jobs.pop(key, None)
+                diagnostic_print(
+                    lambda: (
+                        "BACKGROUND_ROUTE_JOB: "
+                        "event='timeout' "
+                        f"domain={self._key_domain(key)!r} key_digest={self._key_digest(key)!r} "
+                        f"elapsed_ms={(time.monotonic() - job['started_at']) * 1000.0:.1f} "
+                        f"active_jobs={len(self._jobs)!r} completed_jobs={len(self._completed)!r}"
+                    ),
+                    trace=True,
+                    prefix="BACKGROUND_ROUTE_JOB",
+                )
+                return "error", None, error
+            return "pending", None, None
+
+        # Urgent recovery supersedes queued/speculative route work. Search
+        # functions receive this cancellation token at every expansion, so a
+        # lower-priority worker yields promptly instead of monopolizing CPU.
+        for other_key, other in tuple(self._jobs.items()):
+            if other["priority"] > priority:
+                other["budget"].cancel()
+                if other["future"].cancel():
+                    self._jobs.pop(other_key, None)
+
+        budget = _RoutePlanningBudget(timeout_seconds or self.DEFAULT_TIMEOUT_SECONDS)
+        future = self._executor.submit(self._run, operation, budget)
+        self._jobs[key] = {
+            "future": future,
+            "budget": budget,
+            "priority": priority,
+            "started_at": time.monotonic(),
+        }
+        diagnostic_print(
+            lambda: (
+                "BACKGROUND_ROUTE_JOB: "
+                "event='submitted' "
+                f"domain={self._key_domain(key)!r} key_digest={self._key_digest(key)!r} "
+                f"priority={priority!r} timeout_seconds={timeout_seconds or self.DEFAULT_TIMEOUT_SECONDS!r} "
+                f"active_jobs={len(self._jobs)!r} completed_jobs={len(self._completed)!r}"
+            ),
+            trace=True,
+            prefix="BACKGROUND_ROUTE_JOB",
+        )
+        return "pending", None, None
+
+    def _harvest(self, key, job):
+        elapsed_ms = (time.monotonic() - job["started_at"]) * 1000.0
+        try:
+            value = job["future"].result()
+            error = None
+        except Exception as caught:
+            value = None
+            error = caught
+        self._jobs.pop(key, None)
+        self._completed[key] = (value, error)
+        diagnostic_print(
+            lambda: (
+                "BACKGROUND_ROUTE_JOB: "
+                f"event={'error' if error is not None else 'complete'!r} "
+                f"domain={self._key_domain(key)!r} key_digest={self._key_digest(key)!r} "
+                f"elapsed_ms={elapsed_ms:.1f} exception_type={type(error).__name__ if error else None!r} "
+                f"active_jobs={len(self._jobs)!r} completed_jobs={len(self._completed)!r}"
+            ),
+            trace=True,
+            prefix="BACKGROUND_ROUTE_JOB",
+        )
+        return "error" if error is not None else "complete", value, error
+
+    def discard(self, key) -> None:
+        """Forget a completed/retired request before an explicit retry."""
+
+        self._completed.pop(key, None)
+        job = self._jobs.get(key)
+        if job is not None:
+            job["budget"].cancel()
+            job["future"].cancel()
+            # Remove the logical slot immediately. The old worker is already
+            # cancellation-marked and will exit cooperatively; a retry must
+            # not inherit its expired deadline.
+            self._jobs.pop(key, None)
+
+    @staticmethod
+    def _job_domain(key):
+        if isinstance(key, tuple) and key and key[0] in {"recovery", "analysis"}:
+            return key[0]
+        return None
+
+    def close(self) -> None:
+        """Stop accepting route jobs when an embedding discards the mode."""
+
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _overworld_position_is_coherent(overworld) -> bool:
@@ -124,6 +303,31 @@ class CampaignProgressionMode(BotMode):
         self._campaign_boundary_context_seen = False
         self._last_campaign_boundary_context = None
         self._active_battle_wild: bool | None = None
+        self._lead_handoff_pending = False
+        # Recovery and opportunistic route analysis share one worker so a
+        # stale search cannot queue behind a newer one indefinitely.
+        self._background_route_planner = _SingleFlightBackgroundPlanner()
+        self._prepared_recovery_request = None
+        self._prepared_recovery_anchor = None
+
+    def _clear_background_route_state(self) -> None:
+        """Discard frame-bound recovery inputs after a semantic boundary."""
+
+        self._prepared_recovery_request = None
+        self._prepared_recovery_anchor = None
+
+    @staticmethod
+    def _recovery_anchor():
+        runtime = getattr(context, "nuzlocke_runtime", None)
+        snapshot = getattr(runtime, "latest_snapshot", None)
+        player = getattr(snapshot, "player", None)
+        if player is None:
+            return None
+        return (
+            getattr(player, "map_group", None),
+            getattr(player, "map_number", None),
+            getattr(player, "coordinates", None),
+        )
 
     def _select_campaign(self, state):
         """Reuse map-level planning until a relevant campaign fact changes."""
@@ -135,6 +339,164 @@ class CampaignProgressionMode(BotMode):
         self._campaign_selection_key = key
         self._campaign_selection = selection
         return selection
+
+    def _observe_route_recovery_async(
+        self, *, candidate_limit: int | None = None, critical: bool = False
+    ) -> RouteRecovery:
+        """Prepare recovery on the frame thread and search it in one worker."""
+
+        # Most unit-level callers construct the mode with ``__new__`` to
+        # exercise readiness in isolation. Preserve their synchronous seam;
+        # the live mode always initializes the background planner.
+        planner = getattr(self, "_background_route_planner", None)
+        if planner is None:
+            return observe_route_recovery(candidate_limit=candidate_limit)
+        anchor = self._recovery_anchor()
+        prepared = self._prepared_recovery_request
+        if (
+            prepared is None
+            or self._prepared_recovery_anchor != anchor
+            or getattr(prepared, "critical", False) is not critical
+        ):
+            try:
+                prepared = prepare_route_recovery(candidate_limit=candidate_limit, critical=critical)
+            except Exception as error:
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_RECOVERY_PREPARATION_FAILURE: "
+                        f"exception_type={type(error).__name__!r} exception={error!r}"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_RECOVERY_PREPARATION_FAILURE",
+                )
+                return RouteRecovery(observation_available=False, observation_error=str(error))
+            self._prepared_recovery_request = prepared if hasattr(prepared, "key") else None
+            self._prepared_recovery_anchor = anchor
+        if isinstance(prepared, RouteRecovery):
+            return prepared
+
+        status, result, error = planner.poll(
+            ("recovery", prepared.key),
+            lambda budget, prepared=prepared: plan_route_recovery(prepared, cancel_check=budget.check),
+            priority=0 if critical else 1,
+        )
+        if status == "pending":
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_RECOVERY_CALCULATION: "
+                    f"state='pending' request_key={prepared.key!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_RECOVERY_CALCULATION",
+            )
+            return RouteRecovery(
+                observation_available=False,
+                observation_error="route_calculation_pending",
+                calculation_pending=True,
+            )
+        if error is not None:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_RECOVERY_CALCULATION: "
+                    f"state='error' exception_type={type(error).__name__!r} exception={error!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_RECOVERY_CALCULATION",
+            )
+            timed_out = isinstance(error, TimeoutError)
+            if timed_out:
+                planner.discard(("recovery", prepared.key))
+                self._clear_background_route_state()
+            return RouteRecovery(
+                # A non-empty catalog is not evidence that a route was
+                # found. Reporting it as available makes readiness return
+                # RECOVER even though CampaignPlan has no executable
+                # RecoveryStop, producing a false campaign block.
+                # Treat worker failures as unavailable observations so the
+                # same request can be retried after a transient boundary.
+                observation_available=timed_out,
+                observation_error=str(error),
+                calculation_timed_out=timed_out,
+            )
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_RECOVERY_CALCULATION: "
+                f"state='complete' center={getattr(result, 'center_location', None)!r} "
+                f"distance={getattr(result, 'distance_to_center', None)!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_RECOVERY_CALCULATION",
+        )
+        return result
+
+    @staticmethod
+    def _route_analysis_key(world, start, goal, candidates) -> str:
+        """Build a stable key from analysis inputs without loading new maps."""
+        blocked, transitions = world.revision_key()
+        return repr(
+            (
+                start,
+                repr(goal),
+                tuple(repr(candidate) for candidate in candidates),
+                getattr(world, "facing", None),
+                getattr(world, "running_shoes", None),
+                getattr(world, "player_elevation", None),
+                getattr(world, "surfing", None),
+                transitions,
+                blocked,
+            )
+        )
+
+    def _analyze_route_async(self, world, graph, start, goal, candidates):
+        """Run opportunistic route composition without blocking a frame."""
+
+        planner = getattr(self, "_background_route_planner", None)
+        if planner is None:
+            return RouteCostAnalyzer(
+                world,
+                graph=graph,
+                max_expansions=_RECOVERY_ROUTE_ANALYSIS_MAX_EXPANSIONS,
+            ).analyze(start, goal, candidates), False, False
+
+        key = ("analysis", self._route_analysis_key(world, start, goal, candidates))
+        status, result, error = planner.poll(
+            key,
+            lambda budget: RouteCostAnalyzer(
+                world,
+                graph=graph,
+                max_expansions=_RECOVERY_ROUTE_ANALYSIS_MAX_EXPANSIONS,
+            ).analyze(start, goal, candidates, cancel_check=budget.check),
+            priority=2,
+        )
+        if status == "pending":
+            diagnostic_print(
+                lambda: f"CAMPAIGN_RECOVERY_ROUTE_ANALYSIS: state='pending' request_key={key[1]!r}",
+                trace=True,
+                prefix="CAMPAIGN_RECOVERY_ROUTE_ANALYSIS",
+            )
+            return None, True, False
+        if error is not None:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_RECOVERY_ROUTE_ANALYSIS: "
+                    f"state='error' exception_type={type(error).__name__!r} exception={error!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_RECOVERY_ROUTE_ANALYSIS",
+            )
+            timed_out = isinstance(error, TimeoutError)
+            if timed_out:
+                # The request key is stable, so discard the terminal worker
+                # result and allow the readiness scheduler's cooldown to
+                # submit a fresh bounded request later.
+                planner.discard(key)
+            return None, False, timed_out
+        diagnostic_print(
+            lambda: f"CAMPAIGN_RECOVERY_ROUTE_ANALYSIS: state='complete' request_key={key[1]!r}",
+            trace=True,
+            prefix="CAMPAIGN_RECOVERY_ROUTE_ANALYSIS",
+        )
+        return result, False, False
 
     def _campaign_controller(self):
         """Return the controller owned by this mode instance."""
@@ -152,6 +514,22 @@ class CampaignProgressionMode(BotMode):
         invalidates it across a map transition.
         """
 
+        runtime = getattr(context, "nuzlocke_runtime", None)
+        snapshot = getattr(runtime, "latest_snapshot", None)
+        if snapshot is not None:
+            player = getattr(snapshot, "player", None)
+            map_id = (
+                getattr(player, "map_group", None),
+                getattr(player, "map_number", None),
+            )
+            state = getattr(getattr(snapshot, "game_state", None), "name", None)
+            controllable = getattr(player, "controllable", None)
+            return (
+                state,
+                map_id,
+                controllable,
+                getattr(snapshot, "readiness_revision", None),
+            )
         try:
             avatar = get_player_avatar()
             state = getattr(get_game_state(), "name", None)
@@ -174,8 +552,6 @@ class CampaignProgressionMode(BotMode):
         # item, healing, and party-composition changes invalidate readiness
         # without rereading save blocks on the hot path.
         ball_count = None
-        runtime = getattr(context, "nuzlocke_runtime", None)
-        snapshot = getattr(runtime, "latest_snapshot", None)
         if snapshot is not None and getattr(snapshot, "inventory_available", False):
             try:
                 ball_count = sum(
@@ -418,6 +794,7 @@ class CampaignProgressionMode(BotMode):
         critical_recovery_needed = resource_observation_valid and (
             not resources.usable_party
             or any(member.fainted for member in resources.party)
+            or resources.has_poisoned_party
             or resources.worst_hp_ratio < CampaignReadinessPolicy().critical_hp_ratio
         )
         # The main readiness policy owns opportunistic recovery for every
@@ -454,7 +831,10 @@ class CampaignProgressionMode(BotMode):
                 # in the recovery observer. A second candidate only repeats
                 # the expensive synchronous route search at the worst
                 # possible time: immediately after a battle.
-                observe_route_recovery(candidate_limit=1 if critical_recovery_needed else None)
+                self._observe_route_recovery_async(
+                    candidate_limit=None,
+                    critical=critical_recovery_needed,
+                )
                 if recovery_needed
                 else RouteRecovery()
             )
@@ -506,6 +886,8 @@ class CampaignProgressionMode(BotMode):
             trace=True,
         )
         route_analysis = None
+        route_analysis_pending = False
+        route_analysis_timed_out = False
         # A targetless capability has no tactical route to compare against.
         # Its readiness policy uses the already-selected recovery route and
         # its bounded distance; composing a normal route plus recovery
@@ -544,6 +926,7 @@ class CampaignProgressionMode(BotMode):
             recovery_needed
             and not critical_recovery_needed
             and not direct_targetless_recovery
+            and not getattr(recovery, "calculation_pending", False)
             and overworld is not None
             and overworld_availability is Availability.KNOWN
             and readiness_goal is not None
@@ -575,36 +958,46 @@ class CampaignProgressionMode(BotMode):
                 operation = "WorldMapGraph acquisition"
                 graph = get_world_map_graph()
                 operation = "RouteCostAnalyzer.analyze"
-                route_analysis = RouteCostAnalyzer(
+                route_analysis, route_analysis_pending, route_analysis_timed_out = self._analyze_route_async(
                     world,
-                    graph=graph,
-                    max_expansions=_RECOVERY_ROUTE_ANALYSIS_MAX_EXPANSIONS,
-                ).analyze(
-                    current_location, readiness_goal, candidates
+                    graph,
+                    current_location,
+                    readiness_goal,
+                    candidates,
                 )
-                diagnostic_print(
-                    lambda: (
-                        "READINESS_ROUTE_ANALYSIS: "
-                        f"start={current_location!r} goal={readiness_goal!r} "
-                        f"normal_cost={route_analysis.normal_cost!r} "
-                        f"normal_destination={getattr(route_analysis.normal_route, 'destination', None)!r} "
-                        "candidates="
-                        f"{[
-                            {
-                                'destination': repr(candidate.destination),
-                                'reachable': candidate.reachable,
-                                'total_cost': candidate.total_cost,
-                                'detour': candidate.detour,
-                                'reason': candidate.reason,
-                                'first_destination': getattr(candidate.first_route, 'destination', None),
-                                'continuation_destination': getattr(candidate.continuation_route, 'destination', None),
-                            }
-                            for candidate in route_analysis.candidates
-                        ]!r}"
-                    ),
-                    trace=True,
-                    prefix="READINESS_ROUTE_ANALYSIS",
-                )
+                if route_analysis_pending:
+                    diagnostic_print(
+                        lambda: (
+                            "READINESS_ROUTE_ANALYSIS: "
+                            f"state='pending' start={current_location!r} goal={readiness_goal!r}"
+                        ),
+                        trace=True,
+                        prefix="READINESS_ROUTE_ANALYSIS",
+                    )
+                else:
+                    diagnostic_print(
+                        lambda: (
+                            "READINESS_ROUTE_ANALYSIS: "
+                            f"state='complete' start={current_location!r} goal={readiness_goal!r} "
+                            f"normal_cost={route_analysis.normal_cost!r} "
+                            f"normal_destination={getattr(route_analysis.normal_route, 'destination', None)!r} "
+                            "candidates="
+                            f"{[
+                                {
+                                    'destination': repr(candidate.destination),
+                                    'reachable': candidate.reachable,
+                                    'total_cost': candidate.total_cost,
+                                    'detour': candidate.detour,
+                                    'reason': candidate.reason,
+                                    'first_destination': getattr(candidate.first_route, 'destination', None),
+                                    'continuation_destination': getattr(candidate.continuation_route, 'destination', None),
+                                }
+                                for candidate in route_analysis.candidates
+                            ]!r}"
+                        ),
+                        trace=True,
+                        prefix="READINESS_ROUTE_ANALYSIS",
+                    )
             except (RuntimeError, TypeError, ValueError) as error:
                 diagnostic_print(
                     lambda: (
@@ -651,6 +1044,8 @@ class CampaignProgressionMode(BotMode):
             resource_reason=resources.observation_error,
             route_analysis=route_analysis,
             targetless=goal is None,
+            route_analysis_pending=route_analysis_pending,
+            route_analysis_timed_out=route_analysis_timed_out,
         )
 
     def on_battle_started(self, encounter) -> BattleAction:
@@ -801,6 +1196,7 @@ class CampaignProgressionMode(BotMode):
         # cases so HP, party, and Poké Ball changes are observed.
         wild_battle = getattr(self, "_active_battle_wild", None)
         self._active_battle_wild = None
+        self._clear_background_route_state()
         controller = getattr(self, "controller", None)
         selection = getattr(controller, "last_selection", None)
         objective = getattr(selection, "objective", None)
@@ -824,6 +1220,10 @@ class CampaignProgressionMode(BotMode):
             # path invalidates through the controller so the pending
             # ownership boundary and scheduler cache stay synchronized.
             scheduler.invalidate("battle_ended")
+        # The battle listener owns the immediate return-to-field boundary.
+        # Keep a second, mode-level event so special battle strategies and a
+        # capture/recovery handoff cannot skip the overworld lead policy.
+        self._lead_handoff_pending = True
 
     def _observe_campaign_boundary(self, controller) -> None:
         """Invalidate campaign planning when a coarse ROM boundary changes."""
@@ -869,11 +1269,62 @@ class CampaignProgressionMode(BotMode):
         # CampaignProgression owns campaign intent from the first observation.
         # The selected objective's executor owns frame-local emulator details.
         previous = None
+        previous_phase = None
         while True:
             controller = self._campaign_controller()
             self._observe_campaign_boundary(controller)
             state = controller.step()
             marker = (state.status, state.objective_id, state.reason)
+            lead_handoff_pending = getattr(self, "_lead_handoff_pending", False)
+            if (
+                getattr(state, "execution_phase", "CAMPAIGN") == "CAMPAIGN"
+                and state.status.value == "ready"
+                and (
+                    lead_handoff_pending
+                    or previous_phase == "RECOVERY"
+                    or (
+                        previous is not None
+                        and getattr(previous[0], "value", previous[0]) == "ready"
+                        and previous[1] is not None
+                        and state.objective_id is not None
+                        and previous[1] != state.objective_id
+                    )
+                )
+            ):
+                reason = (
+                    "battle_or_capture_completed"
+                    if lead_handoff_pending
+                    else "recovery_completed"
+                    if previous_phase == "RECOVERY"
+                    else "campaign_objective_handoff"
+                )
+                self._lead_handoff_pending = False
+                try:
+                    leveling_strategy = NuzlockeLevelBalancingBattleStrategy()
+                except (AttributeError, RuntimeError, TypeError, ValueError, IndexError) as error:
+                    # Opening campaign objectives can hand off before the
+                    # starter has been inserted into the party. The lead
+                    # policy has nothing to enforce at that boundary; defer
+                    # it until the next battle/recovery event.
+                    diagnostic_print(
+                        lambda: (
+                            "CAMPAIGN_FIELD_LEAD_HANDOFF: "
+                            f"rotated=False reason={reason!r} "
+                            f"strategy_unavailable={type(error).__name__!r}"
+                        ),
+                        trace=True,
+                    )
+                else:
+                    objective = getattr(getattr(state, "selection", None), "objective", None)
+                    field_context = build_campaign_field_lead_context(
+                        objective,
+                        campaign_state=runtime_campaign_state(),
+                    )
+                    yield from ensure_campaign_field_lead(
+                        leveling_strategy,
+                        field_context,
+                        reason=reason,
+                    )
             if marker != previous:
                 diagnostic_print(
                     f"CAMPAIGN: status={state.status.value} objective={state.objective_id!r} "
@@ -881,6 +1332,7 @@ class CampaignProgressionMode(BotMode):
                     trace=True,
                 )
                 previous = marker
+            previous_phase = getattr(state, "execution_phase", "CAMPAIGN")
             if state.status.value == "complete":
                 context.campaign_status = CampaignStatus.complete_status()
             elif state.status.value != "ready" and state.objective_id is None:

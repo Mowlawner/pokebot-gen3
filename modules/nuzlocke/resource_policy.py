@@ -153,6 +153,23 @@ class ResourceSnapshot:
 
         return sum(max(0, p.max_hp - p.current_hp) for p in self.usable_party)
 
+    @property
+    def poisoned_party(self) -> tuple[PartyResource, ...]:
+        """Return living party members that will lose HP while walking."""
+
+        poison_statuses = {"poisoned", "badly poisoned", "poison", "bad_poison"}
+        return tuple(
+            member
+            for member in self.party
+            if not member.fainted and (member.status or "none") in poison_statuses
+        )
+
+    @property
+    def has_poisoned_party(self) -> bool:
+        """Whether any living party member needs poison-aware recovery."""
+
+        return bool(self.poisoned_party)
+
 
 @dataclass(frozen=True, slots=True)
 class RouteRecovery:
@@ -188,6 +205,14 @@ class RouteRecovery:
     # this goal lets readiness compose the same route without converting a
     # blocked door tile into a false ReachLocation target.
     navigation_goal: Any | None = None
+    # Route validation may be running off the frame loop. This is distinct
+    # from an unavailable observation: the request is valid, but no policy
+    # decision may be made until its result arrives.
+    calculation_pending: bool = False
+    # A bounded worker may give up on a pathological route. Keep that result
+    # explicit so the scheduler can retry after a cooldown instead of
+    # treating the timeout as a permanent campaign truth.
+    calculation_timed_out: bool = False
 
 
 @dataclass(frozen=True, slots=True)

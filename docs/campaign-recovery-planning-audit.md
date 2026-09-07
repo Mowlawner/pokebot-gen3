@@ -84,7 +84,7 @@ the final live exit criteria:
   `ReturnFromWallyTutorial` completes before the campaign mounts
   `recover_devon_goods`. The Devon Goods completion and first badge have not
   yet been verified live.
-- The full default test suite passes 1,281 tests, with 38 emulator-tier tests
+- The full default test suite passes 1,354 tests, with 38 emulator-tier tests
   skipped by default. The focused readiness/campaign-recovery tier passes 162
   tests, and the route-recovery observation tier passes 13 tests.
 - Process restart/resume has deterministic unit coverage but still needs a
@@ -321,6 +321,35 @@ CampaignPlan(parent=reach_littleroot,
 
 This preserves the parent objective and makes recovery an explicit first stop.
 
+## Recovery route performance implementation status
+
+The synchronous route-search portion of recovery and opportunistic readiness
+analysis has now been moved off the emulator frame loop. Preparation reads the
+live location, overworld, graph, and bounded healing-source frontier into an
+immutable request; a prioritized background worker pool performs the candidate
+search. The readiness scheduler treats that work as pending rather than
+caching an incomplete `UNKNOWN` result, and the controller displays
+`Calculating recovery route` while it waits. A completed result is accepted
+only for the matching location/world request, so a map transition or dynamic
+world change cannot execute a stale route.
+
+Recovery and normal route analysis use a small prioritized worker pool. A
+critical recovery search can therefore supersede and cancel speculative route
+analysis instead of waiting behind it; diagnostic/speculative analysis has the
+lowest priority. Every worker job has a ten-second wall-clock budget and
+cooperative cancellation checks. Worker-side stutter/profiler instrumentation
+is suppressed, and the bounded A* search cooperatively yields so the emulator
+thread continues to receive scheduling time on low-core machines.
+
+The synchronous `observe_route_recovery()` entry point remains for
+compatibility callers and tests; Campaign Progression uses the prepared and
+asynchronous path. The recovery request is immutable while pending and its
+key uses compact live-world revisions rather than scanning all static tiles.
+Static map routes and location-cost estimates are cached, and exact recovery
+results remain reusable for the same request. A timeout is reported
+explicitly and retried after a cooldown, so a pathological route cannot leave
+the campaign in an indefinite per-frame wait loop.
+
 ### Emulator interaction safety: high feasibility
 
 Dialogue detection remains necessary for the executor, but it no longer needs
@@ -347,14 +376,22 @@ execution should use one world-navigation abstraction. Campaign recovery now
 uses the world planner for cross-map warps and the final Center door, so route
 selection and execution share the same navigation model.
 
-### Performance: medium risk, manageable
+### Performance: implemented with bounded follow-ups
 
 World route analysis can be expensive, especially with debug tracing and
-cross-map searches. It should run when the parent objective or relevant route
-context changes, not once per frame. The existing readiness scheduler and
-navigation caches can be reused, but the planned route must be invalidated on
-map changes, dynamic blockers, battle completion, party HP changes, and
-recovery completion.
+cross-map searches. Recovery candidate searches and opportunistic route
+composition now run only when their request context changes, in prioritized
+background workers rather than on the frame loop. The readiness scheduler
+reuses completed observations across ordinary movement and invalidates them on
+map, battle, party/resource, and other meaningful context changes. Party and
+inventory revisions are carried by the shared snapshot, so readiness does not
+rebuild a full health/inventory signature just because another frame elapsed.
+Requests include compact dynamic-world revisions, and stale results are
+discarded before they can affect execution.
+
+Preparation and first-use static graph construction still deserve profiling on
+new ROMs, but the multi-second synchronous candidate-search stall and the
+full-tile request-key scan have been removed from the live campaign path.
 
 ## Proposed implementation and current status
 
@@ -472,9 +509,10 @@ campaign should recover.
    planned route itself is not consumed directly.
 6. **Outstanding:** remove the readiness-triggered recovery generator and its
    deferred-recovery latch after live validation confirms equivalent behavior.
-7. **Outstanding:** validate with the introductory rival profile, a route with
-   an on-route Center, a critical-HP case, a no-Center route, and a
-   dialogue-heavy case.
+7. **Partial:** validate with the introductory rival profile, a route with an
+   on-route Center, a critical-HP case, a no-Center route, and a dialogue-heavy
+   case. The route-search handoff and recovery selection have been live-tested
+   from the recovery-stall profile; longer healing/resumption coverage remains.
 
 ## Risks and mitigations
 
@@ -530,20 +568,24 @@ included so this section does not imply that the proposal is already complete:
    executable world planner is not treated as available.
 6. **Outstanding:** the introductory-rival profile reaches the Center before
    returning to the Lab when the injured-party condition is present.
-7. **Outstanding:** stutter tracing shows route analysis is bounded/cached and
-   does not create the post-battle speed regression.
+7. **Partial:** stutter tracing shows bounded recovery searches running off the
+   frame loop without the original multi-second stall. Persistent route-result
+   caching and longer live healing validation remain.
 
 ## Conclusion
 
 The proposed system remains feasible without replacing the campaign
 architecture. A first waypoint/envelope implementation and parent-plan
-resumption now exist, while recovery selection still begins in controller-side
-readiness and execution still uses a separate recovery generator. The current
-guards are therefore still evidence of an incomplete ownership boundary, not
-evidence that dynamic recovery is inherently unsafe.
+resumption now exist, and the expensive route searches are now asynchronous
+and bounded. Recovery selection still begins in controller-side readiness and
+execution still uses a separate recovery generator. The current guards are
+therefore still evidence of an incomplete ownership boundary, not evidence
+that dynamic recovery is inherently unsafe.
 
 The next highest-value work is to move recovery selection into campaign-plan
 construction, pass and execute the planned route directly, unify route
-validation and execution, and live-validate the critical/dialogue-heavy
-scenarios. This should eliminate the remaining readiness/dialogue coupling
-while preserving the desired opportunistic and critical-health behavior.
+validation and execution, and complete the longer critical/dialogue-heavy live
+scenarios. Persistent caching and preparation profiling can then be evaluated
+against traces rather than speculation. This should eliminate the remaining
+readiness/dialogue coupling while preserving the desired opportunistic and
+critical-health behavior.

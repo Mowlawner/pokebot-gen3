@@ -6,6 +6,33 @@ import json
 from pathlib import Path
 from time import perf_counter_ns
 from functools import wraps
+import threading
+
+
+_background_state = threading.local()
+
+
+def background_work_suppressed() -> bool:
+    """Return whether the current thread is running non-frame work.
+
+    Background route planning shares the process with the emulator's frame
+    loop.  It must not append spans, marks, or durations to the mutable trace
+    object owned by that loop.
+    """
+
+    return bool(getattr(_background_state, "suppressed", False))
+
+
+@contextmanager
+def suppress_background_instrumentation():
+    """Disable frame instrumentation for the current worker thread only."""
+
+    previous = background_work_suppressed()
+    _background_state.suppressed = True
+    try:
+        yield
+    finally:
+        _background_state.suppressed = previous
 
 
 class StutterTrace:
@@ -98,7 +125,7 @@ class StutterTrace:
         the aggregate profiler. It records only when the trace is enabled and
         does not inspect, cache, or alter navigation state.
         """
-        if not self.enabled or self.current is None:
+        if background_work_suppressed() or not self.enabled or self.current is None:
             yield
             return
         started = perf_counter_ns()
@@ -121,23 +148,25 @@ class StutterTrace:
             self._span_stack.pop()
 
     def mark(self, name: str, value=True) -> None:
-        if self.enabled and self.current is not None:
+        if not background_work_suppressed() and self.enabled and self.current is not None:
             self.current[name] = value
 
     def duration(self, name: str, started_ns: int) -> None:
-        if self.enabled and self.current is not None:
+        if not background_work_suppressed() and self.enabled and self.current is not None:
             self.current[name] = round((perf_counter_ns() - started_ns) / 1_000_000, 3)
 
     def now(self) -> int:
-        return perf_counter_ns() if self.enabled else 0
+        return perf_counter_ns() if self.enabled and not background_work_suppressed() else 0
 
     def call(self, name: str, function, *args, **kwargs):
         """Call one operation under a named span without changing its result."""
+        if background_work_suppressed():
+            return function(*args, **kwargs)
         with self.span(name):
             return function(*args, **kwargs)
 
     def finish(self) -> None:
-        if not self.enabled or self.current is None:
+        if background_work_suppressed() or not self.enabled or self.current is None:
             return
         frame = self.current
         self.current = None

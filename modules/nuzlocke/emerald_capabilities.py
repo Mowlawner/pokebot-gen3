@@ -208,6 +208,7 @@ class EmeraldCampaignAction(Enum):
     ADVANCE_TITLE = auto()
     ENTER_OPTIONS = auto()
     ADVANCE_TEXT_SPEED = auto()
+    ADVANCE_BATTLE_STYLE = auto()
     EXIT_OPTIONS = auto()
     START_NEW_GAME = auto()
     ADVANCE_DIALOGUE = auto()
@@ -400,13 +401,32 @@ def choose_emerald_observation_action(observation: EmeraldObservation) -> Emeral
         if not menu.input_ready:
             return EmeraldCampaignAction.WAIT
         if menu.menu_kind is EmeraldMenuKind.OPTIONS_MENU:
-            return (
-                EmeraldCampaignAction.EXIT_OPTIONS
-                if observation.game_state is GameState.OPTIONS_MENU
-                and observation.campaign_facts
-                and dict(observation.campaign_facts).get("text_speed_fast") is True
-                else EmeraldCampaignAction.ADVANCE_TEXT_SPEED
+            menu_values = menu.raw_option_values or ()
+            observed_text_speed = bool(menu_values and menu_values[0] == 2)
+            observed_battle_style_set = bool(len(menu_values) > 2 and menu_values[2] == 1)
+            facts = dict(observation.campaign_facts)
+            set_battle_style_required = facts.get("set_battle_style_required") is True
+            if not set_battle_style_required:
+                # Campaign facts remain authoritative for the ordinary
+                # startup objective. Raw menu values can be stale during a
+                # menu transition and must not make the dispatcher exit
+                # before the fact reducer has observed Fast text.
+                return (
+                    EmeraldCampaignAction.EXIT_OPTIONS
+                    if observation.game_state is GameState.OPTIONS_MENU
+                    and facts.get("text_speed_fast") is True
+                    else EmeraldCampaignAction.ADVANCE_TEXT_SPEED
+                )
+
+            text_speed_fast = observed_text_speed if menu_values else facts.get("text_speed_fast") is True
+            battle_style_set = (
+                observed_battle_style_set if len(menu_values) > 2 else facts.get("battle_style_set") is True
             )
+            if not text_speed_fast:
+                return EmeraldCampaignAction.ADVANCE_TEXT_SPEED
+            if not battle_style_set:
+                return EmeraldCampaignAction.ADVANCE_BATTLE_STYLE
+            return EmeraldCampaignAction.EXIT_OPTIONS
         if menu.menu_kind is EmeraldMenuKind.MAIN_MENU:
             setup_complete = dict(observation.campaign_facts).get("new_game_setup_complete") is True
             text_speed_fast = dict(observation.campaign_facts).get("text_speed_fast") is True
@@ -1838,6 +1858,16 @@ def _emerald_observation(
         else:
             controllable = False
     observed_text_speed_fast = _observed_text_speed_fast() if live_context else None
+    observed_battle_style_set = _observed_battle_style_set() if live_context else None
+    runtime = getattr(context, "nuzlocke_runtime", None)
+    try:
+        from .rule_config import CampaignRuleId
+
+        set_battle_style_required = bool(
+            runtime is not None and runtime.rule_config.is_enabled(CampaignRuleId.SET_BATTLE_STYLE)
+        )
+    except (AttributeError, TypeError, ValueError):
+        set_battle_style_required = False
     # Wally's tutorial is not complete when the city state first reaches 3:
     # the ROM still has a return-to-gym script and dialogue to run.  Read both
     # save-backed variables so the mounted capability can release only at the
@@ -1876,6 +1906,8 @@ def _emerald_observation(
             )
     facts = (
         ("text_speed_fast", legacy.text_speed_fast if observed_text_speed_fast is None else observed_text_speed_fast),
+        ("battle_style_set", observed_battle_style_set),
+        ("set_battle_style_required", set_battle_style_required),
         ("new_game_setup_complete", legacy.new_game_setup_complete),
         # Emerald's SET_WALL_CLOCK event flag is the ROM-owned completion
         # fact.  Keep the semantic name identical to CampaignFacts so the
@@ -2187,6 +2219,23 @@ def _observed_text_speed_fast() -> bool | None:
         return None
 
 
+def _observed_battle_style_set() -> bool | None:
+    """Read Emerald's live Set/Shift option from the current menu/save."""
+    try:
+        for task_name in (
+            "Task_OptionMenuProcessInput",
+            "Task_OptionMenuFadeIn",
+            "Task_OptionMenuSave",
+            "Task_OptionMenuFadeOut",
+        ):
+            task = get_task(task_name)
+            if task is not None:
+                return task.data_value(3) == 1
+        return bool(unpack_uint16(get_save_block(2, offset=0x14, size=2)) & 0x10)
+    except (AttributeError, RuntimeError, ValueError, TypeError, IndexError, KeyError):
+        return None
+
+
 def _main_menu_target_index(menu: EmeraldMenuObservation, target: EmeraldMainMenuItem) -> int | None:
     """Return the target's index for the observed save-dependent menu."""
     if menu.raw_menu_type is None:
@@ -2224,6 +2273,13 @@ def _menu_button(
             if menu.cursor_index != target_index:
                 return "Down" if menu.cursor_index < target_index else "Up"
             return "Right"
+        if action is EmeraldCampaignAction.ADVANCE_BATTLE_STYLE:
+            target_index = tuple(EmeraldOptionsItem).index(EmeraldOptionsItem.BATTLE_STYLE)
+            if menu.cursor_index != target_index:
+                return "Down" if menu.cursor_index < target_index else "Up"
+            if menu.raw_option_values is None or len(menu.raw_option_values) <= 2:
+                return None
+            return "Right" if menu.raw_option_values[2] != 1 else None
         if action is EmeraldCampaignAction.EXIT_OPTIONS:
             return "B"
     return None
@@ -2716,6 +2772,7 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
         menu_actions = {
             EmeraldCampaignAction.ENTER_OPTIONS,
             EmeraldCampaignAction.ADVANCE_TEXT_SPEED,
+            EmeraldCampaignAction.ADVANCE_BATTLE_STYLE,
             EmeraldCampaignAction.EXIT_OPTIONS,
             EmeraldCampaignAction.START_NEW_GAME,
         }
@@ -2848,6 +2905,11 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
                 context.emulator.press_button(button)
                 issued = True
         elif action is EmeraldCampaignAction.ADVANCE_TEXT_SPEED:
+            button = _menu_button(observation, action)
+            if button is not None:
+                context.emulator.press_button(button)
+                issued = True
+        elif action is EmeraldCampaignAction.ADVANCE_BATTLE_STYLE:
             button = _menu_button(observation, action)
             if button is not None:
                 context.emulator.press_button(button)

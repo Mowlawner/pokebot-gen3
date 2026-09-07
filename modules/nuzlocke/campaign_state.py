@@ -123,6 +123,7 @@ class CampaignFacts:
     # whether a restock task is needed.
     pokeballs_received: Fact[bool] = dataclass_field(default_factory=Fact.unavailable)
     pokeballs_sufficient: Fact[bool] = dataclass_field(default_factory=Fact.unavailable)
+    battle_style_set: Fact[bool] = dataclass_field(default_factory=Fact.unavailable)
 
     def __getitem__(self, name: str) -> Fact[bool]:
         """Access a named campaign fact using attribute-style semantics."""
@@ -154,6 +155,7 @@ def derive_campaign_facts(
     nuzlocke_started: Fact[bool],
     *,
     pokeball_policy: PokeballRestockPolicy | None = None,
+    require_set_battle_style: bool = False,
 ) -> CampaignFacts:
     """Derive semantic campaign facts from one snapshot and inventory fact.
 
@@ -166,10 +168,34 @@ def derive_campaign_facts(
     observation = snapshot.campaign_observation
     pokeball_policy = pokeball_policy or PokeballRestockPolicy()
     available = observation.available
-    text_speed = (
+    raw_text_speed = (
         Fact.unavailable()
         if not available
         else Fact.known(observation.text_speed == 2) if observation.text_speed is not None else Fact.unknown()
+    )
+    battle_style_set = (
+        Fact.unavailable()
+        if not available
+        else Fact.known(observation.battle_style_set)
+        if observation.battle_style_set is not None
+        else Fact.unknown()
+    )
+    # Preserve the historical ``text_speed_fast`` fact as the startup
+    # settings completion boundary. When the optional Set rule is enabled,
+    # that boundary is not complete until both settings are observed.
+    text_speed = (
+        raw_text_speed
+        if not require_set_battle_style
+        else (
+            Fact.known(True)
+            if raw_text_speed.is_known and raw_text_speed.value and battle_style_set.is_known and battle_style_set.value
+            else Fact.known(False)
+            if raw_text_speed.is_known and battle_style_set.is_known
+            else Fact(
+                None,
+                raw_text_speed.status if not raw_text_speed.is_known else battle_style_set.status,
+            )
+        )
     )
     intro = _var(observation.variables, "LITTLEROOT_INTRO_STATE", available)
     rival = _var(observation.variables, "LITTLEROOT_RIVAL_STATE", available)
@@ -317,6 +343,7 @@ def derive_campaign_facts(
         roxanne_available,
         received,
         sufficient,
+        battle_style_set,
     )
 
 
@@ -378,6 +405,7 @@ class CampaignState:
         rules_projection: NuzlockeRulesProjection | NuzlockeCampaignState | None = None,
         canonical_area: str | None = None,
         pokeball_policy: PokeballRestockPolicy | None = None,
+        require_set_battle_style: bool = False,
     ) -> "CampaignState":
         """Construct a facade from already-normalized/projected values."""
 
@@ -457,7 +485,13 @@ class CampaignState:
             last_battle,
             session_id,
             session_ids,
-            _campaign_facts_for_runtime(snapshot, inventory, observed, pokeball_policy=pokeball_policy),
+            _campaign_facts_for_runtime(
+                snapshot,
+                inventory,
+                observed,
+                pokeball_policy=pokeball_policy,
+                require_set_battle_style=require_set_battle_style,
+            ),
             observation_lifecycle,
         )
 
@@ -546,6 +580,7 @@ def _campaign_facts_for_runtime(
     observed: ObservedCampaignState | None,
     *,
     pokeball_policy: PokeballRestockPolicy | None = None,
+    require_set_battle_style: bool = False,
 ) -> CampaignFacts:
     """Combine current-save facts with durable rules/history projections."""
     current = derive_campaign_facts(
@@ -553,6 +588,7 @@ def _campaign_facts_for_runtime(
         inventory,
         Fact.unavailable(),
         pokeball_policy=pokeball_policy,
+        require_set_battle_style=require_set_battle_style,
     )
     # Pokédex receipt is the ROM-owned default Nuzlocke boundary.  The legacy
     # NuzlockeStarted event remains replayable for old stores, but it cannot

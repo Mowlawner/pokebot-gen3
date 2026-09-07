@@ -199,8 +199,9 @@ class BattlePlannerTests(unittest.TestCase):
         ), patch("modules.battle_strategies.default.plan_battle_state", return_value=decision), patch(
             "modules.battle_strategies.catch.CatchStrategy.decide_turn"
         ) as catch:
+            catch.return_value = (TurnAction.UseMove, 1)
             self.assertEqual(DefaultBattleStrategy().decide_turn(battle_state), (TurnAction.UseMove, 1))
-        catch.assert_not_called()
+        catch.assert_called_once_with(battle_state)
 
     def test_legal_target_falls_back_to_capture_when_planner_is_not_safe(self):
         party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
@@ -638,6 +639,63 @@ class BattlePlannerTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, PlannerAction.SwitchPokemon)
         self.assertEqual(decision.target, 2)
+
+    def test_action_report_separates_safe_switch_from_unsafe_zero_damage_switch(self):
+        decision = BattlePlanner().plan(
+            context(
+                active_hp=2,
+                active_max_hp=20,
+                opponent_hp=12,
+                opponent_damage_max=8,
+                moves=(PlannerMove(0, "Astonish", 0, 0),),
+                can_switch=True,
+                switches=(
+                    PlannerSwitch(1, "Lotad", 18, 20, 5, 0),
+                    PlannerSwitch(2, "Treecko", 15, 20, 5, 6),
+                ),
+            )
+        )
+        candidates = {candidate.label: candidate for candidate in decision.candidate_evaluations}
+
+        self.assertFalse(candidates["Astonish"].is_safe)
+        self.assertIn("no effective damaging move", candidates["Astonish"].reason)
+        self.assertFalse(candidates["switch to Lotad (slot 1)"].is_safe)
+        self.assertIn("no effective damaging move", candidates["switch to Lotad (slot 1)"].reason)
+        self.assertTrue(candidates["switch to Treecko (slot 2)"].is_safe)
+        self.assertEqual(decision.best_safe_candidate.label, "switch to Treecko (slot 2)")
+
+        diagnostic = format_planner_decision_diagnostic(decision, context(
+            active_hp=2,
+            active_max_hp=20,
+            opponent_hp=12,
+            opponent_damage_max=8,
+            moves=(PlannerMove(0, "Astonish", 0, 0),),
+            can_switch=True,
+            switches=(
+                PlannerSwitch(1, "Lotad", 18, 20, 5, 0),
+                PlannerSwitch(2, "Treecko", 15, 20, 5, 6),
+            ),
+        ))
+        self.assertIn("BATTLE_ACTION_EVALUATION", diagnostic)
+        self.assertIn("switch to Lotad (slot 1)=unsafe/uncertain", diagnostic)
+        self.assertIn("switch to Treecko (slot 2)=safe", diagnostic)
+
+    def test_action_report_keeps_best_available_separate_from_best_safe(self):
+        decision = BattlePlanner().plan(
+            context(
+                active_hp=5,
+                active_max_hp=20,
+                opponent_hp=12,
+                moves=(PlannerMove(0, "Pound", 4, 5),),
+                opponent_moves=(PlannerOpponentMove("Tackle", 4, 5),),
+            )
+        )
+
+        self.assertEqual(decision.classification, PlannerDecisionClass.BEST_AVAILABLE)
+        self.assertIsNone(decision.best_safe_candidate)
+        self.assertEqual(decision.best_available_candidate.label, "Pound")
+        self.assertFalse(decision.best_available_candidate.is_safe)
+        self.assertIn("No guaranteed-safe sequence", decision.best_available_candidate.reason)
 
     def test_low_hp_still_attacks_when_ko_is_guaranteed(self):
         decision = BattlePlanner().plan(

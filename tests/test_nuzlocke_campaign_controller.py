@@ -27,7 +27,7 @@ from modules.nuzlocke.campaign_objectives import (
     select_campaign_objective,
     ultimate_emerald_campaign_goal,
 )
-from modules.nuzlocke.campaign_state import Fact, RunStatus
+from modules.nuzlocke.campaign_state import Fact, FactStatus, RunStatus
 from modules.nuzlocke.readiness_diagnostics import (
     Availability,
     PartyReadinessMember,
@@ -86,6 +86,104 @@ class CampaignControllerTests(unittest.TestCase):
         self.assertEqual(result.objective_id, "complete_intro_rival")
         self.assertEqual(result.status, CampaignControllerStatus.READY)
 
+    def test_confirmed_pokedex_does_not_regress_on_transient_campaign_read(self):
+        self.state(
+            campaign_facts=self.fixture.facts(
+                text_speed_fast=True,
+                new_game_setup_complete=True,
+                wall_clock_set=True,
+                rival_met=True,
+                birch_rescued=True,
+                starter_obtained=True,
+                intro_rival_battle_complete=True,
+                pokedex_received=True,
+                pokeballs_available=True,
+                pokeballs_ready=True,
+            )
+        )
+        confirmed = self.current
+        controller = self.controller()
+        controller._stabilize_campaign_facts(confirmed)
+        controller._stabilize_campaign_facts(confirmed)
+
+        transient = replace(
+            confirmed,
+            campaign_facts=replace(confirmed.campaign_facts, pokedex_received=Fact.known(False)),
+        )
+        stabilized = controller._stabilize_campaign_facts(transient)
+
+        self.assertTrue(stabilized.campaign_facts.pokedex_received.value)
+
+    def test_late_campaign_fact_is_suppressed_until_coherent_and_repeated(self):
+        transient = replace(
+            self.current,
+            campaign_facts=self.fixture.facts(
+                text_speed_fast=True,
+                new_game_setup_complete=True,
+                wall_clock_set=True,
+                rival_met=True,
+                birch_rescued=True,
+                starter_obtained=True,
+                first_badge_obtained=True,
+            ),
+        )
+        controller = self.controller()
+
+        first = controller._stabilize_campaign_facts(transient)
+        second = controller._stabilize_campaign_facts(transient)
+
+        self.assertEqual(first.campaign_facts.first_badge_obtained.status, FactStatus.UNKNOWN)
+        self.assertEqual(second.campaign_facts.first_badge_obtained.status, FactStatus.UNKNOWN)
+        self.assertNotIn("first_badge_obtained", controller._confirmed_campaign_facts)
+
+        coherent = replace(
+            transient,
+            campaign_facts=self.fixture.facts(
+                text_speed_fast=True,
+                new_game_setup_complete=True,
+                wall_clock_set=True,
+                rival_met=True,
+                birch_rescued=True,
+                starter_obtained=True,
+                petalburg_wally_scene_complete=True,
+                petalburg_woods_scene_complete=True,
+                visited_rustboro=True,
+                first_badge_obtained=True,
+            ),
+        )
+        controller._stabilize_campaign_facts(coherent)
+        confirmed = controller._stabilize_campaign_facts(coherent)
+
+        self.assertTrue(confirmed.campaign_facts.first_badge_obtained.value)
+        self.assertIn("first_badge_obtained", controller._confirmed_campaign_facts)
+
+    def test_campaign_high_water_resets_when_observed_session_changes(self):
+        confirmed = replace(
+            self.current,
+            session_id="session-after-progress",
+            campaign_facts=self.fixture.facts(
+                text_speed_fast=True,
+                new_game_setup_complete=True,
+                wall_clock_set=True,
+                rival_met=True,
+                birch_rescued=True,
+                starter_obtained=True,
+                intro_rival_battle_complete=True,
+                pokedex_received=True,
+            ),
+        )
+        controller = self.controller()
+        controller._stabilize_campaign_facts(confirmed)
+
+        earlier_save = replace(
+            confirmed,
+            session_id="session-before-progress",
+            campaign_facts=replace(confirmed.campaign_facts, pokedex_received=Fact.known(False)),
+        )
+        stabilized = controller._stabilize_campaign_facts(earlier_save)
+
+        self.assertFalse(stabilized.campaign_facts.pokedex_received.value)
+
     def test_task_diagnostics_are_cached_with_map_level_planning_facts(self):
         objective = self.fixture.objective("diagnostic", self.fixture.predicate("diagnostic_done", False))
         selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "diagnostic")
@@ -105,6 +203,16 @@ class CampaignControllerTests(unittest.TestCase):
 
         diagnostics.assert_called_once_with(self.current)
 
+    def test_campaign_frontier_is_published_without_debug_logging(self):
+        controller = self.controller()
+        with patch.object(context, "debug", False), patch(
+            "modules.nuzlocke.campaign_controller.print_campaign_frontier"
+        ) as frontier:
+            controller.refresh()
+            controller.refresh()
+
+        frontier.assert_called_once()
+
     def test_completed_intro_battle_reselects_next_declarative_objective(self):
         controller = self.controller()
         controller.refresh()
@@ -119,6 +227,7 @@ class CampaignControllerTests(unittest.TestCase):
                 intro_rival_battle_complete=True,
             )
         )
+        controller.refresh()
         result = controller.refresh()
         self.assertEqual(result.selection.objective.objective_id, "receive_pokedex")
         self.assertEqual(result.status, CampaignControllerStatus.READY)
@@ -1152,6 +1261,7 @@ class CampaignControllerTests(unittest.TestCase):
                 intro_rival_battle_complete=True,
             )
         )
+        controller.refresh()
         result = controller.refresh()
         self.assertNotEqual(old_goal, None)
         self.assertIsNone(result.tactical_goal)
@@ -1178,6 +1288,7 @@ class CampaignControllerTests(unittest.TestCase):
             adapter=adapt_campaign_execution,
             tactical_loop_factory=self.factory,
         )
+        controller.refresh()
         result = controller.refresh()
         self.assertEqual(result.selection.objective.objective_id, "reach_petalburg")
         self.assertEqual(result.status, CampaignControllerStatus.READY)
@@ -1223,6 +1334,7 @@ class CampaignControllerTests(unittest.TestCase):
             adapter=adapt_campaign_execution,
         )
 
+        controller.refresh()
         result = controller.refresh()
 
         self.assertEqual(result.status, CampaignControllerStatus.READY)

@@ -17,8 +17,9 @@ _cross_map_goal_evaluations: list[dict[str, object]] = []
 def enabled() -> bool:
     """Return whether performance instrumentation is currently enabled."""
     from modules.context import context
+    from modules.stutter_trace import background_work_suppressed
 
-    return bool(getattr(context, "debug_profile", False))
+    return bool(getattr(context, "debug_profile", False)) and not background_work_suppressed()
 
 
 def now() -> int:

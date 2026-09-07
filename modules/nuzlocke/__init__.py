@@ -79,6 +79,12 @@ from .encounter_catalog import (
     encounter_opportunities,
     encounter_candidates_for_location,
 )
+from .field_lead import (
+    CampaignFieldLeadContext,
+    CampaignFieldLeadDecision,
+    FieldEncounterThreat,
+    build_campaign_field_lead_context,
+)
 from .capture_policy import (
     CapturePolicyContext,
     CapturePolicyWeights,

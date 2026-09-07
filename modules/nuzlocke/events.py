@@ -259,12 +259,22 @@ class NuzlockeEventObserver:
         not a legal encounter boundary; accepting it would claim a location
         with stale opponent identity data.
         """
-        return bool(
+        battle = snapshot.battle
+        if not bool(
             snapshot.battle_available
-            and snapshot.battle is not None
-            and snapshot.battle.ready
-            and snapshot.battle.battle_type
-        )
+            and battle is not None
+            and battle.ready
+            and battle.battle_type
+        ):
+            return False
+        # Wild encounter ownership is a Species Clause decision. Do not
+        # publish a consumable BattleStarted boundary until the ROM has
+        # supplied the opponent's species; the early battle transition can
+        # otherwise create an eligible pending encounter and only reveal the
+        # duplicate species one frame later.
+        if battle.is_wild and not battle.is_trainer and battle.opponent_active:
+            return all(pokemon.species for pokemon in battle.opponent_active)
+        return True
 
     @classmethod
     def _battle_lifecycle_is_active(cls, snapshot: NuzlockeSnapshot) -> bool:

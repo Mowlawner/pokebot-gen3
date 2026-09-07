@@ -202,6 +202,10 @@ class ObjectiveSelection:
     objective: CampaignObjective | None
     status: ObjectiveStatus
     reason: str
+    # Populated by the executable-task selector when it has already performed
+    # discovery. Consumers such as the Rich frontier can render the exact
+    # executable set without running route analysis a second time.
+    frontier_objective_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -529,7 +533,7 @@ def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
         CampaignObjective(
             objective_id="return_devon_goods",
             description="Return the Devon Goods to the Rustboro employee",
-            prerequisites=(campaign_fact("devon_goods_recovered"),),
+            prerequisites=(campaign_fact("devon_goods_recovered"), campaign_fact("visited_rustboro")),
             completion=campaign_fact("devon_goods_returned"),
             execution_id="return_devon_goods",
             destination=MapRSE.RUSTBORO_CITY.value,
@@ -538,7 +542,7 @@ def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
         CampaignObjective(
             objective_id="meet_mr_stone",
             description="Meet Mr. Stone in Devon Corporation",
-            prerequisites=(campaign_fact("devon_goods_returned"),),
+            prerequisites=(campaign_fact("devon_goods_returned"), campaign_fact("visited_rustboro")),
             completion=campaign_fact("devon_corp_3f_scene_complete"),
             execution_id="meet_mr_stone",
             destination=MapRSE.RUSTBORO_CITY_DEVON_CORP_3F.value,
@@ -1281,7 +1285,51 @@ def select_available_campaign_task(
     optional tasks, then explicit priority and declaration order decide ties.
     """
 
-    return _select_available_campaign_tasks(available_campaign_tasks(state, tasks, encounter_locations), state)
+    available = available_campaign_tasks(state, tasks, encounter_locations)
+    selection = _select_available_campaign_tasks(available, state)
+    return replace(selection, frontier_objective_ids=tuple(task.objective_id for task in available))
+
+
+def campaign_frontier_summary(
+    state: CampaignState,
+    objectives: tuple[CampaignObjective, ...] | None = None,
+    executable_objective_ids: tuple[str, ...] | None = None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return concise completed and currently available story objectives.
+
+    When ``executable_objective_ids`` is supplied, it is the already-resolved
+    frontier from the selector and is rendered verbatim. This keeps the
+    human-facing report truthful without repeating route/encounter discovery.
+    Without it, the function retains its cheap declarative fallback for
+    callers that do not have a selector result.
+    """
+
+    completed: list[str] = []
+    available: list[str] = []
+    ordered = initial_emerald_campaign() if objectives is None else objectives
+    executable_ids = set(executable_objective_ids or ())
+    for objective in ordered:
+        completion = objective.completion.evaluate(state)
+        if completion.status is FactStatus.KNOWN and completion.value is True:
+            completed.append(objective.objective_id)
+            continue
+        if executable_objective_ids is not None:
+            if objective.objective_id in executable_ids:
+                available.append(objective.objective_id)
+            continue
+        if completion.status is not FactStatus.KNOWN or completion.value:
+            continue
+        if objective.failure is not None:
+            failure = objective.failure.evaluate(state)
+            if failure.status is not FactStatus.KNOWN or failure.value:
+                continue
+        prerequisites = tuple(prerequisite.evaluate(state) for prerequisite in objective.prerequisites)
+        if all(result.status is FactStatus.KNOWN and result.value for result in prerequisites):
+            available.append(objective.objective_id)
+    if executable_objective_ids is not None:
+        known_ids = {objective.objective_id for objective in ordered}
+        available.extend(objective_id for objective_id in executable_objective_ids if objective_id not in known_ids)
+    return tuple(completed), tuple(available)
 
 
 def campaign_task_diagnostics(
@@ -1627,6 +1675,7 @@ def plan_campaign(
                 objective,
                 ObjectiveStatus.READY,
                 f"resolved executable frontier for campaign goal {target.goal_id}",
+                frontier.frontier_objective_ids,
             )
         finally:
             visiting.remove(objective.objective_id)

@@ -96,6 +96,51 @@ class CampaignPlannerTests(unittest.TestCase):
         self.assertIs(plan.recovery_stop.route, observed_route)
         self.assertEqual(plan.recovery_stop.urgency, RecoveryUrgency.CRITICAL)
 
+    def test_targetless_opportunistic_recovery_uses_observed_center_when_parent_route_is_absent(self):
+        destination = ("PetalburgCity", (20, 16))
+        observed_route = object()
+        readiness = SimpleNamespace(
+            readiness_decision=ReadinessDecision.RECOVER,
+            readiness_reason=ReadinessReason.OPPORTUNISTIC_RECOVERY,
+            route_analysis=None,
+            recovery=SimpleNamespace(
+                center_available=True,
+                center_location=destination,
+                safe_to_reach_center=True,
+                route=observed_route,
+            ),
+        )
+
+        plan = build_campaign_plan(self.parent, readiness)
+
+        self.assertIsNotNone(plan.recovery_stop)
+        self.assertEqual(plan.recovery_stop.destination, destination)
+        self.assertIs(plan.recovery_stop.route, observed_route)
+        self.assertEqual(plan.recovery_stop.urgency, RecoveryUrgency.OPPORTUNISTIC)
+
+    def test_poisoned_party_recovery_is_an_executable_critical_stop(self):
+        center = ReachLocation(("Petalburg", (5, 6)))
+        source_route = SimpleNamespace(metrics=SimpleNamespace(total_route_cost=24))
+        candidate = SimpleNamespace(
+            destination=center,
+            total_cost=None,
+            detour=None,
+            reachable=True,
+            first_route=source_route,
+            continuation_route=None,
+        )
+        readiness = SimpleNamespace(
+            readiness_decision=ReadinessDecision.RECOVER,
+            readiness_reason=ReadinessReason.POISONED_PARTY,
+            route_analysis=RouteAnalysis(Goal(), None, None, (candidate,)),
+        )
+
+        plan = build_campaign_plan(self.parent, readiness)
+
+        self.assertIsNotNone(plan.recovery_stop)
+        self.assertEqual(plan.recovery_stop.urgency, RecoveryUrgency.CRITICAL)
+        self.assertIs(plan.recovery_stop.route, source_route)
+
     def test_planner_evaluates_raw_readiness_observations(self):
         center = ReachLocation(("OLDale", (5, 6)))
         candidate = IntermediateRouteAnalysis(

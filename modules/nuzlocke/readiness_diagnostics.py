@@ -45,6 +45,7 @@ class ReadinessReason(Enum):
     RECOVERY_UNAVAILABLE = "RECOVERY_UNAVAILABLE"
     RECOVERY_CAPABILITY_UNKNOWN = "RECOVERY_CAPABILITY_UNKNOWN"
     FAINTED_PARTY_MEMBER = "FAINTED_PARTY_MEMBER"
+    POISONED_PARTY = "POISONED_PARTY"
     NO_IMMINENT_TRAINER = "NO_IMMINENT_TRAINER"
     PARTY_HEALTHY = "PARTY_HEALTHY"
     OVERWORLD_UNAVAILABLE = "OVERWORLD_UNAVAILABLE"
@@ -116,6 +117,13 @@ class ProgressionReadinessDiagnostic:
     # no tactical route of its own. Preserve that distinction for the pure
     # readiness policy without keying behavior to an objective ID.
     targetless: bool = False
+    # Expensive route work is still in flight. The scheduler must poll rather
+    # than cache this diagnostic as a final UNKNOWN decision.
+    route_analysis_pending: bool = False
+    # A bounded route-analysis worker can time out after the recovery route is
+    # already known. This is transient and must not permanently strand the
+    # campaign in UNKNOWN / OPPORTUNISTIC_ROUTE_UNAVAILABLE.
+    route_analysis_timed_out: bool = False
 
     @property
     def party_count(self) -> int | None:
@@ -213,6 +221,8 @@ class ReadinessObservationScheduler:
         self._refresh_count = 0
         self._invalidation_reason = "initial"
         self._last_observation_was_cache_hit = False
+        self._transient_result = None
+        self._retry_after_tick = 0
 
     def invalidate(self, reason: str) -> None:
         """Discard cached readiness and record why it became invalid."""
@@ -221,6 +231,8 @@ class ReadinessObservationScheduler:
         self._cached_key = None
         self._age = None
         self._invalidation_reason = reason
+        self._transient_result = None
+        self._retry_after_tick = 0
 
     def observe(self, objective, goal):
         """Reuse readiness until an objective or semantic context changes.
@@ -236,6 +248,9 @@ class ReadinessObservationScheduler:
         self._tick_count += 1
         cheap = self._cheap_context()
         key = (getattr(objective, "objective_id", None), repr(goal), cheap)
+        if self._cached is None and self._transient_result is not None and self._tick_count < self._retry_after_tick:
+            self._last_observation_was_cache_hit = True
+            return self._transient_result
         can_reuse = (
             self._cached is not None
             and self._cached_key == key
@@ -253,11 +268,37 @@ class ReadinessObservationScheduler:
             prefix="READINESS_SCHEDULER_REFRESH",
         )
         result = self._provider(objective, goal)
+        if _readiness_calculation_pending(result):
+            # A pending route is a valid in-flight state, not a stable
+            # observation. Keep polling the provider so it can harvest the
+            # single worker result on a later frame; caching this value would
+            # otherwise strand readiness in UNKNOWN forever.
+            self._cached = None
+            self._cached_key = None
+            self._age = None
+            self._invalidation_reason = "calculation_pending"
+            self._refresh_count += 1
+            return result
+        if _readiness_calculation_timed_out(result):
+            # Do not let one pathological search pin the campaign forever.
+            # Hold the explicit timeout diagnostic briefly, then ask the
+            # provider to prepare a fresh request. The retry is event-driven
+            # with a bounded cooldown rather than a per-frame busy loop.
+            self._cached = None
+            self._cached_key = None
+            self._age = None
+            self._transient_result = result
+            self._retry_after_tick = self._tick_count + 60
+            self._invalidation_reason = "route_calculation_timed_out"
+            self._refresh_count += 1
+            return result
         self._cached = result
         self._cached_key = key
         self._age = 0
         self._refresh_count += 1
         self._invalidation_reason = None
+        self._transient_result = None
+        self._retry_after_tick = 0
         # An unavailable observation is still a useful synchronization result:
         # it tells the controller to keep campaign ownership while a battle,
         # script, or warp settles.  Dropping it here causes the controller to
@@ -354,6 +395,16 @@ class CampaignReadinessPolicy:
         # the party to another trainer or wild battle.
         if getattr(readiness, "fainted_count", None) > 0:
             return self._recovery_result(readiness, ReadinessReason.FAINTED_PARTY_MEMBER)
+        if any(
+            (getattr(member, "status", None) or "none") in {"poisoned", "badly poisoned", "poison", "bad_poison"}
+            for member in getattr(readiness, "party", ())
+            if not getattr(member, "fainted", False)
+        ):
+            # Poison damage is applied by the overworld on movement. Treat a
+            # known poisoned party as a recovery need even when its current
+            # HP is still high; waiting for the ordinary HP threshold can
+            # consume the last safe steps before the Center.
+            return self._recovery_result(readiness, ReadinessReason.POISONED_PARTY)
         if getattr(readiness, "lowest_hp_ratio", None) is None:
             return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.PARTY_INFORMATION_UNKNOWN)
 
@@ -364,7 +415,30 @@ class CampaignReadinessPolicy:
         # objective.  Do not divert for optional healing immediately before
         # it; critical HP recovery above remains authoritative.
         if readiness.route_analysis is None or readiness.route_analysis.normal_cost is None:
+            if getattr(readiness, "route_analysis_timed_out", False):
+                if (
+                    readiness.lowest_hp_ratio <= self.opportunistic_hp_ratio
+                    and center_available
+                    and center_safe
+                    and readiness.recovery.distance_to_center is not None
+                    and readiness.recovery.distance_to_center <= self.opportunistic_detour_threshold
+                ):
+                    return self._recovery_result(readiness, ReadinessReason.OPPORTUNISTIC_RECOVERY)
+                # Route analysis is a preference check, not a safety
+                # prerequisite. Keep the existing tactical owner moving while
+                # the scheduler retries the bounded worker request.
+                return ReadinessResult(ReadinessDecision.CONTINUE, ReadinessReason.OPPORTUNISTIC_ROUTE_UNAVAILABLE)
             if readiness.lowest_hp_ratio <= self.opportunistic_hp_ratio:
+                # A completed recovery observation already contains an
+                # executable, trainer-safe route to a nearby healing source.
+                # Normal-vs-recovery composition is useful for deciding
+                # whether a long detour is worthwhile, but it must not turn a
+                # short, valid route (for example Route 104 -> Petalburg)
+                # into an indefinite wait when the parent route is not yet
+                # analyzable. The route object is required here so a mere
+                # catalog/distance hint cannot mount an unexecutable stop.
+                if self._completed_nearby_recovery_available(readiness):
+                    return self._recovery_result(readiness, ReadinessReason.OPPORTUNISTIC_RECOVERY)
                 # A trainer ahead is a reason to perform this safety check,
                 # not a reason to skip it. A known nearby healing source is
                 # sufficient even when the active capability has no tactical
@@ -391,13 +465,22 @@ class CampaignReadinessPolicy:
         analysis = readiness.route_analysis
         if analysis is None or analysis.normal_cost is None:
             diagnostic_print(
-                "OPPORTUNISTIC_HEAL_ANALYSIS: route_analysis_unavailable decision=CONTINUE",
+                lambda: (
+                    "OPPORTUNISTIC_HEAL_ANALYSIS: "
+                    f"route_analysis_unavailable completed_recovery_route={self._completed_nearby_recovery_available(readiness)}"
+                ),
                 trace=True,
             )
-            return False
+            return self._completed_nearby_recovery_available(readiness)
         candidates = tuple(
             candidate for candidate in analysis.candidates if candidate.reachable and candidate.detour is not None
         )
+        if not candidates:
+            # Route composition can fail even when recovery observation has
+            # already produced a safe executable route. Do not discard that
+            # route merely because the parent objective has no comparable
+            # continuation (a common boundary near a map entrance).
+            return self._completed_nearby_recovery_available(readiness)
         selected = (
             min(candidates, key=lambda candidate: (candidate.detour, candidate.total_cost)) if candidates else None
         )
@@ -415,6 +498,21 @@ class CampaignReadinessPolicy:
             trace=True,
         )
         return decision
+
+    def _completed_nearby_recovery_available(self, readiness: ProgressionReadinessDiagnostic) -> bool:
+        """Return whether recovery has a bounded, executable nearby route."""
+
+        recovery = getattr(readiness, "recovery", None)
+        available = bool(recovery and recovery.center_available)
+        safe = bool(recovery and recovery.safe_to_reach_center)
+        distance = getattr(recovery, "distance_to_center", None)
+        return bool(
+            available
+            and safe
+            and getattr(recovery, "route", None) is not None
+            and distance is not None
+            and distance <= self.opportunistic_detour_threshold
+        )
 
     @staticmethod
     def _recovery_result(readiness: ProgressionReadinessDiagnostic, reason: ReadinessReason) -> ReadinessResult:
@@ -495,6 +593,8 @@ def build_progression_readiness_diagnostic(
     resource_reason: str | None = None,
     route_analysis: "RouteAnalysis | None" = None,
     targetless: bool = False,
+    route_analysis_pending: bool = False,
+    route_analysis_timed_out: bool = False,
 ) -> ProgressionReadinessDiagnostic:
     """Build a point-in-time diagnostic without applying a survival policy."""
     members = _party(snapshot)
@@ -583,6 +683,26 @@ def build_progression_readiness_diagnostic(
         None,
         route_analysis,
         targetless,
+        route_analysis_pending,
+        route_analysis_timed_out,
+    )
+
+
+def _readiness_calculation_pending(value) -> bool:
+    """Return whether a readiness value contains unfinished route work."""
+
+    return bool(
+        getattr(value, "route_analysis_pending", False)
+        or getattr(getattr(value, "recovery", None), "calculation_pending", False)
+    )
+
+
+def _readiness_calculation_timed_out(value) -> bool:
+    """Return whether a bounded recovery or analysis job timed out."""
+
+    return bool(
+        getattr(value, "route_analysis_timed_out", False)
+        or getattr(getattr(value, "recovery", None), "calculation_timed_out", False)
     )
 
 

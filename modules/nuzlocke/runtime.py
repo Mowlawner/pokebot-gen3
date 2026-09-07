@@ -422,6 +422,7 @@ class NuzlockeRuntime:
             inventory_fact,
             Fact.unavailable(),
             pokeball_policy=self._rule_config.pokeball_policy,
+            require_set_battle_style=self._rule_config.is_enabled(CampaignRuleId.SET_BATTLE_STYLE),
         )
         self._latest_campaign_facts = campaign_facts
         if not self._check_campaign_history(current, campaign_facts):
@@ -488,6 +489,13 @@ class NuzlockeRuntime:
                     (item for item in self._rules_projection.state.encounters if item.location == event.location),
                     None,
                 )
+                species_clause_reason = (
+                    species_clause_conflict_reason(self._rules_projection.state, event.opponent_species)
+                    if event.is_wild
+                    and not event.is_trainer
+                    and self._rule_config.is_enabled(CampaignRuleId.SPECIES_CLAUSE)
+                    else None
+                )
                 diagnostic_print(
                     lambda event=event, encounter=encounter: (
                         "NUZLOCKE_BATTLE_STARTED: "
@@ -500,6 +508,7 @@ class NuzlockeRuntime:
                         # final decision attached to this event.  The latter
                         # also includes area and Species Clause checks.
                         f"encounter_eligible={event.encounter_eligible!r} "
+                        f"species_clause_reason={species_clause_reason!r} "
                         f"global_encounter_gate={encounter_eligible!r} emitted=True "
                         f"projection_encounter_status={getattr(encounter, 'status', None)!r} "
                         f"projection_encounter_eligible={getattr(encounter, 'eligible', None)!r} "

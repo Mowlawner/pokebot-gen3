@@ -19,6 +19,10 @@ class DefaultBattleStrategy(BattleStrategy):
         # Capture decisions are battle-local state.  Keep one strategy for the
         # whole battle so a failed ball cannot silently reset capture policy.
         self._capture_strategy = None
+        # Expose the normalized decision to specialized risk policies. This
+        # avoids rebuilding the planner report after the action has already
+        # been selected and keeps the action/evaluation pair on one path.
+        self._last_planner_decision = None
 
     def party_can_battle(self) -> bool:
         return any(self.pokemon_can_battle(pokemon) for pokemon in get_party())
@@ -211,18 +215,6 @@ class DefaultBattleStrategy(BattleStrategy):
             if self._capture_strategy is None:
                 self._capture_strategy = CatchStrategy()
 
-            # Let the existing planner establish a safe weakening turn before
-            # falling back to the capture strategy.  The planner receives the
-            # legal-target facts from its normal battle-state adapter, so its
-            # capture HP threshold and damage/safety model remain authoritative.
-            planner_decision = plan_battle_state(battle_state, default_battle_recorder.knowledge)
-            if (
-                planner_decision.action is PlannerAction.UseMove
-                and planner_decision.classification is PlannerDecisionClass.SAFE
-                and planner_decision.is_safe_to_execute
-            ):
-                return self._turn_action_from_planner_decision(planner_decision)
-
             try:
                 usable_balls = tuple(ball for ball in get_item_bag().poke_balls if ball.quantity > 0)
             except (AttributeError, RuntimeError, TypeError, ValueError):
@@ -254,6 +246,7 @@ class DefaultBattleStrategy(BattleStrategy):
         # the compatibility fallback below; it is no longer the planner's
         # invocation trigger.
         planner_decision = plan_battle_state(battle_state, default_battle_recorder.knowledge)
+        self._last_planner_decision = planner_decision
         classification = getattr(planner_decision, "classification", None)
         safe = bool(getattr(planner_decision, "is_safe_to_execute", False))
         if classification is None and safe:

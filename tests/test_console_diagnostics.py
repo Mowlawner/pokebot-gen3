@@ -4,6 +4,23 @@ from unittest.mock import patch
 
 
 class TestDiagnosticPrint(unittest.TestCase):
+    def test_campaign_frontier_is_normal_rich_output(self):
+        from modules.console import print_campaign_frontier
+
+        sink = types.SimpleNamespace(print=unittest.mock.Mock())
+        with patch("modules.console.console", sink):
+            print_campaign_frontier(
+                ("receive_pokedex",),
+                ("obtain_encounter:0:17",),
+                selected="obtain_encounter:0:17",
+                status="ready",
+                reason="nearest eligible encounter",
+            )
+
+        sink.print.assert_called_once()
+        rendered = sink.print.call_args.args[0]
+        self.assertIn("Campaign Objective Frontier", rendered.title)
+
     def test_profile_output_is_disabled_without_profile_flag(self):
         from modules.console import profile_print
 

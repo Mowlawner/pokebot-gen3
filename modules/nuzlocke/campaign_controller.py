@@ -25,22 +25,25 @@ from .campaign_execution import CampaignExecutionResult, CampaignExecutionStatus
 from .campaign_objectives import (
     ObjectiveSelection,
     ObjectiveStatus,
+    campaign_frontier_summary,
     campaign_task_diagnostics,
-    campaign_planning_signature,
     select_campaign_objective,
     select_available_campaign_task,
     heal_party_objective,
 )
-from modules.console import diagnostic_print
+from modules.console import diagnostic_print, print_campaign_frontier
 from .campaign_status import CampaignStatus, recovery_status
-from .campaign_state import CampaignState, FactStatus
+from .campaign_state import CampaignState, Fact, FactStatus
+from .snapshots import CampaignObservationLifecycle
 from .readiness_diagnostics import (
     CampaignReadinessPolicy,
     ProgressionReadinessDiagnostic,
     ReadinessDecision,
     ReadinessReason,
+    _readiness_calculation_pending,
 )
 from .campaign_planner import CampaignPlan, build_campaign_plan, RecoveryStop
+from .rule_config import CampaignRuleId
 
 
 class CampaignControllerStatus(Enum):
@@ -72,6 +75,81 @@ TacticalLoopFactory = Callable[[Goal], Iterator[object]]
 CampaignBoundaryHandler = Callable[[str], bool]
 ReadinessProvider = Callable[[Any, Goal | None], ProgressionReadinessDiagnostic]
 RecoveryFactory = Callable[[RecoveryStop], Iterator[object]]
+
+
+# These are completed ROM milestones, not mutable resources. Keeping their
+# high-water values prevents a transient battle/script read from rewinding the
+# dependency planner to an earlier story objective.
+_MONOTONIC_CAMPAIGN_FACTS = (
+    "text_speed_fast",
+    "new_game_setup_complete",
+    "wall_clock_set",
+    "rival_met",
+    "birch_rescued",
+    "starter_obtained",
+    "intro_rival_battle_complete",
+    "pokedex_received",
+    "pokeballs_received",
+    "visited_petalburg",
+    "petalburg_wally_scene_complete",
+    "petalburg_woods_scene_complete",
+    "devon_goods_stolen",
+    "devon_goods_reported",
+    "devon_goods_recovered",
+    "devon_goods_returned",
+    "devon_goods_delivered",
+    "devon_corp_3f_scene_complete",
+    "visited_rustboro",
+    "first_badge_obtained",
+)
+
+# A ROM observation can briefly expose a later map variable or flag while a
+# script is being torn down.  A later milestone is not coherent evidence on
+# its own: these are the causal boundaries that must already be observed (or
+# have been durably confirmed) before a high-water value can be promoted.
+_CAMPAIGN_FACT_PREREQUISITES = {
+    "wall_clock_set": ("new_game_setup_complete",),
+    "rival_met": ("new_game_setup_complete",),
+    "birch_rescued": ("rival_met",),
+    "starter_obtained": ("birch_rescued",),
+    "intro_rival_battle_complete": ("starter_obtained",),
+    "pokedex_received": ("intro_rival_battle_complete",),
+    "pokeballs_received": ("pokedex_received",),
+    "visited_petalburg": ("pokedex_received",),
+    "petalburg_wally_scene_complete": ("visited_petalburg",),
+    "petalburg_woods_scene_complete": ("petalburg_wally_scene_complete",),
+    "visited_rustboro": ("petalburg_woods_scene_complete",),
+    "devon_goods_stolen": ("visited_rustboro",),
+    "devon_goods_reported": ("devon_goods_stolen",),
+    "devon_goods_recovered": ("devon_goods_stolen",),
+    "devon_goods_returned": ("devon_goods_recovered",),
+    "devon_goods_delivered": ("devon_goods_returned",),
+    "devon_corp_3f_scene_complete": ("devon_goods_returned",),
+    "first_badge_obtained": ("visited_rustboro",),
+}
+
+# Require two controller observations. This is intentionally small: the
+# controller is refreshed at event boundaries, not as a second emulator
+# simulation, and a genuine save-backed milestone remains cheap to confirm.
+_CAMPAIGN_FACT_CONFIRMATION_OBSERVATIONS = 2
+_CAMPAIGN_FACTS_REQUIRING_CONFIRMATION = frozenset(
+    {
+        "intro_rival_battle_complete",
+        "pokedex_received",
+        "pokeballs_received",
+        "visited_petalburg",
+        "petalburg_wally_scene_complete",
+        "petalburg_woods_scene_complete",
+        "visited_rustboro",
+        "devon_goods_stolen",
+        "devon_goods_reported",
+        "devon_goods_recovered",
+        "devon_goods_returned",
+        "devon_goods_delivered",
+        "devon_corp_3f_scene_complete",
+        "first_badge_obtained",
+    }
+)
 
 
 @lru_cache(maxsize=1)
@@ -253,6 +331,12 @@ class CampaignController:
         # planning so enabling tracing cannot turn every frame into a second
         # planner pass.
         self._campaign_task_diagnostics_key = None
+        self._confirmed_campaign_facts: set[str] = set()
+        self._pending_campaign_fact_confirmations: dict[str, int] = {}
+        # A save-state load starts a new observed runtime session. The
+        # high-water guard must not carry later story milestones backwards
+        # into an earlier save state.
+        self._confirmed_campaign_session_id: str | None = None
 
     @staticmethod
     def _default_tactical_loop(goal: Goal) -> Iterator[object]:
@@ -353,22 +437,56 @@ class CampaignController:
         )
 
     def _emit_campaign_task_diagnostics(self, observed_state: CampaignState, selection: ObjectiveSelection) -> None:
-        """Emit task discovery only when map-level planning facts change."""
+        """Emit one panel for each semantic frontier, not each state change."""
 
-        # Do this check before constructing the diagnostic key.  Normal runs
-        # must not pay even the small signature cost for a trace-only report.
-        if not context.debug or not getattr(context, "debug_trace", False):
-            return
         try:
-            key = campaign_planning_signature(observed_state)
+            completed, available = campaign_frontier_summary(
+                observed_state,
+                executable_objective_ids=getattr(selection, "frontier_objective_ids", None) or None,
+            )
         except (AttributeError, RuntimeError, TypeError, ValueError):
-            # A partial/custom state is still valid for controller tests and
-            # transient startup boundaries.  Its diagnostics are not safe to
-            # cache semantically, so leave the trace suppressed for that frame.
+            # Custom controller embeddings may intentionally expose only the
+            # facts needed by their selector. Diagnostics must not turn that
+            # compatibility seam into a campaign refresh failure.
             return
+        key = (
+            completed,
+            available,
+            getattr(selection.objective, "objective_id", None),
+            selection.status.value,
+            selection.reason,
+        )
         if key == self._campaign_task_diagnostics_key:
             return
         self._campaign_task_diagnostics_key = key
+        print_campaign_frontier(
+            completed,
+            available,
+            selected=selection.objective.objective_id if selection.objective else None,
+            status=selection.status.value,
+            reason=selection.reason,
+        )
+
+        # Keep the machine-readable diagnostic stream opt-in. The Rich
+        # frontier above is the normal human-facing campaign report; detailed
+        # task discovery remains debug-only because it can perform route and
+        # encounter analysis.
+        if not context.debug:
+            return
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_OBJECTIVE_FRONTIER: "
+                f"completed={completed!r} available={available!r} "
+                f"selected={selection.objective.objective_id if selection.objective else None!r} "
+                f"status={selection.status.value!r} reason={selection.reason!r}"
+            ),
+            trace=False,
+        )
+        # Detailed rows perform route and encounter analysis. Keep those
+        # expensive diagnostics opt-in while leaving the concise frontier
+        # visible in ordinary debug console output.
+        if not getattr(context, "debug_trace", False):
+            return
         diagnostic_print(
             lambda: "CAMPAIGN_TASK_DISCOVERY: "
             + json.dumps(
@@ -383,6 +501,130 @@ class CampaignController:
             ),
             trace=True,
             prefix="CAMPAIGN_TASK_DISCOVERY",
+        )
+
+    def _stabilize_campaign_facts(self, state: CampaignState) -> CampaignState:
+        """Retain confirmed story milestones across transient ROM reads."""
+
+        if not hasattr(state, "campaign_lifecycle") or not hasattr(state, "campaign_facts"):
+            # Lightweight controller embeddings may provide only the facts
+            # needed by a custom selector. Preserve that compatibility seam.
+            return state
+        if state.campaign_lifecycle is CampaignObservationLifecycle.FRESH_START:
+            self._confirmed_campaign_facts.clear()
+            self._pending_campaign_fact_confirmations.clear()
+            self._confirmed_campaign_session_id = None
+
+        session_id = getattr(state, "session_id", None)
+        if session_id is not None:
+            if (
+                self._confirmed_campaign_session_id is not None
+                and session_id != self._confirmed_campaign_session_id
+            ):
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_FACT_HIGH_WATER_RESET: "
+                        f"old_session={self._confirmed_campaign_session_id!r} "
+                        f"new_session={session_id!r} reason='observed session changed'"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_FACT_HIGH_WATER_RESET",
+                )
+                self._confirmed_campaign_facts.clear()
+                self._pending_campaign_fact_confirmations.clear()
+            self._confirmed_campaign_session_id = session_id
+
+        facts = state.campaign_facts
+        newly_confirmed = set()
+        for name in _MONOTONIC_CAMPAIGN_FACTS:
+            fact = getattr(facts, name, Fact.unavailable())
+            if fact.status is not FactStatus.KNOWN or fact.value is not True:
+                self._pending_campaign_fact_confirmations.pop(name, None)
+                continue
+            if not self._campaign_fact_observation_is_coherent(name, facts):
+                self._pending_campaign_fact_confirmations.pop(name, None)
+                diagnostic_print(
+                    lambda name=name: (
+                        "CAMPAIGN_FACT_CONFIRMATION_DEFERRED: "
+                        f"fact={name!r} reason='causal prerequisite not confirmed'"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_FACT_CONFIRMATION_DEFERRED",
+                )
+                continue
+            if name in self._confirmed_campaign_facts:
+                continue
+            observations = self._pending_campaign_fact_confirmations.get(name, 0) + 1
+            required_observations = (
+                _CAMPAIGN_FACT_CONFIRMATION_OBSERVATIONS
+                if name in _CAMPAIGN_FACTS_REQUIRING_CONFIRMATION
+                else 1
+            )
+            if observations >= required_observations:
+                newly_confirmed.add(name)
+                self._pending_campaign_fact_confirmations.pop(name, None)
+            else:
+                self._pending_campaign_fact_confirmations[name] = observations
+                diagnostic_print(
+                    lambda name=name, observations=observations, required_observations=required_observations: (
+                        "CAMPAIGN_FACT_CONFIRMATION_PENDING: "
+                        f"fact={name!r} observations={observations!r}/{required_observations!r}"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_FACT_CONFIRMATION_PENDING",
+                )
+        self._confirmed_campaign_facts.update(newly_confirmed)
+        retained = {
+            name
+            for name in self._confirmed_campaign_facts
+            if getattr(facts, name, Fact.unavailable()).value is not True
+        }
+        suppressed = {
+            name
+            for name in _MONOTONIC_CAMPAIGN_FACTS
+            if (
+                (fact := getattr(facts, name, Fact.unavailable())).status is FactStatus.KNOWN
+                and fact.value is True
+                and name not in self._confirmed_campaign_facts
+                and name in _CAMPAIGN_FACTS_REQUIRING_CONFIRMATION
+            )
+        }
+        if not retained and not suppressed:
+            return state
+
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_FACT_STABILIZED: "
+                f"retained={tuple(sorted(retained))!r} "
+                f"suppressed={tuple(sorted(suppressed))!r} "
+                f"lifecycle={getattr(state.campaign_lifecycle, 'value', state.campaign_lifecycle)!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_FACT_STABILIZED",
+        )
+        return replace(
+            state,
+            campaign_facts=replace(
+                facts,
+                **{
+                    **{name: Fact.known(True) for name in retained},
+                    **{name: Fact.unknown() for name in suppressed},
+                },
+            ),
+        )
+
+    def _campaign_fact_observation_is_coherent(self, name: str, facts) -> bool:
+        """Reject a later true fact until its causal story is also present."""
+
+        return all(
+            (
+                prerequisite in self._confirmed_campaign_facts
+                or (
+                    (fact := getattr(facts, prerequisite, Fact.unavailable())).status is FactStatus.KNOWN
+                    and fact.value is True
+                )
+            )
+            for prerequisite in _CAMPAIGN_FACT_PREREQUISITES.get(name, ())
         )
 
     def request_readiness_recheck(self, reason: str) -> None:
@@ -445,7 +687,7 @@ class CampaignController:
 
     def refresh(self) -> CampaignControllerState:
         """Rebuild state, select, adapt, and mount work if needed."""
-        observed_state = self._state_provider()
+        observed_state = self._stabilize_campaign_facts(self._state_provider())
         active_safety = (
             self.last_selection
             if self.last_selection is not None
@@ -975,6 +1217,58 @@ class CampaignController:
                     lambda: f"CAMPAIGN_READINESS_DEFERRED: controller_id={id(self)!r} frame={getattr(context, 'frame', None)!r} objective={objective_id!r} reason={evaluated.readiness_reason.value!r}",
                     trace=True,
                 )
+                input_pending = _readiness_calculation_pending(readiness_input)
+                evaluated_pending = _readiness_calculation_pending(evaluated)
+                calculation_pending = input_pending or evaluated_pending
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_READINESS_UNKNOWN_DIAGNOSTIC: "
+                        f"controller_id={id(self)!r} frame={getattr(context, 'frame', None)!r} "
+                        f"objective={objective_id!r} reason={evaluated.readiness_reason.value!r} "
+                        f"input_pending={input_pending!r} evaluated_pending={evaluated_pending!r} "
+                        f"input_route_analysis_pending={getattr(readiness_input, 'route_analysis_pending', None)!r} "
+                        f"evaluated_route_analysis_pending={getattr(evaluated, 'route_analysis_pending', None)!r} "
+                        f"input_recovery_pending={getattr(getattr(readiness_input, 'recovery', None), 'calculation_pending', None)!r} "
+                        f"evaluated_recovery_pending={getattr(getattr(evaluated, 'recovery', None), 'calculation_pending', None)!r} "
+                        f"recovery_timed_out={getattr(getattr(evaluated, 'recovery', None), 'calculation_timed_out', None)!r} "
+                        f"recovery_error={getattr(getattr(evaluated, 'recovery', None), 'observation_error', None)!r} "
+                        f"route_analysis_present={getattr(evaluated, 'route_analysis', None) is not None!r} "
+                        f"scheduler_cache_hit={getattr(getattr(self._readiness_provider, '__self__', None), 'last_observation_was_cache_hit', None)!r}"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_READINESS_UNKNOWN_DIAGNOSTIC",
+                )
+                if calculation_pending:
+                    # A worker owns a valid snapshot, but its route result is
+                    # not ready. Do not let the old tactical generator keep
+                    # advancing while the party may require recovery; the
+                    # next controller frame must poll the same request.
+                    self._readiness_recheck_pending = False
+                    self._pending_readiness_objective_id = None
+                    self._publish_status_for_execution(
+                        execution.objective,
+                        execution.tactical_goal,
+                        "Calculating recovery route",
+                    )
+                    old_loop_id = id(self._tactical_loop) if self._tactical_loop is not None else None
+                    self._tactical_loop = None
+                    self._tactical_loop_objective_id = None
+                    self.current_objective_id = objective_id
+                    self.current_tactical_goal = execution.tactical_goal
+                    self._deferred_handoff_requires_refresh = True
+                    self.status = CampaignControllerStatus.READY
+                    self._execution_phase = "CAMPAIGN"
+                    self.transition_reason = "readiness deferred: recovery route calculation pending"
+                    diagnostic_print(
+                        lambda: (
+                            "CAMPAIGN_READINESS_CALCULATION_PENDING: "
+                            f"controller_id={id(self)!r} frame={getattr(context, 'frame', None)!r} "
+                            f"objective={objective_id!r} old_loop_id={old_loop_id!r}"
+                        ),
+                        trace=True,
+                        prefix="CAMPAIGN_READINESS_CALCULATION_PENDING",
+                    )
+                    return self.state
                 # The scheduler retains this bounded UNKNOWN observation, so
                 # do not turn it into a per-frame invalidation loop.  An
                 # explicit battle-end request has already forced the next
@@ -1580,6 +1874,9 @@ def runtime_campaign_state() -> CampaignState:
         rules_projection=runtime.rules_projection if history_ready and runtime is not None else None,
         canonical_area=canonical_area,
         pokeball_policy=(runtime.rule_config.pokeball_policy if runtime is not None else None),
+        require_set_battle_style=(
+            runtime is not None and runtime.rule_config.is_enabled(CampaignRuleId.SET_BATTLE_STYLE)
+        ),
     )
 
 
