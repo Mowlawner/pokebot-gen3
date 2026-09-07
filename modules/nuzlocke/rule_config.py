@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol, TypeVar, runtime_checkable
 
-from .resource_policy import PokeballRestockPolicy
+from .resource_policy import PokeballRestockPolicy, RecoverySupplyPolicy
 
 if TYPE_CHECKING:
     from .campaign_state import CampaignState
@@ -47,12 +47,15 @@ class CampaignRulesConfig:
 
     enabled_rules: frozenset[CampaignRuleId] = DEFAULT_NUZLOCKE_RULES
     pokeball_policy: PokeballRestockPolicy = field(default_factory=PokeballRestockPolicy)
+    recovery_supply_policy: RecoverySupplyPolicy = field(default_factory=RecoverySupplyPolicy)
 
     def __post_init__(self) -> None:
         """Keep direct callers subject to the same policy validation as config files."""
 
         if not isinstance(self.pokeball_policy, PokeballRestockPolicy):
             raise ValueError("pokeball_policy must be a PokeballRestockPolicy")
+        if not isinstance(self.recovery_supply_policy, RecoverySupplyPolicy):
+            raise ValueError("recovery_supply_policy must be a RecoverySupplyPolicy")
 
     @classmethod
     def from_names(
@@ -61,12 +64,24 @@ class CampaignRulesConfig:
         *,
         pokeball_lower_threshold: int = 5,
         pokeball_upper_target: int = 10,
+        antidote_lower_threshold: int = 2,
+        antidote_target: int = 4,
+        potion_lower_threshold: int = 2,
+        potion_target: int = 5,
+        recovery_cash_floor: int = 200,
     ) -> "CampaignRulesConfig":
         """Build configuration from serialized rule identifier names."""
 
         return cls(
             frozenset(CampaignRuleId(name) for name in names),
             PokeballRestockPolicy(pokeball_lower_threshold, pokeball_upper_target),
+            RecoverySupplyPolicy(
+                antidote_lower_threshold,
+                antidote_target,
+                potion_lower_threshold,
+                potion_target,
+                recovery_cash_floor,
+            ),
         )
 
     @classmethod

@@ -17,6 +17,7 @@ from modules.agent_control import (
     select_action,
 )
 from modules.interaction_state import InteractionPhase, InteractionType
+from modules.memory import GameState, get_game_state
 from modules.goals import (
     ActivateTrigger,
     EncounterMode,
@@ -32,6 +33,7 @@ from modules.goals import (
 from modules.map_data import MapFRLG, PokemonCenter
 from modules.map import get_map_all_tiles, get_map_data, get_map_metadata
 from modules.modes.util.items import use_item_from_bag
+from modules.menuing import scroll_to_party_menu_index
 from modules.modes.util.map import find_closest_pokemon_center, pokemon_center_candidates
 from modules.map_path import PathFindingError, Direction
 from modules.player import get_player_location
@@ -67,8 +69,10 @@ from .emerald_healing_catalog import (
 from .resource_policy import (
     HealingResource,
     PartyResource,
+    RecoveryKind,
     ResourceObservationStatus,
     ResourceSnapshot,
+    classify_recovery_item,
 )
 from .resource_policy import ResourceDecision, RouteRecovery, assess_campaign_resources
 
@@ -384,13 +388,29 @@ def observe_resource_snapshot() -> ResourceSnapshot:
         )
     for slot in bag_slots:
         if slot.item.battle_use.value == "healing" or slot.item.field_use.value == "healing":
-            bag_items.append(HealingResource(slot.item.name, slot.quantity, slot.item.parameter, "bag"))
+            bag_items.append(
+                HealingResource(
+                    slot.item.name,
+                    slot.quantity,
+                    slot.item.parameter,
+                    "bag",
+                    kind=classify_recovery_item(slot.item.name, slot.item.parameter),
+                )
+            )
     pc_items = []
     try:
         storage_items = storage.items
         for slot in storage_items:
             if slot.item.battle_use.value == "healing" or slot.item.field_use.value == "healing":
-                pc_items.append(HealingResource(slot.item.name, slot.quantity, slot.item.parameter, "pc"))
+                pc_items.append(
+                    HealingResource(
+                        slot.item.name,
+                        slot.quantity,
+                        slot.item.parameter,
+                        "pc",
+                        kind=classify_recovery_item(slot.item.name, slot.item.parameter),
+                    )
+                )
     except InvalidItemIndexError as error:
         result = ResourceSnapshot(
             party_resources,
@@ -2124,28 +2144,133 @@ def _wait_for_healing_interior(source) -> Iterator[object]:
         yield
 
 
+def _select_bag_recovery_item(snapshot: ResourceSnapshot) -> HealingResource | None:
+    """Select a status cure before an HP medicine, with universal cures last."""
+
+    for member in snapshot.status_party:
+        candidates = [
+            item
+            for item in snapshot.bag_status_items
+            if item.cures(member.status)
+        ]
+        if candidates:
+            return min(candidates, key=lambda item: (item.kind is RecoveryKind.UNIVERSAL_STATUS, item.name))
+    return max(snapshot.bag_hp_items, key=lambda item: item.heal_amount, default=None)
+
+
+def _recovery_target_index(item: HealingResource):
+    """Choose a live party slot for a field medicine."""
+
+    party = get_party()
+    if item.kind is not RecoveryKind.HP:
+        for pokemon in party:
+            if pokemon.current_hp > 0 and item.cures(pokemon.status_condition.value):
+                return pokemon.index
+    candidates = [pokemon for pokemon in party if not pokemon.is_egg and pokemon.current_hp > 0]
+    if not candidates:
+        raise RuntimeError("No living party member can receive recovery item")
+    return min(candidates, key=lambda pokemon: pokemon.current_hp / max(1, pokemon.total_hp)).index
+
+
+def _use_field_recovery_item(item: HealingResource) -> Iterator[object]:
+    """Use one medicine and drive the ROM's target-party menu to completion."""
+
+    target_index = _recovery_target_index(item)
+    before = observe_resource_snapshot()
+    before_quantity = next(
+        (candidate.quantity for candidate in before.bag_healing_items if candidate.name == item.name),
+        0,
+    )
+    before_target = before.party[target_index] if target_index < len(before.party) else None
+    yield from use_item_from_bag(get_item_by_name(item.name), wait_for_start_menu_to_reappear=False)
+
+    # The item context menu ends before Emerald opens the party target menu.
+    # Wait for that authoritative state instead of pressing a fixed sequence of
+    # buttons across both menu transitions.
+    for _ in range(180):
+        if get_game_state() is GameState.PARTY_MENU:
+            break
+        yield
+    if get_game_state() is not GameState.PARTY_MENU:
+        raise RuntimeError(f"Recovery item {item.name!r} did not open the party menu")
+    yield from scroll_to_party_menu_index(target_index)
+    context.emulator.press_button("A")
+    yield
+    while get_game_state() is GameState.PARTY_MENU:
+        context.emulator.press_button("A")
+        yield
+
+    # The item use returns to the bag. Close that menu through the normal ROM
+    # boundary before handing control back to campaign navigation.
+    for _ in range(180):
+        state = get_game_state()
+        if state is GameState.OVERWORLD:
+            break
+        if state is GameState.BAG_MENU:
+            context.emulator.press_button("B")
+        yield
+    if get_game_state() is not GameState.OVERWORLD:
+        raise RuntimeError(f"Recovery item {item.name!r} did not return to the overworld")
+
+    # Verify consumption and an actual party improvement. A stale cached frame
+    # is tolerated briefly, but a no-op medicine is never silently accepted.
+    for _ in range(12):
+        after = observe_resource_snapshot()
+        after_quantity = next(
+            (candidate.quantity for candidate in after.bag_healing_items if candidate.name == item.name),
+            0,
+        )
+        after_target = after.party[target_index] if target_index < len(after.party) else None
+        improved = (
+            before_target is not None
+            and after_target is not None
+            and (
+                after_target.current_hp > before_target.current_hp
+                or (after_target.status or "none") != (before_target.status or "none")
+            )
+        )
+        if after_quantity < before_quantity and improved:
+            return
+        yield
+    raise RuntimeError(f"Recovery item {item.name!r} was not observed as consumed")
+
+
 def use_best_bag_healing_item() -> Iterator[object]:
-    """Use the strongest available healing item from the bag."""
+    """Use the most urgent useful medicine from the bag."""
 
     snapshot = observe_resource_snapshot()
-    usable = [item for item in snapshot.bag_healing_items if item.quantity > 0]
-    if not usable:
-        raise RuntimeError("No healing item is available in the bag")
-    item = max(usable, key=lambda candidate: candidate.heal_amount)
-    yield from use_item_from_bag(get_item_by_name(item.name))
+    item = _select_bag_recovery_item(snapshot)
+    if item is None:
+        raise RuntimeError("No usable recovery item is available in the bag")
+    yield from _use_field_recovery_item(item)
 
 
 def withdraw_best_pc_healing_item() -> Iterator[object]:
     """Withdraw the most useful stored recovery item at an already-open PC."""
     snapshot = observe_resource_snapshot()
-    usable = [item for item in snapshot.pc_healing_items if item.quantity > 0]
-    if not usable:
+    item = next(
+        (
+            candidate
+            for member in snapshot.status_party
+            for candidate in snapshot.pc_status_items
+            if candidate.cures(member.status)
+        ),
+        None,
+    )
+    if item is None:
+        item = max(snapshot.pc_hp_items, key=lambda candidate: candidate.heal_amount, default=None)
+    if item is None:
         raise RuntimeError("No healing item is available in PC storage")
-    item = max(usable, key=lambda candidate: candidate.heal_amount)
     yield from interact_with_pc([PCAction.withdraw_item(get_item_by_name(item.name), 1)])
 
 
-def execute_campaign_recovery() -> Iterator[object]:
+class RunLostError(RuntimeError):
+    """The observed party has no autonomous legal continuation."""
+
+    run_lost = True
+
+
+def execute_campaign_recovery(planned_stop=None) -> Iterator[object]:
     """Execute the route observer's selected recovery source.
 
     Recovery selection and execution must agree on both destination and
@@ -2154,6 +2279,47 @@ def execute_campaign_recovery() -> Iterator[object]:
     separate hard-coded nurse dialogue path and cannot safely cross the same
     observed map/warp boundaries as planned recovery.
     """
+    # The live campaign passes its planner-owned stop. Item use is deliberately
+    # considered before travelling: this is what makes a bag Antidote useful
+    # against overworld poison even when a Center is nearby. The no-argument
+    # compatibility entry point retains its historical route-first behavior.
+    if planned_stop is not None:
+        snapshot = observe_resource_snapshot()
+        if snapshot.pc_healing_items and get_game_state() is GameState.POKE_STORAGE:
+            # Item PC access is already safe and authoritative at this
+            # boundary. Withdraw first; the next recovery observation will
+            # consume the medicine from the bag before any Mart detour.
+            yield from withdraw_best_pc_healing_item()
+            return
+        item = _select_bag_recovery_item(snapshot)
+        status_item = next((candidate for candidate in snapshot.bag_status_items if any(candidate.cures(member.status) for member in snapshot.status_party)), None)
+        route = getattr(planned_stop, "route", None)
+        route_distance = getattr(getattr(route, "metrics", None), "total_route_cost", None)
+        poison_bridge = (
+            item is not None
+            and snapshot.has_poisoned_party
+            and route_distance is not None
+            and min(member.current_hp + item.heal_amount for member in snapshot.poisoned_party)
+            > max(1, route_distance // 4) + 1
+        )
+        if status_item is not None or (item is not None and (getattr(planned_stop, "route", None) is None or poison_bridge)):
+            yield from _use_field_recovery_item(status_item or item)
+            return
+        selected_destination = getattr(planned_stop, "destination", None)
+        selected_source = (
+            emerald_healing_source_for_destination(selected_destination) if selected_destination is not None else None
+        )
+        if selected_destination is not None and selected_source is not None and getattr(planned_stop, "route", None) is not None:
+            yield from execute_planned_recovery(
+                selected_destination,
+                selected_source,
+                planned_route=getattr(planned_stop, "route", None),
+            )
+            return
+        if not snapshot.usable_party or snapshot.has_poisoned_party:
+            raise RunLostError("no recovery item or executable healing route remains")
+        raise RuntimeError("no usable campaign recovery capability is available")
+
     route = observe_route_recovery()
     diagnostic_print(
         lambda: (

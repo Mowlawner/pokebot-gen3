@@ -3,7 +3,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from modules.goals import ActivateTrigger, NavigationGoal, ReachLocation, ReachWarp, TrainerMode
-from modules.nuzlocke.resource_policy import PartyResource, ResourceDecision, ResourceSnapshot, RouteRecovery
+from modules.nuzlocke.resource_policy import (
+    HealingResource,
+    PartyResource,
+    ResourceDecision,
+    ResourceSnapshot,
+    RouteRecovery,
+)
 from modules.nuzlocke.resource_runtime import (
     CampaignCapability,
     HealingSource,
@@ -118,6 +124,84 @@ class CampaignCapabilityTests(unittest.TestCase):
             emulator.press_direction.assert_called_once_with("Right", run=False, fresh=True)
             with self.assertRaises(StopIteration):
                 next(execution)
+
+    def test_field_status_item_targets_the_party_member_with_that_status(self):
+        from modules.nuzlocke import resource_runtime as runtime
+
+        item = HealingResource("Antidote", 1, 0)
+        before = ResourceSnapshot(
+            party=(
+                PartyResource(12, 20, "poisoned"),
+                PartyResource(8, 20, "none"),
+            ),
+            bag_healing_items=(item,),
+        )
+        after = ResourceSnapshot(
+            party=(
+                PartyResource(12, 20, "none"),
+                PartyResource(8, 20, "none"),
+            ),
+            bag_healing_items=(HealingResource("Antidote", 0, 0),),
+        )
+        party = (
+            SimpleNamespace(
+                index=0,
+                current_hp=12,
+                total_hp=20,
+                status_condition=SimpleNamespace(value="poisoned"),
+                is_egg=False,
+            ),
+            SimpleNamespace(
+                index=1,
+                current_hp=8,
+                total_hp=20,
+                status_condition=SimpleNamespace(value="none"),
+                is_egg=False,
+            ),
+        )
+        emulator = SimpleNamespace(press_button=Mock())
+        with (
+            patch.object(runtime, "get_party", return_value=party),
+            patch.object(runtime, "observe_resource_snapshot", side_effect=(before, after)),
+            patch.object(runtime, "get_item_by_name", return_value=item),
+            patch.object(runtime, "use_item_from_bag", return_value=iter(())) as use_item,
+            patch.object(runtime, "scroll_to_party_menu_index", return_value=iter(())) as scroll,
+            patch.object(
+                runtime,
+                "get_game_state",
+                side_effect=(
+                    GameState.PARTY_MENU,
+                    GameState.PARTY_MENU,
+                    GameState.OVERWORLD,
+                    GameState.OVERWORLD,
+                    GameState.OVERWORLD,
+                ),
+            ),
+            patch.object(runtime, "context", SimpleNamespace(emulator=emulator)),
+        ):
+            list(runtime._use_field_recovery_item(item))
+
+        use_item.assert_called_once_with(item, wait_for_start_menu_to_reappear=False)
+        scroll.assert_called_once_with(0)
+
+    def test_pc_withdrawal_prefers_a_status_cure_for_the_current_party(self):
+        from modules.nuzlocke import resource_runtime as runtime
+
+        item = HealingResource("Antidote", 2, 0, location="pc")
+        snapshot = ResourceSnapshot(
+            party=(PartyResource(12, 20, "poisoned"),),
+            pc_healing_items=(item, HealingResource("Potion", 2, 20, location="pc")),
+        )
+        with (
+            patch.object(runtime, "observe_resource_snapshot", return_value=snapshot),
+            patch.object(runtime, "get_item_by_name", return_value=item),
+            patch.object(runtime, "interact_with_pc", return_value=iter(("withdraw",))) as interact,
+        ):
+            self.assertEqual(list(runtime.withdraw_best_pc_healing_item()), ["withdraw"])
+
+        action = interact.call_args.args[0][0]
+        self.assertEqual(action.item, item)
+        self.assertEqual(action.quantity, 1)
 
     def test_preparation_center_loop_uses_observation_driven_recovery_handler(self):
         recovery_calls = []

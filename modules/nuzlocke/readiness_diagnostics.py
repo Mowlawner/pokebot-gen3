@@ -124,6 +124,7 @@ class ProgressionReadinessDiagnostic:
     # already known. This is transient and must not permanently strand the
     # campaign in UNKNOWN / OPPORTUNISTIC_ROUTE_UNAVAILABLE.
     route_analysis_timed_out: bool = False
+    resource_snapshot: ResourceSnapshot | None = None
 
     @property
     def party_count(self) -> int | None:
@@ -685,6 +686,7 @@ def build_progression_readiness_diagnostic(
         targetless,
         route_analysis_pending,
         route_analysis_timed_out,
+        resource_snapshot,
     )
 
 

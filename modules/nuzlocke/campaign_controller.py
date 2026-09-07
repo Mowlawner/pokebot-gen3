@@ -54,6 +54,7 @@ class CampaignControllerStatus(Enum):
     UNKNOWN = "unknown"
     COMPLETE = "complete"
     FAILED = "failed"
+    RUN_LOST = "run_lost"
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +175,7 @@ def _retention_order_allows(active_id: str, selected_id: str) -> bool:
     # A resource shortfall is a genuine interruption, not a transient story
     # regression. Do not retain an already-mounted route objective over the
     # dynamically-created restock task.
-    if selected_id == "restock_pokeballs":
+    if selected_id in {"restock_pokeballs", "restock_recovery_items"}:
         return False
     ranks = _canonical_campaign_objective_ranks()
     active_rank = ranks.get(active_id)
@@ -422,6 +423,9 @@ class CampaignController:
         self.current_objective_id = None
         self.current_tactical_goal = None
         self._tactical_loop = None
+        self._execution_phase = "TERMINAL"
+        if status is CampaignControllerStatus.RUN_LOST:
+            self._recovery_status = "RUN_LOST"
         self._pending_readiness_objective_id = None
         self._readiness_recheck_pending = False
         self.last_execution = execution
@@ -973,6 +977,43 @@ class CampaignController:
             CampaignExecutionStatus.UNSUPPORTED: CampaignControllerStatus.FAILED,
         }
         if execution.status in terminal_status:
+            # Objective selection can legitimately be unavailable for one
+            # observation immediately after a battle or script boundary.  In
+            # that case the selection's objective is still useful diagnostic
+            # context, but it must not strand the controller in TERMINAL:
+            # ``CampaignProgressionMode`` remains mounted so the next frame
+            # can observe the ROM again and resolve the frontier.
+            if selection.status in {ObjectiveStatus.UNKNOWN, ObjectiveStatus.BLOCKED}:
+                self.current_objective_id = (
+                    selection.objective.objective_id if selection.objective is not None else None
+                )
+                self.current_tactical_goal = None
+                self._tactical_loop = None
+                self._tactical_loop_objective_id = None
+                self._execution_phase = "CAMPAIGN"
+                self.status = terminal_status[execution.status]
+                self.transition_reason = execution.reason
+                self._refresh_required = True
+                self._refresh_required_reason = "campaign_selection_retry"
+                self._deferred_handoff_requires_refresh = False
+                self._publish_status_for_execution(
+                    selection.objective,
+                    None,
+                    "Campaign observation unavailable; retrying autonomously"
+                    if selection.status is ObjectiveStatus.UNKNOWN
+                    else "Campaign prerequisite unavailable; retrying autonomously",
+                )
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_SELECTION_RETRY: "
+                        f"controller_id={id(self)!r} frame={getattr(context, 'frame', None)!r} "
+                        f"objective={getattr(selection.objective, 'objective_id', None)!r} "
+                        f"status={selection.status.value!r} reason={selection.reason!r}"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_SELECTION_RETRY",
+                )
+                return self.state
             self._terminal(execution, terminal_status[execution.status])
             diagnostic_print(
                 lambda: f"CAMPAIGN_REFRESH_RETURN: frame={getattr(context, 'frame', None)!r} branch='terminal_execution' status={self.status.value!r} reason={self.transition_reason!r}",
@@ -1369,19 +1410,16 @@ class CampaignController:
                             "OVERWORLD_UNAVAILABLE (overworld observation unavailable)"
                         )
                         return self.state
-                    # A recovery decision without a concrete planner-owned
-                    # stop is not permission to reopen the healing catalog.
-                    # Block explicitly so the caller can improve route or
-                    # resource observations and re-enter the campaign.
-                    self.status = CampaignControllerStatus.BLOCKED
-                    self._execution_phase = "BLOCKED"
-                    self._recovery_status = "UNAVAILABLE"
-                    context.campaign_status = CampaignStatus(
-                        None,
-                        None,
-                        "Campaign blocked: no executable recovery route",
-                    )
-                    self.transition_reason = "campaign planner produced no executable recovery stop"
+                    # A missing stop is a retryable autonomous safety
+                    # boundary. The controller must keep ownership while a
+                    # fresh resource/route observation is obtained.
+                    self.status = CampaignControllerStatus.UNKNOWN
+                    self._execution_phase = "CAMPAIGN"
+                    self._recovery_status = "RETRYABLE_UNAVAILABLE"
+                    self._refresh_required = True
+                    self._refresh_required_reason = "recovery_stop_unavailable"
+                    context.campaign_status = recovery_status(None, "Recovery route unavailable; retrying autonomously")
+                    self.transition_reason = "campaign planner produced no executable recovery stop; retrying"
                     diagnostic_print(
                         lambda: (
                             "CAMPAIGN_RECOVERY_PLAN_UNAVAILABLE: "
@@ -1419,15 +1457,24 @@ class CampaignController:
                     )
                 except Exception as error:
                     self._tactical_loop = None
-                    self.status = CampaignControllerStatus.BLOCKED
-                    self._execution_phase = "BLOCKED"
-                    self._recovery_status = "UNAVAILABLE"
-                    context.campaign_status = CampaignStatus(
-                        None,
-                        None,
-                        f"Recovery unavailable: {type(error).__name__}",
-                    )
-                    self.transition_reason = f"recovery unavailable: {error}"
+                    if getattr(error, "run_lost", False):
+                        self._terminal(
+                            CampaignExecutionResult(
+                                execution.objective,
+                                CampaignExecutionStatus.FAILED,
+                                f"run lost during recovery: {error}",
+                                execution.execution_id,
+                            ),
+                            CampaignControllerStatus.RUN_LOST,
+                        )
+                        return self.state
+                    self.status = CampaignControllerStatus.UNKNOWN
+                    self._execution_phase = "CAMPAIGN"
+                    self._recovery_status = "RETRYABLE_UNAVAILABLE"
+                    self._refresh_required = True
+                    self._refresh_required_reason = "recovery_factory_exception"
+                    context.campaign_status = recovery_status(None, "Recovery unavailable; retrying autonomously")
+                    self.transition_reason = f"recovery unavailable; retrying: {error}"
                     diagnostic_print(
                         lambda: f"CAMPAIGN_REFRESH_RETURN: frame={getattr(context, 'frame', None)!r} branch='recovery_unavailable' status={self.status.value!r} reason={self.transition_reason!r}",
                         trace=True,
@@ -1610,6 +1657,7 @@ class CampaignController:
         if self._execution_phase == "BLOCKED" or self.status in {
             CampaignControllerStatus.COMPLETE,
             CampaignControllerStatus.FAILED,
+            CampaignControllerStatus.RUN_LOST,
         }:
             return self.state
         if self._execution_phase == "RECOVERY":
@@ -1661,15 +1709,24 @@ class CampaignController:
                 if isinstance(error, KeyError) and self._retry_recovery_after_keyerror(error):
                     return self.state
                 self._tactical_loop = None
-                self._execution_phase = "BLOCKED"
-                self._recovery_status = "FAILED"
-                self.status = CampaignControllerStatus.BLOCKED
-                context.campaign_status = CampaignStatus(
-                    None,
-                    None,
-                    f"Recovery failed: {type(error).__name__}",
-                )
-                self.transition_reason = f"recovery failed: {error}"
+                if getattr(error, "run_lost", False):
+                    self._terminal(
+                        CampaignExecutionResult(
+                            self.last_selection.objective if self.last_selection else None,
+                            CampaignExecutionStatus.FAILED,
+                            f"run lost during recovery: {error}",
+                            self.last_execution.execution_id if self.last_execution else None,
+                        ),
+                        CampaignControllerStatus.RUN_LOST,
+                    )
+                else:
+                    self._execution_phase = "CAMPAIGN"
+                    self._recovery_status = "RETRYABLE_FAILED"
+                    self._refresh_required = True
+                    self._refresh_required_reason = "recovery_exception"
+                    self.status = CampaignControllerStatus.UNKNOWN
+                    context.campaign_status = recovery_status(None, "Recovery failed; retrying autonomously")
+                    self.transition_reason = f"recovery failed; retrying: {error}"
             return self.state
         try:
             if self._refresh_required or self._readiness_recheck_pending:
@@ -1701,7 +1758,11 @@ class CampaignController:
                         and self.transition_reason.startswith("readiness deferred:")
                         and self._deferred_handoff_requires_refresh
                     )
-                    if not deferred_handoff_without_loop:
+                    selection_retry_pending = (
+                        self.last_selection is not None
+                        and self.last_selection.status in {ObjectiveStatus.UNKNOWN, ObjectiveStatus.BLOCKED}
+                    )
+                    if not deferred_handoff_without_loop and not selection_retry_pending:
                         self._refresh_required = False
                         self._refresh_required_reason = None
                 diagnostic_print(
@@ -1791,15 +1852,24 @@ class CampaignController:
                 if isinstance(error, KeyError) and self._retry_recovery_after_keyerror(error):
                     return self.state
                 self._tactical_loop = None
-                self._execution_phase = "BLOCKED"
-                self._recovery_status = "FAILED"
-                self.status = CampaignControllerStatus.BLOCKED
-                context.campaign_status = CampaignStatus(
-                    None,
-                    None,
-                    f"Recovery failed: {type(error).__name__}",
-                )
-                self.transition_reason = f"recovery failed: {error}"
+                if getattr(error, "run_lost", False):
+                    self._terminal(
+                        CampaignExecutionResult(
+                            self.last_selection.objective if self.last_selection else None,
+                            CampaignExecutionStatus.FAILED,
+                            f"run lost during recovery: {error}",
+                            self.last_execution.execution_id if self.last_execution else None,
+                        ),
+                        CampaignControllerStatus.RUN_LOST,
+                    )
+                else:
+                    self._execution_phase = "CAMPAIGN"
+                    self._recovery_status = "RETRYABLE_FAILED"
+                    self._refresh_required = True
+                    self._refresh_required_reason = "recovery_exception"
+                    self.status = CampaignControllerStatus.UNKNOWN
+                    context.campaign_status = recovery_status(None, "Recovery failed; retrying autonomously")
+                    self.transition_reason = f"recovery failed; retrying: {error}"
                 diagnostic_print(
                     lambda: (
                         "CAMPAIGN_RECOVERY_EXCEPTION: "

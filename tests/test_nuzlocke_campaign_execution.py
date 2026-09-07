@@ -4,7 +4,6 @@ from unittest.mock import patch
 
 from modules.goals import (
     ActivateTrigger,
-    EARLY_POKEBALL_TRIGGER_ID,
     EngageTrainer,
     GoalConstraints,
     NavigationGoal,
@@ -24,6 +23,7 @@ from modules.nuzlocke.campaign_objectives import (
     ObjectiveStatus,
     initial_emerald_campaign,
     restock_pokeballs_objective,
+    restock_recovery_items_objective,
 )
 from modules.nuzlocke.campaign_state import Fact
 
@@ -43,23 +43,20 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
         self.assertEqual(result.tactical_goal, ActivateTrigger("introductory_rival"))
         self.assertEqual(result.capability.tactical_goal, ActivateTrigger("introductory_rival"))
 
-    def test_pokeball_objective_mounts_observation_capability(self):
-        result = adapt_campaign_execution(self.ready(self.objectives["receive_pokeballs"]))
+    def test_birch_handoff_objective_mounts_observation_capability(self):
+        result = adapt_campaign_execution(self.ready(self.objectives["receive_pokedex"]))
         self.assertEqual(result.status, CampaignExecutionStatus.READY)
-        self.assertEqual(result.execution_id, "receive_pokeballs")
+        self.assertEqual(result.execution_id, "receive_pokedex")
         self.assertIsNone(result.tactical_goal)
         self.assertIsNotNone(result.capability)
 
-    def test_pokeball_objective_uses_birch_interaction_target(self):
+    def test_birch_handoff_objective_targets_birch_lab(self):
         from modules.nuzlocke.emerald_capabilities import _semantic_target_for_objective
 
-        target = _semantic_target_for_objective("receive_pokeballs")
+        target = _semantic_target_for_objective("receive_pokedex")
         self.assertEqual(
             target,
-            SemanticTarget.interaction(
-                MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value,
-                EARLY_POKEBALL_TRIGGER_ID,
-            ),
+            SemanticTarget.map(MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value),
         )
 
     def test_pokeball_restock_translates_to_mart_capability(self):
@@ -67,6 +64,13 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
         result = adapt_campaign_execution(self.ready(objective))
         self.assertEqual(result.status, CampaignExecutionStatus.READY)
         self.assertEqual(result.execution_id, "restock_pokeballs")
+        self.assertIsNotNone(result.capability)
+
+    def test_recovery_restock_translates_to_mart_capability(self):
+        objective = restock_recovery_items_objective()
+        result = adapt_campaign_execution(self.ready(objective))
+        self.assertEqual(result.status, CampaignExecutionStatus.READY)
+        self.assertEqual(result.execution_id, "restock_recovery_items")
         self.assertIsNotNone(result.capability)
 
     def test_opening_objectives_mount_capabilities(self):
@@ -90,7 +94,6 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
             "prepare_roxanne",
             "defeat_roxanne",
             "complete_intro_rival",
-            "receive_pokeballs",
         }
         for objective_id, objective in self.objectives.items():
             if objective_id in supported:

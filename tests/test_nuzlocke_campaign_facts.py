@@ -292,7 +292,6 @@ class CampaignFactsTests(unittest.TestCase):
                 "obtain_starter",
                 "complete_intro_rival",
                 "receive_pokedex",
-                "receive_pokeballs",
                 "reach_petalburg",
                 "complete_petalburg_wally",
                 "complete_petalburg_woods",

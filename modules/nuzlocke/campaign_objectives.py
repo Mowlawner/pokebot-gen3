@@ -19,7 +19,6 @@ from modules.goals import (
     ReachLocation,
     ReachWarp,
     SemanticTarget,
-    early_pokeball_goal,
     introductory_rival_goal,
 )
 from modules.map_data import MapRSE
@@ -27,7 +26,7 @@ from modules.console import diagnostic_print
 from modules.context import context
 
 from .campaign_state import CampaignState, Fact, FactStatus, RunStatus
-from .resource_policy import EncounterPolicy, ReadinessImportance, ResourceObjective
+from .resource_policy import EncounterPolicy, ReadinessImportance, RecoverySupplyPolicy, ResourceObjective
 from modules.world_navigation import WorldMapGraph, WorldNavigationError, get_world_map_graph
 from .encounter_catalog import (
     EncounterOpportunity,
@@ -385,6 +384,30 @@ def campaign_fact(name: str) -> CampaignPredicate:
     )
 
 
+def birch_lab_handoff_complete() -> CampaignPredicate:
+    """Return the completion boundary for Birch's combined lab handoff."""
+
+    def evaluate(state: CampaignState) -> Fact[bool]:
+        # Emerald sets the Pokédex flag before the same ROM-owned dialogue
+        # grants the initial Poké Balls. Keep both facts available to the
+        # planner, but let one capability own the complete script.
+        pokedex = state.campaign_facts.pokedex_received
+        pokeballs = state.campaign_facts.pokeballs_received
+        if pokedex.is_known and pokeballs.is_known:
+            return Fact.known(bool(pokedex.value and pokeballs.value))
+        if (pokedex.is_known and pokedex.value is False) or (
+            pokeballs.is_known and pokeballs.value is False
+        ):
+            return Fact.known(False)
+        return Fact(None, pokedex.status if not pokedex.is_known else pokeballs.status)
+
+    return CampaignPredicate(
+        "campaign_fact:birch_lab_handoff_complete",
+        "Birch's Pokédex and Poké Ball handoff is complete",
+        evaluate,
+    )
+
+
 def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
     """Return Emerald's ordered, declarative early campaign slice."""
 
@@ -452,29 +475,24 @@ def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
         ),
         CampaignObjective(
             objective_id="receive_pokedex",
-            description="Receive the Pokédex",
+            description="Receive the Pokédex and initial Poké Balls",
             prerequisites=(campaign_fact("intro_rival_battle_complete"),),
-            completion=campaign_fact("pokedex_received"),
+            # The Pokédex flag becomes true before Birch finishes the same
+            # script by handing over the initial Poké Balls. Keep this one
+            # capability mounted until the final lab state.
+            completion=birch_lab_handoff_complete(),
             execution_id="receive_pokedex",
-            destination=MapRSE.LITTLEROOT_TOWN.value,
-        ),
-        CampaignObjective(
-            objective_id="receive_pokeballs",
-            description="Receive Poké Balls",
-            prerequisites=(campaign_fact("pokedex_received"),),
-            completion=campaign_fact("pokeballs_ready"),
-            execution_id="receive_pokeballs",
-            tactical_target=early_pokeball_goal(),
             destination=MapRSE.LITTLEROOT_TOWN.value,
         ),
         CampaignObjective(
             objective_id="reach_petalburg",
             description="Reach Petalburg City after receiving the Pokédex",
-            # The Pokédex opens the ROM route west from Oldale.  Poké Balls
-            # are a campaign safety prerequisite so the first encounter
+            # The combined Birch handoff opens the ROM route west from Oldale.
+            # Poké Balls remain a safety prerequisite so the first encounter
             # opportunity is not intentionally passed while the party cannot
-            # catch it; they are not being misrepresented as a ROM map gate.
-            prerequisites=(campaign_fact("pokedex_received"), campaign_fact("pokeballs_ready")),
+            # catch it; they are not being misrepresented as a separate ROM
+            # interaction boundary.
+            prerequisites=(birch_lab_handoff_complete(),),
             completion=campaign_fact("visited_petalburg"),
             execution_id="reach_petalburg",
             destination=MapRSE.PETALBURG_CITY.value,
@@ -599,6 +617,66 @@ def restock_pokeballs_objective() -> CampaignObjective:
     )
 
 
+def recovery_supply_policy() -> RecoverySupplyPolicy:
+    """Return the configured medicine reserve policy."""
+
+    runtime = getattr(context, "nuzlocke_runtime", None)
+    configured = getattr(getattr(runtime, "rule_config", None), "recovery_supply_policy", None)
+    return configured if isinstance(configured, RecoverySupplyPolicy) else RecoverySupplyPolicy()
+
+
+def _observed_recovery_quantities(state: CampaignState) -> tuple[int, int] | None:
+    if not state.inventory.is_known or state.inventory.value is None:
+        return None
+    quantities = {item.name.casefold(): item.quantity for item in state.inventory.value.items}
+    return quantities.get("antidote", 0), quantities.get("potion", 0)
+
+
+def _recovery_restock_is_required(state: CampaignState) -> bool:
+    pokedex = state.campaign_facts.pokedex_received
+    pokeballs_received = state.campaign_facts.pokeballs_received
+    counts = _observed_recovery_quantities(state)
+    area = state.canonical_area.value if state.canonical_area.is_known else None
+    # The opening Littleroot handoff has no purchase route and its empty item
+    # pocket is not evidence that a post-route reserve is overdue. Begin the
+    # mutable medicine policy once the player has left the opening town.
+    if (
+        area == "LITTLEROOT_TOWN"
+        or not pokedex.is_known
+        or pokedex.value is not True
+        or not pokeballs_received.is_known
+        or pokeballs_received.value is not True
+        or counts is None
+    ):
+        return False
+    return recovery_supply_policy().needs_restock(*counts)
+
+
+def recovery_supply_sufficient() -> CampaignPredicate:
+    """Return the mutable inventory fact used by the medicine interrupt."""
+
+    def evaluate(state: CampaignState) -> Fact[bool]:
+        counts = _observed_recovery_quantities(state)
+        if counts is None:
+            return Fact(None, state.inventory.status)
+        return Fact.known(not recovery_supply_policy().needs_restock(*counts))
+
+    return CampaignPredicate("recovery_items_sufficient", "Antidote and Potion reserves are sufficient", evaluate)
+
+
+def restock_recovery_items_objective() -> CampaignObjective:
+    """Return the dynamic medicine restock task."""
+
+    return CampaignObjective(
+        "restock_recovery_items",
+        "Restock Antidotes and Potions before continuing campaign travel",
+        (birch_lab_handoff_complete(),),
+        recovery_supply_sufficient(),
+        execution_id="restock_recovery_items",
+        priority=11,
+    )
+
+
 def _observed_pokeball_count(state: CampaignState) -> int | None:
     """Return the observed ordinary Poké Ball count for diagnostics.
 
@@ -635,8 +713,8 @@ def _restock_is_required(state: CampaignState) -> bool:
         return False
     # A nonzero live reserve proves the opening handoff has already happened,
     # even if its durable fact is unavailable.  For zero balls, retain the
-    # receipt guard so this dynamic task cannot pre-empt receive_pokeballs at
-    # the start of a run.
+    # Receipt guard so this dynamic task cannot pre-empt Birch's combined
+    # Pokédex/Poké Ball handoff at the start of a run.
     return received.status is FactStatus.KNOWN and received.value is True or count > 0
 
 
@@ -949,6 +1027,13 @@ def available_campaign_tasks(
     # mutable resource and a low-ball observation should create a task only
     # when it is actually needed.
     if tasks is None:
+        if _recovery_restock_is_required(state):
+            recovery_restock = restock_recovery_items_objective()
+            insertion = next(
+                (index for index, candidate in enumerate(candidates) if candidate.objective_id == "reach_petalburg"),
+                len(candidates),
+            )
+            candidates = candidates[:insertion] + (recovery_restock,) + candidates[insertion:]
         if _restock_is_required(state):
             restock = restock_pokeballs_objective()
             insertion = next(
@@ -1122,9 +1207,17 @@ def _select_available_campaign_tasks(
     # immediately when it is available, even if an encounter or story task
     # was already mounted and would otherwise win the normal required-task
     # ordering.
-    restock = next((task for task in required if task.objective_id == "restock_pokeballs"), None)
+    restock = next(
+        (task for task in required if task.objective_id in {"restock_pokeballs", "restock_recovery_items"}),
+        None,
+    )
     if restock is not None:
-        return ObjectiveSelection(restock, ObjectiveStatus.READY, "selected required Poké Ball restock task")
+        reason = (
+            "selected required recovery-item restock task"
+            if restock.objective_id == "restock_recovery_items"
+            else "selected required Poké Ball restock task"
+        )
+        return ObjectiveSelection(restock, ObjectiveStatus.READY, reason)
 
     if strategic_optional and required:
         selected_optional = max(strategic_optional, key=lambda item: (strategic_score(item), item.objective_id))
@@ -1564,6 +1657,22 @@ def plan_campaign(
     # well as through the available-task compatibility selector. Without this
     # early return the recursive story frontier can keep the bot travelling
     # while encounter tasks are correctly suppressed by the low reserve.
+    if objectives is None and _recovery_restock_is_required(state):
+        restock = restock_recovery_items_objective()
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_RECOVERY_RESTOCK_DECISION: "
+                f"selected=True objective={restock.objective_id!r} "
+                f"reason='medicine reserve below lower threshold'"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_RECOVERY_RESTOCK_DECISION",
+        )
+        return ObjectiveSelection(
+            restock,
+            ObjectiveStatus.READY,
+            "selected required recovery-item restock task",
+        )
     if objectives is None and _restock_is_required(state):
         restock = restock_pokeballs_objective()
         diagnostic_print(

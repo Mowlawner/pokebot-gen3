@@ -95,6 +95,11 @@ def main_loop() -> None:
             context.config.nuzlocke_rules.enabled_rules,
             pokeball_lower_threshold=context.config.nuzlocke_rules.pokeball_lower_threshold,
             pokeball_upper_target=context.config.nuzlocke_rules.pokeball_upper_target,
+            antidote_lower_threshold=context.config.nuzlocke_rules.antidote_lower_threshold,
+            antidote_target=context.config.nuzlocke_rules.antidote_target,
+            potion_lower_threshold=context.config.nuzlocke_rules.potion_lower_threshold,
+            potion_target=context.config.nuzlocke_rules.potion_target,
+            recovery_cash_floor=context.config.nuzlocke_rules.recovery_cash_floor,
         )
         context.nuzlocke_runtime = NuzlockeRuntime(
             event_sink=nuzlocke_event_store,

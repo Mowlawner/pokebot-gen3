@@ -93,6 +93,11 @@ class NuzlockeRules(BaseConfig):
     # below the lower threshold, then buy back up to the upper target.
     pokeball_lower_threshold: Annotated[int, Field(ge=0)] = 5
     pokeball_upper_target: Annotated[int, Field(gt=0)] = 10
+    antidote_lower_threshold: Annotated[int, Field(ge=0)] = 2
+    antidote_target: Annotated[int, Field(gt=0)] = 4
+    potion_lower_threshold: Annotated[int, Field(ge=0)] = 2
+    potion_target: Annotated[int, Field(gt=0)] = 5
+    recovery_cash_floor: Annotated[int, Field(ge=0)] = 200
 
     @model_validator(mode="after")
     def validate_pokeball_thresholds(self):
@@ -100,6 +105,10 @@ class NuzlockeRules(BaseConfig):
 
         if self.pokeball_upper_target <= self.pokeball_lower_threshold:
             raise ValueError("pokeball_upper_target must be greater than pokeball_lower_threshold")
+        if self.antidote_target <= self.antidote_lower_threshold:
+            raise ValueError("antidote_target must be greater than antidote_lower_threshold")
+        if self.potion_target <= self.potion_lower_threshold:
+            raise ValueError("potion_target must be greater than potion_lower_threshold")
         return self
 
 

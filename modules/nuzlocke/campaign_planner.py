@@ -174,6 +174,35 @@ def build_campaign_plan(
                 readiness_decision=decision,
                 readiness_reason=reason,
             )
+        # A bag cure is an executable recovery stop even when no Center route
+        # is available. Keep it at the current location so the recovery
+        # factory can consume the item without inventing a navigation target.
+        resources = getattr(readiness, "resource_snapshot", None)
+        current_map = getattr(readiness, "current_map", None)
+        current_coordinates = getattr(readiness, "current_coordinates", None)
+        if (
+            resources is not None
+            and getattr(resources, "bag_healing_items", ())
+            and isinstance(current_map, tuple)
+            and len(current_map) == 2
+            and isinstance(current_coordinates, tuple)
+            and len(current_coordinates) == 2
+        ):
+            location = (current_map, current_coordinates)
+            return CampaignPlan(
+                objective.objective_id,
+                (
+                    RecoveryStop(
+                        source=ReachLocation(location),
+                        destination=location,
+                        parent_objective_id=objective.objective_id,
+                        reason=getattr(reason, "value", "item recovery required"),
+                        urgency=RecoveryUrgency.CRITICAL if critical else RecoveryUrgency.OPPORTUNISTIC,
+                    ),
+                ),
+                readiness_decision=decision,
+                readiness_reason=reason,
+            )
     if not candidates:
         return base
     if critical:

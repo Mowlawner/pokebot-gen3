@@ -26,12 +26,16 @@ from modules.agent_control import (
 )
 from modules.goals import (
     ActivateTrigger,
+    EncounterMode,
+    EngageTrainer,
+    GoalConstraints,
     NavigationGoal,
     ReachLocation,
     ReachInteractionPosition,
     ReachWarp,
     SemanticTarget,
     SemanticTargetKind,
+    TrainerMode,
 )
 from modules.navigation import (
     GoalAwareNavigator,
@@ -98,7 +102,7 @@ from .emerald_confirmation import (
 )
 from .emerald_campaign_registry import emerald_capability_definition
 from .emerald_dialogue import advance_dialogue, dialogue_state_snapshot, observe_dialogue
-from .resource_policy import PokeballRestockPolicy
+from .resource_policy import PokeballRestockPolicy, RecoverySupplyPolicy
 
 # Compatibility hooks for existing campaign tests and diagnostics.  These
 # names now resolve to the extracted, phase-free dialogue implementation; they
@@ -1923,10 +1927,23 @@ def _emerald_observation(
             else False if defeated_rival is False and hidden_rival is False else None
         )
         facts += (("intro_rival_battle_complete", rival_complete),)
-    if live_context and objective_id == "receive_pokeballs":
+    if live_context and objective_id == "receive_pokedex":
+        pokedex_received = _safe_event_flag("RECEIVED_POKEDEX_FROM_BIRCH")
+        system_pokedex_received = _safe_event_flag("SYS_POKEDEX_GET")
         birch_lab_state = _safe_event_var("BIRCH_LAB_STATE")
+        pokedex_received = (
+            True
+            if pokedex_received is True or system_pokedex_received is True
+            else False
+            if pokedex_received is False and system_pokedex_received is False
+            else None
+        )
         pokeballs_ready = None if birch_lab_state is None else birch_lab_state >= 5
-        facts += (("pokeballs_ready", pokeballs_ready),)
+        facts += (
+            ("pokedex_received", pokedex_received),
+            ("pokeballs_received", pokeballs_ready),
+            ("pokeballs_ready", pokeballs_ready),
+        )
     if objective_id == "complete_petalburg_wally":
         facts += (
             ("petalburg_city_state", petalburg_city_state),
@@ -2148,8 +2165,7 @@ def _publish_campaign_status(
         "rescue_birch": "Rescue Professor Birch",
         "obtain_starter": "Obtain Starter Pokémon",
         "complete_intro_rival": "Complete Introductory Rival Battle",
-        "receive_pokedex": "Receive Pokédex",
-        "receive_pokeballs": "Receive Poké Balls",
+        "receive_pokedex": "Receive Pokédex and initial Poké Balls",
         "reach_petalburg": "Reach Petalburg City",
         "complete_petalburg_wally": "Complete Wally's Tutorial",
         "complete_petalburg_woods": "Complete Petalburg Woods Scene",
@@ -2301,6 +2317,7 @@ def _press_confirmation_button(button: str) -> None:
 
 
 _DEFAULT_POKEBALL_RESTOCK_POLICY = PokeballRestockPolicy()
+_DEFAULT_RECOVERY_SUPPLY_POLICY = RecoverySupplyPolicy()
 _POKEMART_TASK_NAMES = (
     "Task_ShopMenu",
     "Task_GoToBuyOrSellMenu",
@@ -2332,6 +2349,14 @@ def _pokeball_restock_policy() -> PokeballRestockPolicy:
         )
     except (TypeError, ValueError):
         return _DEFAULT_POKEBALL_RESTOCK_POLICY
+
+
+def _recovery_supply_policy() -> RecoverySupplyPolicy:
+    """Read the immutable run medicine policy with a compatibility fallback."""
+
+    runtime = getattr(context, "nuzlocke_runtime", None)
+    configured = getattr(getattr(runtime, "rule_config", None), "recovery_supply_policy", None)
+    return configured if isinstance(configured, RecoverySupplyPolicy) else _DEFAULT_RECOVERY_SUPPLY_POLICY
 
 
 def _nearest_pokeball_source(current_map) -> PokeballSourceRSE | None:
@@ -2464,7 +2489,110 @@ def _finish_shop_exit_dialogue() -> Iterator[object]:
     raise RuntimeError("Poké Ball restock could not finish the Mart exit dialogue")
 
 
-def execute_pokeball_restock() -> Iterator[object]:
+def _purchase_recovery_items_in_shop() -> Iterator[object]:
+    """Purchase medicine deficits while preserving the configured cash floor."""
+
+    from modules.items import get_item_bag, get_item_by_name
+    from modules.mart import get_mart_buyable_items
+    from modules.modes.util.higher_level_actions import buy_in_shop
+    from modules.player import get_player
+
+    policy = _recovery_supply_policy()
+    antidote = get_item_by_name("Antidote")
+    potion = get_item_by_name("Potion")
+    buyable = get_mart_buyable_items()
+    if antidote not in buyable and potion not in buyable:
+        raise RuntimeError("The current Poké Mart sells neither Antidote nor Potion")
+    quantities = policy.affordable_quantities(
+        get_item_bag().quantity_of(antidote),
+        get_item_bag().quantity_of(potion),
+        getattr(get_player(), "money", 0),
+        {
+            name: item.price
+            for name, item in (("Antidote", antidote), ("Potion", potion))
+            if item in buyable
+        },
+    )
+    shopping = [(get_item_by_name(name), quantity) for name, quantity in quantities.items()]
+    if not shopping:
+        context.message = "Cannot restock recovery items without violating the cash floor."
+        return False
+    context.message = "Restocking recovery items"
+    yield from buy_in_shop(shopping)
+    return True
+
+
+def _undefeated_money_trainer(observation):
+    """Select the nearest observed undefeated trainer on the current map."""
+
+    overworld = getattr(observation, "overworld", None)
+    if overworld is None:
+        return None
+    # TriggerObservation carries the stable affordance ID and sight-line
+    # geometry, while ObjectObservation carries the live save-backed defeat
+    # flag. Join them by trainer ID instead of reading a field that does not
+    # exist on triggers. Static trainer hazards are intentionally excluded:
+    # they are route constraints, not proof that a trainer is available to
+    # fight or that its payout is still collectible.
+    trainers = {
+        getattr(obj, "trainer_id", None): obj
+        for obj in getattr(overworld, "objects", ())
+        if getattr(obj, "trainer_id", None) is not None
+    }
+    current = getattr(overworld, "player_coordinates", None)
+    candidates = []
+    for trigger in getattr(overworld, "triggers", ()):
+        trainer_id = getattr(trigger, "affordance_id", None)
+        if not trainer_id or not getattr(trigger, "hazard_locations", ()):
+            continue
+        trainer = trainers.get(trainer_id)
+        if trainer is None or getattr(trainer, "trainer_defeated", None) is not False:
+            continue
+        if getattr(trigger, "currently_actionable", True) is False:
+            continue
+        distances = []
+        for location in getattr(trigger, "activation_locations", ()):
+            if isinstance(location, tuple) and len(location) == 2 and location[0] == overworld.map_id:
+                coordinate = location[1]
+                if current is not None:
+                    distances.append(abs(current[0] - coordinate[0]) + abs(current[1] - coordinate[1]))
+        candidates.append((min(distances, default=10**9), str(trainer_id), trainer_id))
+    return min(candidates, default=None)[2] if candidates else None
+
+
+def _earn_money_from_safe_trainer() -> Iterator[object]:
+    """Fight one nearby undefeated trainer and verify that money increased."""
+
+    from modules.player import get_player
+
+    observation = _emerald_observation(False, "earn_money")
+    trainer_id = _undefeated_money_trainer(observation)
+    if trainer_id is None:
+        raise RuntimeError("No observed safe undefeated trainer is available to fund recovery supplies")
+    overworld = observation.overworld
+    semantic_target = SemanticTarget.interaction(overworld.map_id, trainer_id)
+    navigation_policy = NavigationGoal(
+        EngageTrainer(trainer_id),
+        constraints=GoalConstraints(trainer_mode=TrainerMode.ENGAGE),
+        encounter_mode=EncounterMode.AVOID,
+    )
+    starting_money = getattr(get_player(), "money", 0)
+    navigation = observation_driven_overworld_progression(
+        semantic_target=semantic_target,
+        navigation_policy=navigation_policy,
+        execution_cache={},
+        objective_id="earn_money",
+        initial_observation=overworld,
+    )
+    for _ in range(1200):
+        if getattr(get_player(), "money", 0) > starting_money:
+            return
+        next(navigation)
+        yield
+    raise RuntimeError("Trainer money objective did not produce an observed payout")
+
+
+def execute_pokeball_restock(objective_id: str = "restock_pokeballs") -> Iterator[object]:
     """Navigate to a reachable Emerald shop and restore the capture reserve."""
 
     from modules.items import get_item_bag, get_item_by_name
@@ -2480,6 +2608,17 @@ def execute_pokeball_restock() -> Iterator[object]:
         # this before rebuilding the broader Emerald observation so the
         # generic overworld navigator cannot press into an open menu.
         if _shop_main_menu_is_active():
+            if objective_id == "restock_recovery_items":
+                purchased = yield from _purchase_recovery_items_in_shop()
+                yield from _leave_shop_menu()
+                yield from _finish_shop_exit_dialogue()
+                if not purchased:
+                    execution_cache.clear()
+                    source = None
+                    navigation = None
+                    yield from _earn_money_from_safe_trainer()
+                    continue
+                return
             ball = get_item_by_name("Poké Ball")
             current = get_item_bag().quantity_of(ball)
             required = policy.quantity_to_buy(current)
@@ -2533,7 +2672,7 @@ def execute_pokeball_restock() -> Iterator[object]:
             yield
             continue
 
-        observation = _emerald_observation(False, "restock_pokeballs")
+        observation = _emerald_observation(False, objective_id)
         if observation.overworld is None:
             yield
             continue
@@ -2550,7 +2689,7 @@ def execute_pokeball_restock() -> Iterator[object]:
             navigation = observation_driven_overworld_progression(
                 semantic_target=semantic_target,
                 execution_cache=execution_cache,
-                objective_id="restock_pokeballs",
+                objective_id=objective_id,
                 initial_observation=observation.overworld,
             )
         try:
@@ -2643,6 +2782,21 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
                     f"frame={getattr(context, 'frame', None)!r} "
                     "objective='complete_intro_rival' "
                     "reason='authoritative_completion_observed'"
+                ),
+                trace=True,
+            )
+            return
+        if (
+            objective_id == "receive_pokedex"
+            and dict(observation.campaign_facts).get("pokedex_received") is True
+            and dict(observation.campaign_facts).get("pokeballs_ready") is True
+        ):
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_CAPABILITY_BOUNDARY: "
+                    f"frame={getattr(context, 'frame', None)!r} "
+                    "objective='receive_pokedex' "
+                    "reason='birch_lab_handoff_complete'"
                 ),
                 trace=True,
             )
@@ -3158,8 +3312,11 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
                             dict(observation.campaign_facts).get("intro_rival_battle_complete")
                             if objective_id == "complete_intro_rival"
                             else (
-                                dict(observation.campaign_facts).get("pokeballs_ready")
-                                if objective_id == "receive_pokeballs"
+                                (
+                                    dict(observation.campaign_facts).get("pokedex_received") is True
+                                    and dict(observation.campaign_facts).get("pokeballs_ready") is True
+                                )
+                                if objective_id == "receive_pokedex"
                                 else None
                             )
                         ),
@@ -3193,6 +3350,9 @@ def emerald_campaign_capability(objective_id: str) -> Iterator[object]:
 
     if objective_id == "restock_pokeballs":
         yield from execute_pokeball_restock()
+        return
+    if objective_id == "restock_recovery_items":
+        yield from execute_pokeball_restock(objective_id="restock_recovery_items")
         return
 
     # Campaign objectives are executed by a current-observation loop. The

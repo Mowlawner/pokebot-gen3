@@ -951,7 +951,10 @@ class CampaignObjectiveTests(unittest.TestCase):
 
         sufficient_facts = replace(facts, pokeballs_sufficient=Fact.known(True))
         sufficient_selection = select_available_campaign_task(self.state(balls=5, campaign_facts=sufficient_facts))
-        self.assertNotEqual(sufficient_selection.objective.objective_id, "restock_pokeballs")
+        self.assertTrue(
+            sufficient_selection.objective is None
+            or sufficient_selection.objective.objective_id != "restock_pokeballs"
+        )
 
     def test_zero_ball_restock_requires_opening_receipt_fact(self):
         facts = self.facts(pokedex_received=True, pokeballs_ready=True)
@@ -999,8 +1002,8 @@ class CampaignObjectiveTests(unittest.TestCase):
         self.assertNotIn("restock_pokeballs", tuple(task.objective_id for task in available))
 
     def test_pokeballs_available_without_ready_blocks_nuzlocke(self):
-        # Test that pokeballs_available=True but pokeballs_ready=False blocks nuzlocke
-        # and keeps receive_pokeballs active (i.e., not complete).
+        # Test that pokeballs_available=True but pokeballs_ready=False keeps
+        # Birch's combined handoff active (i.e., not complete).
         state = self.state(
             balls=5,
             campaign_facts=self.facts(
@@ -1018,7 +1021,20 @@ class CampaignObjectiveTests(unittest.TestCase):
         )
         selection = select_campaign_objective(state)
         self.assertEqual(selection.status, ObjectiveStatus.READY)
-        self.assertEqual(selection.objective.objective_id, "receive_pokeballs")
+        self.assertEqual(selection.objective.objective_id, "receive_pokedex")
+
+    def test_medicine_restock_waits_for_birch_pokeball_handoff(self):
+        facts = self.facts(
+            intro_rival_battle_complete=True,
+            pokedex_received=True,
+            pokeballs_received=False,
+            pokeballs_ready=False,
+        )
+        state = self.state(area="ROUTE102", campaign_facts=facts)
+
+        available = available_campaign_tasks(state)
+        self.assertNotIn("restock_recovery_items", tuple(task.objective_id for task in available))
+        self.assertEqual(plan_campaign(state).objective.objective_id, "receive_pokedex")
         first = initial_emerald_campaign()
         second = initial_emerald_campaign()
         self.assertEqual(
@@ -1032,7 +1048,6 @@ class CampaignObjectiveTests(unittest.TestCase):
                 "obtain_starter",
                 "complete_intro_rival",
                 "receive_pokedex",
-                "receive_pokeballs",
                 "reach_petalburg",
                 "complete_petalburg_wally",
                 "complete_petalburg_woods",
@@ -1124,6 +1139,42 @@ class CampaignObjectiveTests(unittest.TestCase):
         )
         self.assertEqual(select_available_campaign_task(state).objective.objective_id, "prepare_roxanne")
 
+    def test_recovery_restock_interrupt_precedes_campaign_progression(self):
+        complete = self.facts(
+            text_speed_fast=True,
+            new_game_setup_complete=True,
+            wall_clock_set=True,
+            rival_met=True,
+            birch_rescued=True,
+            starter_obtained=True,
+            intro_rival_battle_complete=True,
+            pokedex_received=True,
+            pokeballs_available=True,
+            pokeballs_ready=True,
+            nuzlocke_started=True,
+        )
+        state = self.state(area="ROUTE101", balls=5, campaign_facts=complete)
+        state = replace(
+            state,
+            inventory=Fact.known(
+                InventorySnapshot(
+                    (),
+                    (
+                        ItemQuantity("Poke Ball", 5),
+                        ItemQuantity("Antidote", 0),
+                        ItemQuantity("Potion", 1),
+                    ),
+                    (),
+                )
+            ),
+        )
+
+        selection = select_available_campaign_task(state)
+
+        self.assertEqual(selection.objective.objective_id, "restock_recovery_items")
+        self.assertEqual(selection.reason, "selected required recovery-item restock task")
+        self.assertEqual(plan_campaign(state).objective.objective_id, "restock_recovery_items")
+
     def test_first_badge_fixture_advances_from_new_run_to_authoritative_gym_flag(self):
         """Exercise the complete declarative slice through DEFEATED_RUSTBORO_GYM."""
         stages = [((), "set_text_speed")]
@@ -1136,11 +1187,11 @@ class CampaignObjectiveTests(unittest.TestCase):
             ("birch_rescued", "obtain_starter"),
             ("starter_obtained", "complete_intro_rival"),
             ("intro_rival_battle_complete", "receive_pokedex"),
-            ("pokedex_received", "receive_pokeballs"),
+            ("pokedex_received", "receive_pokedex"),
         ):
             completed.append(fact)
             stages.append((tuple(completed), next_objective))
-        completed.extend(("pokeballs_available", "pokeballs_ready"))
+        completed.extend(("pokeballs_available", "pokeballs_received"))
         for fact, next_objective in (
             ("pokeballs_ready", "reach_petalburg"),
             ("visited_petalburg", "complete_petalburg_wally"),

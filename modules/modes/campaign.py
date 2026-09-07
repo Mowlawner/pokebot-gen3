@@ -25,6 +25,7 @@ from modules.nuzlocke.resource_policy import (
     assess_wild_encounter,
 )
 from modules.nuzlocke.resource_runtime import (
+    execute_campaign_recovery,
     execute_planned_recovery,
     observe_resource_snapshot,
     observe_route_recovery,
@@ -291,11 +292,7 @@ class CampaignProgressionMode(BotMode):
             # CampaignPlan owns recovery selection.  There is deliberately no
             # fallback here that can reopen the healing catalog or select a
             # different Center after the plan has been composed.
-            recovery_factory=lambda stop: execute_planned_recovery(
-                stop.destination,
-                emerald_healing_source_for_destination(stop.destination),
-                planned_route=stop.route,
-            ),
+            recovery_factory=execute_campaign_recovery,
         )
         self._readiness_evaluated = False
         self._campaign_selection_key = None

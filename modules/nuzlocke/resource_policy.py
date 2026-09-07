@@ -34,6 +34,48 @@ class ResourceDecision(Enum):
     RECOVER_AT_CENTER = "recover_at_center"
     USE_HEALING_ITEM = "use_healing_item"
     WITHDRAW_HEALING_ITEM = "withdraw_healing_item"
+    RECOVER_UNDER_ATTRITION = "recover_under_attrition"
+    RUN_LOST = "run_lost"
+
+
+class RecoveryKind(Enum):
+    """The problem a field medicine can solve."""
+
+    HP = "hp"
+    POISON = "poison"
+    PARALYSIS = "paralysis"
+    SLEEP = "sleep"
+    BURN = "burn"
+    FREEZE = "freeze"
+    UNIVERSAL_STATUS = "universal_status"
+
+
+def classify_recovery_item(name: str, heal_amount: int = 0) -> RecoveryKind:
+    """Classify a medicine using the stable Emerald item names.
+
+    The ROM item parameter is zero for status medicines, so it cannot be used
+    as an HP/status discriminator by itself. Names are the same data already
+    exposed by the item catalog and are stable across the supported RSE ROMs.
+    """
+
+    normalized = str(name).strip().casefold()
+    if normalized in {"full restore", "full heal"}:
+        return RecoveryKind.UNIVERSAL_STATUS
+    for token, kind in (
+        ("antidote", RecoveryKind.POISON),
+        ("parlyz heal", RecoveryKind.PARALYSIS),
+        ("paralyze heal", RecoveryKind.PARALYSIS),
+        ("awakening", RecoveryKind.SLEEP),
+        ("burn heal", RecoveryKind.BURN),
+        ("ice heal", RecoveryKind.FREEZE),
+    ):
+        if normalized == token:
+            return kind
+    if heal_amount > 0 or normalized in {"full restore", "max potion"}:
+        return RecoveryKind.HP
+    # Unknown zero-parameter medicines are safer to treat as status cures than
+    # as HP items. They cannot satisfy an HP restoration check accidentally.
+    return RecoveryKind.UNIVERSAL_STATUS
 
 
 class ResourceObservationStatus(Enum):
@@ -93,6 +135,62 @@ class PokeballRestockPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class RecoverySupplyPolicy:
+    """Hysteresis and cash-floor policy for early campaign medicines."""
+
+    antidote_lower_threshold: int = 2
+    antidote_target: int = 4
+    potion_lower_threshold: int = 2
+    potion_target: int = 5
+    cash_floor: int = 200
+
+    def __post_init__(self) -> None:
+        values = (
+            self.antidote_lower_threshold,
+            self.antidote_target,
+            self.potion_lower_threshold,
+            self.potion_target,
+            self.cash_floor,
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+            raise ValueError("recovery supply policy values must be non-negative integers")
+        if self.antidote_target <= self.antidote_lower_threshold:
+            raise ValueError("Antidote target must exceed its lower threshold")
+        if self.potion_target <= self.potion_lower_threshold:
+            raise ValueError("Potion target must exceed its lower threshold")
+
+    def needs_restock(self, antidotes: int, potions: int) -> bool:
+        return antidotes < self.antidote_lower_threshold or potions < self.potion_lower_threshold
+
+    def desired_quantities(self, antidotes: int, potions: int) -> dict[str, int]:
+        return {
+            "Antidote": max(0, self.antidote_target - antidotes),
+            "Potion": max(0, self.potion_target - potions),
+        }
+
+    def affordable_quantities(
+        self,
+        antidotes: int,
+        potions: int,
+        money: int,
+        prices: dict[str, int],
+    ) -> dict[str, int]:
+        if money < 0:
+            raise ValueError("money must be non-negative")
+        budget = max(0, money - self.cash_floor)
+        result = {}
+        for name, desired in self.desired_quantities(antidotes, potions).items():
+            price = prices.get(name)
+            if price is None or price < 0:
+                continue
+            quantity = desired if price == 0 else min(desired, budget // price)
+            if quantity:
+                result[name] = quantity
+                budget -= quantity * price
+        return result
+
+
+@dataclass(frozen=True, slots=True)
 class PartyResource:
     """Observed health and status information for one party member."""
 
@@ -117,6 +215,23 @@ class HealingResource:
     heal_amount: int
     location: str = "bag"
     acquisition_cost: int = 0
+    kind: RecoveryKind | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind is None:
+            object.__setattr__(self, "kind", classify_recovery_item(self.name, self.heal_amount))
+
+    def cures(self, status: str | None) -> bool:
+        """Return whether this item cures the supplied condition."""
+
+        normalized = (status or "none").strip().casefold().replace(" ", "_")
+        if normalized in {"none", "normal"}:
+            return False
+        if normalized in {"poisoned", "bad_poison", "badly_poisoned"}:
+            normalized = "poison"
+        if self.kind is RecoveryKind.UNIVERSAL_STATUS:
+            return True
+        return self.kind.value == normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +284,40 @@ class ResourceSnapshot:
         """Whether any living party member needs poison-aware recovery."""
 
         return bool(self.poisoned_party)
+
+    @property
+    def status_party(self) -> tuple[PartyResource, ...]:
+        """Return living party members with any curable status condition."""
+
+        return tuple(member for member in self.party if not member.fainted and member.current_hp > 0 and (member.status or "none") not in {"none", "normal"})
+
+    @property
+    def needs_status_recovery(self) -> bool:
+        return bool(self.status_party)
+
+    @property
+    def bag_hp_items(self) -> tuple[HealingResource, ...]:
+        return tuple(
+            item
+            for item in self.bag_healing_items
+            if item.quantity > 0 and (item.kind is RecoveryKind.HP or item.kind is RecoveryKind.UNIVERSAL_STATUS) and item.heal_amount > 0
+        )
+
+    @property
+    def bag_status_items(self) -> tuple[HealingResource, ...]:
+        return tuple(item for item in self.bag_healing_items if item.quantity > 0 and item.kind is not RecoveryKind.HP)
+
+    @property
+    def pc_hp_items(self) -> tuple[HealingResource, ...]:
+        return tuple(
+            item
+            for item in self.pc_healing_items
+            if item.quantity > 0 and (item.kind is RecoveryKind.HP or item.kind is RecoveryKind.UNIVERSAL_STATUS) and item.heal_amount > 0
+        )
+
+    @property
+    def pc_status_items(self) -> tuple[HealingResource, ...]:
+        return tuple(item for item in self.pc_healing_items if item.quantity > 0 and item.kind is not RecoveryKind.HP)
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,13 +378,49 @@ class ResourceObjective:
 
 
 def _useful_item(snapshot: ResourceSnapshot, route: RouteRecovery) -> HealingResource | None:
-    """Choose the strongest bag item that can cover current missing HP."""
+    """Choose the strongest bag HP item that improves the party's position."""
 
-    candidates = [item for item in snapshot.bag_healing_items if item.quantity > 0 and item.heal_amount > 0]
-    candidates = [item for item in candidates if item.heal_amount >= snapshot.total_missing_hp]
+    candidates = [item for item in snapshot.bag_hp_items if item.heal_amount > 0]
     if not candidates:
         return None
     return max(candidates, key=lambda item: item.heal_amount)
+
+
+def _status_item(snapshot: ResourceSnapshot) -> HealingResource | None:
+    """Choose the least wasteful bag item that cures an observed status."""
+
+    for member in snapshot.status_party:
+        candidates = [item for item in snapshot.bag_status_items if item.cures(member.status)]
+        if candidates:
+            return min(candidates, key=lambda item: (item.kind is RecoveryKind.UNIVERSAL_STATUS, item.name))
+    return None
+
+
+def _pc_status_item(snapshot: ResourceSnapshot) -> HealingResource | None:
+    for member in snapshot.status_party:
+        candidates = [item for item in snapshot.pc_status_items if item.cures(member.status)]
+        if candidates:
+            return min(candidates, key=lambda item: (item.kind is RecoveryKind.UNIVERSAL_STATUS, item.name))
+    return None
+
+
+def _pc_hp_item(snapshot: ResourceSnapshot) -> HealingResource | None:
+    return max(snapshot.pc_hp_items, key=lambda item: item.heal_amount, default=None)
+
+
+def _poison_bridge_is_sufficient(snapshot: ResourceSnapshot, route: RouteRecovery, item: HealingResource | None) -> bool:
+    """Estimate whether one HP item buys enough steps to reach the source."""
+
+    if item is None or route.distance_to_center is None:
+        return False
+    poisoned = snapshot.poisoned_party
+    if not poisoned:
+        return True
+    # Emerald applies overworld poison damage periodically. Keep one extra HP
+    # as a boundary margin because route cost is measured in inputs, not only
+    # completed tile transitions.
+    damage = max(1, route.distance_to_center // 4) + 1
+    return min(member.current_hp + item.heal_amount for member in poisoned) > damage
 
 
 def assess_campaign_resources(
@@ -251,7 +436,15 @@ def assess_campaign_resources(
     if objective.readiness is ReadinessImportance.NONE or not objective.mandatory_battle:
         return ResourceDecision.CONTINUE
     if not snapshot.usable_party:
-        return ResourceDecision.RECOVER_AT_CENTER if route.center_available else ResourceDecision.PRESERVE_RESOURCES
+        return ResourceDecision.RECOVER_AT_CENTER if route.center_available else ResourceDecision.RUN_LOST
+
+    # Status damage is time-sensitive. Cure it from the bag before spending
+    # turns on optional work, then use accessible PC stock before buying.
+    if snapshot.needs_status_recovery:
+        if _status_item(snapshot) is not None:
+            return ResourceDecision.USE_HEALING_ITEM
+        if _pc_status_item(snapshot) is not None and route.pc_accessible and (route.pc_acquisition_cost or 0) <= 2:
+            return ResourceDecision.WITHDRAW_HEALING_ITEM
 
     healthy = snapshot.worst_hp_ratio >= objective.minimum_hp_ratio
     # A healthy party may spend some HP before a planned recovery point. The
@@ -273,24 +466,22 @@ def assess_campaign_resources(
         return ResourceDecision.CONTINUE
 
     item = _useful_item(snapshot, route)
-    pc_item = next(
-        (
-            item
-            for item in snapshot.pc_healing_items
-            if item.quantity > 0 and item.heal_amount >= snapshot.total_missing_hp
-        ),
-        None,
-    )
+    pc_item = _pc_hp_item(snapshot)
     if item is None and pc_item is not None and route.pc_accessible and (route.pc_acquisition_cost or 0) <= 2:
         return ResourceDecision.WITHDRAW_HEALING_ITEM
     if item is not None and not route.center_on_route and not route.safe_to_reach_center:
         return ResourceDecision.USE_HEALING_ITEM
+    if snapshot.has_poisoned_party and route.center_available and route.safe_to_reach_center and not _poison_bridge_is_sufficient(snapshot, route, item):
+        # Preserve autonomous ownership even when the route may cost a life.
+        return ResourceDecision.RECOVER_UNDER_ATTRITION
     if route.center_available and route.safe_to_reach_center and (route.center_on_route or not healthy):
         return ResourceDecision.RECOVER_AT_CENTER
     if item is not None and not healthy:
         return ResourceDecision.USE_HEALING_ITEM
     if wild_encounter and objective.encounters is EncounterPolicy.PRESERVE:
         return ResourceDecision.PREFER_RUN
+    if snapshot.has_poisoned_party and route.observation_available:
+        return ResourceDecision.RECOVER_UNDER_ATTRITION if route.center_available else ResourceDecision.RUN_LOST
     return ResourceDecision.PRESERVE_RESOURCES
 
 

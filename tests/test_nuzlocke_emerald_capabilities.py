@@ -289,6 +289,23 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             with self.assertRaises(StopIteration):
                 next(campaign)
 
+    def test_birch_handoff_capability_releases_after_both_rom_facts(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        observation = SimpleNamespace(
+            map_id=None,
+            dialogue_lifecycle_active=False,
+            campaign_facts=(
+                ("pokedex_received", True),
+                ("pokeballs_received", True),
+                ("pokeballs_ready", True),
+            ),
+        )
+        with patch.object(capabilities, "_emerald_observation", return_value=observation):
+            campaign = capabilities.observation_driven_emerald_campaign("receive_pokedex")
+            with self.assertRaises(StopIteration):
+                next(campaign)
+
     def test_completed_petalburg_wally_capability_releases_on_rom_state(self):
         from modules.nuzlocke import emerald_capabilities as capabilities
 
@@ -347,6 +364,94 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
                 next(restock)
 
         buy.assert_called_once_with([(ball, 9)])
+
+    def test_money_trainer_joins_trigger_to_live_object_defeat_state(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        map_id = (1, 2)
+        available_id = f"trainer:{map_id}:7"
+        defeated_id = f"trainer:{map_id}:8"
+        overworld = SimpleNamespace(
+            map_id=map_id,
+            player_coordinates=(1, 1),
+            objects=(
+                SimpleNamespace(trainer_id=available_id, trainer_defeated=False),
+                SimpleNamespace(trainer_id=defeated_id, trainer_defeated=True),
+            ),
+            triggers=(
+                TriggerObservation(
+                    "available",
+                    frozenset(),
+                    activation_locations=frozenset({(map_id, (3, 1))}),
+                    affordance_id=available_id,
+                    hazard_locations=frozenset({(map_id, (2, 1))}),
+                ),
+                TriggerObservation(
+                    "defeated",
+                    frozenset(),
+                    activation_locations=frozenset({(map_id, (2, 1))}),
+                    affordance_id=defeated_id,
+                    hazard_locations=frozenset({(map_id, (2, 1))}),
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            capabilities._undefeated_money_trainer(SimpleNamespace(overworld=overworld)),
+            available_id,
+        )
+
+    def test_money_funding_waits_for_observed_trainer_payout(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        player = SimpleNamespace(money=100)
+        trainer_id = "trainer:(1, 2):7"
+        overworld = SimpleNamespace(
+            map_id=(1, 2),
+            player_coordinates=(1, 1),
+            objects=(SimpleNamespace(trainer_id=trainer_id, trainer_defeated=False),),
+            triggers=(
+                TriggerObservation(
+                    "trainer",
+                    frozenset(),
+                    activation_locations=frozenset({((1, 2), (2, 1))}),
+                    affordance_id=trainer_id,
+                    hazard_locations=frozenset({((1, 2), (2, 1))}),
+                ),
+            ),
+        )
+
+        def navigation():
+            player.money = 500
+            yield
+
+        with (
+            patch.object(capabilities, "_emerald_observation", return_value=SimpleNamespace(overworld=overworld)),
+            patch("modules.player.get_player", return_value=player),
+            patch.object(capabilities, "observation_driven_overworld_progression", return_value=navigation()),
+        ):
+            self.assertEqual(list(capabilities._earn_money_from_safe_trainer()), [None])
+
+    def test_recovery_shop_purchase_respects_cash_floor(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        antidote = SimpleNamespace(name="Antidote", price=100)
+        potion = SimpleNamespace(name="Potion", price=300)
+        items = {item.name: item for item in (antidote, potion)}
+        bag = SimpleNamespace(quantity_of=lambda _item: 0)
+        player = SimpleNamespace(money=1000)
+        buy = Mock(return_value=iter(()))
+
+        with (
+            patch("modules.items.get_item_by_name", side_effect=lambda name: items[name]),
+            patch("modules.items.get_item_bag", return_value=bag),
+            patch("modules.player.get_player", return_value=player),
+            patch("modules.mart.get_mart_buyable_items", return_value=[antidote, potion]),
+            patch("modules.modes.util.higher_level_actions.buy_in_shop", buy),
+        ):
+            list(capabilities._purchase_recovery_items_in_shop())
+
+        buy.assert_called_once_with([(antidote, 4), (potion, 1)])
 
     def test_pokeball_restock_recognizes_shop_transition_tasks(self):
         from modules.nuzlocke import emerald_capabilities as capabilities

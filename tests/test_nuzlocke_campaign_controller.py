@@ -245,6 +245,93 @@ class CampaignControllerTests(unittest.TestCase):
             self.assertEqual(controller.step().status.value, status.value)
             self.assertEqual(self.executed, 0)
 
+    def test_transient_unknown_selection_retries_after_post_battle_boundary(self):
+        objective = self.fixture.objective("receive_pokedex", self.fixture.predicate("pokedex_done", False))
+        unknown = ObjectiveSelection(
+            objective,
+            ObjectiveStatus.UNKNOWN,
+            "prerequisite campaign_fact:intro_rival_battle_complete is unknown",
+        )
+        ready = ObjectiveSelection(objective, ObjectiveStatus.READY, "all prerequisites are satisfied")
+        selections = iter((unknown, ready))
+
+        def capability():
+            while True:
+                yield
+
+        execution = CampaignExecutionResult(
+            objective,
+            CampaignExecutionStatus.READY,
+            "pokedex capability",
+            capability=capability,
+        )
+
+        def adapt(selection):
+            if selection.status is ObjectiveStatus.UNKNOWN:
+                return CampaignExecutionResult(
+                    objective,
+                    CampaignExecutionStatus.UNKNOWN,
+                    selection.reason,
+                )
+            return execution
+
+        controller = CampaignController(
+            lambda: self.current,
+            selector=lambda _: next(selections),
+            adapter=adapt,
+        )
+
+        first = controller.step()
+        second = controller.step()
+
+        self.assertEqual(first.status, CampaignControllerStatus.UNKNOWN)
+        self.assertEqual(first.execution_phase, "CAMPAIGN")
+        self.assertEqual(first.objective_id, "receive_pokedex")
+        self.assertEqual(second.status, CampaignControllerStatus.READY)
+        self.assertEqual(second.objective_id, "receive_pokedex")
+        self.assertEqual(second.execution_phase, "CAMPAIGN")
+        self.assertIsNotNone(controller._tactical_loop)
+
+    def test_blocked_selection_remains_autonomous_and_retries(self):
+        objective = self.fixture.objective("blocked", self.fixture.predicate("blocked_done", False))
+        blocked = ObjectiveSelection(objective, ObjectiveStatus.BLOCKED, "prerequisite is false")
+        ready = ObjectiveSelection(objective, ObjectiveStatus.READY, "prerequisite became available")
+        selections = iter((blocked, ready))
+
+        def capability():
+            while True:
+                yield
+
+        execution = CampaignExecutionResult(
+            objective,
+            CampaignExecutionStatus.READY,
+            "blocked capability",
+            capability=capability,
+        )
+
+        def adapt(selection):
+            if selection.status is ObjectiveStatus.BLOCKED:
+                return CampaignExecutionResult(
+                    objective,
+                    CampaignExecutionStatus.BLOCKED,
+                    selection.reason,
+                )
+            return execution
+
+        controller = CampaignController(
+            lambda: self.current,
+            selector=lambda _: next(selections),
+            adapter=adapt,
+        )
+
+        first = controller.step()
+        second = controller.step()
+
+        self.assertEqual(first.status, CampaignControllerStatus.BLOCKED)
+        self.assertEqual(first.execution_phase, "CAMPAIGN")
+        self.assertEqual(second.status, CampaignControllerStatus.READY)
+        self.assertIsNotNone(controller._tactical_loop)
+
     def test_refresh_exception_is_retried_without_unwinding_campaign_mode(self):
         calls = []
         objective = self.fixture.objective("retry", self.fixture.predicate("retry_done", False))
@@ -919,11 +1006,11 @@ class CampaignControllerTests(unittest.TestCase):
 
     def test_deferred_readiness_does_not_advance_stale_previous_capability(self):
         pokedex = next(item for item in initial_emerald_campaign() if item.objective_id == "receive_pokedex")
-        pokeballs = next(item for item in initial_emerald_campaign() if item.objective_id == "receive_pokeballs")
+        next_objective = next(item for item in initial_emerald_campaign() if item.objective_id == "complete_intro_rival")
         selections = iter(
             (
                 ObjectiveSelection(pokedex, ObjectiveStatus.READY, "pokedex frontier"),
-                ObjectiveSelection(pokeballs, ObjectiveStatus.READY, "pokeball frontier"),
+                ObjectiveSelection(next_objective, ObjectiveStatus.READY, "next frontier"),
             )
         )
         advanced = []
@@ -943,10 +1030,10 @@ class CampaignControllerTests(unittest.TestCase):
             )
 
         unknown = ProgressionReadinessDiagnostic(
-            objective_id="receive_pokeballs",
+            objective_id="complete_intro_rival",
             objective_status="ready",
-            destination=pokeballs.destination,
-            navigation_goal=pokeballs.tactical_target,
+            destination=next_objective.destination,
+            navigation_goal=next_objective.tactical_target,
             current_map=(1, 4),
             current_coordinates=(6, 5),
             game_state="BATTLE",
@@ -975,7 +1062,7 @@ class CampaignControllerTests(unittest.TestCase):
         result = controller.step()
 
         self.assertEqual(advanced, ["receive_pokedex"])
-        self.assertEqual(result.objective_id, "receive_pokeballs")
+        self.assertEqual(result.objective_id, "complete_intro_rival")
         self.assertIsNone(controller._tactical_loop)
         self.assertTrue(controller._refresh_required)
 

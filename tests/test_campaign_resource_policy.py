@@ -1,6 +1,8 @@
 from modules.nuzlocke.resource_policy import (
     EncounterPolicy,
     HealingResource,
+    RecoveryKind,
+    RecoverySupplyPolicy,
     PokeballRestockPolicy,
     PartyResource,
     ReadinessImportance,
@@ -77,6 +79,40 @@ def test_damaged_party_uses_bag_item_when_center_is_unsafe():
     snapshot = ResourceSnapshot((PartyResource(8, 20),), (HealingResource("Potion", 1, 20),))
     route = RouteRecovery(center_available=True, safe_to_reach_center=False)
     assert assess_campaign_resources(IMPORTANT, snapshot, route) is ResourceDecision.USE_HEALING_ITEM
+
+
+def test_status_items_are_classified_separately_from_hp_items():
+    assert HealingResource("Antidote", 2, 0).kind is RecoveryKind.POISON
+    assert HealingResource("Potion", 2, 20).kind is RecoveryKind.HP
+    assert HealingResource("Full Heal", 1, 0).kind is RecoveryKind.UNIVERSAL_STATUS
+
+
+def test_poison_uses_bag_antidote_before_center_travel():
+    snapshot = ResourceSnapshot(
+        (PartyResource(18, 20, "poisoned"),),
+        (HealingResource("Antidote", 1, 0), HealingResource("Potion", 1, 20)),
+    )
+    assert assess_campaign_resources(
+        IMPORTANT,
+        snapshot,
+        RouteRecovery(center_available=True, safe_to_reach_center=True),
+    ) is ResourceDecision.USE_HEALING_ITEM
+
+
+def test_poison_without_any_cure_preserves_autonomous_attrition_path():
+    snapshot = ResourceSnapshot((PartyResource(2, 20, "poisoned"),))
+    decision = assess_campaign_resources(
+        IMPORTANT,
+        snapshot,
+        RouteRecovery(center_available=True, safe_to_reach_center=True, distance_to_center=20),
+    )
+    assert decision is ResourceDecision.RECOVER_UNDER_ATTRITION
+
+
+def test_recovery_supply_policy_reserves_cash():
+    policy = RecoverySupplyPolicy()
+    assert policy.needs_restock(0, 0)
+    assert policy.affordable_quantities(0, 0, 500, {"Antidote": 100, "Potion": 300}) == {"Antidote": 3}
 
 
 def test_damaged_party_can_withdraw_accessible_pc_item():
