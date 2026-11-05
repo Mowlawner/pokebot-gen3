@@ -139,10 +139,14 @@ also support an explicit alternative new-game activation mode, including a
 defined policy for encounters that occur before Poké Balls are obtainable or
 that cannot be caught.
 
-`SPECIES_CLAUSE` is now present as a configuration identifier, but its
-enforcement is not implemented. Missing configurable semantics also include
-shiny clause, healing restrictions, item restrictions, and the detailed
-encounter-source rules required by Gen 3.
+`SPECIES_CLAUSE` is implemented and enabled by default, including
+evolutionary-branch families such as Wurmple; it has no per-area duplicate
+cap. `SET_BATTLE_STYLE` is an optional rule. Missing configurable semantics
+include the shiny clause, healing and item restrictions, a revive prohibition,
+an HM helper, and the detailed encounter-source rules required by Gen 3. All
+rules beyond the two basic ones are optional and configurable. ROM hacks and
+randomizers are not supported. The rule-by-rule comparison with the Nuzlocke
+rule set is in [nuzlocke-rules-coverage.md](docs/nuzlocke-rules-coverage.md).
 
 ### Navigation
 
@@ -289,7 +293,10 @@ of Fame with objective transitions verified from observations.
 
 ### P3 — Complete Nuzlocke semantics
 
-1. Implement Species Clause and future rule extensions behind configuration.
+1. Species Clause is implemented. Add the remaining rule extensions in the
+   optional-rule backlog of
+   [nuzlocke-rules-coverage.md](docs/nuzlocke-rules-coverage.md) behind
+   configuration, each off by default.
 2. Define canonical encounter-area identity separately from raw map IDs.
 3. Model land, surfing, fishing, Rock Smash, static, gift, roamer, Safari,
    forced, egg, and duplicate-species encounters.
