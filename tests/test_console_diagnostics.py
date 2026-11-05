@@ -130,6 +130,21 @@ class TestDiagnosticPrint(unittest.TestCase):
         self.assertIn("WALK_SEQUENCE_DOWN_RIGHT_UP_LEFT", rendered)
         self.assertIn("movement_range", rendered)
 
+    def test_print_always_prints_without_debug_but_diagnostic_print_does_not(self):
+        from modules.console import diagnostic_print, print_always
+
+        output = StringIO()
+        sink = Console(file=output, color_system=None, width=120)
+        with patch("modules.console.console", sink), patch("modules.context.context.debug", False), patch(
+            "modules.context.context.debug_trace", False
+        ):
+            diagnostic_print("DEBUG_ONLY_RECORD", trace=False)
+            print_always("ALWAYS_RECORD")
+
+        rendered = output.getvalue()
+        self.assertIn("ALWAYS_RECORD", rendered)
+        self.assertNotIn("DEBUG_ONLY_RECORD", rendered)
+
     def test_campaign_snapshot_party_rows_show_where_each_pokemon_was_met(self):
         from modules.console import print_campaign_snapshot
 

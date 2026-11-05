@@ -50,6 +50,7 @@ from .campaign_objectives import (
 )
 from modules.console import (
     diagnostic_print,
+    print_always,
     format_campaign_objective_id,
     print_campaign_frontier,
     print_campaign_snapshot,
@@ -700,13 +701,11 @@ def _report_controller_exception(kind: str, error: BaseException, **fields) -> N
     frames = traceback.extract_tb(error.__traceback__)[-3:] if error.__traceback__ else []
     where = " <- ".join(f"{frame.name}:{frame.lineno}" for frame in reversed(frames)) or "unknown"
     extra = " ".join(f"{name}={value!r}" for name, value in fields.items())
-    diagnostic_print(
+    print_always(
         lambda: (
             f"CAMPAIGN_CONTROLLER_EXCEPTION: kind={kind!r} occurrence={count} "
             f"error_type={type(error).__name__!r} error={str(error)[:300]!r} where={where!r} {extra}"
         ),
-        trace=False,
-        prefix="CAMPAIGN_CONTROLLER_EXCEPTION",
     )
 
 
@@ -4270,7 +4269,7 @@ class CampaignController:
             idle=self._tactical_loop is None,
         )
         if idle_frames is not None:
-            diagnostic_print(
+            print_always(
                 lambda: (
                     "CAMPAIGN_CONTROLLER_IDLE: no capability mounted and state unchanged "
                     f"for {idle_frames} controller steps phase={self._execution_phase!r} "
@@ -4279,8 +4278,6 @@ class CampaignController:
                     f"refresh_reason={self._refresh_required_reason!r} "
                     f"reason={self.transition_reason!r}"
                 ),
-                trace=False,
-                prefix="CAMPAIGN_CONTROLLER_IDLE",
             )
         diagnostic_print(
             lambda: (

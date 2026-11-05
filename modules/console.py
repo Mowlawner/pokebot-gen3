@@ -1930,6 +1930,25 @@ def diagnostic_print(message: str | Callable[[], str], *, trace: bool = False, p
             file.flush()
 
 
+def print_always(message: str | Callable[[], str]) -> None:
+    """Print a rare, decisive diagnostic regardless of the debug flags.
+
+    ``diagnostic_print`` is silent unless ``--debug`` or ``--debug-trace`` is
+    given, even for ``trace=False``.  A few records explain a visible pause or
+    a swallowed failure (a failed background search, an exception the
+    controller turned into a retry, a controller that has gone idle).  Without
+    them an ordinary run shows only "failed; retrying" with no cause, so they
+    are written unconditionally, like the pathfinding and cancellation panels.
+    Callers must rate limit anything that can repeat.
+    """
+
+    rendered = message() if callable(message) else message
+    console.print(format_map_ids_in_text(rendered))
+    file = getattr(console, "file", None)
+    if file is not None:
+        file.flush()
+
+
 def profile_print(message: str | Callable[[], str], *, every: int = 1) -> None:
     """Print performance output under the independent performance gate."""
     from modules.context import context

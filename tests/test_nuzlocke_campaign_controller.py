@@ -3510,11 +3510,6 @@ class ControllerDiagnosticsTests(unittest.TestCase):
         from modules.nuzlocke import campaign_controller as controller
 
         logs = []
-        flags = []
-
-        def capture(message, *args, **kwargs):
-            logs.append(message())
-            flags.append(kwargs.get("trace"))
 
         def boom():
             raise ValueError("no executable capability")
@@ -3522,12 +3517,13 @@ class ControllerDiagnosticsTests(unittest.TestCase):
         try:
             boom()
         except ValueError as error:
-            with patch.object(controller, "diagnostic_print", side_effect=capture), patch.object(
+            # print_always, not diagnostic_print: the latter is silent without --debug.
+            with patch.object(controller, "print_always", side_effect=lambda m: logs.append(m())), patch.object(
                 controller, "_CONTROLLER_EXCEPTIONS", controller._ControllerExceptionReporter()
             ):
                 controller._report_controller_exception("trainer_preparation", error, objective="x")
 
-        self.assertEqual(flags, [False])
+        self.assertEqual(len(logs), 1)
         self.assertIn("CAMPAIGN_CONTROLLER_EXCEPTION", logs[0])
         self.assertIn("no executable capability", logs[0])
         self.assertIn("boom:", logs[0])

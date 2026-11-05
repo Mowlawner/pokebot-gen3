@@ -21,6 +21,7 @@ from typing import Callable, Generator
 from modules.context import context
 from modules.console import (
     diagnostic_print,
+    print_always,
     print_navigation_cancellation,
     print_navigation_invalidation,
     print_recovery_handoff,
@@ -196,16 +197,12 @@ def _dump_slow_navigation_search(world, start, goal, elapsed_ms: float) -> None:
         path = os.path.join(directory, f"slow_search_{int(_time.time())}_{int(elapsed_ms)}ms.pkl")
         with open(path, "wb") as handle:
             pickle.dump({"world": world, "start": start, "goal": goal, "elapsed_ms": elapsed_ms}, handle)
-        diagnostic_print(
+        print_always(
             lambda: f"NAVIGATION_SEARCH_DUMP: path={path!r}",
-            trace=False,
-            prefix="NAVIGATION_SEARCH_DUMP",
         )
     except Exception as error:  # diagnostics must never break navigation
-        diagnostic_print(
+        print_always(
             lambda: f"NAVIGATION_SEARCH_DUMP_FAILED: {type(error).__name__}: {error}",
-            trace=False,
-            prefix="NAVIGATION_SEARCH_DUMP_FAILED",
         )
 
 
@@ -3172,14 +3169,12 @@ class AgentControlLoop:
                 # Unconditional like the pathfinding panels (and written to the
                 # debug log, not only stdout): this explains a visible
                 # navigation pause without requiring --debug-trace.
-                diagnostic_print(
+                print_always(
                     lambda: (
                         "NAVIGATION_SEARCH_FAILURE: "
                         f"error_type={type(error).__name__!r} elapsed_ms={elapsed_ms:.0f} "
                         f"{_navigation_world_summary(world, start, planning_goal)}"
                     ),
-                    trace=False,
-                    prefix="NAVIGATION_SEARCH_FAILURE",
                 )
                 _dump_slow_navigation_search(world, start, planning_goal, elapsed_ms)
                 raise

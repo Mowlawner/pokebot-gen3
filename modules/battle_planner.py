@@ -26,7 +26,7 @@ from modules.battle_expectiminimax import (
     SearchSwitch,
     search_planner_context,
 )
-from modules.console import diagnostic_print
+from modules.console import diagnostic_print, print_always
 from modules.context import context
 from modules.trainer_checkpoints import known_moves_for_battle
 
@@ -3213,24 +3213,20 @@ def plan_battle_state(
         # would make the release look harmless, so assume the worst case: a
         # release (twice the stored damage) that can faint the active Pokémon.
         opponent_bide_damage = max(opponent_bide_damage, (int(active_hp) + 1) // 2)
-        diagnostic_print(
+        print_always(
             lambda: (
                 "BATTLE_BIDE_DAMAGE_UNKNOWN: opponent Bide release is next but gBideDmg is "
                 f"unreadable; assuming stored_damage={opponent_bide_damage!r}"
             ),
-            trace=False,
-            prefix="BATTLE_BIDE_DAMAGE_UNKNOWN:",
         )
     if opponent_bide_turns > 0:
-        diagnostic_print(
+        print_always(
             lambda: (
                 "BATTLE_BIDE_OBSERVED: "
                 f"opponent={getattr(getattr(opponent, 'species', None), 'name', None)!r} "
                 f"turns_remaining={opponent_bide_turns!r} stored_damage={opponent_bide_damage!r} "
                 f"release_damage={opponent_bide_damage * 2!r} active_hp={active_hp!r}"
             ),
-            trace=False,
-            prefix="BATTLE_BIDE_OBSERVED:",
         )
     util = BattleStrategyUtil(battle_state)
     visible = knowledge_for_planner(knowledge)

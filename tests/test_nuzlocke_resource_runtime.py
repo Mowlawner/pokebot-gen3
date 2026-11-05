@@ -986,6 +986,7 @@ class CampaignCapabilityTests(unittest.TestCase):
             patch.object(runtime, "_preparation_navigation_goal", return_value=goal_result),
             patch.object(runtime, "AgentControlLoop", side_effect=FakeLoop),
             patch.object(runtime, "diagnostic_print", side_effect=capture),
+            patch.object(runtime, "print_always", side_effect=capture),
             patch.object(runtime, "_encounter_stage_trainer_mode") as stage_mode,
             patch.object(runtime, "_rom_backed_encounter_route") as route,
             patch.object(runtime, "static_map_transitions") as static,
@@ -1780,7 +1781,7 @@ class CampaignCapabilityTests(unittest.TestCase):
         logs = []
         fake_context = SimpleNamespace(campaign_preparation_target=None, campaign_status=None)
         with patch.object(runtime, "context", fake_context), patch.object(
-            runtime, "diagnostic_print", side_effect=lambda message, *a, **k: logs.append(message())
+            runtime, "print_always", side_effect=lambda message: logs.append(message())
         ):
             result = runtime._publish_preparation_target(object(), SimpleNamespace(objects=(), triggers=()))
 

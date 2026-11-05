@@ -3498,7 +3498,7 @@ class SlowSearchDumpTests(TestCase):
 
         with patch.dict("os.environ", {}, clear=False) as env:
             env.pop("POKEBOT_DUMP_SLOW_SEARCH", None)
-            with patch("modules.agent_control.diagnostic_print") as printed:
+            with patch("modules.agent_control.print_always") as printed:
                 _dump_slow_navigation_search(object(), (0, 0), object(), 99999.0)
         printed.assert_not_called()
 
@@ -3511,7 +3511,7 @@ class SlowSearchDumpTests(TestCase):
 
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             "os.environ", {"POKEBOT_DUMP_SLOW_SEARCH": directory}
-        ), patch("modules.agent_control.diagnostic_print"):
+        ), patch("modules.agent_control.print_always"):
             _dump_slow_navigation_search({"tiles": 1}, ((0, 1), (2, 3)), ("goal",), 500.0)
             self.assertEqual(os.listdir(directory), [])
             _dump_slow_navigation_search({"tiles": 1}, ((0, 1), (2, 3)), ("goal",), 12000.0)
@@ -3526,7 +3526,7 @@ class SlowSearchDumpTests(TestCase):
         from modules.agent_control import _dump_slow_navigation_search
 
         with patch.dict("os.environ", {"POKEBOT_DUMP_SLOW_SEARCH": "/proc/definitely/not/writable"}), patch(
-            "modules.agent_control.diagnostic_print"
+            "modules.agent_control.print_always"
         ):
             _dump_slow_navigation_search(lambda: None, (0, 0), None, 99999.0)  # unpicklable
 

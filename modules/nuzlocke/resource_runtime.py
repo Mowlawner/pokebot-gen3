@@ -69,6 +69,7 @@ from modules.pokemon_party import get_party
 from modules.pokemon_storage import get_pokemon_storage
 from modules.console import (
     diagnostic_print,
+    print_always,
     print_campaign_encounter_stage,
     print_recovery_attempt,
     print_recovery_failure,
@@ -2892,7 +2893,7 @@ def execute_campaign_encounter(
         if overworld is None or getattr(overworld, "map_id", None) != map_id:
             unsettled_observations += 1
             if _encounter_wait_should_log(unsettled_observations):
-                diagnostic_print(
+                print_always(
                     lambda: (
                         "CAMPAIGN_ENCOUNTER_STAGE: event=awaiting_destination_observation "
                         f"expected_map={map_id!r} "
@@ -2900,8 +2901,6 @@ def execute_campaign_encounter(
                         f"overworld_available={overworld is not None} "
                         f"waits={unsettled_observations}"
                     ),
-                    trace=False,
-                    prefix="CAMPAIGN_ENCOUNTER_STAGE",
                 )
             if unsettled_observations > _ENCOUNTER_POST_TRANSITION_UNSETTLED_LIMIT:
                 raise BotModeError(
@@ -2923,15 +2922,13 @@ def execute_campaign_encounter(
                 trainer_gate_waits += 1
                 exhausted = trainer_gate_waits > _ENCOUNTER_TRAINER_GATE_WAIT_LIMIT
                 if exhausted or _encounter_wait_should_log(trainer_gate_waits):
-                    diagnostic_print(
+                    print_always(
                         lambda: (
                             "CAMPAIGN_ENCOUNTER_TRAINER_GATE: "
                             f"map={map_id!r} "
                             f"action={'return_to_frontier' if exhausted else 'reobserve'!r} "
                             f"reason={error!r} waits={trainer_gate_waits}"
                         ),
-                        trace=False,
-                        prefix="CAMPAIGN_ENCOUNTER_TRAINER_GATE",
                     )
                 if exhausted:
                     # The geometry never resolved.  Fail closed by handing the
@@ -2965,13 +2962,11 @@ def _publish_preparation_target(navigation_goal, overworld):
     if target is None:
         # No published target means the wild-battle policy will not treat the
         # battles that follow as training.  Never let that be silent.
-        diagnostic_print(
+        print_always(
             lambda: (
                 "CAMPAIGN_PREPARATION_TARGET_UNDESCRIBED: "
                 f"goal={navigation_goal!r} action='wild_battles_will_not_be_training'"
             ),
-            trace=False,
-            prefix="CAMPAIGN_PREPARATION_TARGET_UNDESCRIBED",
         )
         return None
     context.campaign_preparation_target = target.description

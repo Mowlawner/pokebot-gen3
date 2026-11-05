@@ -782,3 +782,19 @@ separate from code-level findings.
   geometry. Both waits are now logged in the normal log and bounded (unsettled
   observation raises `BotModeError`; an unresolved trainer gate returns to the
   frontier).
+
+### Diagnostic visibility correction (2026-11-05)
+
+`diagnostic_print` is silent unless `--debug` or `--debug-trace` is passed, even
+with `trace=False`. Several diagnostics added earlier in this audit were written
+with it while the notes described them as appearing "in the normal log"; in an
+ordinary run they were not visible. The rare, decisive records are now written
+with `print_always` (`modules/console.py`), which prints unconditionally:
+`NAVIGATION_SEARCH_FAILURE`, `NAVIGATION_SEARCH_DUMP`,
+`CAMPAIGN_CONTROLLER_EXCEPTION`, `CAMPAIGN_CONTROLLER_IDLE`,
+`CAMPAIGN_PREPARATION_TARGET_UNDESCRIBED`, `BATTLE_BIDE_OBSERVED`,
+`BATTLE_BIDE_DAMAGE_UNKNOWN`, and the bounded post-warp encounter waits
+(`awaiting_destination_observation`, trainer-gate `return_to_frontier`). Anything
+that can repeat is rate limited. Opt-in tools for silent stalls:
+`POKEBOT_DUMP_SLOW_SEARCH=<dir>` (pickle a slow failed search) and
+`POKEBOT_STALL_DUMP=<file>` (periodic Python stack dumps).
