@@ -249,6 +249,12 @@ if __name__ == "__main__":
     configure_console_log(startup_settings.debug_log_path)
     console.print(f"Starting [bold cyan]{pokebot_name} {pokebot_version}![/]")
 
+    from modules.stall_dump import enable_from_environment as enable_stall_dump
+
+    stall_dump_path = enable_stall_dump()
+    if stall_dump_path is not None:
+        console.print(f"Periodic stack dumps enabled: {stall_dump_path}")
+
     if not is_bundled_app() and not (get_base_path() / ".git").is_dir():
         run_updater()
 
