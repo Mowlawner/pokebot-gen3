@@ -142,6 +142,40 @@ def _gate_observer_call(method_name: str, *args, **kwargs) -> None:
         return
 
 
+def _navigation_world_summary(world, start, goal) -> str:
+    """Summarize the facts that decide whether a trainer-safe search can succeed.
+
+    A search that is cancelled by its time budget and a search that has no
+    safe route look identical in the pathfinding panel.  This compact line is
+    logged when a background search fails so the two can be told apart.
+    """
+
+    try:
+        constraints = getattr(goal, "constraints", None)
+        mode = getattr(getattr(constraints, "trainer_mode", None), "name", None)
+        hazards = []
+        start_in = []
+        total = 0
+        for trigger in getattr(world, "triggers", ()) or ():
+            locations = frozenset(getattr(trigger, "hazard_locations", ()) or ())
+            if not locations:
+                continue
+            total += len(locations)
+            label = getattr(trigger, "affordance_id", None) or getattr(trigger, "trigger_id", None)
+            hazards.append(f"{label}:{len(locations)}")
+            if start in locations:
+                start_in.append(str(label))
+        tiles = len(getattr(world, "tiles", ()) or ())
+        return (
+            f"trainer_mode={mode} forced_exposure_allowed="
+            f"{getattr(constraints, 'allow_forced_trainer_exposure', None)} tiles={tiles} "
+            f"hazard_tiles={total} hazards={sorted(hazards)!r} start={start!r} "
+            f"start_inside_hazard_of={sorted(start_in)!r}"
+        )
+    except Exception as error:  # diagnostics must never break navigation
+        return f"world_summary_unavailable error={type(error).__name__}: {error}"
+
+
 class _SingleFlightNavigationPlanner:
     """Run one tactical world search away from the emulator frame thread."""
 
@@ -3080,13 +3114,27 @@ class AgentControlLoop:
         key = _navigation_request_key(start, planning_goal, world)
         dynamic_blocked_revision, _transition_revision = world.revision_key()
         failure_key = (key, dynamic_blocked_revision, _navigation_failure_revision(world))
-        operation = lambda cancel_check: plan_with_world_navigation(
-            world,
-            start,
-            planning_goal,
-            caller=f"agent_control.background_navigation[{self._navigation_owner_label}]",
-            cancel_check=cancel_check,
-        )
+        def operation(cancel_check):
+            began = monotonic()
+            try:
+                return plan_with_world_navigation(
+                    world,
+                    start,
+                    planning_goal,
+                    caller=f"agent_control.background_navigation[{self._navigation_owner_label}]",
+                    cancel_check=cancel_check,
+                )
+            except (NavigationError, WorldNavigationError, NavigationSearchCancelled) as error:
+                # Unconditional like the pathfinding panels: this explains a
+                # visible navigation pause without requiring --debug-trace.
+                print(
+                    "NAVIGATION_SEARCH_FAILURE: "
+                    f"error_type={type(error).__name__!r} elapsed_ms={(monotonic() - began) * 1000.0:.0f} "
+                    f"{_navigation_world_summary(world, start, planning_goal)}",
+                    flush=True,
+                )
+                raise
+
         result = _background_navigation_planner.poll(
             key,
             operation,

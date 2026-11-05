@@ -3450,3 +3450,43 @@ class AgentExecutionTests(TestCase):
         assert advance.call_count == 1
         step.assert_called_once_with()
         assert emulator.reset_held_buttons.call_count >= 2
+
+
+class NavigationWorldSummaryTests(TestCase):
+    def test_summary_reports_hazards_and_whether_the_start_is_inside_one(self):
+        from modules.agent_control import _navigation_world_summary
+
+        map_id = (0, 19)
+        world = SimpleNamespace(
+            tiles=tuple(range(12)),
+            triggers=(
+                SimpleNamespace(
+                    affordance_id="trainer:(0, 19):26",
+                    hazard_locations=frozenset({(map_id, (11, 41)), (map_id, (11, 42))}),
+                ),
+                SimpleNamespace(affordance_id="not_a_trainer", hazard_locations=frozenset()),
+            ),
+        )
+        goal = NavigationGoal(
+            ReachLocation((map_id, (1, 1))),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+        )
+
+        inside = _navigation_world_summary(world, (map_id, (11, 41)), goal)
+        outside = _navigation_world_summary(world, (map_id, (10, 45)), goal)
+
+        self.assertIn("trainer_mode=AVOID", inside)
+        self.assertIn("hazard_tiles=2", inside)
+        self.assertIn("trainer:(0, 19):26:2", inside)
+        self.assertIn("start_inside_hazard_of=['trainer:(0, 19):26']", inside)
+        self.assertIn("start_inside_hazard_of=[]", outside)
+        self.assertNotIn("not_a_trainer", inside)
+
+    def test_summary_never_raises(self):
+        from modules.agent_control import _navigation_world_summary
+
+        # A hostile world must not break navigation diagnostics.
+        broken = SimpleNamespace(triggers=object())
+        summary = _navigation_world_summary(broken, (0, 0), None)
+
+        self.assertIn("world_summary_unavailable", summary)
