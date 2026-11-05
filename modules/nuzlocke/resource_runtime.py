@@ -2701,26 +2701,20 @@ def _encounter_wait_should_log(waits: int) -> bool:
     return waits == 1 or waits % _ENCOUNTER_WAIT_LOG_INTERVAL == 0
 
 
-def execute_campaign_encounter(
-    encounter_map, *, encounter_method: EncounterMethod = EncounterMethod.LAND
-) -> Iterator[object]:
-    """Navigate to the nearest reachable land-encounter tile on a map.
+def _travel_to_map_staged(map_id, graph) -> Iterator[object]:
+    """Travel to ``map_id`` one ROM-backed exit at a time.
 
-    Cross-map travel is executed one ROM-backed exit at a time.  A semantic
-    destination is useful to campaign policy, but making the tactical search
-    infer an entire interior-to-route chain in one state search can lose the
-    first exit when live perception is partial.
+    Each stage searches the *live* observation of the current map under the
+    stage's trainer policy, which sees trainer geometry accurately.  A single
+    global semantic route plans through static data for the maps ahead, and its
+    static trainer hazards are more conservative than a live observation, so it
+    can report an avoidable corridor (for example Route 104) as unreachable.
+
+    Returns ``True`` once the avatar is on ``map_id``, or ``False`` when the
+    staging owner found no legal exit; the caller decides what that means
+    (the encounter capability hands the objective back to the frontier).
     """
 
-    if not isinstance(encounter_method, EncounterMethod):
-        raise BotModeError(f"malformed campaign encounter method: {encounter_method!r}")
-    if encounter_method is not EncounterMethod.LAND:
-        raise BotModeError(
-            f"campaign encounter method {encounter_method.value!r} is not supported; land is currently implemented"
-        )
-
-    map_id, encounter_candidates = _preparation_training_location(encounter_map)
-    graph = get_world_map_graph()
     stage_retry_delay = 0
     stage_failures = 0
     interaction_executor = AgentActionExecutor()
@@ -2750,7 +2744,7 @@ def execute_campaign_encounter(
             continue
         current_map = overworld.map_id
         if current_map == map_id:
-            break
+            return True
 
         route = _rom_backed_encounter_route(graph, current_map, map_id)
         if len(route.maps) < 2:
@@ -2785,7 +2779,7 @@ def execute_campaign_encounter(
                 trace=True,
                 prefix="CAMPAIGN_ENCOUNTER_STAGE",
             )
-            return
+            return False
         stage_goal = NavigationGoal(
             ReachWarp(
                 destination_map=next_map,
@@ -2883,6 +2877,31 @@ def execute_campaign_encounter(
             ),
             trace=True,
         )
+
+
+def execute_campaign_encounter(
+    encounter_map, *, encounter_method: EncounterMethod = EncounterMethod.LAND
+) -> Iterator[object]:
+    """Navigate to the nearest reachable land-encounter tile on a map.
+
+    Cross-map travel is executed one ROM-backed exit at a time.  A semantic
+    destination is useful to campaign policy, but making the tactical search
+    infer an entire interior-to-route chain in one state search can lose the
+    first exit when live perception is partial.
+    """
+
+    if not isinstance(encounter_method, EncounterMethod):
+        raise BotModeError(f"malformed campaign encounter method: {encounter_method!r}")
+    if encounter_method is not EncounterMethod.LAND:
+        raise BotModeError(
+            f"campaign encounter method {encounter_method.value!r} is not supported; land is currently implemented"
+        )
+
+    map_id, encounter_candidates = _preparation_training_location(encounter_map)
+    graph = get_world_map_graph()
+    arrived = yield from _travel_to_map_staged(map_id, graph)
+    if not arrived:
+        return
 
     attempts = 0
     unsettled_observations = 0
@@ -3176,20 +3195,24 @@ def execute_campaign_preparation(training_map, *, target_level: int) -> Iterator
                 goal=map_goal,
             ).run()
         except NavigationError as error:
-            diagnostic_print(
+            # The global route plans through static data for the maps ahead and
+            # can report an avoidable corridor as unreachable.  Fall back to the
+            # staged travel the encounter capability uses: each stage searches
+            # the live map and still enforces the stage's trainer policy, so
+            # this never becomes a permissive route.
+            print_always(
                 lambda: (
-                    "CAMPAIGN_PREPARATION_MAP_RETRY: "
-                    f"map={training_map!r} attempt={map_navigation_attempts} "
-                    f"error_type={type(error).__name__!r} error={error!r}"
-                ),
-                trace=True,
-                prefix="CAMPAIGN_PREPARATION_MAP_RETRY",
+                    "CAMPAIGN_PREPARATION_MAP_ROUTE: global route unavailable; "
+                    f"using staged trainer-safe travel map={training_map!r} "
+                    f"error_type={type(error).__name__!r} error={str(error)[:200]!r}"
+                )
             )
-            if map_navigation_attempts >= _PREPARATION_NAVIGATION_RETRY_LIMIT:
+            arrived = yield from _travel_to_map_staged(training_map, get_world_map_graph())
+            if not arrived:
                 raise BotModeError(
-                    f"preparation could not reach training map {training_map!r}: {error}"
+                    f"preparation could not reach training map {training_map!r}: "
+                    f"no trainer-safe staged route ({error})"
                 ) from error
-            continue
         break
 
     # The map-level route intentionally stops at the observed entry tile. Pick

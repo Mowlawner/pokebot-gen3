@@ -1886,6 +1886,105 @@ class CampaignCapabilityTests(unittest.TestCase):
         for goal in goals[:2]:
             self.assertEqual(goal.constraints.trainer_mode, TrainerMode.AVOID)
 
+    def _run_preparation_with_failing_global_route(self, *, staged_result):
+        from modules.nuzlocke import resource_runtime as runtime
+        from modules.navigation import NavigationError
+
+        party = (SimpleNamespace(is_egg=False, level=1),)
+        staged_calls = []
+        logs = []
+        loops = []
+
+        class FakeLoop:
+            def __init__(self, fails):
+                self.fails = fails
+
+            def run(self):
+                if self.fails:
+
+                    def failed():
+                        raise NavigationError(
+                            "preferred map route is currently unreachable: (a, b, c)"
+                        )
+                        yield
+
+                    return failed()
+                return iter(())
+
+        class FakePokecenterLoop:
+            def __init__(self, **_kwargs):
+                self.battle_strategy = None
+
+            def on_battle_ended(self):
+                return None
+
+            def verify_on_start(self):
+                return None
+
+            def run(self, *, stop_condition):
+                stop_condition()
+                return iter(())
+
+        def make_loop(_observe, goal=None, **_kwargs):
+            loops.append(goal)
+            # Only the first (global, map-level) route fails.
+            return FakeLoop(fails=len(loops) == 1)
+
+        def fake_travel(map_id, graph):
+            staged_calls.append(map_id)
+            return staged_result
+            yield
+
+        with patch("modules.nuzlocke.resource_runtime.get_party", return_value=party), patch.object(
+            runtime, "_preparation_training_location", return_value=((0, 16), ((1, 1),))
+        ), patch.object(runtime, "AgentControlLoop", side_effect=make_loop), patch.object(
+            runtime,
+            "observe_agent",
+            return_value=SimpleNamespace(overworld=SimpleNamespace(map_id=(0, 16), player_coordinates=(1, 1))),
+        ), patch.object(runtime, "get_world_map_graph", return_value=SimpleNamespace()), patch.object(
+            runtime, "_travel_to_map_staged", side_effect=fake_travel
+        ), patch.object(
+            runtime.NavigationWorld, "from_overworld", return_value=object()
+        ), patch.object(
+            runtime,
+            "plan_with_world_navigation",
+            return_value=(SimpleNamespace(forced_trainer_exposure=False), None),
+        ), patch.object(
+            runtime, "CampaignPreparationLoopController", return_value=FakePokecenterLoop()
+        ), patch.object(
+            runtime, "print_always", side_effect=lambda message: logs.append(message())
+        ):
+            try:
+                list(execute_campaign_preparation((0, 16), target_level=14))
+                error = None
+            except Exception as caught:  # noqa: BLE001 - asserted by the callers
+                error = caught
+        return staged_calls, logs, loops, error
+
+    def test_preparation_falls_back_to_staged_travel_when_the_global_route_fails(self):
+        from modules.goals import TrainerMode
+
+        staged_calls, logs, loops, error = self._run_preparation_with_failing_global_route(staged_result=True)
+
+        self.assertIsNone(error)
+        self.assertEqual(staged_calls, [(0, 16)])
+        self.assertTrue(any("CAMPAIGN_PREPARATION_MAP_ROUTE" in line for line in logs))
+        # The failed global attempt was itself trainer-avoiding, and so was
+        # everything after it: the fallback is not a permissive route.
+        for goal in loops:
+            self.assertEqual(goal.constraints.trainer_mode, TrainerMode.AVOID)
+
+    def test_preparation_surfaces_a_staged_travel_failure_instead_of_going_permissive(self):
+        from modules.modes._interface import BotModeError
+
+        staged_calls, _logs, loops, error = self._run_preparation_with_failing_global_route(staged_result=False)
+
+        self.assertEqual(staged_calls, [(0, 16)])
+        self.assertIsInstance(error, BotModeError)
+        self.assertIn("no trainer-safe staged route", str(error))
+        # No further navigation was attempted after the staged route failed.
+        self.assertEqual(len(loops), 1)
+
     def test_preparation_can_select_a_reachable_trainer_when_grass_is_blocked(self):
         from modules.goals import EngageTrainer, ReachLocation, TrainerMode
         from modules.navigation import NavigationError
