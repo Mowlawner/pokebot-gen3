@@ -1757,6 +1757,36 @@ class CampaignCapabilityTests(unittest.TestCase):
         pokecenter_loop.verify_on_start.assert_called_once_with()
         pokecenter_loop.on_battle_ended.assert_called_once_with()
 
+    def test_preparation_publishes_a_target_for_the_trainer_safe_grass_goal(self):
+        from modules.goals import ReachLocation, TrainerMode
+        from modules.nuzlocke import resource_runtime as runtime
+
+        goal = NavigationGoal(
+            ReachLocation((MapRSE.ROUTE103.value, (11, 14))),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+        )
+        fake_context = SimpleNamespace(campaign_preparation_target=None, campaign_status=None)
+        with patch.object(runtime, "context", fake_context):
+            target = runtime._publish_preparation_target(
+                goal, SimpleNamespace(map_id=MapRSE.ROUTE103.value, objects=(), triggers=())
+            )
+
+        self.assertIsNotNone(target)
+        self.assertTrue(fake_context.campaign_preparation_target)
+
+    def test_preparation_logs_when_a_goal_cannot_be_described(self):
+        from modules.nuzlocke import resource_runtime as runtime
+
+        logs = []
+        fake_context = SimpleNamespace(campaign_preparation_target=None, campaign_status=None)
+        with patch.object(runtime, "context", fake_context), patch.object(
+            runtime, "diagnostic_print", side_effect=lambda message, *a, **k: logs.append(message())
+        ):
+            result = runtime._publish_preparation_target(object(), SimpleNamespace(objects=(), triggers=()))
+
+        self.assertIsNone(result)
+        self.assertTrue(any("CAMPAIGN_PREPARATION_TARGET_UNDESCRIBED" in line for line in logs))
+
     def test_preparation_grass_goal_defaults_to_trainer_avoidance(self):
         from modules.goals import ReachLocation, TrainerMode
 

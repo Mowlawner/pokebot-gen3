@@ -74,6 +74,10 @@ def describe_preparation_target(navigation_goal, overworld) -> PreparationTarget
     """Describe a selected grass tile or trainer from the live observation."""
 
     goal = navigation_goal
+    if isinstance(goal, NavigationGoal) and isinstance(goal.target, ReachLocation):
+        # A trainer-safe grass route is a ReachLocation wrapped with its AVOID
+        # constraints.  It describes the same training tile as a bare goal.
+        goal = goal.target
     if isinstance(goal, ReachLocation):
         map_id, coordinates = goal.location
         map_name = map_display_name(map_id) or repr(map_id)

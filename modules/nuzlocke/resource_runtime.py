@@ -2963,6 +2963,16 @@ def _publish_preparation_target(navigation_goal, overworld):
 
     target = describe_preparation_target(navigation_goal, overworld)
     if target is None:
+        # No published target means the wild-battle policy will not treat the
+        # battles that follow as training.  Never let that be silent.
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_PREPARATION_TARGET_UNDESCRIBED: "
+                f"goal={navigation_goal!r} action='wild_battles_will_not_be_training'"
+            ),
+            trace=False,
+            prefix="CAMPAIGN_PREPARATION_TARGET_UNDESCRIBED",
+        )
         return None
     context.campaign_preparation_target = target.description
     status = getattr(context, "campaign_status", None)

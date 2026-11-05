@@ -15,6 +15,30 @@ def test_grass_preparation_target_includes_map_name_and_tile():
     assert result.semantic_target.location == ((0, 31), (12, 17))
 
 
+def test_trainer_safe_grass_goal_is_described_like_a_bare_grass_goal():
+    """A trainer-safe grass route wraps its ReachLocation in a NavigationGoal.
+
+    The wild-battle policy treats a published preparation target as "training
+    requested".  If the wrapped goal is not described, no target is published
+    and every wild battle during preparation is fled, so no XP is ever earned.
+    """
+
+    from modules.goals import GoalConstraints, TrainerMode
+
+    wrapped = NavigationGoal(
+        ReachLocation(((0, 31), (12, 17))),
+        constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+    )
+    result = describe_preparation_target(
+        wrapped,
+        SimpleNamespace(map_id=(0, 31), objects=(), triggers=()),
+    )
+
+    assert result is not None
+    assert result.description == "grass on Route 116 at (12, 17)"
+    assert result.semantic_target.location == ((0, 31), (12, 17))
+
+
 def test_trainer_preparation_target_uses_script_and_stable_id():
     trainer = ObjectObservation(
         local_id=6,
