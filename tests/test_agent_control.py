@@ -3490,3 +3490,42 @@ class NavigationWorldSummaryTests(TestCase):
         summary = _navigation_world_summary(broken, (0, 0), None)
 
         self.assertIn("world_summary_unavailable", summary)
+
+
+class SlowSearchDumpTests(TestCase):
+    def test_dump_is_disabled_without_the_environment_variable(self):
+        from modules.agent_control import _dump_slow_navigation_search
+
+        with patch.dict("os.environ", {}, clear=False) as env:
+            env.pop("POKEBOT_DUMP_SLOW_SEARCH", None)
+            with patch("modules.agent_control.diagnostic_print") as printed:
+                _dump_slow_navigation_search(object(), (0, 0), object(), 99999.0)
+        printed.assert_not_called()
+
+    def test_dump_skips_fast_failures_and_writes_slow_ones(self):
+        import os
+        import pickle
+        import tempfile
+
+        from modules.agent_control import _dump_slow_navigation_search
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            "os.environ", {"POKEBOT_DUMP_SLOW_SEARCH": directory}
+        ), patch("modules.agent_control.diagnostic_print"):
+            _dump_slow_navigation_search({"tiles": 1}, ((0, 1), (2, 3)), ("goal",), 500.0)
+            self.assertEqual(os.listdir(directory), [])
+            _dump_slow_navigation_search({"tiles": 1}, ((0, 1), (2, 3)), ("goal",), 12000.0)
+            files = os.listdir(directory)
+            self.assertEqual(len(files), 1)
+            with open(os.path.join(directory, files[0]), "rb") as handle:
+                payload = pickle.load(handle)
+        self.assertEqual(payload["start"], ((0, 1), (2, 3)))
+        self.assertEqual(payload["goal"], ("goal",))
+
+    def test_dump_failure_never_raises(self):
+        from modules.agent_control import _dump_slow_navigation_search
+
+        with patch.dict("os.environ", {"POKEBOT_DUMP_SLOW_SEARCH": "/proc/definitely/not/writable"}), patch(
+            "modules.agent_control.diagnostic_print"
+        ):
+            _dump_slow_navigation_search(lambda: None, (0, 0), None, 99999.0)  # unpicklable

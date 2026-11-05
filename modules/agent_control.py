@@ -13,6 +13,8 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from threading import Event
 from time import monotonic, perf_counter_ns
+import os
+import time as _time
 import traceback
 from typing import Callable, Generator
 
@@ -174,6 +176,37 @@ def _navigation_world_summary(world, start, goal) -> str:
         )
     except Exception as error:  # diagnostics must never break navigation
         return f"world_summary_unavailable error={type(error).__name__}: {error}"
+
+
+def _dump_slow_navigation_search(world, start, goal, elapsed_ms: float) -> None:
+    """Optionally persist a slow failed search for offline profiling.
+
+    Set ``POKEBOT_DUMP_SLOW_SEARCH`` to a directory to capture the exact
+    immutable world, start and goal of a search that ran for more than three
+    seconds without a result.  Disabled by default.
+    """
+
+    directory = os.environ.get("POKEBOT_DUMP_SLOW_SEARCH")
+    if not directory or elapsed_ms < 3000.0:
+        return
+    try:
+        import pickle
+
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"slow_search_{int(_time.time())}_{int(elapsed_ms)}ms.pkl")
+        with open(path, "wb") as handle:
+            pickle.dump({"world": world, "start": start, "goal": goal, "elapsed_ms": elapsed_ms}, handle)
+        diagnostic_print(
+            lambda: f"NAVIGATION_SEARCH_DUMP: path={path!r}",
+            trace=False,
+            prefix="NAVIGATION_SEARCH_DUMP",
+        )
+    except Exception as error:  # diagnostics must never break navigation
+        diagnostic_print(
+            lambda: f"NAVIGATION_SEARCH_DUMP_FAILED: {type(error).__name__}: {error}",
+            trace=False,
+            prefix="NAVIGATION_SEARCH_DUMP_FAILED",
+        )
 
 
 class _SingleFlightNavigationPlanner:
@@ -3125,14 +3158,20 @@ class AgentControlLoop:
                     cancel_check=cancel_check,
                 )
             except (NavigationError, WorldNavigationError, NavigationSearchCancelled) as error:
-                # Unconditional like the pathfinding panels: this explains a
-                # visible navigation pause without requiring --debug-trace.
-                print(
-                    "NAVIGATION_SEARCH_FAILURE: "
-                    f"error_type={type(error).__name__!r} elapsed_ms={(monotonic() - began) * 1000.0:.0f} "
-                    f"{_navigation_world_summary(world, start, planning_goal)}",
-                    flush=True,
+                elapsed_ms = (monotonic() - began) * 1000.0
+                # Unconditional like the pathfinding panels (and written to the
+                # debug log, not only stdout): this explains a visible
+                # navigation pause without requiring --debug-trace.
+                diagnostic_print(
+                    lambda: (
+                        "NAVIGATION_SEARCH_FAILURE: "
+                        f"error_type={type(error).__name__!r} elapsed_ms={elapsed_ms:.0f} "
+                        f"{_navigation_world_summary(world, start, planning_goal)}"
+                    ),
+                    trace=False,
+                    prefix="NAVIGATION_SEARCH_FAILURE",
                 )
+                _dump_slow_navigation_search(world, start, planning_goal, elapsed_ms)
                 raise
 
         result = _background_navigation_planner.poll(
