@@ -2181,6 +2181,94 @@ class CampaignCapabilityTests(unittest.TestCase):
                 context.campaign_readiness_diagnostic,
             ) = previous
 
+    def _recovery_guard_fixture(self, *, route_tiles, hazard_tiles, status=None, goal=None):
+        from modules.nuzlocke.resource_runtime import _recovery_trainer_safety_error
+
+        route_map = MapRSE.ROUTE104.value
+        route = NavigationPlan(
+            actions=tuple(
+                NavigationAction(
+                    NavigationActionType.MOVE,
+                    Direction.East,
+                    (route_map, source),
+                    (route_map, destination),
+                )
+                for source, destination in zip(route_tiles, route_tiles[1:])
+            ),
+            destination=(route_map, route_tiles[-1]),
+        )
+        goal = goal or NavigationGoal(
+            ReachLocation(PokemonCenter.OldaleTown.value),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+        )
+        diagnostic = SimpleNamespace(
+            trainer_checkpoint=None,
+            trainer_risks=(
+                SimpleNamespace(
+                    trainer_id="trainer:(0, 19):26",
+                    hazard_locations=frozenset((route_map, tile) for tile in hazard_tiles),
+                ),
+            ),
+        )
+        readiness = SimpleNamespace(status=SimpleNamespace(value=status)) if status else None
+        previous = (
+            context.campaign_trainer_checkpoint,
+            context.campaign_trainer_readiness,
+            context.campaign_readiness_diagnostic,
+        )
+        context.campaign_trainer_checkpoint = None
+        context.campaign_trainer_readiness = readiness
+        context.campaign_readiness_diagnostic = diagnostic
+        self.addCleanup(
+            lambda: (
+                setattr(context, "campaign_trainer_checkpoint", previous[0]),
+                setattr(context, "campaign_trainer_readiness", previous[1]),
+                setattr(context, "campaign_readiness_diagnostic", previous[2]),
+            )
+        )
+        return _recovery_trainer_safety_error(route, goal)
+
+    def test_recovery_guard_rejects_any_undefeated_trainer_on_the_route(self):
+        error = self._recovery_guard_fixture(
+            route_tiles=((11, 42), (12, 42), (13, 42)),
+            hazard_tiles=((12, 42),),
+            status=None,
+        )
+
+        self.assertIsNotNone(error)
+        self.assertIn("undefeated trainer", error)
+
+    def test_recovery_guard_accepts_route_clear_of_every_trainer_hazard(self):
+        self.assertIsNone(
+            self._recovery_guard_fixture(
+                route_tiles=((11, 42), (12, 42), (13, 42)),
+                hazard_tiles=((12, 44),),
+                status=None,
+            )
+        )
+
+    def test_recovery_guard_rejects_non_avoid_and_forced_exposure_goals(self):
+        permissive = NavigationGoal(
+            ReachLocation(PokemonCenter.OldaleTown.value),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.IGNORE),
+        )
+        forced = NavigationGoal(
+            ReachLocation(PokemonCenter.OldaleTown.value),
+            constraints=GoalConstraints(
+                trainer_mode=TrainerMode.AVOID,
+                allow_forced_trainer_exposure=True,
+            ),
+        )
+        for goal in (permissive, forced):
+            with self.subTest(goal=goal):
+                self.assertIsNotNone(
+                    self._recovery_guard_fixture(
+                        route_tiles=((11, 42), (13, 42)),
+                        hazard_tiles=(),
+                        goal=goal,
+                    )
+                )
+
     def test_planned_recovery_preserves_exact_center_warp_goal(self):
         planned_route = object()
         center_warp = object()

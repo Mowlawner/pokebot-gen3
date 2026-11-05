@@ -3655,34 +3655,36 @@ def _recovery_trainer_safety_error(route, navigation_goal) -> str | None:
 
     readiness = getattr(context, "campaign_trainer_readiness", None)
     status = getattr(getattr(readiness, "status", None), "value", None)
-    if status != "prepare":
-        return None
-    checkpoints = [
-        getattr(context, "campaign_trainer_checkpoint", None),
-        getattr(getattr(context, "campaign_readiness_diagnostic", None), "trainer_checkpoint", None),
-    ]
-    aliases = set()
-    for checkpoint in checkpoints:
-        aliases.update(_checkpoint_trainer_aliases(checkpoint))
-    if not aliases:
-        # The readiness result is explicitly unready but has no stable owner.
-        # Keep the route from being mounted under a possibly stale hazard
-        # envelope; the next readiness pass must reconstruct the checkpoint.
-        return "readiness marked a trainer unready but supplied no stable checkpoint identity"
+    aliases: set[str] = set()
+    if status == "prepare":
+        checkpoints = [
+            getattr(context, "campaign_trainer_checkpoint", None),
+            getattr(getattr(context, "campaign_readiness_diagnostic", None), "trainer_checkpoint", None),
+        ]
+        for checkpoint in checkpoints:
+            aliases.update(_checkpoint_trainer_aliases(checkpoint))
+        if not aliases:
+            # The readiness result is explicitly unready but has no stable owner.
+            # Keep the route from being mounted under a possibly stale hazard
+            # envelope; the next readiness pass must reconstruct the checkpoint.
+            return "readiness marked a trainer unready but supplied no stable checkpoint identity"
 
+    # Every recorded risk describes an undefeated trainer.  Recovery heals a
+    # damaged party, so it may not expose any of them: an explicitly unready
+    # checkpoint is reported by name, but an unrelated undefeated trainer on
+    # the route is just as unsafe to meet while recovering.
     diagnostic = getattr(context, "campaign_readiness_diagnostic", None)
     route_locations = _location_set_for_navigation_route(route)
     for risk in tuple(getattr(diagnostic, "trainer_risks", ()) or ()):
         trainer_id = getattr(risk, "trainer_id", None)
-        if trainer_id not in aliases:
-            continue
         hazards = frozenset(getattr(risk, "hazard_locations", ()) or ())
         conflict = route_locations.intersection(hazards)
-        if conflict:
-            return (
-                f"route intersects explicitly unready trainer {trainer_id!r} "
-                f"at {tuple(sorted(conflict, key=repr))!r}"
-            )
+        if not conflict:
+            continue
+        locations = tuple(sorted(conflict, key=repr))
+        if trainer_id in aliases:
+            return f"route intersects explicitly unready trainer {trainer_id!r} at {locations!r}"
+        return f"route intersects undefeated trainer {trainer_id!r} at {locations!r}"
     return None
 
 
