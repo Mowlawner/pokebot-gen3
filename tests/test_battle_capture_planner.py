@@ -152,6 +152,45 @@ class CapturePlanChoiceTests(unittest.TestCase):
         self.assertGreaterEqual(risky.target_ko_probability, 0.0)
 
 
+class CaptureCriticalHitTests(unittest.TestCase):
+    def test_our_critical_hit_is_a_knockout_risk_even_when_normal_damage_is_not(self):
+        # Tackle 3-4 cannot knock out a 7 HP target, but a critical hit (double
+        # the maximum, 8) can: exactly the 1-in-16 critical chance.
+        plans, _ = evaluate_capture_plans(
+            capture_context(opponent_hp=7, moves=(PlannerMove(0, "Tackle", 3, 4),))
+        )
+        one_move = next(plan for plan in plans if plan.weaken_turns == 1)
+
+        self.assertAlmostEqual(one_move.target_ko_probability, 1 / 16, places=4)
+
+    def test_an_opponent_critical_that_exceeds_the_leads_hp_raises_the_faint_risk(self):
+        def throw_now_faint(critical_damage):
+            context = capture_context(
+                active_hp=12,
+                active_max_hp=12,
+                opponent_moves=(
+                    PlannerOpponentMove(
+                        "Tackle", 5, 7, accuracy=1.0, critical_damage_max=critical_damage
+                    ),
+                ),
+            )
+            plans, _ = evaluate_capture_plans(context)
+            return next(plan for plan in plans if plan.weaken_turns == 0).active_faint_probability
+
+        # 14 can one-shot a 12 HP lead; 11 cannot.
+        self.assertGreater(throw_now_faint(14), throw_now_faint(11))
+
+    def test_a_replan_after_a_critical_uses_the_live_target_hp(self):
+        # The plan is recomputed from the observed state each turn: after a
+        # critical drops the target to 3 HP the planner throws instead of
+        # attacking, because another hit would knock it out.
+        before = choose_capture_plan(capture_context(opponent_hp=19))
+        after_crit = choose_capture_plan(capture_context(opponent_hp=3))
+
+        self.assertGreater(before.plan.weaken_turns, 0)
+        self.assertEqual(after_crit.plan.weaken_turns, 0)
+
+
 class CapturePreconditionTests(unittest.TestCase):
     def assertDefers(self, **changes):
         self.assertIsNone(choose_capture_plan(capture_context(**changes)))
