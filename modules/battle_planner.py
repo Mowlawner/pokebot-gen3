@@ -26,6 +26,7 @@ from modules.battle_expectiminimax import (
     SearchSwitch,
     search_planner_context,
 )
+from modules.battle_kind import BattleKind, classify_battle
 from modules.console import diagnostic_print, print_always
 from modules.context import context
 from modules.trainer_checkpoints import known_moves_for_battle
@@ -190,6 +191,45 @@ def normalized_battle_objective(
     if not getattr(battle_state, "is_trainer_battle", False):
         return intent or "defeat"
     return "defeat"
+
+
+_LAST_BATTLE_KIND_LOG: tuple | None = None
+
+
+def _log_battle_kind(battle_state, knowledge, planner_context) -> None:
+    """Name the battle kind once per battle (and again if it changes)."""
+
+    global _LAST_BATTLE_KIND_LOG
+    try:
+        from modules.battle_state import BattleType
+
+        first_battle = BattleType.FirstBattle in getattr(battle_state, "type", BattleType(0))
+    except (AttributeError, TypeError, ValueError):
+        first_battle = False
+    classification = classify_battle(
+        objective=planner_context.battle_objective,
+        is_trainer=bool(getattr(battle_state, "is_trainer_battle", False)),
+        first_battle=first_battle,
+        capture_target=planner_context.capture_target,
+        capture_available=planner_context.capture_available,
+        intent=getattr(context, "campaign_wild_battle_intent", None),
+    )
+    key = (
+        getattr(knowledge, "battle_id", None),
+        planner_context.opponent_name,
+        classification.kind,
+        classification.reason,
+    )
+    if key == _LAST_BATTLE_KIND_LOG:
+        return
+    _LAST_BATTLE_KIND_LOG = key
+    print_always(
+        lambda: (
+            f"BATTLE_KIND: kind={classification.kind.value!r} "
+            f"objective={planner_context.battle_objective!r} "
+            f"opponent={planner_context.opponent_name!r} reason={classification.reason!r}"
+        )
+    )
 
 
 def format_search_principal_variation(result, planner_context=None) -> str:
@@ -1069,7 +1109,71 @@ class BattlePlanner:
 
         usable = [move for move in context.moves if self._is_candidate(move)]
         search_config = _CAMPAIGN_SEARCH_CONFIG if context.campaign_owned else _LIVE_SEARCH_CONFIG
+        # A wild capture is a single-agent problem with chance, not an
+        # adversarial game: answer it with the dedicated bounded solver and
+        # defer to the generic search only when it cannot model the battle or
+        # cannot find a plan within its faint-risk bound.
+        classification = classify_battle(
+            objective=context.battle_objective,
+            is_trainer=context.is_trainer,
+            capture_target=context.capture_target,
+            capture_available=context.capture_available,
+        )
+        if classification.kind is BattleKind.WILD_CAPTURE:
+            capture_decision = self._capture_decision(context)
+            if capture_decision is not None:
+                return capture_decision
         return self._expectiminimax_decision(context, usable)
+
+    def _capture_decision(self, context: PlannerContext) -> PlannerDecision | None:
+        """Decide a wild capture with the dedicated solver, or return ``None``."""
+
+        from modules.battle_capture_planner import choose_capture_plan
+
+        try:
+            choice = choose_capture_plan(context)
+        except (AttributeError, IndexError, KeyError, RuntimeError, TypeError, ValueError, ZeroDivisionError):
+            return None
+        if choice is None:
+            return None
+        plan = choice.plan
+        rationale = (
+            f"capture planner (bounded exact plan comparison): chose {plan.summary()}. "
+            "Alternatives: "
+            + (" | ".join(alternative.summary() for alternative in choice.alternatives) or "none")
+        )
+        evidence = (
+            PlannerEvidence(
+                PlannerEvidenceKind.KNOWN,
+                f"{context.active_name} HP is {context.active_hp}/{context.active_max_hp}",
+            ),
+            PlannerEvidence(
+                PlannerEvidenceKind.KNOWN,
+                f"{context.opponent_name} HP is {context.opponent_hp}/{context.opponent_max_hp or 'unknown'}",
+            ),
+            PlannerEvidence(
+                PlannerEvidenceKind.KNOWN,
+                f"{context.capture_ball_count} capture ball(s) available",
+            ),
+            PlannerEvidence(PlannerEvidenceKind.DERIVED, rationale),
+        )
+        common = dict(
+            confidence=PlannerConfidence.HIGH,
+            rationale=rationale,
+            safety=PlannerSafety.SAFE,
+            evidence=evidence,
+            rejected_candidates=tuple(alternative.summary() for alternative in choice.alternatives),
+            classification=PlannerDecisionClass.SAFE,
+            risk=PlannerRisk.LOW,
+            evaluation_method="capture_planner",
+        )
+        if plan.weaken_turns == 0:
+            return PlannerDecision(
+                PlannerAction.UseItem,
+                (choice.ball_item.item, context.active_party_index),
+                **common,
+            )
+        return PlannerDecision(PlannerAction.UseMove, plan.move_index, **common)
 
         # The code below is retained temporarily as a reference for the
         # conservative fact checks that preceded the unified evaluator.  It is
@@ -3587,6 +3691,7 @@ def plan_battle_state(
         opponent_bide_turns=opponent_bide_turns,
         opponent_bide_damage=opponent_bide_damage,
     )
+    _log_battle_kind(battle_state, knowledge, planner_context)
     objective_facts = (
         f"capture_available={planner_context.capture_available} "
         f"capture_ball_count={planner_context.capture_ball_count}"
