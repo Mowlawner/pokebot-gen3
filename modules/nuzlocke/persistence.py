@@ -33,6 +33,7 @@ from .events import (
     MapChanged,
     PartyChanged,
     PokemonFainted,
+    RunFailed,
     StorageChanged,
     WhiteoutOccurred,
     NuzlockeStarted,
@@ -71,10 +72,37 @@ _EVENT_TYPES = {
         PartyChanged,
         PokemonFainted,
         WhiteoutOccurred,
+        RunFailed,
         StorageChanged,
         NuzlockeStarted,
     )
 }
+
+
+def _stable_identity_matches(historical: Any, current: Any) -> bool:
+    """Compare save identities across the old and current provenance formats.
+
+    Older manifests stored one party member's full Pokémon identity, which
+    included its personality value.  Party order is mutable, so the
+    personality value made an ordinary lead rotation look like a different
+    save.  Current provenance stores the original trainer ID and secret ID,
+    which are shared by the player's Pokémon and survive those rotations.
+    """
+
+    def trainer_pair(value: Any) -> tuple[int, int] | None:
+        if not isinstance(value, (list, tuple)) or len(value) < 2:
+            return None
+        try:
+            # The legacy shape is [personality, original_trainer_id,
+            # original_trainer_secret_id].  The current shape contains only
+            # the final two fields.
+            return int(value[-2]), int(value[-1])
+        except (TypeError, ValueError):
+            return None
+
+    historical_pair = trainer_pair(historical)
+    current_pair = trainer_pair(current)
+    return historical_pair is not None and historical_pair == current_pair
 
 
 class EventStoreError(Exception):
@@ -240,6 +268,8 @@ class JsonEventStore:
         self._legacy = False
         self._append_path = self.path.with_name(self.path.name + ".append")
         self._provenance_path = self.path.with_name(self.path.name + ".provenance")
+        self._provenance_loaded = False
+        self._provenance_cache: dict[str, Any] | None = None
         self._write_lock = RLock()
         self._initialized = False
         if self.path.exists():
@@ -472,6 +502,12 @@ class JsonEventStore:
         if not isinstance(current, dict):
             return True
         manifest = self._read_provenance()
+        if manifest is not None:
+            # Compatibility checks may update the local high-water candidate
+            # before a save boundary. Work on a shallow copy so a
+            # persist=False check never makes an unsaved update look persisted
+            # to the next boundary check.
+            manifest = dict(manifest)
         if manifest is None:
             manifest = {
                 "schema_version": PROVENANCE_SCHEMA_VERSION,
@@ -494,7 +530,9 @@ class JsonEventStore:
 
         historical_identity = manifest.get("stable_identity")
         current_identity = observation.get("stable_identity")
-        if enforce and historical_identity and current_identity and historical_identity != current_identity:
+        if enforce and historical_identity and current_identity and not _stable_identity_matches(
+            historical_identity, current_identity
+        ):
             return False
 
         changed = False
@@ -514,17 +552,19 @@ class JsonEventStore:
             self._write_provenance(manifest)
         return True
 
-    def quarantine(self) -> Path | None:
-        """Archive incompatible history and start a fresh event log.
+    def quarantine(self, *, label: str = "stale") -> Path | None:
+        """Archive history and start a fresh event log.
 
         The old files are renamed, never deleted.  This lets a user inspect
         or restore a prior timeline while keeping the profile's canonical
-        event-store path aligned with the newly observed save.
+        event-store path aligned with the newly observed save.  ``label``
+        distinguishes save-incompatible history (``stale``) from a terminal
+        failed run (``failed``).
         """
         with self._write_lock:
             archived: Path | None = None
             if self.path.exists():
-                suffix = f".stale-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+                suffix = f".{label}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
                 archived = self.path.with_name(self.path.name + suffix)
                 os.replace(self.path, archived)
                 if self._append_path.exists():
@@ -534,6 +574,8 @@ class JsonEventStore:
             self._records = []
             self._ids = set()
             self._legacy = False
+            self._provenance_loaded = True
+            self._provenance_cache = None
             self._write_header()
             self._initialized = True
             return archived
@@ -541,7 +583,11 @@ class JsonEventStore:
     def _read_provenance(self) -> dict[str, Any] | None:
         """Read the optional save-compatibility manifest."""
 
+        if self._provenance_loaded:
+            return self._provenance_cache
         if not self._provenance_path.exists():
+            self._provenance_loaded = True
+            self._provenance_cache = None
             return None
         try:
             value = json.loads(self._provenance_path.read_text(encoding="utf-8"))
@@ -551,6 +597,8 @@ class JsonEventStore:
             ) from error
         if not isinstance(value, dict) or value.get("schema_version") != PROVENANCE_SCHEMA_VERSION:
             raise EventStoreCorruptionError("Unsupported event-store provenance schema")
+        self._provenance_loaded = True
+        self._provenance_cache = value
         return value
 
     def _write_provenance(self, value: dict[str, Any]) -> None:
@@ -567,13 +615,15 @@ class JsonEventStore:
                 os.fsync(handle.fileno())
             os.replace(temporary, self._provenance_path)
             self._fsync_directory()
+            self._provenance_loaded = True
+            self._provenance_cache = dict(value)
         except OSError as error:
             raise EventStoreError(f"Could not write event-store provenance: {self._provenance_path}") from error
         finally:
             temporary.unlink(missing_ok=True)
 
     def _historical_stable_identity(self) -> list[int] | None:
-        """Find the first durable party identity in old event payloads."""
+        """Find the save-wide trainer identity in old event payloads."""
         for event in self.iter_events():
             candidates = []
             for name in (
@@ -590,7 +640,6 @@ class JsonEventStore:
             for identity in candidates:
                 if isinstance(identity, PokemonIdentity):
                     return [
-                        identity.personality_value,
                         identity.original_trainer_id,
                         identity.original_trainer_secret_id,
                     ]

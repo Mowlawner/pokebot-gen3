@@ -326,6 +326,20 @@ class GoalAwareNavigationTests(TestCase):
         self.assertTrue(dynamic_world.tiles[("test", (1, 0))].blocked)
         self.assertIs(dynamic_world.tiles[("test", (0, 0))], first.tiles[("test", (0, 0))])
 
+        static_blocked = OverworldObservation(
+            map_id=("test", 0),
+            player_coordinates=(0, 0),
+            facing=Direction.East,
+            controllable=True,
+            tiles=tiles,
+            warps=(),
+            objects=(),
+            triggers=(),
+            static_blocked_coordinates=frozenset({(1, 0)}),
+        )
+        static_world = NavigationWorld.from_overworld(static_blocked)
+        self.assertTrue(static_world.tiles[("test", (1, 0))].blocked)
+
     def test_prefers_shortest_matching_warp(self):
         start = (("test"), (0, 0))
         near = WarpObservation((("test"), (1, 0)), (("outside", 0), (0, 0)))
@@ -396,3 +410,37 @@ class GoalAwareNavigationTests(TestCase):
             GoalAwareNavigator(world({(0, 0), (1, 0)}, blocked={(1, 0)})).plan(
                 (("test"), (0, 0)), ReachLocation((("test"), (1, 0)))
             )
+
+    def test_failed_reach_warp_emits_a_bounded_transition_diagnostic(self):
+        from modules.navigation import _failed_reach_warp_diagnostics
+
+        target_warp = WarpObservation(
+            (("test"), (1, 0)),
+            (("outside", 0), (0, 0)),
+        )
+        navigator = GoalAwareNavigator(world({(0, 0)}, warps=()))
+        goal = ReachWarp(
+            destination_map=("outside", 0),
+            destination=(("outside", 0), (0, 0)),
+            warp=target_warp,
+        )
+
+        with patch("modules.navigation.diagnostic_print") as trace:
+            with self.assertRaises(NavigationError):
+                navigator.plan((("test"), (0, 0)), goal)
+
+        calls = [call for call in trace.call_args_list if call.kwargs.get("prefix") == "NAVIGATION_REACH_WARP_DIAGNOSTIC:"]
+        self.assertEqual(len(calls), 1)
+        rendered = calls[0].args[0]()
+        self.assertIn("target_source=('test', (1, 0))", rendered)
+        self.assertIn("entry_tile_present=False", rendered)
+        self.assertIn("identity_matches=()", rendered)
+
+        # A retry against the same immutable world snapshot is deduplicated.
+        with patch("modules.navigation.diagnostic_print") as retry_trace:
+            with self.assertRaises(NavigationError):
+                navigator.plan((("test"), (0, 0)), goal)
+        self.assertFalse(
+            any(call.kwargs.get("prefix") == "NAVIGATION_REACH_WARP_DIAGNOSTIC:" for call in retry_trace.call_args_list)
+        )
+        _failed_reach_warp_diagnostics.clear()

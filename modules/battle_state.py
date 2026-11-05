@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, Flag, KEEP, auto
 from typing import Literal
 
@@ -240,6 +240,7 @@ class BattleState:
         absent_battler_flags: int,
         current_turn: int,
         weather: int,
+        bide_damage: bytes = b"",
     ):
         self._battle_type = battle_type
         self._side_timers = side_timers
@@ -252,6 +253,9 @@ class BattleState:
         self._absent_battler_flags = absent_battler_flags
         self._current_turn = current_turn
         self._weather = weather
+        # Emerald stores accumulated direct Bide damage in the global
+        # gBideDmg array. Keep it with the other frame snapshot buffers.
+        self._bide_damage = bide_damage
 
     def __eq__(self, other):
         if isinstance(other, BattleState):
@@ -265,6 +269,7 @@ class BattleState:
                 and self._battler_disable_structs == other._battler_disable_structs
                 and self._absent_battler_flags == other._absent_battler_flags
                 and self._weather == other._weather
+                and self._bide_damage == other._bide_damage
             )
         else:
             return NotImplemented
@@ -320,6 +325,27 @@ class BattleState:
             return False
 
     @property
+    def nuzlocke_duplicate_encounter(self) -> bool:
+        """Return whether Species Clause rejected the current wild species."""
+
+        runtime = getattr(context, "nuzlocke_runtime", None)
+        if runtime is None or self.is_trainer_battle:
+            return False
+        try:
+            location = get_player_avatar().map_group_and_number
+            opponent = self.opponent.active_battler
+            species = (opponent.species.name,) if opponent is not None else ()
+            eligibility = runtime.capture_eligibility_for(
+                location,
+                is_wild=True,
+                is_trainer=False,
+                species=species,
+            )
+            return bool(getattr(eligibility, "duplicate", False))
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            return False
+
+    @property
     def battling_pokemon(self) -> list["BattlePokemon"]:
         if self._battler_count > 4:
             return []
@@ -338,6 +364,7 @@ class BattleState:
                     self._battler_status3[0x4 * index : 0x4 * (index + 1)],
                     self._battler_disable_structs[0x1C * index : 0x1C * (index + 1)],
                     self._battler_party_indexes[index * 2],
+                    self._bide_damage[0x4 * index : 0x4 * (index + 1)],
                 )
             )
         return result
@@ -542,11 +569,19 @@ class BattleStateSide:
 
 
 class BattlePokemon:
-    def __init__(self, data: bytes, status3: bytes, disable_struct: bytes, party_index: int):
+    def __init__(
+        self,
+        data: bytes,
+        status3: bytes,
+        disable_struct: bytes,
+        party_index: int,
+        bide_damage: bytes = b"",
+    ):
         self._data = data
         self._status3 = status3
         self._disable_struct = disable_struct
         self.party_index = party_index
+        self._bide_damage = bide_damage
 
     def __eq__(self, other):
         if isinstance(other, BattlePokemon):
@@ -782,6 +817,20 @@ class BattlePokemon:
         return TemporaryStatus.from_bitfield(unpack_uint32(self._data[0x50:0x54]), unpack_uint32(self._status3))
 
     @property
+    def bide_turns_remaining(self) -> int:
+        """Return Emerald's live Bide counter from the status2 bitfield."""
+
+        return (unpack_uint32(self._data[0x50:0x54]) >> 8) & 0b11
+
+    @property
+    def bide_damage(self) -> int:
+        """Return the direct HP damage accumulated by this Bide user."""
+
+        if len(self._bide_damage) < 4:
+            return 0
+        return unpack_uint32(self._bide_damage[:4])
+
+    @property
     def ot_id(self) -> int:
         return unpack_uint32(self._data[0x54:0x58])
 
@@ -881,6 +930,13 @@ def get_battle_state() -> BattleState:
     if state_cache.battle_state.age_in_frames == 0:
         return state_cache.battle_state.value
 
+    try:
+        bide_damage = read_symbol("gBideDmg", size=0x10)
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        # Older ROM adapters may not expose this optional global. The status2
+        # timer remains authoritative; only stored damage is unavailable.
+        bide_damage = b""
+
     battle_state = BattleState(
         read_symbol("gBattleTypeFlags", size=0x04),
         read_symbol("gSideTimers", size=0x18),
@@ -893,6 +949,7 @@ def get_battle_state() -> BattleState:
         read_symbol("gAbsentBattlerFlags", size=0x01)[0],
         read_symbol("gBattleResults", offset=0x13, size=1)[0],
         unpack_uint16(read_symbol("gBattleWeather", size=0x02)),
+        bide_damage,
     )
 
     state_cache.battle_state = battle_state
@@ -1054,3 +1111,4 @@ class HandledBattleResult:
     party_indices_that_took_damage_or_changed_status: list[int]
     party_indices_that_gained_exp: list[int]
     party_indices_that_evolved: list[int]
+    experience_gained: list[tuple[int, int]] = field(default_factory=list)

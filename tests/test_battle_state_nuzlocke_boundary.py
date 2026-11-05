@@ -2,13 +2,21 @@ import types
 import unittest
 from unittest.mock import patch
 
-from modules.battle_state import BattleState
+from modules.battle_state import BattlePokemon, BattleState
 from modules.context import context
 from modules.nuzlocke.runtime import NuzlockeRuntime
 from modules.nuzlocke.rules import LocationEncounter, NuzlockeCampaignState, PENDING
 
 
 class TestBattleStateNuzlockeBoundary(unittest.TestCase):
+    def test_battle_pokemon_exposes_live_bide_timer_and_stored_damage(self):
+        data = bytearray(0x58)
+        data[0x50:0x54] = (2 << 8).to_bytes(4, "little")
+        battler = BattlePokemon(bytes(data), b"\x00" * 4, b"\x00" * 0x1C, 0, (7).to_bytes(4, "little"))
+
+        self.assertEqual(battler.bide_turns_remaining, 2)
+        self.assertEqual(battler.bide_damage, 7)
+
     def test_route_101_pending_wild_encounter_is_capture_target(self):
         runtime = NuzlockeRuntime()
         runtime.rules_projection._state = NuzlockeCampaignState(

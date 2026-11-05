@@ -21,6 +21,7 @@ from .events import (
     PartyChanged,
     PokemonCaptured,
     PokemonFainted,
+    RunFailed,
     StorageChanged,
     WhiteoutOccurred,
     NuzlockeStarted,
@@ -83,6 +84,7 @@ class ObservedCampaignState:
     observed_pokemon: tuple[ObservedPokemon, ...] = ()
     observed_faints: tuple[PokemonFainted, ...] = ()
     observed_whiteouts: tuple[ObservedEvent, ...] = ()
+    run_failure: RunFailed | None = None
     observed_captures: tuple[PokemonCaptured, ...] = ()
     nuzlocke_started: bool = False
 
@@ -140,6 +142,7 @@ class CampaignProjection:
                 PokemonCaptured,
                 StorageChanged,
                 WhiteoutOccurred,
+                RunFailed,
                 GameStateChanged,
                 NuzlockeStarted,
             ),
@@ -240,6 +243,8 @@ class CampaignProjection:
             changes["pc_locations"] = tuple((identity, box, slot) for identity, (box, slot) in locations.items())
         elif isinstance(event, WhiteoutOccurred):
             changes["observed_whiteouts"] = state.observed_whiteouts + (meta,)
+        elif isinstance(event, RunFailed):
+            changes["run_failure"] = event
         elif isinstance(event, NuzlockeStarted):
             changes["nuzlocke_started"] = True
         self._state = replace(state, **changes)

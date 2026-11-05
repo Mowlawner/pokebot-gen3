@@ -12,6 +12,7 @@ from modules.nuzlocke.events import (
     PartyChanged,
     PokemonFainted,
     WhiteoutOccurred,
+    RunFailed,
 )
 from modules.nuzlocke.persistence import JsonEventStore
 from modules.nuzlocke.projection import (
@@ -58,6 +59,8 @@ class TestCampaignProjection(unittest.TestCase):
         self.assertEqual(state.observed_pokemon[0].personality_value, 123)
         projection.apply(WhiteoutOccurred(4))
         self.assertEqual(len(projection.state.observed_whiteouts), 1)
+        projection.apply(RunFailed(5, "whiteout"))
+        self.assertEqual(projection.state.run_failure.reason, "whiteout")
 
     def test_replay_incremental_duplicate_and_unknown_party(self):
         events = (PartyChanged(1, (), (), True, (0,)), MapChanged(2, (1, 1), (1, 2)))

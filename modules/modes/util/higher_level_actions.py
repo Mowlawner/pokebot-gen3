@@ -3,6 +3,8 @@ from typing import Generator, Union, Callable
 
 from modules.context import context
 from modules.debug import debug
+from modules.agent_control import AgentActionExecutor, observe_agent, select_action
+from modules.interaction_state import InteractionPhase, InteractionType, classify_interaction, observe_interaction
 from modules.map_data import PokemonCenter
 from modules.memory import (
     get_event_flag,
@@ -385,10 +387,37 @@ def _wait_for_shop_condition(
     *,
     button_to_press: str | None = None,
     task_names: tuple[str, ...] = (),
+    dialogue_executor: AgentActionExecutor | None = None,
 ) -> Generator:
     """Wait for one shop transition without allowing a missed ROM state to hang forever."""
 
     for _ in range(_SHOP_WAIT_TIMEOUT_FRAMES):
+        if dialogue_executor is not None:
+            try:
+                interaction = observe_interaction()
+                interaction_type = classify_interaction(interaction)
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+                interaction_type = InteractionType.UNKNOWN
+                interaction = None
+            dialogue_is_actionable = (
+                getattr(interaction, "interaction_phase", None) is InteractionPhase.FIELD_MESSAGE_INPUT_WAIT
+            )
+            if interaction_type is InteractionType.DIALOGUE:
+                if dialogue_is_actionable:
+                    observation = observe_agent()
+                    decision = select_action(observation)
+                    dialogue_executor.execute(decision.action, observation)
+                    yield
+                    continue
+                # During a purchase confirmation, Task_BuyMenu can remain
+                # active while Task_DrawFieldMessage is still rendering. Do
+                # not let that task satisfy the transition before the message
+                # reaches its A/B input boundary. The initial Mart menu can
+                # retain a stale lifecycle flag, but has no active draw task,
+                # so it still falls through to its normal menu condition.
+                if getattr(interaction, "metadata", {}).get("field_message_task_active", False):
+                    yield
+                    continue
         if condition():
             return
         if button_to_press is not None:
@@ -397,6 +426,18 @@ def _wait_for_shop_condition(
     raise RuntimeError(
         f"Poké Mart operation timed out waiting for {description}; " f"{_shop_wait_diagnostic(task_names)}"
     )
+
+
+def _shop_interaction_is_settled() -> bool:
+    """Return whether a shop message has released control of the item list."""
+
+    try:
+        interaction = observe_interaction()
+        return classify_interaction(interaction) is not InteractionType.DIALOGUE
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+        # Do not issue menu navigation while the interaction boundary is
+        # incomplete; the next frame can provide a coherent observation.
+        return False
 
 
 @debug.track
@@ -449,12 +490,15 @@ def buy_in_shop(shopping_list: list[tuple[Item, int]]):
     if player_money < total_cost:
         raise BotModeError(f"This shopping list would total ${total_cost:,}, but player only has ${player_money:,}")
 
+    dialogue_executor = AgentActionExecutor()
+
     # Scroll to the 'Buy' option
     yield from _wait_for_shop_condition(
         lambda: get_mart_main_menu_scroll_position() <= 0,
         "the Mart Buy option",
         button_to_press="Up",
         task_names=(shop_menu_task,),
+        dialogue_executor=dialogue_executor,
     )
 
     # Wait for 'Buy' menu to open
@@ -467,11 +511,12 @@ def buy_in_shop(shopping_list: list[tuple[Item, int]]):
         lambda: get_game_state_symbol() == buy_menu_cb2,
         f"Buy-menu callback {buy_menu_cb2}",
         task_names=(shop_menu_task,),
+        dialogue_executor=dialogue_executor,
     )
     for _ in range(22):
         yield
 
-    for item, quantity in shopping_list:
+    for item_index, (item, quantity) in enumerate(shopping_list):
         slot = buyable_items.index(item)
         for _ in range(_SHOP_WAIT_TIMEOUT_FRAMES):
             current_slot = get_mart_buy_menu_scroll_position()
@@ -493,6 +538,7 @@ def buy_in_shop(shopping_list: list[tuple[Item, int]]):
             f"quantity-selection task {select_quantity_task}",
             button_to_press="A",
             task_names=(select_quantity_task, shop_menu_task),
+            dialogue_executor=dialogue_executor,
         )
 
         reverse_scroll = quantity > 50
@@ -528,26 +574,37 @@ def buy_in_shop(shopping_list: list[tuple[Item, int]]):
             f"purchase task {buy_menu_task}",
             button_to_press="A",
             task_names=(buy_menu_task, select_quantity_task),
+            dialogue_executor=dialogue_executor,
         )
         yield
         yield
+        if item_index < len(shopping_list) - 1:
+            yield from _wait_for_shop_condition(
+                _shop_interaction_is_settled,
+                "purchase confirmation dialogue",
+                task_names=(buy_menu_task, select_quantity_task, shop_menu_task),
+                dialogue_executor=dialogue_executor,
+            )
 
     yield from _wait_for_shop_condition(
         lambda: task_is_active(return_task),
         f"return task {return_task} to start",
         button_to_press="B",
         task_names=(return_task, shop_menu_task),
+        dialogue_executor=dialogue_executor,
     )
     yield from _wait_for_shop_condition(
         lambda: not task_is_active(return_task),
         f"return task {return_task} to finish",
         button_to_press="B",
         task_names=(return_task, shop_menu_task),
+        dialogue_executor=dialogue_executor,
     )
     yield from _wait_for_shop_condition(
         lambda: task_is_active(shop_menu_task),
         f"Mart task {shop_menu_task} after purchase",
         task_names=(return_task, shop_menu_task),
+        dialogue_executor=dialogue_executor,
     )
     # The purchase mutates save-block inventory while the shop task may still
     # be active on the same emulator frame. Force the next campaign/resource

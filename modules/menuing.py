@@ -24,11 +24,26 @@ from modules.menu_parsers import (
 )
 from modules.modes._asserts import assert_has_pokemon_with_any_move
 from modules.modes._interface import BotModeError
+from modules.nuzlocke.held_item_policy import party_held_items_needing_removal
 from modules.player import player_avatar_is_controllable
 from modules.pokemon import get_move_by_name
 from modules.pokemon_party import get_party, get_party_size, PartyPokemon
 from modules.console import diagnostic_print
-from modules.tasks import get_task, task_is_active
+from modules.tasks import get_task, get_tasks, task_is_active
+
+
+_MENU_NAVIGATION_TIMEOUT = 240
+_ROTATE_PHASE_TIMEOUT = 180
+_ROTATE_EXIT_TIMEOUT = 180
+
+
+class MenuRotationFailure(RuntimeError):
+    """Structured failure raised only when a lead rotation cannot finish."""
+
+    def __init__(self, phase: str, reason: str):
+        self.phase = phase
+        self.reason = reason
+        super().__init__(f"lead rotation failed during {phase}: {reason}")
 
 
 def get_scroll_direction(current_index: int, target_index: int, total_items: int, horizontal: bool = False):
@@ -119,24 +134,37 @@ def scroll_to_item_slot(pocket: ItemPocket, slot_index: int) -> Generator:
 
     # Wait for fade-in to finish (happens when the bag is opened, during which time inputs
     # are not yet active.)
-    while (
-        get_game_state() != GameState.BAG_MENU
-        or unpack_uint16(read_symbol("gPaletteFade", offset=0x07, size=0x02)) & 0x80 != 0
-    ):
-        yield
+    for _ in range(_MENU_NAVIGATION_TIMEOUT):
+        if (
+            get_game_state() != GameState.BAG_MENU
+            or unpack_uint16(read_symbol("gPaletteFade", offset=0x07, size=0x02)) & 0x80 != 0
+        ):
+            yield
+            continue
+        break
+    else:
+        raise RuntimeError("Bag menu did not become input-ready before the navigation timeout")
 
     # Select the correct pocket
     target_pocket_index = pocket.index
-    while open_pocket_index() != target_pocket_index:
+    for _ in range(_MENU_NAVIGATION_TIMEOUT):
+        if open_pocket_index() == target_pocket_index:
+            break
         if open_pocket_index() < target_pocket_index:
             context.emulator.press_button("Right")
         else:
             context.emulator.press_button("Left")
         for _ in range(26):
             yield
+    else:
+        raise RuntimeError(
+            f"Bag pocket did not reach target: target={target_pocket_index!r} current={open_pocket_index()!r}"
+        )
 
     # Scroll to the item
-    while currently_selected_slot() != slot_index:
+    for _ in range(_MENU_NAVIGATION_TIMEOUT):
+        if currently_selected_slot() == slot_index:
+            break
         if currently_selected_slot() < slot_index:
             context.emulator.press_button("Down")
         else:
@@ -146,6 +174,10 @@ def scroll_to_item_slot(pocket: ItemPocket, slot_index: int) -> Generator:
         yield
         if context.rom.is_rs:
             yield
+    else:
+        raise RuntimeError(
+            f"Bag cursor did not reach target: target={slot_index!r} current={currently_selected_slot()!r}"
+        )
 
 
 def scroll_to_party_menu_index(target_index: int) -> Generator:
@@ -156,13 +188,18 @@ def scroll_to_party_menu_index(target_index: int) -> Generator:
 
     # Wait for fade-in to finish (happens when the bag is opened, during which time inputs
     # are not yet active.)
-    while (
-        get_game_state() != GameState.PARTY_MENU
-        or unpack_uint16(read_symbol("gPaletteFade", offset=0x07, size=0x02)) & 0x80 != 0
-    ):
-        yield
+    for _ in range(_MENU_NAVIGATION_TIMEOUT):
+        if (
+            get_game_state() != GameState.PARTY_MENU
+            or unpack_uint16(read_symbol("gPaletteFade", offset=0x07, size=0x02)) & 0x80 != 0
+        ):
+            yield
+            continue
+        break
+    else:
+        raise RuntimeError("Party menu did not become input-ready before the navigation timeout")
 
-    while True:
+    for _ in range(_MENU_NAVIGATION_TIMEOUT):
         cursor = get_current_party_menu_index()
 
         if cursor == target_index:
@@ -173,6 +210,11 @@ def scroll_to_party_menu_index(target_index: int) -> Generator:
             context.emulator.press_button("Up")
         yield
         yield
+    else:
+        raise RuntimeError(
+            f"Party menu cursor did not reach target: target={target_index!r} "
+            f"current={get_current_party_menu_index()!r}"
+        )
 
 
 def get_current_party_menu_index():
@@ -714,6 +756,12 @@ def get_items_available_for_pickup() -> list[str]:
         ]
 
 
+def _item_name_matches(left: str, right: str) -> bool:
+    """Compare ROM item names across the data file's punctuation variants."""
+
+    return str(left).casefold().replace("’", "'") == str(right).casefold().replace("’", "'")
+
+
 def take_held_items_from_multiple_party_pokemon(
     list_of_party_indices: Iterable[int], force_checking: bool = False
 ) -> Generator[None, None, list[Item]]:
@@ -814,6 +862,11 @@ class MenuWrapper:
 
 
 def should_check_for_pickup():
+    # Held-item maintenance also handles incidental items on caught wild
+    # Pokémon and on ordinary party members.  It is independent of the
+    # optional Pickup feature flag.
+    if party_held_items_needing_removal(get_party()):
+        return True
     if not context.config.battle.pickup:
         return False
 
@@ -822,7 +875,10 @@ def should_check_for_pickup():
         [
             pokemon.ability.name == "Pickup"
             and not pokemon.is_egg
-            and ((held_item := pokemon.held_item) is None or held_item.name in items_available_for_pickup)
+                and (
+                    (held_item := pokemon.held_item) is None
+                    or any(_item_name_matches(held_item.name, name) for name in items_available_for_pickup)
+                )
             for pokemon in get_party()
         ]
     ):
@@ -835,7 +891,10 @@ def should_check_for_pickup():
                 pokemon.ability.name == "Pickup"
                 and not pokemon.is_egg
                 and pokemon.held_item is not None
-                and pokemon.held_item.name in items_available_for_pickup
+                and any(
+                    _item_name_matches(pokemon.held_item.name, name)
+                    for name in items_available_for_pickup
+                )
             ):
                 pokemon_with_items_to_pick_up += 1
         if pokemon_with_items_to_pick_up >= context.config.battle.pickup_threshold:
@@ -958,6 +1017,10 @@ class RotatePokemon(BaseMenuNavigator):
     def __init__(self, first_party_index: int, second_party_index: int = 0):
         super().__init__()
         self.party = get_party()
+        self.completed = False
+        self.failure: MenuRotationFailure | None = None
+        self.last_input: str | None = None
+        self._diagnostic_phase: str | None = None
 
         if first_party_index >= len(self.party):
             raise RuntimeError(
@@ -974,6 +1037,100 @@ class RotatePokemon(BaseMenuNavigator):
 
         self._first_party_index = first_party_index
         self._second_party_index = second_party_index
+
+    def _record_input(self, button: str) -> None:
+        self.last_input = button
+        context.emulator.press_button(button)
+
+    def _diagnostic_state(self) -> tuple[object, tuple[str, ...], object]:
+        try:
+            game_state = get_game_state()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            game_state = None
+        try:
+            tasks = tuple(task.symbol for task in (get_tasks() or ()))
+        except (AttributeError, RuntimeError, TypeError, ValueError, KeyError):
+            tasks = ()
+        if game_state is GameState.PARTY_MENU:
+            try:
+                cursor = get_party_menu_cursor_pos(len(self.party))
+            except (AttributeError, RuntimeError, TypeError, ValueError, KeyError):
+                cursor = None
+        else:
+            cursor = None
+        return game_state, tasks, cursor
+
+    def _trace_phase(self, phase: str, event: str = "enter", *, detail: str | None = None) -> None:
+        self._diagnostic_phase = phase
+        diagnostic_state = self._diagnostic_state()
+        diagnostic_print(
+            lambda: (
+                "MENU_ROTATION_PHASE: "
+                f"event={event!r} phase={phase!r} "
+                f"game_state={diagnostic_state[0]!r} tasks={diagnostic_state[1]!r} "
+                f"cursor={diagnostic_state[2]!r} last_input={self.last_input!r} "
+                f"target={self._first_party_index!r} replacement={self._second_party_index!r} "
+                f"detail={detail!r}"
+            ),
+            trace=True,
+            prefix="MENU_ROTATION_PHASE",
+        )
+
+    def _fail(self, phase: str, reason: str) -> None:
+        self.failure = MenuRotationFailure(phase, reason)
+        self.current_step = "exit"
+        self._trace_phase(phase, "failure", detail=reason)
+
+    def _bounded_subnavigator(self, phase: str, navigator, timeout: int):
+        """Run one nested menu navigator with a frame bound and phase telemetry."""
+
+        self._trace_phase(phase)
+        for elapsed in range(timeout):
+            try:
+                next(navigator)
+            except StopIteration as result:
+                if result.value is False:
+                    self._fail(phase, "nested navigator reported failure")
+                    return False
+                if getattr(context, "bot_mode", None) == "Manual":
+                    self._fail(phase, "nested navigator switched to manual mode")
+                    return False
+                self._trace_phase(phase, "complete", detail=f"elapsed_frames={elapsed!r}")
+                return True
+            except (AttributeError, RuntimeError, TypeError, ValueError, IndexError, KeyError) as error:
+                self._fail(phase, f"{type(error).__name__}: {error}")
+                return False
+            if getattr(context, "bot_mode", None) == "Manual":
+                self._fail(phase, "nested navigator switched to manual mode")
+                return False
+            yield
+        self._fail(phase, f"timeout_frames={timeout!r}")
+        return False
+
+    def step(self):
+        """Rotate a field lead through bounded, observable menu phases."""
+
+        phases = (
+            (
+                "open_party_menu",
+                StartMenuNavigator("POKEMON").step(),
+                _ROTATE_PHASE_TIMEOUT,
+            ),
+            (
+                "select_first_pokemon",
+                PokemonPartyMenuNavigator(idx=self._first_party_index, mode="select_switch").step(),
+                _ROTATE_PHASE_TIMEOUT,
+            ),
+            ("select_second_pokemon", self.select_replacement(), _ROTATE_PHASE_TIMEOUT),
+            ("exit_to_overworld", self.exit_to_overworld(), _ROTATE_EXIT_TIMEOUT),
+        )
+        for phase, navigator, timeout in phases:
+            self.current_step = phase
+            succeeded = yield from self._bounded_subnavigator(phase, navigator, timeout)
+            if not succeeded:
+                return
+        self.completed = True
+        self._trace_phase("complete", "success")
 
     def get_next_func(self):
         match self.current_step:
@@ -1004,18 +1161,31 @@ class RotatePokemon(BaseMenuNavigator):
                 self.navigator = self.exit_to_overworld()
 
     def select_replacement(self):
-        while get_party_menu_cursor_pos(len(self.party))["slot_id_2"] != self._second_party_index:
-            if get_party_menu_cursor_pos(len(self.party))["slot_id_2"] > self._second_party_index:
-                context.emulator.press_button("Up")
-            else:
-                context.emulator.press_button("Down")
+        for _ in range(_ROTATE_PHASE_TIMEOUT):
+            cursor = get_party_menu_cursor_pos(len(self.party))["slot_id_2"]
+            if cursor == self._second_party_index:
+                break
+            self._record_input("Up" if cursor > self._second_party_index else "Down")
             yield
+        else:
+            self._fail("select_second_pokemon", "replacement cursor did not reach target")
+            return False
 
-        while not task_is_active("Task_SlideSelectedSlotsOnscreen") and not task_is_active("sub_806D198"):
-            context.emulator.press_button("A")
+        for _ in range(_ROTATE_PHASE_TIMEOUT):
+            if task_is_active("Task_SlideSelectedSlotsOnscreen") or task_is_active("sub_806D198"):
+                break
+            self._record_input("A")
             yield
-        while task_is_active("Task_SlideSelectedSlotsOnscreen") or task_is_active("sub_806D198"):
+        else:
+            self._fail("select_second_pokemon", "replacement confirmation did not start")
+            return False
+
+        for _ in range(_ROTATE_PHASE_TIMEOUT):
+            if not task_is_active("Task_SlideSelectedSlotsOnscreen") and not task_is_active("sub_806D198"):
+                return True
             yield
+        self._fail("select_second_pokemon", "replacement animation did not finish")
+        return False
 
     def exit_to_overworld(self):
         """Close the party menu and the Start menu it was opened from.
@@ -1035,7 +1205,7 @@ class RotatePokemon(BaseMenuNavigator):
         # supported Gen 3 titles.
         if not getattr(getattr(context, "rom", None), "is_emerald", True):
             yield from PartyMenuExit().step()
-            return
+            return getattr(context, "bot_mode", None) != "Manual"
 
         party_input_task = "Task_HandleChooseMonInput"
         start_menu_task = "Task_ShowStartMenu"
@@ -1058,9 +1228,8 @@ class RotatePokemon(BaseMenuNavigator):
                     ),
                     trace=True,
                 )
-                context.message = "Error closing party rotation menu, switching to manual mode..."
-                context.set_manual_mode(enable_video_and_slow_down=False)
-                return
+                self._fail(phase, "menu cleanup timeout")
+                return False
             wait_counter += 1
 
             if phase != last_phase:
@@ -1077,6 +1246,7 @@ class RotatePokemon(BaseMenuNavigator):
                 # strand the navigator.
                 if task_is_active(party_input_task):
                     press_fresh_b()
+                    self.last_input = "B"
                 else:
                     phase = "wait_for_start_menu"
                 yield
@@ -1096,6 +1266,7 @@ class RotatePokemon(BaseMenuNavigator):
             elif phase == "close_start_menu":
                 if task_is_active(start_menu_task):
                     press_fresh_b()
+                    self.last_input = "B"
                 elif get_game_state() == GameState.OVERWORLD and not parse_start_menu()["open"]:
-                    return
+                    return True
                 yield

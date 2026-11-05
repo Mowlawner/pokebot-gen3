@@ -6,6 +6,7 @@ from modules.nuzlocke.emerald_healing_catalog import (
     emerald_healing_source_for_destination,
     emerald_healing_sources_for_map,
 )
+from modules.map_path import Direction
 
 
 class EmeraldHealingCatalogTests(unittest.TestCase):
@@ -29,6 +30,15 @@ class EmeraldHealingCatalogTests(unittest.TestCase):
     def test_destination_resolves_to_catalog_source(self):
         source = emerald_healing_source_for_destination((MapRSE.ROUTE111, (26, 18)))
         self.assertIs(source, HealingSourceRSE.ROUTE111_REST_STOP)
+
+    def test_center_pc_fallback_uses_the_actual_emerald_center_approach(self):
+        source = HealingSourceRSE.OLDALE_POKEMON_CENTER
+
+        self.assertEqual(
+            source.center_pc_approach,
+            ((MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value, (10, 2)), Direction.North),
+        )
+        self.assertIs(source.center_pc_approach[1], Direction.North)
 
 
 if __name__ == "__main__":

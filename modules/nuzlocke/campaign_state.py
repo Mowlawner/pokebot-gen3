@@ -25,6 +25,7 @@ from .snapshots import (
     StoragePokemonSnapshot,
 )
 from .resource_policy import PokeballRestockPolicy
+from .rule_config import CampaignRuleId
 
 T = TypeVar("T")
 MapId = tuple[int, int]
@@ -124,11 +125,30 @@ class CampaignFacts:
     pokeballs_received: Fact[bool] = dataclass_field(default_factory=Fact.unavailable)
     pokeballs_sufficient: Fact[bool] = dataclass_field(default_factory=Fact.unavailable)
     battle_style_set: Fact[bool] = dataclass_field(default_factory=Fact.unavailable)
+    # ROM-backed field access is a campaign capability, not a map-topology
+    # fact.  Keep it explicit so map registries can require Surf without
+    # interpreting party moves or badges themselves.
+    basement_key_obtained: Fact[bool] = dataclass_field(default_factory=Fact.unavailable)
+    surf_available: Fact[bool] = dataclass_field(default_factory=Fact.unavailable)
+    # Raw early Emerald scene variables are retained as diagnostics and as
+    # inputs for future source-backed local guards. They are deliberately not
+    # campaign objectives by themselves.
+    littleroot_intro_state: Fact[int] = dataclass_field(default_factory=Fact.unavailable)
+    littleroot_rival_state: Fact[int] = dataclass_field(default_factory=Fact.unavailable)
+    littleroot_town_state: Fact[int] = dataclass_field(default_factory=Fact.unavailable)
+    route101_state: Fact[int] = dataclass_field(default_factory=Fact.unavailable)
+    birch_lab_state: Fact[int] = dataclass_field(default_factory=Fact.unavailable)
+    oldale_rival_state: Fact[int] = dataclass_field(default_factory=Fact.unavailable)
 
     def __getitem__(self, name: str) -> Fact[bool]:
         """Access a named campaign fact using attribute-style semantics."""
 
         return getattr(self, name)
+
+    def capability(self, name: str) -> Fact[bool]:
+        """Return one registered field/story capability by stable ID."""
+
+        return getattr(self, name, Fact.unknown())
 
 
 def _flag(flags: tuple[NamedFlag, ...], name: str, available: bool) -> Fact[bool]:
@@ -147,6 +167,28 @@ def _var(variables: tuple[NamedVariable, ...], name: str, available: bool) -> Fa
         return Fact.unavailable()
     match = next((variable for variable in variables if variable.name == name), None)
     return Fact.known(match.value) if match is not None else Fact.unknown()
+
+
+def intro_rival_battle_completion_value(
+    defeated_rival: bool | None,
+    birch_lab_state: int | None,
+) -> bool | None:
+    """Resolve the Emerald Route 103 rival completion boundary.
+
+    In the pinned pret/pokeemerald Emerald source revision
+    ``5eff78649e7170a877b961ef0b3da13b81a16038``,
+    ``Route103_EventScript_RivalEnd`` sets both
+    ``FLAG_DEFEATED_RIVAL_ROUTE103`` and ``VAR_BIRCH_LAB_STATE = 4``. The
+    lab later advances that variable to 5 while giving the Pokédex. The
+    Route 103 hide flag belongs to the object template and is deliberately
+    not part of this completion fact.
+    """
+
+    if defeated_rival is True:
+        return True
+    if birch_lab_state is not None:
+        return birch_lab_state >= 4
+    return None
 
 
 def derive_campaign_facts(
@@ -199,7 +241,10 @@ def derive_campaign_facts(
     )
     intro = _var(observation.variables, "LITTLEROOT_INTRO_STATE", available)
     rival = _var(observation.variables, "LITTLEROOT_RIVAL_STATE", available)
+    littleroot_town = _var(observation.variables, "LITTLEROOT_TOWN_STATE", available)
+    route101 = _var(observation.variables, "ROUTE101_STATE", available)
     lab = _var(observation.variables, "BIRCH_LAB_STATE", available)
+    oldale_rival = _var(observation.variables, "OLDALE_RIVAL_STATE", available)
     pokemon_get = _flag(observation.flags, "SYS_POKEMON_GET", available)
     setup = Fact.known(intro.value >= 3) if intro.is_known else Fact(None, intro.status)
     rival_met = Fact.known(rival.value >= 3) if rival.is_known else Fact(None, rival.status)
@@ -217,31 +262,17 @@ def derive_campaign_facts(
     if pokedex.is_known and system_dex.is_known:
         pokedex = Fact.known(pokedex.value or system_dex.value)
     defeated_rival = _flag(observation.flags, "DEFEATED_RIVAL_ROUTE103", available)
-    hidden_rival = _flag(observation.flags, "HIDE_ROUTE_103_RIVAL", available)
-    # Emerald hides the Route 103 rival as the final part of the post-battle
-    # scene.  Depending on when the observation is taken, the battle flag and
-    # hide flag do not become visible at the same boundary.  Either is a
-    # ROM-backed completion signal; retain explicit uncertainty if neither
-    # signal is available instead of making a missing flag look like false.
-    if defeated_rival.is_known and hidden_rival.is_known:
-        intro_rival_complete = Fact.known(defeated_rival.value or hidden_rival.value)
-    elif defeated_rival.is_known and defeated_rival.value:
-        intro_rival_complete = Fact.known(True)
-    elif hidden_rival.is_known and hidden_rival.value:
-        intro_rival_complete = Fact.known(True)
+    completion_value = intro_rival_battle_completion_value(
+        defeated_rival.value if defeated_rival.is_known else None,
+        lab.value if lab.is_known else None,
+    )
+    if completion_value is not None:
+        intro_rival_complete = Fact.known(completion_value)
     else:
-        # Both flags being readable and false is an authoritative negative
-        # observation.  Do not manufacture a ``KNOWN`` fact whose value is
-        # ``None``: selectors treat that as an incomplete/unknown value and
-        # can leave the active capability and GUI target stranded after a
-        # transient object disappearance.
-        if defeated_rival.is_known and hidden_rival.is_known:
-            intro_rival_complete = Fact.known(False)
-        else:
-            intro_rival_complete = Fact(
-                None,
-                defeated_rival.status if not defeated_rival.is_known else hidden_rival.status,
-            )
+        intro_rival_complete = Fact(
+            None,
+            lab.status if defeated_rival.is_known else defeated_rival.status,
+        )
     ball_count = (
         sum(
             item.quantity
@@ -314,6 +345,21 @@ def derive_campaign_facts(
             None,
             visited_rustboro.status if not visited_rustboro.is_known else first_badge.status,
         )
+    basement_key = _flag(observation.flags, "GOT_BASEMENT_KEY_FROM_WATTSON", available)
+    surf_badge = _flag(snapshot.progression.badges, "BADGE05_GET", snapshot.game_state_available)
+    if surf_badge.is_known and not surf_badge.value:
+        surf_available = Fact.known(False)
+    elif not surf_badge.is_known:
+        surf_available = Fact(None, surf_badge.status)
+    elif not snapshot.party_available:
+        surf_available = Fact.unknown()
+    else:
+        has_surf = any(
+            move.name.casefold() == "surf"
+            for pokemon in snapshot.party
+            for move in pokemon.moves
+        )
+        surf_available = Fact.known(has_surf)
     return CampaignFacts(
         text_speed,
         setup,
@@ -344,6 +390,14 @@ def derive_campaign_facts(
         received,
         sufficient,
         battle_style_set,
+        basement_key_obtained=basement_key,
+        surf_available=surf_available,
+        littleroot_intro_state=intro,
+        littleroot_rival_state=rival,
+        littleroot_town_state=littleroot_town,
+        route101_state=route101,
+        birch_lab_state=lab,
+        oldale_rival_state=oldale_rival,
     )
 
 
@@ -395,6 +449,11 @@ class CampaignState:
     # lets the planner mount title/menu opening work while keeping an
     # uninitialized save block out of completion decisions.
     campaign_lifecycle: CampaignObservationLifecycle = CampaignObservationLifecycle.UNAVAILABLE
+    # Durable Species Clause history is separate from current encounter
+    # ownership so duplicate rerolls can influence future utility without
+    # manufacturing a consumed area.
+    captured_species: Fact[frozenset[str]] = dataclass_field(default_factory=Fact.unknown)
+    species_clause_enabled: bool = False
 
     @classmethod
     def from_runtime_state(
@@ -439,12 +498,20 @@ class CampaignState:
             dead_pokemon = Fact.unknown()
             alive_pokemon = Fact.unknown()
             rules_legal = Fact.unknown()
+            captured_species = Fact.unknown()
+            species_clause_enabled = False
         else:
             encounters = Fact.known(rules.encounters)
             run_status = Fact.known(RunStatus.LOST if rules.run_lost else RunStatus.ACTIVE)
             dead_pokemon = Fact.known(frozenset(rules.dead_pokemon))
             alive_pokemon = Fact.known(frozenset(rules.alive_pokemon))
             rules_legal = Fact.known(rules.legal)
+            captured_species = Fact.known(frozenset(rules.captured_species))
+            species_clause_enabled = bool(
+                getattr(getattr(rules_projection, "rule_config", None), "is_enabled", lambda _rule: False)(
+                    CampaignRuleId.SPECIES_CLAUSE
+                )
+            )
 
         if observed is None:
             story_flags = Fact.unavailable()
@@ -493,6 +560,8 @@ class CampaignState:
                 require_set_battle_style=require_set_battle_style,
             ),
             observation_lifecycle,
+            captured_species=captured_species,
+            species_clause_enabled=species_clause_enabled,
         )
 
     def has_badge(self, name: str) -> Fact[bool]:

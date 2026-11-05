@@ -5,6 +5,9 @@ enabled_rules:
   - fainting
   - species_clause
   - level_cap
+  # Remove this rule when a whiteout should return the player to the last
+  # healing location without ending the campaign run.
+  - whiteout_failure
   # Optional: answer trainer replacement prompts strategically.
   # - set_battle_style
 

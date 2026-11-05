@@ -55,6 +55,72 @@ class RanOutOfRepels(BotModeError):
     pass
 
 
+_EMERALD_FIELD_ITEM_CONTEXT_TASKS = (
+    "Task_ItemContext_Normal",
+    "Task_ItemContext_SingleRow",
+    "Task_ItemContext_MultipleRows",
+)
+_EMERALD_FIELD_ITEM_CONTEXT_TIMEOUT = 180
+_EMERALD_FIELD_ITEM_CONTEXT_CLOSE_TIMEOUT = 45
+
+
+def _close_emerald_bag_after_item_context_failure() -> Generator:
+    """Release the bag capability after a context task fails to appear."""
+
+    if get_game_state() is not GameState.BAG_MENU:
+        return
+    press_fresh = getattr(context.emulator, "press_button_fresh", None)
+    if callable(press_fresh):
+        press_fresh("B")
+    else:
+        context.emulator.press_button("B")
+    for _ in range(_EMERALD_FIELD_ITEM_CONTEXT_CLOSE_TIMEOUT):
+        yield
+        if get_game_state() is not GameState.BAG_MENU:
+            return
+
+
+def _wait_for_emerald_field_item_context() -> Generator:
+    """Open and finish Emerald's field-item context menu.
+
+    The ROM selects one of three task handlers based on the item pocket and
+    the number of visible context rows. Waiting for only the multiple-row
+    handler leaves field medicine recovery suspended forever when Emerald
+    chooses either of the other two handlers.
+    """
+
+    active_task = None
+    for _ in range(_EMERALD_FIELD_ITEM_CONTEXT_TIMEOUT):
+        active_task = next(
+            (task_name for task_name in _EMERALD_FIELD_ITEM_CONTEXT_TASKS if task_is_active(task_name)),
+            None,
+        )
+        if active_task is not None:
+            # Preserve the ROM task boundary: the task may be installed on
+            # the frame after the A edge that opened the context menu.
+            yield
+            break
+        context.emulator.press_button("A")
+        yield
+    else:
+        yield from _close_emerald_bag_after_item_context_failure()
+        raise BotModeError(
+            "Emerald field-item context menu did not start after "
+            f"{_EMERALD_FIELD_ITEM_CONTEXT_TIMEOUT} frames"
+        )
+
+    for _ in range(_EMERALD_FIELD_ITEM_CONTEXT_TIMEOUT):
+        if not task_is_active(active_task):
+            return
+        context.emulator.press_button("A")
+        yield
+    yield from _close_emerald_bag_after_item_context_failure()
+    raise BotModeError(
+        f"Emerald field-item context task {active_task!r} did not finish after "
+        f"{_EMERALD_FIELD_ITEM_CONTEXT_TIMEOUT} frames"
+    )
+
+
 @isolate_inputs
 @debug.track
 def use_item_from_bag(item: Item, wait_for_start_menu_to_reappear: bool = True) -> Generator:
@@ -66,13 +132,15 @@ def use_item_from_bag(item: Item, wait_for_start_menu_to_reappear: bool = True) 
         confirmation_menu_task = "sub_80A5414"
         start_menu_task = "sub_80712B4"
     elif context.rom.is_emerald:
-        confirmation_menu_task = "Task_ItemContext_MultipleRows"
         start_menu_task = "Task_ShowStartMenu"
     else:
         confirmation_menu_task = "Task_FieldItemContextMenuHandleInput"
         start_menu_task = "Task_StartMenuHandleInput"
 
-    yield from wait_for_task_to_start_and_finish(confirmation_menu_task, "A")
+    if context.rom.is_emerald:
+        yield from _wait_for_emerald_field_item_context()
+    else:
+        yield from wait_for_task_to_start_and_finish(confirmation_menu_task, "A")
     if wait_for_start_menu_to_reappear:
         yield from wait_for_task_to_start_and_finish(start_menu_task, "B")
     yield

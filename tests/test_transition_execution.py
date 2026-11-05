@@ -95,6 +95,30 @@ class TestTransitionExecution(unittest.TestCase):
         self.assertEqual(result.result_type, ActionResultType.WAITING)
         self.assertIsNotNone(loop._pending_transition)
 
+    def test_transition_signal_releases_activation_direction(self):
+        action = transition()
+        base = observation()
+        signaled = replace(
+            base,
+            overworld=replace(
+                base.overworld,
+                transition_in_progress=True,
+                transition_signals=frozenset({"task:Task_WarpAndLoadMap"}),
+            ),
+        )
+        loop, emulator, selected = self.make_loop((base, signaled), action)
+        with patch("modules.agent_control.context.emulator", emulator), patch(
+            "modules.agent_control.select_action", return_value=selected
+        ):
+            loop.step()
+            _, decision, result = loop.step()
+
+        self.assertEqual(decision.action.reason, "ROM transition task owns field; waiting for destination")
+        self.assertEqual(result.result_type, ActionResultType.WAITING)
+        self.assertEqual(emulator.released, ["Down"])
+        self.assertEqual(emulator.held, [])
+        self.assertIsNotNone(loop._pending_transition)
+
     def test_rom_control_releases_bot_direction_before_control_returns(self):
         emulator = _Emulator()
         emulator.active.add("Down")
@@ -135,6 +159,23 @@ class TestTransitionExecution(unittest.TestCase):
         self.assertEqual(emulator.fresh, ["Down"])
         self.assertEqual(emulator.held, ["Down", "Down"])
         self.assertIsNotNone(loop._pending_transition)
+
+    def test_rom_owned_exit_releases_pending_transition_direction(self):
+        action = transition()
+        owned_by_rom = observation(controllable=False)
+        loop, emulator, selected = self.make_loop([observation(), owned_by_rom], action)
+        with patch("modules.agent_control.context.emulator", emulator), patch(
+            "modules.agent_control.select_action", return_value=selected
+        ):
+            loop.step()
+            _, decision, result = loop.step()
+
+        self.assertEqual(decision.action.reason, "transition script owns avatar; waiting for control")
+        self.assertEqual(result.result_type, ActionResultType.WAITING)
+        self.assertEqual(emulator.fresh, ["Down"])
+        self.assertEqual(emulator.held, [])
+        self.assertEqual(emulator.released[-1], "Down")
+        self.assertEqual(emulator.active, set())
 
     def test_player_motion_does_not_replan_before_destination(self):
         action = transition()

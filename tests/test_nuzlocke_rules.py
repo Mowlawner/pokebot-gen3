@@ -76,6 +76,17 @@ class TestNuzlockeRules(unittest.TestCase):
         self.assertFalse(state.encounters[-1].eligible)
         self.assertEqual(state.encounters[0].pokemon_identity, captured)
 
+    def test_ineligible_history_does_not_consume_later_eligible_encounter(self):
+        projection = NuzlockeRulesProjection(encounters_active=False)
+        projection.apply(self.start(), encounter_eligible=False, sequence=1)
+        projection.apply(self.end(), encounter_eligible=False, sequence=2)
+        projection.set_encounters_active(True)
+        projection.apply(self.start(3), encounter_eligible=True, sequence=3)
+
+        eligible = tuple(item for item in projection.state.encounters if item.eligible)
+        self.assertEqual(len(eligible), 1)
+        self.assertEqual(eligible[0].status, PENDING)
+
     def test_trainer_battle_does_not_consume_encounter(self):
         state = reduce_rules((self.start(trainer=True, wild=False), self.end(trainer=True, wild=False)))
         self.assertEqual(state.encounters, ())
@@ -92,6 +103,22 @@ class TestNuzlockeRules(unittest.TestCase):
         unknown = reduce_rules((PokemonFainted(1, 0, "Poochyena", "Pup", 10, "unknown"),))
         self.assertEqual(unknown.dead_pokemon, ())
         self.assertEqual(len(unknown.unknown_faints), 1)
+
+    def test_fainting_rule_loses_run_when_all_caught_pokemon_are_dead(self):
+        captured = PokemonIdentity(99, 20, 30)
+        state = reduce_rules(
+            (
+                self.start(),
+                PokemonCaptured(2, captured, self.a),
+                PokemonFainted(3, 0, "Poochyena", "Pup", 99, "battle", captured),
+            )
+        )
+        self.assertEqual(state.dead_pokemon, (captured,))
+        self.assertTrue(state.run_lost)
+
+    def test_fainting_rule_does_not_lose_run_for_an_uncaught_faint(self):
+        state = reduce_rules((PokemonFainted(3, 0, "Poochyena", "Pup", 99, "battle", self.wild),))
+        self.assertFalse(state.run_lost)
 
     def test_locations_are_independent_duplicate_and_replay_are_deterministic(self):
         events = (self.start(), self.end(), self.start(3, self.b), self.end(4, self.b, "Fainted"))

@@ -13,7 +13,7 @@ from modules.navigation import (
     plan_observed_warp_locally,
     plan_with_world_navigation,
 )
-from modules.overworld import MapConnectionObservation, TriggerObservation, WarpActivation, WarpObservation
+from modules.overworld import MapConnectionObservation, TriggerObservation, WarpActivation, WarpObservation, WorldTransition
 from modules.world_navigation import WorldEdge, WorldMapGraph
 
 
@@ -23,6 +23,315 @@ def world(map_id, coords, transitions=(), facing=Direction.South):
 
 
 class GlobalNavigationTests(unittest.TestCase):
+    def test_weighted_portal_route_prefers_cheaper_intermediate_map(self):
+        source_map, expensive_map, cheap_map, target_map = (702, 0), (702, 1), (702, 2), (702, 3)
+        tiles = {}
+        for map_id, width, traversal_cost in (
+            (source_map, 5, 1),
+            (expensive_map, 5, 10),
+            (cheap_map, 2, 1),
+            (target_map, 1, 1),
+        ):
+            for x in range(width):
+                location = (map_id, (x, 0))
+                tiles[location] = NavigableTile(
+                    location,
+                    False,
+                    frozenset(Direction),
+                    traversal_cost=traversal_cost,
+                )
+
+        transitions = (
+            WorldTransition((source_map, (4, 0)), (expensive_map, (0, 0))),
+            WorldTransition((expensive_map, (4, 0)), (target_map, (0, 0))),
+            WorldTransition((source_map, (1, 0)), (cheap_map, (0, 0))),
+            WorldTransition((cheap_map, (1, 0)), (target_map, (0, 0))),
+        )
+        graph = WorldMapGraph(
+            (
+                WorldEdge(source_map, expensive_map, "warp", ((4, 0),), ((0, 0),), estimated_cost=1),
+                WorldEdge(expensive_map, target_map, "warp", ((4, 0),), ((0, 0),), estimated_cost=1),
+                WorldEdge(source_map, cheap_map, "warp", ((1, 0),), ((0, 0),), estimated_cost=5),
+                WorldEdge(cheap_map, target_map, "warp", ((1, 0),), ((0, 0),), estimated_cost=5),
+            )
+        )
+
+        plan, route = plan_with_world_navigation(
+            NavigationWorld(
+                tiles=tiles,
+                transitions=transitions,
+                facing=Direction.East,
+                static_metadata_frozen=True,
+            ),
+            (source_map, (0, 0)),
+            NavigationGoal(SemanticTarget.map(target_map)),
+            graph,
+        )
+
+        self.assertEqual(route.maps, (source_map, cheap_map, target_map))
+        self.assertEqual(plan.destination, (target_map, (0, 0)))
+        self.assertEqual(route.selected_transitions, transitions[2:])
+        self.assertEqual(route.estimated_cost, plan.metrics.total_route_cost)
+
+    def test_preferred_map_route_does_not_expand_unrelated_detours(self):
+        source_map, direct_map, detour_map, target_map = (703, 0), (703, 1), (703, 2), (703, 3)
+        tiles = {
+            (map_id, (x, 0)): NavigableTile(
+                (map_id, (x, 0)),
+                False,
+                frozenset(Direction),
+            )
+            for map_id in (source_map, direct_map, detour_map, target_map)
+            for x in range(5)
+        }
+        transitions = (
+            WorldTransition((source_map, (4, 0)), (direct_map, (0, 0))),
+            WorldTransition((direct_map, (4, 0)), (target_map, (0, 0))),
+            WorldTransition((source_map, (1, 0)), (detour_map, (0, 0))),
+            WorldTransition((detour_map, (1, 0)), (target_map, (0, 0))),
+        )
+        graph = WorldMapGraph(
+            (
+                WorldEdge(source_map, direct_map, "warp", ((4, 0),), ((0, 0),), estimated_cost=100),
+                WorldEdge(direct_map, target_map, "warp", ((4, 0),), ((0, 0),), estimated_cost=100),
+                WorldEdge(source_map, detour_map, "warp", ((1, 0),), ((0, 0),), estimated_cost=1),
+                WorldEdge(detour_map, target_map, "warp", ((1, 0),), ((0, 0),), estimated_cost=1),
+            )
+        )
+
+        plan, route = plan_with_world_navigation(
+            NavigationWorld(
+                tiles=tiles,
+                transitions=transitions,
+                facing=Direction.East,
+                static_metadata_frozen=True,
+            ),
+            (source_map, (0, 0)),
+            NavigationGoal(
+                SemanticTarget.map(target_map),
+                preferred_map_route=(source_map, direct_map, target_map),
+            ),
+            graph,
+        )
+
+        self.assertEqual(route.maps, (source_map, direct_map, target_map))
+        self.assertEqual(plan.destination, (target_map, (0, 0)))
+
+    def test_semantic_map_goal_composes_each_boundary_locally(self):
+        source_map, middle_map, target_map = (701, 0), (701, 1), (701, 2)
+        tiles = {
+            (map_id, (x, 0)): NavigableTile(
+                (map_id, (x, 0)),
+                False,
+                frozenset(Direction),
+            )
+            for map_id in (source_map, middle_map, target_map)
+            for x in range(3)
+        }
+        first_transition = WorldTransition(
+            (source_map, (2, 0)),
+            (middle_map, (0, 0)),
+        )
+        second_transition = WorldTransition(
+            (middle_map, (2, 0)),
+            (target_map, (0, 0)),
+        )
+        graph = WorldMapGraph(
+            (
+                WorldEdge(source_map, middle_map, "warp", ((2, 0),), ((0, 0),)),
+                WorldEdge(middle_map, target_map, "warp", ((2, 0),), ((0, 0),)),
+            )
+        )
+        navigation_world = NavigationWorld(
+            tiles=tiles,
+            transitions=(first_transition, second_transition),
+            facing=Direction.East,
+            static_metadata_frozen=True,
+        )
+
+        with patch(
+            "modules.navigation.plan_observed_warp_locally",
+            wraps=plan_observed_warp_locally,
+        ) as local_planner:
+            plan, route = plan_with_world_navigation(
+                navigation_world,
+                (source_map, (0, 0)),
+                NavigationGoal(SemanticTarget.map(target_map)),
+                graph,
+            )
+
+        self.assertEqual(route.maps, (source_map, middle_map, target_map))
+        self.assertEqual(plan.destination, (target_map, (0, 0)))
+        self.assertEqual(local_planner.call_count, 2)
+
+    def test_semantic_route_uses_downstream_safe_intermediate_entry(self):
+        source_map, middle_map, target_map = (704, 0), (704, 1), (704, 2)
+        tiles = {}
+        for x in range(5):
+            tiles[(source_map, (x, 0))] = NavigableTile(
+                (source_map, (x, 0)), False, frozenset(Direction)
+            )
+            # The two middle-map corridors are deliberately independent. The
+            # upper corridor contains the trainer hazard; only its lower
+            # counterpart can reach the final exit under AVOID.
+            for y in (0, 1):
+                tiles[(middle_map, (x, y))] = NavigableTile(
+                    (middle_map, (x, y)),
+                    False,
+                    frozenset((Direction.East, Direction.West)),
+                )
+        tiles[(source_map, (4, 1))] = NavigableTile(
+            (source_map, (4, 1)), False, frozenset(Direction)
+        )
+        tiles[(target_map, (0, 0))] = NavigableTile(
+            (target_map, (0, 0)), False, frozenset(Direction)
+        )
+
+        upper_entry = WorldTransition(
+            (source_map, (4, 0)),
+            (middle_map, (0, 0)),
+        )
+        lower_entry = WorldTransition(
+            (source_map, (4, 1)),
+            (middle_map, (0, 1)),
+        )
+        final_exit = WorldTransition(
+            (middle_map, (4, 1)),
+            (target_map, (0, 0)),
+        )
+        trainer = TriggerObservation(
+            "trainer:upper",
+            locations=frozenset({(middle_map, (2, 0))}),
+            hazard_locations=frozenset({(middle_map, (2, 0))}),
+            hazard_kind="trainer",
+            affordance_id="trainer:upper",
+        )
+        graph = WorldMapGraph(
+            (
+                WorldEdge(
+                    source_map,
+                    middle_map,
+                    "warp",
+                    ((4, 0), (4, 1)),
+                    ((0, 0), (0, 1)),
+                ),
+                WorldEdge(middle_map, target_map, "warp", ((4, 1),), ((0, 0),)),
+            )
+        )
+
+        plan, route = plan_with_world_navigation(
+            NavigationWorld(
+                tiles=tiles,
+                transitions=(upper_entry, lower_entry, final_exit),
+                triggers=(trainer,),
+                facing=Direction.East,
+                static_metadata_frozen=True,
+            ),
+            (source_map, (0, 0)),
+            NavigationGoal(
+                SemanticTarget.map(target_map),
+                constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+            ),
+            graph,
+        )
+
+        self.assertEqual(route.selected_transitions, (lower_entry, final_exit))
+        self.assertEqual(plan.destination, (target_map, (0, 0)))
+
+    def test_semantic_cross_map_chain_resolves_final_interaction_locally(self):
+        source_map, middle_map, target_map = (700, 0), (700, 1), (700, 2)
+        tiles = {
+            (map_id, (x, 0)): NavigableTile(
+                (map_id, (x, 0)),
+                False,
+                frozenset(Direction),
+            )
+            for map_id in (source_map, middle_map, target_map)
+            for x in range(3)
+        }
+        first_transition = WorldTransition(
+            (source_map, (2, 0)),
+            (middle_map, (0, 0)),
+        )
+        second_transition = WorldTransition(
+            (middle_map, (2, 0)),
+            (target_map, (0, 0)),
+        )
+        final_trigger = TriggerObservation(
+            trigger_id="norman",
+            locations=frozenset({(target_map, (2, 0))}),
+            activation_locations=frozenset({(target_map, (1, 0))}),
+        )
+        graph = WorldMapGraph(
+            (
+                WorldEdge(source_map, middle_map, "warp", ((2, 0),), ((0, 0),)),
+                WorldEdge(middle_map, target_map, "warp", ((2, 0),), ((0, 0),)),
+            )
+        )
+        navigation_goal = NavigationGoal(SemanticTarget.interaction(target_map, "norman"))
+
+        plan, route = plan_with_world_navigation(
+            NavigationWorld(
+                tiles=tiles,
+                transitions=(first_transition, second_transition),
+                triggers=(final_trigger,),
+                facing=Direction.East,
+                static_metadata_frozen=True,
+            ),
+            (source_map, (0, 0)),
+            navigation_goal,
+            graph,
+        )
+
+        assert route.maps == (source_map, middle_map, target_map)
+        assert plan.destination == (target_map, (1, 0))
+        warp_actions = [action for action in plan.actions if action.action_type is NavigationActionType.WARP]
+        assert [action.destination for action in warp_actions] == [
+            (middle_map, (0, 0)),
+            (target_map, (0, 0)),
+        ]
+        assert plan.actions[-1].destination == (target_map, (1, 0))
+
+    def test_general_route_cannot_use_pokemon_center_as_transit(self):
+        source_map, center_map, target_map = (91, 0), (91, 1), (91, 2)
+        tiles = {
+            (source_map, (x, 0)): NavigableTile((source_map, (x, 0)), False, frozenset(Direction))
+            for x in range(9)
+        }
+        tiles.update(
+            {
+                (center_map, (0, 0)): NavigableTile((center_map, (0, 0)), False, frozenset(Direction)),
+                (target_map, (0, 0)): NavigableTile((target_map, (0, 0)), False, frozenset(Direction)),
+            }
+        )
+        transitions = (
+            WarpObservation((source_map, (1, 0)), (center_map, (0, 0))),
+            WarpObservation((center_map, (0, 0)), (source_map, (0, 0))),
+            MapConnectionObservation((source_map, (8, 0)), (target_map, (0, 0)), required_facing=Direction.East),
+        )
+        graph = WorldMapGraph(
+            (
+                WorldEdge(source_map, center_map, "warp", ((1, 0),), ((0, 0),)),
+                WorldEdge(center_map, source_map, "warp", ((0, 0),), ((0, 0),)),
+                WorldEdge(source_map, target_map, "connection", ((8, 0),), ((0, 0),)),
+            )
+        )
+        with patch("modules.navigation._pokemon_center_map_ids", return_value=frozenset({center_map})):
+            plan, _ = plan_with_world_navigation(
+                NavigationWorld(tiles=tiles, transitions=transitions, facing=Direction.East),
+                (source_map, (0, 0)),
+                SemanticTarget.map(target_map),
+                graph,
+            )
+
+        route_maps = {
+            location[0]
+            for action in plan.actions
+            for location in (action.source, action.destination)
+            if location is not None
+        }
+        self.assertNotIn(center_map, route_maps)
+
     def test_cross_map_navigation_preserves_trainer_avoidance_constraints(self):
         source_map, target_map = (56, 0), (56, 1)
         coordinates = {(source_map, (x, y)) for y in range(2) for x in range(3)}
@@ -101,6 +410,40 @@ class GlobalNavigationTests(unittest.TestCase):
         self.assertIsNone(route)
         self.assertEqual(plan.actions[-1].action_type, NavigationActionType.WARP)
         self.assertEqual(plan.actions[-1].destination, warp.destination)
+
+    def test_cross_map_navigation_selects_cheapest_reachable_activation_side(self):
+        source_map, target_map = (99, 1), (99, 2)
+        entry = (source_map, (2, 1))
+        # Keep the more expensive side first to prove that selection is based
+        # on the completed route cost rather than activation-side iteration
+        # order. Live ROM observations use a frozenset here, so order must not
+        # affect the result.
+        expensive_side = (source_map, (3, 1))
+        cheap_side = (source_map, (2, 0))
+        warp = WarpObservation(
+            entry,
+            (target_map, (0, 0)),
+            activation_locations=(expensive_side, cheap_side),
+        )
+        tiles = {
+            (source_map, (x, y)): NavigableTile((source_map, (x, y)), False, frozenset(Direction))
+            for y in range(3)
+            for x in range(4)
+        }
+        tiles[(target_map, (0, 0))] = NavigableTile((target_map, (0, 0)), False, frozenset(Direction))
+        graph = WorldMapGraph(
+            (WorldEdge(source_map, target_map, "warp", ((2, 1),), ((0, 0),)),)
+        )
+
+        plan, _ = plan_with_world_navigation(
+            NavigationWorld(tiles=tiles, transitions=(warp,), facing=Direction.East),
+            (source_map, (0, 0)),
+            SemanticTarget.map(target_map),
+            graph,
+        )
+
+        transition = next(action for action in plan.actions if action.action_type is NavigationActionType.WARP)
+        self.assertEqual(transition.source, cheap_side)
 
     def test_debug_trace_keeps_first_goal_termination(self):
         from modules.context import context

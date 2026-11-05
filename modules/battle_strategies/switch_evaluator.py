@@ -129,8 +129,11 @@ _POLICIES: dict[SwitchEvaluationContext, SwitchPolicyWeights] = {
         response_margin=4.0,
         offensive_progress=1.5,
         guaranteed_ko=0.5,
-        training_priority=0.5,
-        fresh_participant=1.0,
+        # A successful capture awards no battle EXP. Capture support choices
+        # therefore must not be biased by cap headroom or participation
+        # freshness; those factors belong to defeat-oriented battles.
+        training_priority=0.0,
+        fresh_participant=0.0,
         health_ratio=1.0,
         healthy_status=1.5,
         continuity=0.0,

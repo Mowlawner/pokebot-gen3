@@ -78,6 +78,7 @@ class StutterTrace:
             "emulator_frame_callback_duration_ms": 0.0,
             "emulator_throttle_duration_ms": 0.0,
             "nuzlocke_game_state_duration_ms": 0.0,
+            "nuzlocke_history_duration_ms": 0.0,
             "nuzlocke_duration_ms": 0.0,
             "total_frame_duration_ms": 0.0,
             "map_warp_transition": False,

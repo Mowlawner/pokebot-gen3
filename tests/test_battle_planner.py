@@ -1,12 +1,19 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
-from modules.battle_observation import BattleKnowledge, KnowledgePolicy
+from unittest.mock import Mock, patch
+from modules.battle_observation import (
+    BattleKnowledge,
+    DamageOccurred,
+    KnowledgePolicy,
+    PokemonSwitched,
+)
+from modules.battle_expectiminimax import SearchResult, SearchRootEvaluation, SearchResultCategory
 from modules.battle_planner import (
     BattlePlanner,
     PlannerAction,
     PlannerConfidence,
     PlannerContext,
+    PlannerDecision,
     PlannerDecisionClass,
     PlannerEvidenceKind,
     PlannerSafety,
@@ -15,13 +22,23 @@ from modules.battle_planner import (
     PlannerOpponentMove,
     PlannerRisk,
     PlannerSwitch,
+    RecoveryItem,
+    _battle_hp_facts,
+    _battle_moves,
+    _knowledge_hp_facts,
     knowledge_for_planner,
     plan_battle_state,
     format_planner_decision_diagnostic,
+    format_search_principal_variation,
+    normalized_battle_objective,
+    _planner_stat_stages,
+    _observed_switch_pressure,
 )
+from modules.battle_state import BattleType
 from modules.battle_strategies.default import DefaultBattleStrategy
 from modules.battle_strategies.catch import CatchStrategy
 from modules.battle_strategies import TurnAction
+from modules.context import context as shared_context
 
 
 def context(**changes):
@@ -38,6 +55,172 @@ def context(**changes):
 
 
 class BattlePlannerTests(unittest.TestCase):
+    def test_observed_switch_pressure_survives_new_planner_roots_until_damage(self):
+        knowledge = BattleKnowledge(
+            "battle",
+            KnowledgePolicy.HUMAN_KNOWLEDGE,
+            events=(
+                DamageOccurred(1, "opponent", 0, 2, 20, 18),
+                PokemonSwitched(2, "player", 0, 1),
+                PokemonSwitched(3, "player", 1, 2),
+                PokemonSwitched(4, "player", 2, 0),
+            ),
+        )
+
+        self.assertEqual(_observed_switch_pressure(knowledge), (3, 1))
+
+    def test_battle_boundary_falls_back_only_to_matching_party_slot(self):
+        party = (
+            SimpleNamespace(index=0, current_hp=18, total_hp=20),
+            SimpleNamespace(index=1, current_hp=12, total_hp=20),
+        )
+        transient_active = SimpleNamespace(party_index=0, current_hp=0, total_hp=0, moves=())
+        unrelated_active = SimpleNamespace(party_index=2, current_hp=0, total_hp=0, moves=())
+        move = SimpleNamespace(name="Tackle")
+        party[0].moves = (move,)
+
+        self.assertEqual(_battle_hp_facts(transient_active, party), (18, 20))
+        self.assertEqual(_battle_moves(transient_active, party), (move,))
+        self.assertEqual(_battle_hp_facts(unrelated_active, party), (0, 0))
+        self.assertEqual(_battle_moves(unrelated_active, party), ())
+
+    def test_battle_boundary_uses_latest_same_battle_observation_for_zero_zero_hp(self):
+        observation = SimpleNamespace(
+            player_active=(SimpleNamespace(party_index=0, species="Wurmple", current_hp=13, max_hp=13),),
+            opponent_active=(SimpleNamespace(party_index=0, species="Lotad", current_hp=18, max_hp=18),),
+        )
+        knowledge = SimpleNamespace(observations=(observation,))
+
+        self.assertEqual(
+            _knowledge_hp_facts(
+                knowledge,
+                SimpleNamespace(party_index=0, species=SimpleNamespace(name="Wurmple")),
+                side="player",
+            ),
+            (13, 13),
+        )
+        self.assertEqual(
+            _knowledge_hp_facts(
+                knowledge,
+                SimpleNamespace(party_index=0, species=SimpleNamespace(name="Lotad")),
+                side="opponent",
+            ),
+            (18, 18),
+        )
+
+    def test_battle_boundary_does_not_restore_an_explicit_faint(self):
+        observation = SimpleNamespace(
+            player_active=(SimpleNamespace(party_index=0, species="Wurmple", current_hp=0, max_hp=13),),
+        )
+        knowledge = SimpleNamespace(observations=(observation,))
+
+        self.assertIsNone(
+            _knowledge_hp_facts(
+                knowledge,
+                SimpleNamespace(party_index=0, species=SimpleNamespace(name="Wurmple")),
+                side="player",
+            )
+        )
+
+    def test_first_battle_is_always_a_defeat_objective(self):
+        previous_intent = shared_context.campaign_wild_battle_intent
+        shared_context.campaign_wild_battle_intent = "transit"
+        try:
+            state = SimpleNamespace(type=BattleType.FirstBattle, is_trainer_battle=False)
+            self.assertEqual(normalized_battle_objective(state), "defeat")
+        finally:
+            shared_context.campaign_wild_battle_intent = previous_intent
+
+    def test_unavailable_escape_is_not_presented_as_a_legal_candidate(self):
+        decision = BattlePlanner().plan(
+            context(
+                moves=(PlannerMove(0, "Tackle", 10, 10),),
+                opponent_moves=(PlannerOpponentMove("Tackle", 1, 1),),
+                is_wild=True,
+                can_run=False,
+            )
+        )
+
+        self.assertFalse(any(candidate.action is PlannerAction.RunAway for candidate in decision.candidate_evaluations))
+
+    def test_principal_variation_labels_search_escape_as_player_action(self):
+        result = SimpleNamespace(
+            principal_variation=("Tackle", "Tackle", "Run Away", "FAILED", "Tackle"),
+            action_kind="move",
+            category=None,
+        )
+
+        formatted = format_search_principal_variation(result, context(active_speed=10, opponent_speed=20))
+
+        self.assertIn("player:Run Away", formatted)
+        self.assertNotIn("opponent:Run Away", formatted)
+
+    def test_decision_diagnostic_logs_the_effective_battle_intent(self):
+        decision = BattlePlanner().plan(
+            context(
+                battle_objective="avoid",
+                is_wild=True,
+                can_run=True,
+                escape_probability=1.0,
+                opponent_moves=(PlannerOpponentMove("Tackle", 1, 1),),
+            )
+        )
+
+        diagnostic = format_planner_decision_diagnostic(decision, context(
+            battle_objective="avoid",
+            is_wild=True,
+            can_run=True,
+            escape_probability=1.0,
+            opponent_moves=(PlannerOpponentMove("Tackle", 1, 1),),
+        ))
+
+        self.assertIn("effective_intent='avoid'", diagnostic)
+
+    def test_live_stage_note_uses_literal_delimiters_for_rich(self):
+        note = BattlePlanner._live_stage_note(
+            context(
+                active_stat_stages=(("attack", 2),),
+                opponent_stat_stages=(("defense", -1),),
+            )
+        )
+
+        self.assertIn("Live stages: active (attack=+2); opponent (defense=-1).", note)
+
+    def test_live_stat_stage_diagnostics_keep_readable_fields_when_one_stage_is_unreadable(self):
+        class PartialModifiers:
+            attack = 2
+            speed = -1
+
+            @property
+            def defence(self):
+                raise RuntimeError("transient stage read")
+
+        stages = dict(_planner_stat_stages(SimpleNamespace(stats_modifiers=PartialModifiers())))
+
+        self.assertEqual(stages, {"attack": 2, "speed": -1})
+
+    def test_recovery_item_exposes_unified_hp_effect_name(self):
+        potion = SimpleNamespace(name="Potion")
+        item = RecoveryItem(potion, 2, 20)
+        self.assertEqual(item.amount_healed, 20)
+        self.assertFalse(item.status_healed)
+
+    def test_full_heal_is_status_only_and_cures_all_statuses(self):
+        item = RecoveryItem(SimpleNamespace(name="Full Heal"), 1, 0, status_healed=frozenset({"ALL"}))
+        self.assertEqual(item.amount_healed, 0)
+        self.assertTrue(item.cures_all_status)
+
+    def test_abort_retains_ranked_legal_candidate_for_executor_policy(self):
+        decision = BattlePlanner().plan(
+            context(
+                is_trainer=True,
+                moves=(PlannerMove(0, "Unsupported", 1, 2, mechanics_supported=False),),
+            )
+        )
+        self.assertEqual(decision.action, PlannerAction.AbortForSafety)
+        self.assertIsNotNone(decision.best_available_candidate)
+        self.assertEqual(decision.best_available_candidate.target, 0)
+
     def test_catch_strategy_ignores_empty_ball_slots(self):
         empty = SimpleNamespace(quantity=0, item=SimpleNamespace(name="Poké Ball", index=4))
         usable = SimpleNamespace(quantity=2, item=SimpleNamespace(name="Great Ball", index=3))
@@ -65,18 +248,20 @@ class BattlePlannerTests(unittest.TestCase):
         self.assertEqual(result, expected)
         ordinary.assert_called_once()
 
-    def test_capture_target_prefers_nonlethal_move_over_guaranteed_ko(self):
+    def test_capture_target_prefers_a_ball_when_weakening_does_not_change_odds(self):
+        ball = SimpleNamespace(name="Poké Ball")
         decision = BattlePlanner().plan(
             context(
                 opponent_hp=10,
                 moves=(PlannerMove(0, "Strong", 10, 14), PlannerMove(1, "Weak", 3, 5)),
                 capture_target=True,
                 capture_available=True,
-                capture_appropriate_hp=2,
+                capture_probability_for_state=lambda _state, _item: 0.5,
+                items=(PlannerItem(ball, 3, 0, True),),
             )
         )
-        self.assertEqual(decision.action, PlannerAction.UseMove)
-        self.assertEqual(decision.target, 1)
+        self.assertEqual(decision.action, PlannerAction.UseItem)
+        self.assertEqual(decision.target, (ball, 0))
 
     def test_capture_target_prefers_ball_at_capture_hp(self):
         ball = SimpleNamespace(name="Poké Ball")
@@ -85,7 +270,7 @@ class BattlePlannerTests(unittest.TestCase):
                 opponent_hp=2,
                 capture_target=True,
                 capture_available=True,
-                capture_appropriate_hp=3,
+                capture_probability_for_state=lambda _state, _item: 1.0,
                 items=(PlannerItem(ball, 5, 0, True),),
             )
         )
@@ -100,7 +285,7 @@ class BattlePlannerTests(unittest.TestCase):
                 moves=(PlannerMove(0, "Strong", 10, 14),),
                 capture_target=True,
                 capture_available=True,
-                capture_appropriate_hp=1,
+                capture_probability_for_state=lambda _state, _item: 1.0,
                 items=(PlannerItem(ball, 1, 0, True),),
             )
         )
@@ -116,6 +301,87 @@ class BattlePlannerTests(unittest.TestCase):
             )
         )
         self.assertEqual(decision.action, PlannerAction.UseMove)
+
+    def test_healing_is_not_selected_when_active_pokemon_is_at_full_hp(self):
+        potion = SimpleNamespace(name="Potion")
+        decision = BattlePlanner().plan(
+            context(
+                active_hp=20,
+                active_max_hp=20,
+                moves=(),
+                opponent_damage_max=5,
+                items=(PlannerItem(potion, 1, 20),),
+            )
+        )
+
+        self.assertNotEqual(decision.action, PlannerAction.UseItem)
+        self.assertIsNone(decision.best_safe_candidate)
+        healing_candidate = next(
+            candidate
+            for candidate in decision.candidate_evaluations
+            if candidate.action is PlannerAction.UseItem
+        )
+        self.assertFalse(healing_candidate.is_safe)
+        self.assertIn("full HP", healing_candidate.reason)
+
+    def test_complete_expectiminimax_can_own_a_healing_item_decision(self):
+        potion = SimpleNamespace(name="Potion")
+        decision = BattlePlanner().plan(
+            context(
+                active_hp=5,
+                active_max_hp=20,
+                opponent_hp=11,
+                moves=(PlannerMove(0, "Tackle", 10, 10),),
+                opponent_moves=(PlannerOpponentMove("Tackle", 5, 5),),
+                active_speed=10,
+                opponent_speed=20,
+                is_trainer=True,
+                opponent_response_facts_complete=True,
+                items=(PlannerItem(potion, 1, 20),),
+            )
+        )
+
+        self.assertEqual(decision.action, PlannerAction.UseItem)
+        self.assertEqual(decision.target, (potion, 0))
+        self.assertEqual(decision.evaluation_method, "expectiminimax")
+        self.assertEqual(decision.stochastic_result.action_kind, "item")
+
+    def test_healing_is_not_selected_when_active_already_clears_response_ceiling(self):
+        potion = SimpleNamespace(name="Potion")
+        decision = BattlePlanner().plan(
+            context(
+                active_hp=17,
+                active_max_hp=18,
+                moves=(),
+                opponent_damage_max=5,
+                items=(PlannerItem(potion, 1, 20),),
+            )
+        )
+
+        self.assertNotEqual(decision.action, PlannerAction.UseItem)
+        healing_candidate = next(
+            candidate
+            for candidate in decision.candidate_evaluations
+            if candidate.action is PlannerAction.UseItem
+        )
+        self.assertFalse(healing_candidate.is_safe)
+        self.assertIn("above the known response ceiling", healing_candidate.reason)
+
+    def test_safe_item_action_can_target_a_benched_party_member(self):
+        potion = SimpleNamespace(name="Potion")
+        decision = BattlePlanner().plan(
+            context(
+                active_hp=17,
+                active_max_hp=18,
+                moves=(),
+                switches=(PlannerSwitch(1, "Mudkip", 2, 20, None),),
+                opponent_damage_max=5,
+                items=(PlannerItem(potion, 1, 20),),
+            )
+        )
+
+        self.assertEqual(decision.action, PlannerAction.UseItem)
+        self.assertEqual(decision.target, (potion, 1))
 
     def test_best_available_diagnostic_explains_unknown_response_and_rejected_move(self):
         battle_context = context(
@@ -301,6 +567,37 @@ class BattlePlannerTests(unittest.TestCase):
             self.assertEqual(DefaultBattleStrategy().decide_turn(battle_state), (TurnAction.UseMove, 1))
             util.return_value.pokemon_has_enough_hp.assert_not_called()
 
+    def test_default_strategy_uses_legacy_move_after_planner_abort(self):
+        party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
+        battle_state = SimpleNamespace(
+            own_side=SimpleNamespace(active_battler=SimpleNamespace(current_hp_percentage=80)),
+            opponent=SimpleNamespace(active_battler=SimpleNamespace()),
+        )
+        candidate = SimpleNamespace(
+            action=PlannerAction.UseMove,
+            target=2,
+            label="use Unsupported",
+            reason="unsupported mechanics",
+        )
+        aborted = SimpleNamespace(
+            action=PlannerAction.AbortForSafety,
+            target=None,
+            confidence=PlannerConfidence.INSUFFICIENT,
+            rationale="no safe line",
+            is_safe_to_execute=False,
+            classification=PlannerDecisionClass.ABORT,
+            best_available_candidate=candidate,
+        )
+        with patch("modules.battle_strategies.default.get_party", return_value=party), patch(
+            "modules.battle_strategies.default.BattleStrategyUtil"
+        ) as util, patch("modules.battle_strategies.default.plan_battle_state", return_value=aborted):
+            util.return_value.pokemon_has_enough_hp.return_value = True
+            util.return_value.get_strongest_move_against.return_value = 2
+            self.assertEqual(DefaultBattleStrategy().decide_turn(battle_state), (TurnAction.UseMove, 2))
+            util.return_value.pokemon_has_enough_hp.assert_called_once_with(
+                battle_state.own_side.active_battler
+            )
+
     def test_unsafe_planner_result_keeps_legacy_attack_fallback_above_threshold(self):
         party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
         battle_state = SimpleNamespace(
@@ -322,6 +619,35 @@ class BattlePlannerTests(unittest.TestCase):
             "modules.battle_strategies.default.BattleStrategyUtil", return_value=util
         ), patch("modules.battle_strategies.default.plan_battle_state", return_value=unsafe):
             self.assertEqual(DefaultBattleStrategy().decide_turn(battle_state), (TurnAction.UseMove, 3))
+
+    def test_strict_strategy_does_not_use_legacy_attack_fallback(self):
+        party = SimpleNamespace(first_non_fainted=SimpleNamespace(index=0))
+        battle_state = SimpleNamespace(
+            own_side=SimpleNamespace(active_battler=SimpleNamespace(current_hp_percentage=80)),
+            opponent=SimpleNamespace(active_battler=SimpleNamespace()),
+        )
+        util = SimpleNamespace(
+            pokemon_has_enough_hp=lambda pokemon: True,
+            get_strongest_move_against=Mock(return_value=3),
+        )
+        unsafe = SimpleNamespace(
+            action=PlannerAction.AbortForSafety,
+            target=None,
+            confidence=PlannerConfidence.INSUFFICIENT,
+            rationale="unknown response",
+            is_safe_to_execute=False,
+        )
+
+        class StrictStrategy(DefaultBattleStrategy):
+            def allows_legacy_fallback(self):
+                return False
+
+        with patch("modules.battle_strategies.default.get_party", return_value=party), patch(
+            "modules.battle_strategies.default.BattleStrategyUtil", return_value=util
+        ), patch("modules.battle_strategies.default.plan_battle_state", return_value=unsafe):
+            self.assertEqual(StrictStrategy().decide_turn(battle_state), (TurnAction.SwitchToManual, None))
+
+        util.get_strongest_move_against.assert_not_called()
 
     def test_live_party_switch_candidates_use_ordered_slot_not_party_index(self):
         class PartyPokemonWithoutPartyIndex:
@@ -375,10 +701,167 @@ class BattlePlannerTests(unittest.TestCase):
         self.assertEqual(decision.action, PlannerAction.SwitchPokemon)
         self.assertEqual(decision.target, 1)
 
+    def test_live_planner_adapter_passes_battle_stat_stages(self):
+        move = SimpleNamespace(
+            name="Pound",
+            base_power=40,
+            accuracy=1.0,
+            priority=0,
+            effect="HIT",
+            type=SimpleNamespace(kind="Physical"),
+        )
+        learned = SimpleNamespace(move=move, pp=1)
+        modifiers = SimpleNamespace(
+            attack=1,
+            defence=-2,
+            speed=0,
+            special_attack=0,
+            special_defence=0,
+            accuracy=0,
+            evasion=0,
+        )
+        species = SimpleNamespace(name="Treecko")
+        active = SimpleNamespace(
+            party_index=0,
+            species=species,
+            current_hp=10,
+            total_hp=20,
+            moves=(learned,),
+            disabled_move=None,
+            stats=SimpleNamespace(speed=10),
+            stats_modifiers=modifiers,
+            status_permanent=None,
+        )
+        opponent = SimpleNamespace(
+            party_index=0,
+            species=SimpleNamespace(name="Zigzagoon"),
+            current_hp=10,
+            total_hp=15,
+            moves=(),
+            stats=SimpleNamespace(speed=8),
+            stats_modifiers=SimpleNamespace(
+                attack=0,
+                defence=-6,
+                speed=0,
+                special_attack=0,
+                special_defence=0,
+                accuracy=0,
+                evasion=0,
+            ),
+        )
+        battle_state = SimpleNamespace(
+            own_side=SimpleNamespace(active_battler=active),
+            opponent=SimpleNamespace(active_battler=opponent),
+            is_trainer_battle=True,
+        )
+        party_member = SimpleNamespace(
+            is_egg=False,
+            current_hp=20,
+            total_hp=20,
+            name="Treecko",
+            moves=(learned,),
+            status_condition=None,
+        )
+        damage_range = SimpleNamespace(min=2, max=3)
+        util = SimpleNamespace(
+            calculate_move_damage_range=lambda *args, **kwargs: damage_range,
+            can_switch=lambda: False,
+        )
+        captured = {}
+
+        def capture_plan(_planner, planner_context):
+            captured["context"] = planner_context
+            return PlannerDecision(PlannerAction.AbortForSafety)
+
+        with (
+            patch("modules.pokemon_party.get_party", return_value=(party_member,)),
+            patch("modules.battle_strategies._util.BattleStrategyUtil", return_value=util),
+            patch("modules.battle_planner.opponent_response_move_names", return_value=("Tackle",)),
+            patch("modules.pokemon.get_move_by_name", return_value=move),
+            patch("modules.items.get_item_bag", return_value=SimpleNamespace(items=(), poke_balls=())),
+            patch.object(BattlePlanner, "plan", autospec=True, side_effect=capture_plan),
+        ):
+            plan_battle_state(battle_state, BattleKnowledge("battle", KnowledgePolicy.HUMAN_KNOWLEDGE))
+
+        planner_context = captured["context"]
+        self.assertEqual(dict(planner_context.active_stat_stages)["defense"], -2)
+        self.assertEqual(dict(planner_context.opponent_stat_stages)["defense"], -6)
+
     def test_safe_attack_is_high_confidence(self):
         decision = BattlePlanner().plan(context())
         self.assertEqual(decision.action, PlannerAction.UseMove)
         self.assertEqual(decision.confidence, PlannerConfidence.HIGH)
+
+    def test_complete_wild_response_envelope_uses_expectiminimax(self):
+        decision = BattlePlanner().plan(
+            context(
+                is_wild=True,
+                opponent_hp=10,
+                moves=(PlannerMove(0, "Pound", 5, 5),),
+                opponent_moves=(PlannerOpponentMove("Tackle", 1, 2),),
+                opponent_response_facts_complete=True,
+            )
+        )
+
+        self.assertEqual(decision.evaluation_method, "expectiminimax")
+        self.assertIsNotNone(decision.stochastic_result)
+
+    def test_partial_response_facts_cannot_be_called_safe(self):
+        decision = BattlePlanner().plan(
+            context(
+                opponent_hp=12,
+                moves=(PlannerMove(0, "Pound", 4, 5),),
+                opponent_moves=(PlannerOpponentMove("Tackle", 1, 2, response_facts_complete=False),),
+            )
+        )
+        self.assertEqual(decision.action, PlannerAction.UseMove)
+        self.assertEqual(decision.classification, PlannerDecisionClass.BEST_AVAILABLE)
+        self.assertFalse(decision.is_safe_to_execute)
+        self.assertIn("incomplete", decision.rationale)
+
+    def test_paralysis_reduces_action_reliability(self):
+        decision = BattlePlanner().plan(
+            context(
+                active_status="paralysed",
+                opponent_hp=4,
+                moves=(PlannerMove(0, "Pound", 4, 4),),
+            )
+        )
+        self.assertEqual(decision.action, PlannerAction.UseMove)
+        self.assertEqual(decision.classification, PlannerDecisionClass.BEST_AVAILABLE)
+        self.assertFalse(decision.is_safe_to_execute)
+
+    def test_targeted_status_cure_beats_full_restore_when_hp_is_safe(self):
+        antidote = SimpleNamespace(name="Antidote")
+        full_restore = SimpleNamespace(name="Full Restore")
+        decision = BattlePlanner().plan(
+            context(
+                active_hp=20,
+                active_max_hp=20,
+                active_status="poison",
+                moves=(),
+                opponent_damage_max=5,
+                items=(
+                    PlannerItem(antidote, 1, 0, False, frozenset({"poison"})),
+                    PlannerItem(full_restore, 1, 0, False, frozenset({"ALL"}), True, 5),
+                ),
+            )
+        )
+        self.assertEqual(decision.action, PlannerAction.UseItem)
+        self.assertIs(decision.target[0], antidote)
+
+    def test_small_hp_gap_does_not_spend_full_restore_when_response_is_cleared(self):
+        full_restore = SimpleNamespace(name="Full Restore")
+        decision = BattlePlanner().plan(
+            context(
+                active_hp=19,
+                active_max_hp=20,
+                moves=(),
+                opponent_damage_max=5,
+                items=(PlannerItem(full_restore, 1, 0, False, frozenset({"ALL"}), True, 5),),
+            )
+        )
+        self.assertNotEqual(decision.action, PlannerAction.UseItem)
 
     def test_immediate_ko_rationale_contains_known_and_derived_evidence(self):
         decision = BattlePlanner().plan(
@@ -595,6 +1078,174 @@ class BattlePlannerTests(unittest.TestCase):
         self.assertEqual(decision.action, PlannerAction.AbortForSafety)
         self.assertIn("unsupported", decision.rationale)
 
+    def test_bide_is_an_executable_stateful_move(self):
+        decision = BattlePlanner().plan(
+            context(
+                opponent_hp=20,
+                moves=(PlannerMove(0, "Bide", 0, 0, effect="BIDE"),),
+                opponent_moves=(PlannerOpponentMove("Tackle", 1, 1),),
+                active_speed=20,
+                opponent_speed=10,
+            )
+        )
+
+        assert decision.action is PlannerAction.UseMove
+        assert decision.target == 0
+        assert decision.evaluation_method == "expectiminimax"
+
+    def test_stale_selected_item_root_falls_back_to_a_live_move_root(self):
+        potion = RecoveryItem(SimpleNamespace(name="Potion"), 1, 20)
+        battle_context = context(
+            active_hp=20,
+            active_max_hp=20,
+            moves=(PlannerMove(0, "Scratch", 3, 3),),
+            items=(potion,),
+            opponent_moves=(PlannerOpponentMove("Tackle", 1, 1),),
+        )
+        roots = (
+            SearchRootEvaluation(
+                "item", 0, "Potion", 100.0, 1.0, 0.0, 0.0,
+                SearchResultCategory.TERMINAL_COMPLETE,
+            ),
+            SearchRootEvaluation(
+                "move", 0, "Scratch", 10.0, 1.0, 0.0, 0.0,
+                SearchResultCategory.TERMINAL_COMPLETE,
+            ),
+        )
+        stale = SearchResult(
+            0,
+            "Potion",
+            100.0,
+            1.0,
+            0.0,
+            0.0,
+            action_kind="item",
+            category=SearchResultCategory.TERMINAL_COMPLETE,
+            root_evaluations=roots,
+        )
+
+        with patch("modules.battle_planner.search_planner_context", return_value=stale):
+            decision = BattlePlanner().plan(battle_context)
+
+        assert decision.action is PlannerAction.UseMove
+        assert decision.target == 0
+        assert decision.stochastic_result.action_name == "Scratch"
+
+    def test_incomplete_capture_root_translates_a_reserve_item_target(self):
+        potion = RecoveryItem(SimpleNamespace(name="Potion"), 6, heal_amount=20)
+        projected_reserve_item = SearchResult(
+            1,
+            "Potion",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            action_kind="item",
+            category=SearchResultCategory.INCOMPLETE,
+            objective="capture",
+            target_party_index=1,
+        )
+        with patch(
+            "modules.battle_planner.search_planner_context",
+            return_value=projected_reserve_item,
+        ):
+            decision = BattlePlanner().plan(
+                context(
+                    active_name="Wurmple",
+                    active_hp=18,
+                    active_max_hp=18,
+                    opponent_name="Silcoon",
+                    opponent_hp=21,
+                    opponent_max_hp=21,
+                    moves=(PlannerMove(0, "Tackle", 2, 3),),
+                    switches=(PlannerSwitch(1, "Samuel", 5, 20, None, moves=()),),
+                    items=(
+                        RecoveryItem(
+                            SimpleNamespace(name="Antidote"),
+                            4,
+                            status_healed=frozenset({"poison"}),
+                        ),
+                        potion,
+                        RecoveryItem(SimpleNamespace(name="Poké Ball"), 10, is_capture_ball=True),
+                    ),
+                    is_wild=True,
+                    can_switch=True,
+                    can_run=True,
+                    escape_confidence=PlannerConfidence.HIGH,
+                    capture_target=True,
+                    capture_available=True,
+                    battle_objective="capture",
+                    campaign_owned=True,
+                    opponent_response_facts_complete=False,
+                )
+            )
+
+        assert decision.action is PlannerAction.UseItem
+        assert decision.target == (potion.item, 1)
+        assert decision.stochastic_result is not None
+
+    def test_incomplete_capture_root_recovers_target_from_matching_root_evaluation(self):
+        potion = RecoveryItem(SimpleNamespace(name="Potion"), 6, heal_amount=20)
+        projected_reserve_item = SearchResult(
+            1,
+            "Potion",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            action_kind="item",
+            category=SearchResultCategory.INCOMPLETE,
+            objective="capture",
+            root_evaluations=(
+                SearchRootEvaluation(
+                    "item",
+                    1,
+                    "Potion",
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    SearchResultCategory.INCOMPLETE,
+                    target_party_index=1,
+                ),
+            ),
+        )
+        with patch(
+            "modules.battle_planner.search_planner_context",
+            return_value=projected_reserve_item,
+        ):
+            decision = BattlePlanner().plan(
+                context(
+                    active_name="Wurmple",
+                    active_hp=18,
+                    active_max_hp=18,
+                    opponent_name="Silcoon",
+                    opponent_hp=21,
+                    moves=(PlannerMove(0, "Tackle", 2, 3),),
+                    switches=(PlannerSwitch(1, "Samuel", 5, 20, None, moves=()),),
+                    items=(
+                        RecoveryItem(
+                            SimpleNamespace(name="Antidote"),
+                            4,
+                            status_healed=frozenset({"poison"}),
+                        ),
+                        potion,
+                    ),
+                    is_wild=True,
+                    can_switch=True,
+                    can_run=True,
+                    escape_confidence=PlannerConfidence.HIGH,
+                    capture_target=True,
+                    capture_available=True,
+                    battle_objective="capture",
+                    campaign_owned=True,
+                    opponent_response_facts_complete=False,
+                )
+            )
+
+        assert decision.action is PlannerAction.UseItem
+        assert decision.target == (potion.item, 1)
+
     def test_low_hp_prefers_a_clearly_safer_switch(self):
         decision = BattlePlanner().plan(
             context(
@@ -721,6 +1372,24 @@ class BattlePlannerTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, PlannerAction.RunAway)
 
+    def test_expectiminimax_can_use_wild_escape_for_zero_progress_conservation(self):
+        decision = BattlePlanner().plan(
+            context(
+                active_hp=20,
+                active_max_hp=20,
+                opponent_hp=20,
+                moves=(PlannerMove(0, "Growl", 0, 0),),
+                opponent_moves=(PlannerOpponentMove("Tackle", 1, 1),),
+                is_wild=True,
+                can_run=True,
+                escape_confidence=PlannerConfidence.HIGH,
+                escape_probability=1.0,
+            )
+        )
+
+        self.assertEqual(decision.action, PlannerAction.RunAway)
+        self.assertEqual(decision.evaluation_method, "expectiminimax")
+
     def test_trainer_battle_never_runs(self):
         decision = BattlePlanner().plan(
             context(
@@ -758,7 +1427,7 @@ class BattlePlannerTests(unittest.TestCase):
         self.assertEqual(decision.classification, PlannerDecisionClass.BEST_AVAILABLE)
         self.assertIn("No guaranteed-safe sequence established", decision.rationale)
 
-    def test_supported_setup_move_can_beat_repeated_damage(self):
+    def test_setup_move_can_remain_in_a_shorter_damage_line(self):
         decision = BattlePlanner().plan(
             context(
                 active_hp=20,
@@ -771,8 +1440,70 @@ class BattlePlannerTests(unittest.TestCase):
             )
         )
         self.assertEqual(decision.action, PlannerAction.UseMove)
-        self.assertEqual(decision.target, 1)
-        self.assertIn("stat/effect changes", decision.rationale)
+        # Expectiminimax evaluates the setup root as well, then selects the
+        # direct damaging line because it wins within the configured horizon.
+        self.assertEqual(decision.target, 0)
+        self.assertIn("expectiminimax", decision.rationale)
+        self.assertIn("effective stat changes", decision.rationale)
+
+    def test_setup_move_is_selected_when_direct_damage_cannot_finish_in_horizon(self):
+        decision = BattlePlanner().plan(
+            context(
+                active_hp=20,
+                opponent_hp=10,
+                moves=(
+                    PlannerMove(0, "Pound", 1, 1),
+                    PlannerMove(1, "Tail Whip", 0, 0, effect="DEFENSE_DOWN_2"),
+                ),
+                opponent_moves=(PlannerOpponentMove("Ember", 1, 1),),
+            )
+        )
+        self.assertEqual(decision.action, PlannerAction.UseMove)
+        self.assertEqual(decision.target, 0)
+        self.assertIn("expectiminimax", decision.rationale)
+        self.assertIn("Tail Whip", decision.rationale)
+
+    def test_stat_move_at_live_lower_bound_is_rejected_as_ineffective(self):
+        battle_context = context(
+            opponent_hp=10,
+            opponent_stat_stages=(("defense", -6),),
+            moves=(
+                PlannerMove(0, "Pound", 2, 2),
+                PlannerMove(1, "Leer", 0, 0, effect="DEFENSE_DOWN"),
+            ),
+            opponent_moves=(PlannerOpponentMove("Tackle", 1, 1),),
+        )
+        decision = BattlePlanner().plan(battle_context)
+        self.assertEqual(decision.target, 0)
+        leer = next(candidate for candidate in decision.candidate_evaluations if candidate.label == "Leer")
+        self.assertFalse(leer.is_safe)
+        self.assertIn("no battle effect", leer.reason)
+
+    def test_stat_move_can_improve_from_the_opposite_bound(self):
+        battle_context = context(
+            opponent_hp=10,
+            opponent_stat_stages=(("defense", 6),),
+            moves=(
+                PlannerMove(0, "Pound", 2, 2),
+                PlannerMove(1, "Leer", 0, 0, effect="DEFENSE_DOWN"),
+            ),
+            opponent_moves=(PlannerOpponentMove("Tackle", 1, 1),),
+        )
+        decision = BattlePlanner().plan(battle_context)
+        leer = next(candidate for candidate in decision.candidate_evaluations if candidate.label == "Leer")
+        self.assertIn("can improve the line", leer.reason)
+
+    def test_diagnostic_includes_live_stat_stages_and_move_effectiveness(self):
+        battle_context = context(
+            opponent_stat_stages=(("defense", -6),),
+            moves=(PlannerMove(0, "Leer", 0, 0, effect="DEFENSE_DOWN"),),
+        )
+        decision = BattlePlanner().plan(battle_context)
+        diagnostic = format_planner_decision_diagnostic(decision, battle_context)
+        self.assertIn("opponent_stat_stages", diagnostic)
+        self.assertIn("defense=-6", diagnostic)
+        self.assertIn("selected_move_effectiveness", diagnostic)
+        self.assertIn("effective=False", diagnostic)
 
     def test_full_emulator_facts_are_not_forwarded_as_planner_knowledge(self):
         knowledge = BattleKnowledge("b", KnowledgePolicy.FULL_EMULATOR, known_opponent_moves=(("id", "Thunder"),))

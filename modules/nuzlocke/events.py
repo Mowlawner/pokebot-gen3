@@ -147,6 +147,19 @@ class WhiteoutOccurred:
     """Observation that the ROM entered its whiteout game state."""
 
     frame: int
+    # The observer can resolve this from the same snapshot boundary. ``None``
+    # preserves the historical event meaning for older callers and persisted
+    # records: a whiteout is terminal unless continuation was explicitly
+    # observed.
+    run_ending: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RunFailed:
+    """Durable semantic boundary recording that the current run ended."""
+
+    frame: int
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +187,7 @@ Event = (
     | PokemonFainted
     | StorageChanged
     | WhiteoutOccurred
+    | RunFailed
     | GameStateChanged
     | NuzlockeStarted
 )
@@ -469,7 +483,24 @@ class NuzlockeEventObserver:
             and previous_state.game_state != snapshot.game_state
             and getattr(snapshot.game_state, "name", None) == "WHITEOUT"
         ):
-            events.append(WhiteoutOccurred(snapshot.frame))
+            living_party = tuple(
+                pokemon
+                for pokemon in getattr(snapshot, "party", ())
+                if not getattr(pokemon, "egg", False)
+                and not getattr(pokemon, "fainted", False)
+                and getattr(pokemon, "current_hp", 0) > 0
+            )
+            living_pc = tuple(
+                pokemon
+                for stored in getattr(getattr(snapshot, "pc", None), "pokemon", ())
+                for pokemon in (getattr(stored, "pokemon", None),)
+                if pokemon is not None
+                and not getattr(pokemon, "egg", False)
+                and not getattr(pokemon, "fainted", False)
+                and getattr(pokemon, "current_hp", 0) > 0
+            )
+            run_ending = not (living_party or living_pc)
+            events.append(WhiteoutOccurred(snapshot.frame, run_ending=run_ending))
 
         if snapshot.party_available and self._previous_party is not None:
             events.extend(self._party_events(self._previous_party, snapshot))

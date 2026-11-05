@@ -39,10 +39,41 @@ class WorldRoute:
     maps: tuple[MapId, ...]
     edges: tuple[WorldEdge, ...]
     estimated_cost: int = 0
+    # When a portal-aware planner specializes the route, retain the exact
+    # executable transition chosen for each edge.  Static map-only callers
+    # leave this empty and continue to use the topology-only route contract.
+    selected_transitions: tuple[object, ...] = ()
 
 
 class WorldNavigationError(RuntimeError):
     pass
+
+
+def route_with_edge_filter(graph: "WorldMapGraph", source_map: MapId, target_map: MapId, edge_allowed) -> WorldRoute:
+    """Return a shortest map route using only edges accepted by ``edge_allowed``."""
+    if source_map == target_map:
+        return WorldRoute((source_map,), ())
+    queue: list[tuple[int, int, MapId]] = [(0, 0, source_map)]
+    distances: dict[MapId, int] = {source_map: 0}
+    came_from: dict[MapId, tuple[MapId, WorldEdge] | None] = {source_map: None}
+    order = 0
+    while queue:
+        distance, _, current = heapq.heappop(queue)
+        if distance != distances[current]:
+            continue
+        if current == target_map:
+            return WorldMapGraph._unroll(came_from, target_map, distance)
+        for edge in graph.outgoing(current):
+            if not edge_allowed(edge):
+                continue
+            next_distance = distance + max(1, edge.estimated_cost)
+            if next_distance >= distances.get(edge.destination_map, float("inf")):
+                continue
+            distances[edge.destination_map] = next_distance
+            came_from[edge.destination_map] = (current, edge)
+            order += 1
+            heapq.heappush(queue, (next_distance, order, edge.destination_map))
+    raise WorldNavigationError(f"No filtered map route from {source_map!r} to {target_map!r}")
 
 
 def _connection_coordinates(

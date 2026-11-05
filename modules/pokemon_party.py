@@ -204,11 +204,15 @@ def get_opponent_party() -> Party | None:
     for index in range(6):
         offset = index * 100
         pokemon = PartyPokemon(data[offset : offset + 100], index)
-        if pokemon is None:
-            if index == 0:
+        # gEnemyParty is a fixed six-slot buffer. PartyPokemon is a wrapper,
+        # so it is never None; the old branch consequently exposed empty ROM
+        # slots as placeholder Pokémon in battle diagnostics.
+        if pokemon.is_empty:
+            continue
+        if not pokemon.is_valid:
+            if not list_of_pokemon:
                 return None
-            else:
-                continue
+            continue
         list_of_pokemon.append(pokemon)
 
     party = Party(list_of_pokemon)

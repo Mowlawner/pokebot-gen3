@@ -1,9 +1,10 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from modules.goals import (
     ActivateTrigger,
+    EncounterMode,
     EngageTrainer,
     GoalConstraints,
     NavigationGoal,
@@ -82,7 +83,6 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
             "rescue_birch",
             "obtain_starter",
             "receive_pokedex",
-            "reach_petalburg",
             "complete_petalburg_wally",
             "complete_petalburg_woods",
             "complete_rustboro_goods_stolen",
@@ -90,7 +90,6 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
             "recover_devon_goods",
             "return_devon_goods",
             "meet_mr_stone",
-            "reach_rustboro",
             "prepare_roxanne",
             "defeat_roxanne",
             "complete_intro_rival",
@@ -125,27 +124,23 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
         self.assertIsNone(result.tactical_goal)
         self.assertIsNotNone(result.capability)
 
-    def test_reach_petalburg_mounts_shared_emerald_navigation_capability(self):
-        result = adapt_campaign_execution(self.ready(self.objectives["reach_petalburg"]))
-        self.assertEqual(result.status, CampaignExecutionStatus.READY)
-        self.assertEqual(result.execution_id, "reach_petalburg")
-        self.assertIsNone(result.tactical_goal)
-        self.assertIsNotNone(result.capability)
-
-    def test_reach_petalburg_resolves_to_map_semantic_target(self):
-        from modules.nuzlocke.emerald_capabilities import _semantic_target_for_objective
-
-        target = _semantic_target_for_objective("reach_petalburg")
-        self.assertIsNotNone(target)
-        self.assertEqual(target.kind, SemanticTargetKind.MAP)
-        self.assertEqual(target.target_map, MapRSE.PETALBURG_CITY.value)
-
     def test_petalburg_wally_targets_norman_in_the_gym(self):
         from modules.nuzlocke.emerald_capabilities import _semantic_target_for_objective
 
         result = adapt_campaign_execution(self.ready(self.objectives["complete_petalburg_wally"]))
         self.assertEqual(result.status, CampaignExecutionStatus.READY)
         self.assertIsNotNone(result.capability)
+        self.assertEqual(
+            result.tactical_goal,
+            NavigationGoal(
+                SemanticTarget.interaction(
+                    MapRSE.PETALBURG_CITY_GYM.value,
+                    interaction_id="PetalburgCity_Gym_EventScript_Norman",
+                ),
+                constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+                encounter_mode=EncounterMode.AVOID,
+            ),
+        )
         target = _semantic_target_for_objective("complete_petalburg_wally")
         self.assertIsNotNone(target)
         self.assertEqual(target.kind, SemanticTargetKind.INTERACTION)
@@ -261,12 +256,16 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
         result = adapt_campaign_execution(self.ready(self.objectives["set_text_speed"]))
         self.assertIsNotNone(result)
 
-    def test_campaign_mode_delegates_scripted_battle_to_existing_fight_controller(self):
-        from modules.modes import BattleAction
+    def test_campaign_mode_returns_explicit_strategy_without_legacy_fight_action(self):
         from modules.modes.campaign import CampaignProgressionMode
 
         mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
-        self.assertIs(mode.on_battle_started(None), BattleAction.Fight)
+        selected = object()
+        with patch(
+            "modules.modes.campaign.NuzlockeLevelBalancingBattleStrategy", return_value=selected
+        ) as factory:
+            self.assertIs(mode.on_battle_started(None), selected)
+        factory.assert_called_once_with()
 
     def test_campaign_mode_hands_legal_wild_encounter_to_catch_strategy(self):
         from modules.modes import BattleAction
@@ -294,6 +293,88 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
             patch("modules.modes.campaign.diagnostic_print"),
         ):
             self.assertIs(mode.on_battle_started(object()), BattleAction.Catch)
+
+    def test_campaign_preparation_keeps_wild_battle_with_planner_when_resources_prefer_run(self):
+        from modules.modes import BattleAction
+        from modules.modes.campaign import CampaignProgressionMode
+        from modules.nuzlocke.resource_policy import ResourceDecision
+
+        mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
+        objective = SimpleNamespace(
+            objective_id="prepare_trainer",
+            resource_policy=SimpleNamespace(objective_id="prepare_trainer"),
+        )
+        mode.controller = SimpleNamespace(last_selection=SimpleNamespace(objective=objective))
+        runtime = SimpleNamespace(
+            capture_target_for=lambda location, *, is_wild, is_trainer: False,
+        )
+        avatar = SimpleNamespace(map_group_and_number=(0, 17))
+        fake_context = SimpleNamespace(
+            nuzlocke_runtime=runtime,
+            campaign_preparation_target="reach preparation level 5",
+        )
+        selected = object()
+
+        with (
+            patch("modules.modes.campaign.context", fake_context),
+            patch("modules.modes.campaign.get_player_avatar", return_value=avatar),
+            patch("modules.modes.campaign.get_party", return_value=()),
+            patch(
+                "modules.modes.campaign.runtime_campaign_state", return_value=SimpleNamespace(campaign_facts=object())
+            ),
+            patch("modules.modes.campaign.evaluate_battle_entry", return_value=SimpleNamespace(allowed=True)),
+            patch("modules.modes.campaign.assess_wild_encounter", return_value=ResourceDecision.PREFER_RUN),
+            patch("modules.modes.campaign.NuzlockeLevelBalancingBattleStrategy", return_value=selected) as factory,
+            patch("modules.modes.campaign.diagnostic_print"),
+        ):
+            self.assertIs(mode.on_battle_started(object()), selected)
+
+        factory.assert_called_once_with()
+
+    def test_low_health_preparation_requests_recovery_after_wild_battle_boundary(self):
+        from modules.modes import BattleAction
+        from modules.modes.campaign import CampaignProgressionMode
+        from modules.nuzlocke.resource_policy import ResourceDecision
+
+        mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
+        request_recovery = Mock()
+        objective = SimpleNamespace(
+            objective_id="prepare_trainer",
+            resource_policy=SimpleNamespace(objective_id="prepare_trainer"),
+        )
+        mode.controller = SimpleNamespace(
+            last_selection=SimpleNamespace(objective=objective),
+            request_recovery_after_wild_battle=request_recovery,
+        )
+        runtime = SimpleNamespace(
+            capture_target_for=lambda location, *, is_wild, is_trainer: False,
+        )
+        avatar = SimpleNamespace(map_group_and_number=(0, 17))
+        party_member = SimpleNamespace(
+            current_hp=6,
+            total_hp=19,
+            status_condition=SimpleNamespace(value="none"),
+        )
+        fake_context = SimpleNamespace(
+            nuzlocke_runtime=runtime,
+            campaign_preparation_target="reach preparation level 5",
+        )
+
+        with (
+            patch("modules.modes.campaign.context", fake_context),
+            patch("modules.modes.campaign.get_player_avatar", return_value=avatar),
+            patch("modules.modes.campaign.get_party", return_value=(party_member,)),
+            patch(
+                "modules.modes.campaign.runtime_campaign_state", return_value=SimpleNamespace(campaign_facts=object())
+            ),
+            patch("modules.modes.campaign.evaluate_battle_entry", return_value=SimpleNamespace(allowed=True)),
+            patch("modules.modes.campaign.assess_wild_encounter", return_value=ResourceDecision.PREFER_RUN),
+            patch("modules.modes.campaign.NuzlockeLevelBalancingBattleStrategy", return_value=object()),
+            patch("modules.modes.campaign.diagnostic_print"),
+        ):
+            mode.on_battle_started(object())
+
+        request_recovery.assert_called_once_with("wild_battle_resource_boundary")
 
     def test_campaign_mode_selects_nuzlocke_strategy_for_preparation_and_roxanne(self):
         from modules.modes.campaign import CampaignProgressionMode
@@ -326,7 +407,7 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
         from modules.modes.campaign import CampaignProgressionMode
 
         mode = CampaignProgressionMode.__new__(CampaignProgressionMode)
-        objective = SimpleNamespace(objective_id="reach_petalburg", resource_policy=None)
+        objective = SimpleNamespace(objective_id="complete_petalburg_wally", resource_policy=None)
         mode.controller = SimpleNamespace(last_selection=SimpleNamespace(objective=objective))
         selected = object()
         with (
@@ -403,6 +484,76 @@ class CampaignExecutionAdapterTests(unittest.TestCase):
             next(progression)
 
         self.assertEqual(len(created), 1)
+
+    def test_continuation_route_is_adopted_only_at_its_exact_origin(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        current = SimpleNamespace(
+            map_id=(1, 3),
+            player_coordinates=(2, 2),
+            controllable=True,
+            facing=None,
+            tiles=(),
+            bindings=(),
+            dynamic_blocked_coordinates=frozenset(),
+            triggers=(),
+            warps=(),
+            objects=(),
+        )
+        continuation = SimpleNamespace(
+            actions=(SimpleNamespace(source=((1, 3), (2, 2))),),
+            destination=((1, 4), (0, 0)),
+        )
+        cache = {"continuation_route": continuation}
+        created = []
+
+        class FakeLoop:
+            def run(self):
+                while True:
+                    yield
+
+        def fake_constructor(*_args, **_kwargs):
+            created.append(1)
+            return FakeLoop()
+
+        with (
+            patch.object(capabilities, "perceive_overworld", return_value=current),
+            patch.object(capabilities, "AgentControlLoop", side_effect=fake_constructor),
+        ):
+            progression = capabilities.observation_driven_overworld_progression(execution_cache=cache)
+            next(progression)
+
+        self.assertNotIn("continuation_route", cache)
+        self.assertEqual(len(created), 1)
+
+    def test_continuation_route_is_discarded_after_a_map_mismatch(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        current = SimpleNamespace(
+            map_id=(1, 4),
+            player_coordinates=(2, 2),
+            controllable=True,
+            facing=None,
+            tiles=(),
+            bindings=(),
+            dynamic_blocked_coordinates=frozenset(),
+            triggers=(),
+            warps=(),
+            objects=(),
+        )
+        continuation = SimpleNamespace(
+            actions=(SimpleNamespace(source=((1, 3), (2, 2))),),
+            destination=((1, 5), (0, 0)),
+        )
+        cache = {"continuation_route": continuation}
+        with (
+            patch.object(capabilities, "perceive_overworld", return_value=current),
+            patch.object(capabilities, "GoalAwareNavigator"),
+        ):
+            progression = capabilities.observation_driven_overworld_progression(execution_cache=cache)
+            next(progression)
+
+        self.assertNotIn("continuation_route", cache)
 
     def test_tactical_loop_failure_releases_cached_execution(self):
         from modules.goals import ReachWarp, SemanticTarget

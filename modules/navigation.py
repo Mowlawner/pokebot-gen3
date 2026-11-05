@@ -1,16 +1,19 @@
 """Deterministic goal-aware navigation over a small abstract world model."""
 
 import heapq
+from collections import OrderedDict
 from time import perf_counter_ns, sleep
 from itertools import count
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
+from threading import RLock
 from typing import Mapping
 
 from modules.goals import (
     ActivateTrigger,
     EngageTrainer,
     Goal,
+    GoalConstraints,
     NavigationGoal,
     ReachInteractionPosition,
     ReachLocation,
@@ -18,6 +21,9 @@ from modules.goals import (
     SemanticTarget,
     SemanticTargetKind,
     EncounterMode,
+    TrainerEngagementMode,
+    TrainerEngagementPlan,
+    TrainerMode,
 )
 from modules.map_path import Direction
 from modules.overworld import (
@@ -29,13 +35,17 @@ from modules.overworld import (
     WarpObservation,
     WarpActivation,
     prewarm_static_map_observation,
+    resolve_object_activation_positions,
     static_map_transitions,
+    static_trainer_observations,
+    trainer_engagement_locations,
+    trainer_hazard_locations,
 )
 from modules.trigger_bindings import BindingResolution
-from modules.world_navigation import WorldMapGraph, WorldNavigationError, WorldRoute, get_world_map_graph
+from modules.world_navigation import WorldEdge, WorldMapGraph, WorldNavigationError, WorldRoute, get_world_map_graph
 from modules.stutter_trace import background_work_suppressed, traced
 from modules.context import context
-from modules.console import diagnostic_print
+from modules.console import diagnostic_print, print_navigation_pathfinding
 from modules.profiler import profiled
 from modules.profiler import (
     enabled as profiling_enabled,
@@ -44,6 +54,138 @@ from modules.profiler import (
     record_pathfinding_search,
     pathfinding_searches,
 )
+
+
+_pathfinding_call_ids = count(1)
+_failed_reach_warp_diagnostics: OrderedDict[tuple, None] = OrderedDict()
+_failed_reach_warp_diagnostics_lock = RLock()
+_MAX_FAILED_REACH_WARP_DIAGNOSTICS = 256
+
+
+def _transition_diagnostic_signature(transition: WorldTransition) -> tuple:
+    """Return executable transition facts suitable for a failure log."""
+
+    return (
+        getattr(transition, "kind", None),
+        getattr(transition, "entry", None),
+        transition_approach_position(transition),
+        getattr(transition, "destination", None),
+        getattr(getattr(transition, "activation", None), "value", getattr(transition, "activation", None)),
+        tuple(sorted(getattr(transition, "activation_locations", ()) or (), key=repr)),
+        getattr(transition, "activation_direction", None),
+        getattr(transition, "required_facing", None),
+    )
+
+
+def _failed_reach_warp_diagnostic_key(world: "NavigationWorld", start: Location, target: ReachWarp) -> tuple:
+    """Identify one failed ReachWarp observation without retaining worlds."""
+
+    return (
+        start,
+        repr(target),
+        world.dynamic_blocked_revision,
+        world.transition_revision,
+    )
+
+
+def _should_emit_failed_reach_warp_diagnostic(key: tuple) -> bool:
+    """Bound repeated retry-loop diagnostics while retaining recent snapshots."""
+
+    with _failed_reach_warp_diagnostics_lock:
+        if key in _failed_reach_warp_diagnostics:
+            return False
+        _failed_reach_warp_diagnostics[key] = None
+        while len(_failed_reach_warp_diagnostics) > _MAX_FAILED_REACH_WARP_DIAGNOSTICS:
+            _failed_reach_warp_diagnostics.popitem(last=False)
+        return True
+
+
+def _log_failed_reach_warp_diagnostic(world: "NavigationWorld", start: Location, target: ReachWarp) -> None:
+    """Explain why a reachable-looking transition was rejected by search."""
+
+    key = _failed_reach_warp_diagnostic_key(world, start, target)
+    if not _should_emit_failed_reach_warp_diagnostic(key):
+        return
+
+    transitions = tuple(world.transitions or world.warps)
+    allowed = target.warps or ((target.warp,) if target.warp is not None else transitions)
+    target_transition = target.warp
+    target_source = (
+        transition_approach_position(target_transition)
+        if target_transition is not None and getattr(target_transition, "kind", None) == "map_connection"
+        else (
+            next(iter(getattr(target_transition, "activation_locations", ()) or ()), None)
+            if target_transition is not None and getattr(target_transition, "activation_locations", ())
+            else getattr(target_transition, "entry", None)
+        )
+    )
+    target_entry = getattr(target_transition, "entry", None)
+    entry_tile = world.tiles.get(target_entry) if target_entry is not None else None
+    dynamic_blocked = world.dynamic_blocked_revision or ()
+    indexed_target = tuple(world._transitions_by_source.get(target_source, ())) if target_source else ()
+    indexed_sources = tuple(
+        sorted(
+            (
+                (
+                    source,
+                    tuple(_transition_diagnostic_signature(transition) for transition in indexed),
+                )
+                for source, indexed in world._transitions_by_source.items()
+                if source == target_source or (target_entry is not None and source == target_entry)
+            ),
+            key=repr,
+        )
+    )
+    identity_matches = tuple(
+        _transition_diagnostic_signature(transition)
+        for transition in indexed_target
+        if any(transitions_match(transition, candidate) for candidate in allowed)
+    )
+    diagnostic_print(
+        lambda: (
+            "NAVIGATION_REACH_WARP_DIAGNOSTIC: "
+            f"start={start!r} target={target!r} "
+            f"target_source={target_source!r} target_entry={target_entry!r} "
+            f"entry_tile_present={entry_tile is not None!r} "
+            f"entry_tile_blocked={getattr(entry_tile, 'blocked', None)!r} "
+            f"entry_in_blocked_revision={target_entry is not None and target_entry[1] in dynamic_blocked!r} "
+            f"dynamic_blocked_revision={world.dynamic_blocked_revision!r} "
+            f"indexed_target_sources={indexed_sources!r} "
+            f"identity_matches={identity_matches!r} "
+            f"target_transition={_transition_diagnostic_signature(target_transition) if target_transition is not None else None!r} "
+            f"world_transitions={tuple(_transition_diagnostic_signature(transition) for transition in transitions)!r}"
+        ),
+        trace=True,
+        prefix="NAVIGATION_REACH_WARP_DIAGNOSTIC:",
+    )
+
+
+def _pokemon_center_map_ids() -> frozenset[MapId]:
+    """Return Emerald Center interior maps without hard-coding map numbers."""
+
+    from modules.map_data import MapRSE
+
+    return frozenset(
+        member.value
+        for member in MapRSE
+        if "POKEMON_CENTER_" in member.name
+    )
+
+
+def _goal_allows_pokemon_center_destination(goal: NavigationGoal) -> bool:
+    """Return whether this goal explicitly requests a Center interior."""
+
+    target = goal.target
+    center_maps = _pokemon_center_map_ids()
+    if isinstance(target, ReachWarp):
+        destination = target.destination
+        destination_map = target.destination_map or (destination[0] if destination is not None else None)
+        return canonical_map_id(destination_map) in center_maps
+    if isinstance(target, ReachLocation):
+        return canonical_map_id(target.location[0]) in center_maps
+    if isinstance(target, SemanticTarget):
+        return canonical_map_id(target.target_map) in center_maps
+    return False
 
 
 class NavigationActionType(Enum):
@@ -59,8 +201,55 @@ class TransitionRelevance(Enum):
     BLOCKED = auto()
 
 
+class TrainerAvoidability(Enum):
+    """How difficult it is to keep one trainer out of a route."""
+
+    AVOIDABLE = "avoidable"
+    COSTLY = "costly"
+    PRACTICALLY_UNAVOIDABLE = "practically_unavoidable"
+    UNAVOIDABLE = "unavoidable"
+    IMMINENT = "imminent"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class TrainerRouteRisk:
+    """Route geometry and cost evidence for one undefeated trainer."""
+
+    trainer_id: str
+    avoidability: TrainerAvoidability
+    hazard_locations: frozenset[Location] = frozenset()
+    exposed_on_normal_route: bool = False
+    normal_cost: int | None = None
+    engagement_cost: int | None = None
+    avoidance_cost: int | None = None
+    detour: int | None = None
+    confidence: str = "known"
+    reason: str = ""
+
+
 class NavigationSearchCancelled(RuntimeError):
     """Raised when a background route search is superseded or times out."""
+
+
+def canonical_map_id(map_id):
+    """Return the tuple/value form used at navigation cache boundaries.
+
+    ROM-facing callers commonly pass ``MapRSE`` members while live
+    perception and the static navigation cache use their ``.value`` tuples.
+    Keeping that conversion at the cache boundary prevents a valid map from
+    being looked up once as an enum and once as its raw value.
+    """
+
+    return getattr(map_id, "value", map_id)
+
+
+def canonical_location(location):
+    """Normalize the map component of a navigation location."""
+
+    if not isinstance(location, tuple) or len(location) != 2:
+        return location
+    return canonical_map_id(location[0]), location[1]
 
 
 def classify_transition_relevance(
@@ -152,6 +341,13 @@ def _semantic_plan_cache_key(world: "NavigationWorld", start: Location, goal: Na
     """
     blocked, transitions = world.revision_key()
     hazards = tuple(sorted(location for trigger in world.triggers for location in trigger.hazard_locations))
+    engagement_locations = tuple(
+        sorted(
+            (trigger.trigger_id, location)
+            for trigger in world.triggers
+            for location in getattr(trigger, "engagement_locations", ())
+        )
+    )
     constraints = goal.constraints
     return (
         start,
@@ -160,12 +356,16 @@ def _semantic_plan_cache_key(world: "NavigationWorld", start: Location, goal: Na
         repr(target),
         tuple(sorted(constraints.avoid_trigger_ids)),
         tuple(sorted(constraints.avoid_locations, key=repr)),
+        tuple(sorted(getattr(constraints, "avoid_trainer_ids", ()))),
         getattr(getattr(constraints, "trainer_mode", None), "value", None),
+        bool(getattr(constraints, "allow_forced_trainer_exposure", False)),
         goal.encounter_mode.value,
         goal.encounter_penalty,
+        tuple(goal.preferred_map_route or ()),
         transitions,
         blocked,
         hazards,
+        engagement_locations,
     )
 
 
@@ -240,6 +440,39 @@ def transitions_match(left: WorldTransition, right: WorldTransition) -> bool:
     )
 
 
+def transition_source_matches(left: WorldTransition, right: WorldTransition) -> bool:
+    """Compare the stable executable identity of two transition records.
+
+    A live transition may carry a destination learned from a previous ROM
+    observation while a grouped ``ReachWarp`` still contains the static
+    record that selected that source.  The source, kind, and entry identify
+    the executable door; the goal separately verifies the destination map.
+    Keep the relaxed comparison private to grouped observed goals so exact
+    destination goals retain their stronger contract.
+    """
+
+    left_source = transition_approach_position(left) or left.entry
+    right_source = transition_approach_position(right) or right.entry
+    return left.kind == right.kind and left_source == right_source and left.entry == right.entry
+
+
+def _reach_warp_transition_matches(transition: WorldTransition, target: ReachWarp) -> bool:
+    """Return whether a live transition satisfies a ``ReachWarp`` identity."""
+
+    if target.warp is not None:
+        return transitions_match(transition, target.warp)
+    if not target.warps:
+        return True
+    return any(
+        transitions_match(transition, allowed)
+        or (
+            target.destination is None
+            and transition_source_matches(transition, allowed)
+        )
+        for allowed in target.warps
+    )
+
+
 @dataclass(frozen=True)
 class NavigableTile:
     location: Location
@@ -262,6 +495,7 @@ class _DynamicTileMapping(Mapping[Location, NavigableTile]):
         self._blocked = blocked
 
     def __getitem__(self, location: Location) -> NavigableTile:
+        location = canonical_location(location)
         tile = self._static_tiles[location]
         if location[1] not in self._blocked or tile.blocked:
             return tile
@@ -282,6 +516,12 @@ class _DynamicTileMapping(Mapping[Location, NavigableTile]):
     def __len__(self):
         return len(self._static_tiles)
 
+    def get(self, location: Location, default=None):
+        try:
+            return self[location]
+        except KeyError:
+            return default
+
 
 class _LazyStaticTileMapping(Mapping[Location, NavigableTile]):
     """Read-through immutable per-map tile models for global search.
@@ -291,10 +531,26 @@ class _LazyStaticTileMapping(Mapping[Location, NavigableTile]):
     most once and is retained by the existing static navigation cache.
     """
 
-    def __init__(self, initial: Mapping[Location, NavigableTile], map_ids, *, static_maps=()):
+    def __init__(
+        self,
+        initial: Mapping[Location, NavigableTile],
+        map_ids,
+        *,
+        static_maps=(),
+        static_models=(),
+        metadata_frozen=False,
+    ):
+        normalized_initial = {
+            canonical_location(location): tile
+            for location, tile in initial.items()
+        }
         self._observed = {
-            map_id: dict((location, tile) for location, tile in initial.items() if location[0] == map_id)
-            for map_id in {location[0] for location in initial}
+            map_id: dict(
+                (location, tile)
+                for location, tile in normalized_initial.items()
+                if location[0] == map_id
+            )
+            for map_id in {location[0] for location in normalized_initial}
         }
         # Live perception is often a partial window around the avatar.  Do
         # not treat those entries as a complete model: the ROM tile map must
@@ -302,15 +558,31 @@ class _LazyStaticTileMapping(Mapping[Location, NavigableTile]):
         # reachable.  Observed tiles are overlaid afterward so dynamic
         # occupancy and live collision information retain precedence.
         self._models: dict[MapId, dict[Location, NavigableTile]] = {}
-        self._map_ids = frozenset(map_ids)
-        self._static_maps = frozenset(static_maps)
+        self._map_ids = frozenset(canonical_map_id(map_id) for map_id in map_ids)
+        self._static_maps = frozenset(canonical_map_id(map_id) for map_id in static_maps)
+        self._static_models = {
+            canonical_map_id(map_id): {
+                canonical_location(location): tile for location, tile in tiles
+            }
+            for map_id, tiles in static_models
+        }
+        self._metadata_frozen = bool(metadata_frozen)
         self._loaded: set[MapId] = set()
 
     def _load(self, map_id) -> dict[Location, NavigableTile]:
-        if map_id not in self._static_maps and map_id in self._observed:
+        map_id = canonical_map_id(map_id)
+        if map_id in self._static_models:
+            self._models[map_id] = dict(self._static_models[map_id])
+            self._loaded.add(map_id)
+        elif map_id not in self._static_maps and map_id in self._observed:
             self._models[map_id] = dict(self._observed[map_id])
             self._loaded.add(map_id)
         elif map_id not in self._loaded:
+            if self._metadata_frozen:
+                # Background route workers must not touch ROM-backed caches.
+                self._models.setdefault(map_id, {})
+                self._loaded.add(map_id)
+                return self._models[map_id]
             try:
                 static_tiles = prewarm_static_map_observation(map_id)
             except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
@@ -333,9 +605,11 @@ class _LazyStaticTileMapping(Mapping[Location, NavigableTile]):
         return self._models.get(map_id, {})
 
     def __getitem__(self, location: Location) -> NavigableTile:
+        location = canonical_location(location)
         return self._load(location[0])[location]
 
     def get(self, location: Location, default=None):
+        location = canonical_location(location)
         return self._load(location[0]).get(location, default)
 
     def __iter__(self):
@@ -357,13 +631,14 @@ def prewarm_navigation_tiles(map_id, tiles: tuple) -> None:
     ``tiles`` must come from static overworld perception.  Dynamic blocking
     is intentionally absent here and remains an observation-time overlay.
     """
+    map_id = canonical_map_id(map_id)
     cache = _static_navigation_tiles.get(map_id)
     if cache is None or cache[0] is not tiles:
         _static_navigation_tiles[map_id] = (
             tiles,
             {
-                tile.location: NavigableTile(
-                    tile.location,
+                canonical_location(tile.location): NavigableTile(
+                    canonical_location(tile.location),
                     tile.blocked,
                     tile.walkable_neighbors,
                     tile.traversal_cost,
@@ -377,6 +652,18 @@ def prewarm_navigation_tiles(map_id, tiles: tuple) -> None:
         )
 
 
+def static_navigation_tile_snapshot(
+    map_id: MapId, tiles: tuple | None = None
+) -> tuple[tuple[Location, NavigableTile], ...]:
+    """Return a static tile model prepared by the caller's ROM-owning thread."""
+
+    map_id = canonical_map_id(map_id)
+    if tiles is None:
+        tiles = prewarm_static_map_observation(map_id)
+    prewarm_navigation_tiles(map_id, tiles)
+    return tuple(_static_navigation_tiles[map_id][1].items())
+
+
 @dataclass(frozen=True)
 class NavigationWorld:
     tiles: Mapping[Location, NavigableTile]
@@ -388,6 +675,11 @@ class NavigationWorld:
     running_shoes: bool = False
     player_elevation: int | None = None
     surfing: bool = False
+    # Background route workers consume immutable frame-thread snapshots rather
+    # than reading ROM metadata or mutating navigation caches themselves.
+    static_tile_catalog: tuple[tuple[MapId, tuple[tuple[Location, NavigableTile], ...]], ...] = ()
+    static_transition_catalog: tuple[tuple[MapId, tuple[WorldTransition, ...]], ...] = ()
+    static_metadata_frozen: bool = False
     # These revisions are produced while the live observation is assembled.
     # Keeping them on the immutable world avoids scanning a potentially large
     # static tile mapping every time a background request is polled.
@@ -452,10 +744,11 @@ class NavigationWorld:
     @traced("NavigationWorld_construction")
     def from_overworld(cls, observation: OverworldObservation) -> "NavigationWorld":
         """Adapt the live perception model without coupling the search to emulator APIs."""
-        cache = _static_navigation_tiles.get(observation.map_id)
+        map_id = canonical_map_id(observation.map_id)
+        cache = _static_navigation_tiles.get(map_id)
         if cache is None or cache[0] is not observation.tiles:
-            prewarm_navigation_tiles(observation.map_id, observation.tiles)
-            static_tiles = _static_navigation_tiles[observation.map_id][1]
+            prewarm_navigation_tiles(map_id, observation.tiles)
+            static_tiles = _static_navigation_tiles[map_id][1]
         else:
             static_tiles = cache[1]
         # Runtime object events are authoritative occupancy evidence even for
@@ -465,9 +758,13 @@ class NavigationWorld:
         object_blocked_coordinates = frozenset(
             object_observation.location[1]
             for object_observation in getattr(observation, "objects", ())
-            if object_observation.location[0] == observation.map_id
+            if canonical_map_id(object_observation.location[0]) == map_id
         )
-        blocked_coordinates = frozenset(observation.dynamic_blocked_coordinates) | object_blocked_coordinates
+        blocked_coordinates = (
+            frozenset(observation.dynamic_blocked_coordinates)
+            | frozenset(getattr(observation, "static_blocked_coordinates", ()))
+            | object_blocked_coordinates
+        )
         tiles: Mapping[Location, NavigableTile] = static_tiles
         if blocked_coordinates:
             tiles = _DynamicTileMapping(static_tiles, blocked_coordinates)
@@ -573,9 +870,100 @@ class NavigationWorld:
     @staticmethod
     def _warp_direction(location: Location, warp: WorldTransition) -> Direction:
         # Entering a warp is an input in the direction of the destination tile
-        # only when the map data supplies one; otherwise any adjacent route can
-        # reach the entry and the direction is a stable default.
+        # only when the map data supplies one; door warps expose that input as
+        # ``activation_direction`` while their entry tile often has no
+        # ``required_facing``.  Falling through to the stable South default
+        # sends a Center-door approach back into the town and can create an
+        # up/down route loop after recovery.
+        if warp.activation_direction is not None:
+            return warp.activation_direction
+        if warp.activation_locations:
+            # Multi-side door records do not have one global activation
+            # direction.  The input is the direction from the selected
+            # source tile onto the door entry.  Falling back to South here
+            # sends a north-side approach back into the town and can trap
+            # cross-map navigation in an up/down loop.
+            source = next(
+                (candidate for candidate in warp.activation_locations if candidate == location),
+                None,
+            )
+            if source is not None:
+                direction = _direction_between(source[1], warp.entry[1])
+                if direction is not None:
+                    return direction
         return warp.required_facing if warp.required_facing is not None else Direction.South
+
+
+def resolve_trainer_engagement_plan(world: NavigationWorld, trainer_id: str) -> TrainerEngagementPlan:
+    """Resolve the executable activation mode for a trainer in ``world``.
+
+    Runtime/static trainer triggers and semantic campaign bindings can
+    describe the same trainer. Prefer a semantic or live adjacent interaction
+    when it is positively observed, then a live sight line, and otherwise
+    preserve an explicit unknown result. In particular, an empty sight-line
+    set is not permission to press A: static hazard metadata can be incomplete
+    and must remain fail-closed.
+    """
+
+    matching = tuple(trigger for trigger in world.triggers if trigger.affordance_id == trainer_id)
+    if not matching:
+        return TrainerEngagementPlan(
+            trainer_id,
+            None,
+            TrainerEngagementMode.UNKNOWN,
+            reason="trainer affordance is not present in the current world observation",
+        )
+
+    interaction_candidates = tuple(
+        trigger
+        for trigger in matching
+        if getattr(trigger, "requires_input", True)
+        and getattr(trigger, "activation_locations", ())
+        and (
+            str(getattr(trigger, "kind", "")).startswith("semantic_")
+            or not getattr(trigger, "engagement_locations", ())
+        )
+    )
+    if interaction_candidates:
+        trigger = interaction_candidates[0]
+        return TrainerEngagementPlan(
+            trainer_id,
+            trigger.trigger_id,
+            TrainerEngagementMode.INTERACTION,
+            interaction_locations=frozenset(trigger.activation_locations),
+            activation_requirements=tuple(trigger.activation_requirements),
+            requires_input=True,
+            reason="adjacent interaction geometry is positively observed",
+        )
+
+    sightline_candidates = tuple(
+        trigger for trigger in matching if getattr(trigger, "engagement_locations", ())
+    )
+    if sightline_candidates:
+        trigger = sightline_candidates[0]
+        return TrainerEngagementPlan(
+            trainer_id,
+            trigger.trigger_id,
+            TrainerEngagementMode.SIGHTLINE,
+            engagement_locations=frozenset(trigger.engagement_locations),
+            interaction_locations=frozenset(trigger.activation_locations),
+            activation_requirements=tuple(trigger.activation_requirements),
+            requires_input=False,
+            reason="trainer sight-line geometry is positively observed",
+        )
+
+    # Retain the trigger identity for diagnostics and future re-observation,
+    # but do not claim that either activation mechanism is executable.
+    trigger = matching[0]
+    return TrainerEngagementPlan(
+        trainer_id,
+        trigger.trigger_id,
+        TrainerEngagementMode.UNKNOWN,
+        interaction_locations=frozenset(trigger.activation_locations),
+        activation_requirements=tuple(trigger.activation_requirements),
+        requires_input=getattr(trigger, "requires_input", None),
+        reason="trainer is known but no executable sight line or interaction geometry is observed",
+    )
 
 
 @dataclass(frozen=True)
@@ -771,6 +1159,7 @@ class RouteAnalysis:
     normal_route: NavigationPlan | None
     normal_cost: int | None
     candidates: tuple[IntermediateRouteAnalysis, ...] = ()
+    trainer_risks: tuple[TrainerRouteRisk, ...] = ()
 
 
 class RouteCostAnalyzer:
@@ -799,6 +1188,199 @@ class RouteCostAnalyzer:
     @staticmethod
     def _cost(plan: NavigationPlan | None) -> int | None:
         return plan.metrics.total_route_cost if plan is not None and plan.metrics is not None else None
+
+    @staticmethod
+    def _route_locations(plan: NavigationPlan | None) -> frozenset[Location]:
+        if plan is None:
+            return frozenset()
+        locations = set()
+        for action in plan.actions:
+            if action.source is not None:
+                locations.add(action.source)
+            if action.destination is not None:
+                locations.add(action.destination)
+        if plan.destination is not None:
+            locations.add(plan.destination)
+        return frozenset(locations)
+
+    @staticmethod
+    def _route_maps(plan: NavigationPlan | None) -> frozenset[MapId]:
+        """Return maps represented by a route, including its terminal map."""
+
+        return frozenset(
+            canonical_map_id(location[0])
+            for location in RouteCostAnalyzer._route_locations(plan)
+            if isinstance(location, tuple) and len(location) == 2
+        )
+
+    @staticmethod
+    def _trainer_goal(goal, *, mode, avoid_ids=frozenset()):
+        if not isinstance(goal, NavigationGoal):
+            return None
+        constraints = replace(
+            goal.constraints,
+            trainer_mode=mode,
+            avoid_trainer_ids=frozenset(avoid_ids),
+        )
+        return replace(goal, constraints=constraints)
+
+    def _trainer_risks(self, start: Location, goal, normal: NavigationPlan | None, normal_cost: int | None, plan):
+        """Measure per-trainer avoidance using bounded route alternatives."""
+
+        if not isinstance(goal, NavigationGoal) or not getattr(self.world, "triggers", ()):
+            return ()
+        risks = []
+        normal_locations = self._route_locations(normal)
+        ignore_goal = self._trainer_goal(goal, mode=TrainerMode.IGNORE)
+        if ignore_goal is None:
+            return ()
+        # A caller may deliberately request the parent route with AVOID so
+        # that execution is safe.  That route cannot also be the exposure
+        # baseline: by definition it has already removed the trainer hazard.
+        # Compare it with the same route under IGNORE, which represents the
+        # route the campaign would take if it accepted the engagement.
+        try:
+            engagement_route = plan(self.world, start, ignore_goal)
+        except (NavigationError, RuntimeError, TypeError, ValueError):
+            engagement_route = None
+        engagement_cost = self._cost(engagement_route)
+        engagement_locations = self._route_locations(engagement_route)
+        engagement_maps = self._route_maps(engagement_route)
+        requested_mode = getattr(getattr(goal, "constraints", None), "trainer_mode", None)
+        exposure_locations = (
+            engagement_locations
+            if requested_mode is TrainerMode.AVOID and engagement_route is not None
+            else normal_locations
+        )
+        for trigger in getattr(self.world, "triggers", ()):
+            trainer_id = getattr(trigger, "affordance_id", None) or getattr(trigger, "trigger_id", None)
+            if not trainer_id:
+                continue
+            is_trainer = getattr(trigger, "hazard_kind", None) == "trainer" or str(trainer_id).startswith(
+                ("trainer:", "rom_trainer:")
+            )
+            if not is_trainer:
+                continue
+            if getattr(trigger, "trainer_defeated", None) is True:
+                continue
+            hazards = frozenset(getattr(trigger, "hazard_locations", ()) or ())
+            if not hazards:
+                # A trainer trigger with no geometry is not evidence that the
+                # trainer is harmless when the selected route actually
+                # reaches its object or interaction positions. It also is not
+                # evidence that every trainer on the map blocks the route:
+                # static Gym trainers and other unreachable objects can be
+                # present in the world with an empty envelope. Keep the
+                # unknown hazard only when the route has a concrete
+                # intersection with the trigger's positions.
+                trigger_positions = frozenset(
+                    location
+                    for field in ("locations", "activation_locations", "engagement_locations")
+                    for location in (getattr(trigger, field, ()) or ())
+                    if isinstance(location, tuple) and len(location) == 2
+                )
+                if trigger_positions and not trigger_positions.intersection(normal_locations):
+                    continue
+                risks.append(
+                    TrainerRouteRisk(
+                        trainer_id,
+                        TrainerAvoidability.UNKNOWN,
+                        exposed_on_normal_route=True,
+                        confidence="unknown",
+                        reason="trainer sight-line geometry is unavailable; route exposure is unknown",
+                    )
+                )
+                continue
+            exposed = bool(hazards & exposure_locations)
+            if (
+                not exposed
+                and engagement_route is not None
+                and not getattr(engagement_route, "actions", ())
+                and engagement_maps
+            ):
+                # A lightweight planner/test double may return only a
+                # terminal location and omit its movement actions.  That is
+                # insufficient to prove that a trainer on the terminal map
+                # is avoided, so keep the hazard in the bounded comparison.
+                # Full live plans carry action locations and use the precise
+                # intersection above.
+                exposed = any(
+                    isinstance(location, tuple)
+                    and len(location) == 2
+                    and canonical_map_id(location[0]) in engagement_maps
+                    for location in hazards
+                )
+            # Avoidance cost is only relevant for a trainer that the selected
+            # normal route can actually expose.  Computing an IGNORE route
+            # and a separate AVOID route for every trainer on a map made the
+            # campaign readiness worker spend most of its time solving
+            # unrelated branches.  Static and live hazard geometry still
+            # remains in the route envelope, and the tactical navigator keeps
+            # validating movement against every trainer trigger.
+            if not exposed:
+                continue
+            if start in hazards:
+                risks.append(
+                    TrainerRouteRisk(
+                        trainer_id,
+                        TrainerAvoidability.IMMINENT,
+                        hazards,
+                        exposed,
+                        normal_cost,
+                        engagement_cost,
+                        0,
+                        0,
+                        reason="current position is inside the trainer sight line",
+                    )
+                )
+                continue
+            avoid_goal = self._trainer_goal(
+                goal,
+                mode=TrainerMode.AVOID,
+                avoid_ids={trainer_id},
+            )
+            try:
+                avoidance_route = plan(self.world, start, avoid_goal)
+            except (NavigationError, RuntimeError, TypeError, ValueError):
+                avoidance_route = None
+            avoidance_cost = self._cost(avoidance_route)
+            avoidance_locations = self._route_locations(avoidance_route)
+            if avoidance_route is None:
+                level = TrainerAvoidability.UNAVOIDABLE
+                reason = "no route avoiding this trainer was found"
+                detour = None
+            elif getattr(avoidance_route, "forced_trainer_exposure", False) or hazards & avoidance_locations:
+                level = TrainerAvoidability.UNAVOIDABLE
+                reason = "every bounded route still intersects this trainer's sight line"
+                detour = None if avoidance_cost is None or engagement_cost is None else avoidance_cost - engagement_cost
+            else:
+                detour = None if avoidance_cost is None or engagement_cost is None else avoidance_cost - engagement_cost
+                if detour is None:
+                    level = TrainerAvoidability.UNKNOWN
+                    reason = "route costs were unavailable"
+                elif detour <= 12:
+                    level = TrainerAvoidability.AVOIDABLE
+                    reason = "a low-cost trainer-free route exists"
+                elif detour <= 40:
+                    level = TrainerAvoidability.COSTLY
+                    reason = "avoidance requires a measurable detour"
+                else:
+                    level = TrainerAvoidability.PRACTICALLY_UNAVOIDABLE
+                    reason = "avoidance requires a substantial detour"
+            risks.append(
+                TrainerRouteRisk(
+                    trainer_id,
+                    level,
+                    hazards,
+                    exposed,
+                    normal_cost,
+                    engagement_cost,
+                    avoidance_cost,
+                    detour,
+                    reason=reason,
+                )
+            )
+        return tuple(risks)
 
     def analyze(
         self,
@@ -859,7 +1441,8 @@ class RouteCostAnalyzer:
                         destination, None, None, False, first, continuation, str(error) or normal_error
                     )
                 )
-        return RouteAnalysis(goal, normal, normal_cost, tuple(candidates))
+        trainer_risks = self._trainer_risks(start, goal, normal, normal_cost, plan)
+        return RouteAnalysis(goal, normal, normal_cost, tuple(candidates), trainer_risks)
 
 
 # NORMAL is deliberately opportunity-first.  The second component keeps the
@@ -867,6 +1450,20 @@ class RouteCostAnalyzer:
 # not allowed to trade an extra encounter opportunity for fewer steps.
 NORMAL_ENCOUNTER_OPPORTUNITY_WEIGHT = 1
 NORMAL_MOVEMENT_COST_SCALE = 1
+
+
+def _goal_requires_orientation(target: Goal) -> bool:
+    """Return whether the search must preserve avatar facing.
+
+    Ordinary location routing only needs a sequence of cardinal inputs.  The
+    executor already handles the first input as a turn when the avatar is
+    facing another direction, so carrying facing through every movement
+    state only multiplies the search space.  Interaction and transition
+    goals are different: their activation preconditions can depend on the
+    final facing, so those searches retain the orientation dimension.
+    """
+
+    return isinstance(target, (ActivateTrigger, ReachInteractionPosition, EngageTrainer, ReachWarp))
 
 
 def navigation_candidate_key(metrics: NavigationMetrics, encounter_mode: EncounterMode, candidate_id: str = ""):
@@ -907,6 +1504,47 @@ def goal_target_map(world: NavigationWorld, goal: Goal) -> MapId | None:
     target = goal.target if isinstance(goal, NavigationGoal) else goal
     if isinstance(target, SemanticTarget):
         return target.target_map or (target.location[0] if target.location else None)
+    if isinstance(target, EngageTrainer):
+        matching_maps = {
+            trigger_location[0]
+            for trigger in world.triggers
+            if trigger.affordance_id == target.trainer_id
+            for trigger_location in (
+                *trigger.locations,
+                *trigger.navigation_locations,
+                *trigger.activation_locations,
+                *getattr(trigger, "engagement_locations", ()),
+                *trigger.hazard_locations,
+            )
+        }
+        if len(matching_maps) == 1:
+            return next(iter(matching_maps))
+
+        # Trainer goals are often promoted while the player is still on the
+        # previous map. The runtime trigger is therefore not guaranteed to be
+        # present in the current observation. Resolve the stable affordance
+        # identity from the verified trainer catalog first, then from the
+        # map/local-id encoding used by every live trainer observation.
+        try:
+            from modules.trainer_checkpoints import trainer_checkpoint_for_id
+
+            checkpoint = trainer_checkpoint_for_id(target.trainer_id)
+        except (ImportError, AttributeError, TypeError, ValueError):
+            checkpoint = None
+        if checkpoint is not None:
+            return checkpoint.map_id
+
+        if isinstance(target.trainer_id, str):
+            parts = target.trainer_id.split(":", 2)
+            if len(parts) == 3 and parts[0] == "trainer":
+                try:
+                    parsed_map = tuple(int(part.strip()) for part in parts[1].strip("() ").split(","))
+                    int(parts[2])
+                except (TypeError, ValueError):
+                    parsed_map = ()
+                if len(parsed_map) == 2:
+                    return parsed_map
+        return None
     if isinstance(target, ReachLocation):
         return target.location[0]
     if isinstance(target, ActivateTrigger | ReachInteractionPosition):
@@ -994,6 +1632,7 @@ def _global_navigation_world(
     graph: WorldMapGraph,
     *,
     enrich_maps: tuple[MapId, ...] = (),
+    allow_pokemon_center_destination: bool = False,
 ) -> NavigationWorld:
     """Build the lazy static world overlay used by the exact-state search.
 
@@ -1008,15 +1647,23 @@ def _global_navigation_world(
     # transitions as fallback avenues on every map involved in the search.
     transitions: list[WorldTransition] = list(observation_world.transitions or observation_world.warps)
     rom_transitions: dict[MapId, tuple[WorldTransition, ...]] = {}
+    frozen_transition_catalog = {
+        canonical_map_id(map_id): tuple(transitions_for_map)
+        for map_id, transitions_for_map in observation_world.static_transition_catalog
+    }
     observed_maps = {location[0] for location in observation_world.tiles}
     maps_to_enrich = tuple(dict.fromkeys((*observed_maps, *enrich_maps)))
     for map_id in maps_to_enrich:
-        try:
-            rom_transitions[map_id] = static_map_transitions(map_id)
-        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
-            # A partially available map should not make a semantic route
-            # disappear. The graph transition remains a valid fallback.
-            continue
+        map_id = canonical_map_id(map_id)
+        if observation_world.static_metadata_frozen:
+            rom_transitions[map_id] = frozen_transition_catalog.get(map_id, ())
+        else:
+            try:
+                rom_transitions[map_id] = static_map_transitions(map_id)
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                # A partially available map should not make a semantic route
+                # disappear. The graph transition remains a valid fallback.
+                continue
     # Expand the current map only when a ROM avenue leads beyond the live
     # tile window. Complete synthetic/live maps should continue to use their
     # observed topology without being replaced by unrelated ROM coordinates.
@@ -1042,12 +1689,39 @@ def _global_navigation_world(
         observation_world.tiles,
         {edge.source_map for edge in graph.edges} | {edge.destination_map for edge in graph.edges},
         static_maps=observed_maps if current_static_needed else set(),
+        static_models=observation_world.static_tile_catalog,
+        metadata_frozen=observation_world.static_metadata_frozen,
     )
-    known_entries = {(t.kind, t.entry, t.destination) for t in transitions}
+    def transition_key(transition: WorldTransition) -> tuple:
+        """Identify a transition by the state from which the ROM executes it.
+
+        A door can have more than one ROM warp record for the same field
+        interaction.  The entry tile is metadata for the warp record, while
+        ``activation_locations`` is the executable source used by navigation.
+        If live perception and the static overlay expose different entry
+        records for the same source and destination, keeping both creates two
+        competing inputs (and can select the wrong facing at a Center door).
+        Live transitions are inserted first, so this key preserves the
+        executable observation and treats static records as fallback data.
+        """
+
+        activation_sources = tuple(sorted(getattr(transition, "activation_locations", ()), key=repr))
+        source = (
+            activation_sources
+            if activation_sources
+            else (
+                transition_approach_position(transition)
+                if transition.kind == "map_connection"
+                else transition.entry
+            )
+        )
+        return transition.kind, source, transition.destination
+
+    known_entries = {transition_key(t) for t in transitions}
     for map_id, candidates in rom_transitions.items():
         for transition in candidates:
             transition = effective_transition(transition)
-            key = (transition.kind, transition.entry, transition.destination)
+            key = transition_key(transition)
             if key not in known_entries:
                 transitions.append(transition)
                 known_entries.add(key)
@@ -1075,9 +1749,10 @@ def _global_navigation_world(
                 if rom_transition is not None:
                     transition = rom_transition
             transition = effective_transition(transition)
-            if (transition.kind, transition.entry, transition.destination) not in known_entries:
+            key = transition_key(transition)
+            if key not in known_entries:
                 transitions.append(transition)
-                known_entries.add((transition.kind, transition.entry, transition.destination))
+                known_entries.add(key)
             if transition.destination is not None:
                 # Destination endpoints are known without loading the whole
                 # destination map; the lazy mapping resolves their neighbors
@@ -1086,17 +1761,1065 @@ def _global_navigation_world(
                 model.setdefault(
                     transition.destination, NavigableTile(transition.destination, False, frozenset(Direction))
                 )
+    # Static trainer templates are needed on destination maps before their
+    # runtime object events enter the camera. Without this overlay an
+    # encounter route can cross a trainer sight line and only learn about the
+    # trainer after the battle has already started. Current-map perception
+    # already publishes these triggers, so enrich only unseen maps.
+    enriched_triggers = list(observation_world.triggers)
+    if not observation_world.static_metadata_frozen:
+        for map_id in maps_to_enrich:
+            map_id = canonical_map_id(map_id)
+            try:
+                from modules.map import get_map_metadata
+
+                map_metadata = get_map_metadata(map_id)
+                static_map_tiles = prewarm_static_map_observation(map_id)
+                # Use an empty runtime set here intentionally. A runtime
+                # object can exist while its facing/range fields are still
+                # incomplete during a camera boundary. In that case the
+                # current observation contains the trainer identity but no
+                # usable sight line; the ROM template is the safe fallback.
+                trainers = static_trainer_observations(map_id, map_metadata, ())
+                static_objects = tuple(trainers)
+                for trainer in trainers:
+                    matching = tuple(
+                        trigger
+                        for trigger in enriched_triggers
+                        if getattr(trigger, "affordance_id", None) == trainer.trainer_id
+                    )
+                    if any(getattr(trigger, "trainer_defeated", None) is True for trigger in matching):
+                        continue
+                    activation_requirements = resolve_object_activation_positions(
+                        trainer,
+                        static_objects,
+                        static_map_tiles,
+                        map_metadata.map_size,
+                    )
+                    hazard_locations = trainer_hazard_locations(trainer, static_map_tiles, static_objects)
+                    # An observed non-empty envelope is authoritative for the
+                    # live trainer orientation. Add the ROM fallback only
+                    # when the current-map trigger is absent or geometrically
+                    # unresolved. This also covers unseen destination maps.
+                    if not hazard_locations or any(
+                        getattr(trigger, "hazard_locations", ()) for trigger in matching
+                    ):
+                        continue
+                    enriched_triggers.append(
+                        TriggerObservation(
+                            trigger_id=f"static_object:{trainer.local_id}:{trainer.script}",
+                            locations=frozenset({trainer.location}),
+                            activation_locations=frozenset(location for location, _ in activation_requirements),
+                            kind="trainer_hazard",
+                            affordance_id=trainer.trainer_id,
+                            hazard_locations=hazard_locations,
+                            hazard_kind="trainer",
+                            engagement_locations=trainer_engagement_locations(trainer, static_map_tiles, static_objects),
+                            trainer_defeated=trainer.trainer_defeated,
+                            requires_input=False,
+                        )
+                    )
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+                # Destination-map metadata can be unavailable during a ROM
+                # transition. The coarse route remains usable; readiness will
+                # retry trainer discovery at the next stable boundary.
+                continue
+
+    if not allow_pokemon_center_destination:
+        center_maps = _pokemon_center_map_ids()
+        transitions = [
+            transition
+            for transition in transitions
+            if transition.entry[0] in center_maps
+            or transition.destination is None
+            or transition.destination[0] not in center_maps
+        ]
     return NavigationWorld(
         tiles=tiles,
         warps=observation_world.warps,
-        triggers=observation_world.triggers,
+        triggers=tuple(enriched_triggers),
         bindings=observation_world.bindings,
         facing=observation_world.facing,
         transitions=tuple(transitions),
         running_shoes=observation_world.running_shoes,
         player_elevation=observation_world.player_elevation,
         surfing=observation_world.surfing,
+        static_tile_catalog=observation_world.static_tile_catalog,
+        static_transition_catalog=observation_world.static_transition_catalog,
+        static_metadata_frozen=observation_world.static_metadata_frozen,
     )
+
+
+def _plan_exact_cross_map_warp_chain(
+    world: NavigationWorld,
+    start: Location,
+    navigation_goal: NavigationGoal,
+    route,
+    *,
+    max_expansions: int | None = None,
+    max_route_cost: int | None = None,
+    cost_ceiling: tuple[int, ...] | int | None = None,
+    cancel_check=None,
+    caller: str | None = None,
+) -> NavigationPlan | None:
+    """Plan a selected cross-map warp one map transition at a time.
+
+    A final Center door is a semantic recovery target with one known ROM
+    transition. Searching the entire enriched Emerald world for that terminal
+    state spends most of its budget exploring unrelated tiles. The coarse map
+    route already supplies the map order, so each segment can terminate at the
+    next exact transition and hand its destination to the following segment.
+    Return ``None`` only when the transition overlay is incomplete; callers can
+    then use the general state search as a compatibility fallback.
+    """
+
+    selected = navigation_goal.target.warp
+
+    def abort(reason: str, **details):
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_EXACT_WARP_CHAIN: "
+                f"status='fallback' reason={reason!r} "
+                + " ".join(f"{key}={value!r}" for key, value in details.items())
+            ),
+            trace=True,
+            prefix="CAMPAIGN_EXACT_WARP_CHAIN",
+        )
+        return None
+
+    if selected is None or selected.destination is None:
+        return abort("selected_warp_unresolved")
+    edges = tuple(getattr(route, "edges", ()) or ())
+    if not edges:
+        return abort("map_route_empty", start=start, target=selected.destination)
+
+    transitions = tuple(world.transitions or world.warps)
+    current = start
+    actions: list[NavigationAction] = []
+    total_cost = 0
+    navigator = GoalAwareNavigator(world)
+
+    for edge_index, edge in enumerate(edges):
+        if cancel_check is not None:
+            cancel_check()
+        if current[0] != edge.source_map:
+            return abort(
+                "map_route_discontinuity",
+                edge_index=edge_index,
+                current=current,
+                expected=edge.source_map,
+                route_maps=getattr(route, "maps", None),
+            )
+        candidates = tuple(
+            transition
+            for transition in transitions
+            if transition.entry[0] == edge.source_map
+            and transition.destination is not None
+            and transition.destination[0] == edge.destination_map
+            and (
+                transition.kind == "map_connection"
+                if edge.kind == "connection"
+                else transition.kind == edge.kind
+            )
+        )
+        if edge_index == len(edges) - 1:
+            candidates = tuple(
+                transition for transition in candidates if transitions_match(transition, selected)
+            )
+        if not candidates:
+            return abort(
+                "transition_candidates_missing",
+                edge_index=edge_index,
+                source_map=edge.source_map,
+                destination_map=edge.destination_map,
+                kind=edge.kind,
+                transition_count=len(transitions),
+                route_maps=getattr(route, "maps", None),
+            )
+
+        def candidate_distance(transition: WorldTransition) -> tuple[int, str]:
+            approach = transition_approach_position(transition)
+            coordinate = approach[1] if approach is not None else transition.entry[1]
+            return (
+                abs(current[1][0] - coordinate[0]) + abs(current[1][1] - coordinate[1]),
+                repr(transition.entry),
+            )
+
+        # Map connection records are commonly listed in map-data order rather
+        # than travel order.  Trying the nearest boundary first gives the
+        # bounded search an incumbent quickly; the branch-and-bound check
+        # below then avoids spending thousands of expansions on distant,
+        # equivalent exits.
+        candidates = tuple(sorted(candidates, key=candidate_distance))
+
+        shared_local_plans: dict[Location, NavigationPlan] | None = None
+        shared_search_attempted = False
+        if len(candidates) > 1 and all(transition.kind == "map_connection" for transition in candidates):
+            approaches = tuple(
+                approach
+                for transition in candidates
+                if (approach := transition_approach_position(transition)) is not None
+            )
+            if len(approaches) == len(candidates):
+                shared_search_attempted = True
+                # All connection candidates share the same local movement
+                # graph. One multi-target search is substantially cheaper
+                # than running an independent A* for every boundary tile.
+                # Remove the transitions from this local snapshot so the
+                # search cannot cross a boundary while looking for an
+                # approach position.
+                local_world = replace(world, transitions=(), warps=())
+                try:
+                    shared_local_plans = GoalAwareNavigator(local_world).plan_many_locations(
+                        current,
+                        approaches,
+                        target_groups=(approaches,),
+                        encounter_mode=navigation_goal.encounter_mode,
+                        encounter_penalty=navigation_goal.encounter_penalty,
+                        constraints=navigation_goal.constraints,
+                        max_expansions=max_expansions,
+                        max_route_cost=(
+                            None if max_route_cost is None else max_route_cost - total_cost
+                        ),
+                        cancel_check=cancel_check,
+                    )
+                    if not shared_local_plans:
+                        shared_local_plans = None
+                except NavigationSearchLimitExceeded:
+                    # Preserve the individual-candidate fallback when a
+                    # partially observed map cannot resolve every approach
+                    # within the shared search budget.
+                    shared_local_plans = None
+
+        segment_plans: list[tuple[NavigationPlan, WorldTransition]] = []
+        for candidate_index, transition in enumerate(candidates):
+            if cancel_check is not None:
+                cancel_check()
+            if shared_search_attempted and shared_local_plans is None and candidate_index > 0:
+                # The shared safe search already established that no
+                # trainer-free approach was available within its bound. Give
+                # the nearest live boundary one local compatibility attempt;
+                # do not multiply the fallback cost by every map-data row.
+                break
+            if segment_plans:
+                best_segment = min(
+                    segment_plans,
+                    key=lambda item: navigation_candidate_key(
+                        item[0].metrics,
+                        navigation_goal.encounter_mode,
+                        repr(item[1].entry),
+                    )
+                    if item[0].metrics is not None
+                    else (float("inf"),) * 6 + (repr(item[1].entry),),
+                )[0]
+                best_encounters = best_segment.metrics.encounter_opportunities if best_segment.metrics else None
+                best_cost = best_segment.metrics.total_route_cost if best_segment.metrics else None
+                lower_bound = candidate_distance(transition)[0]
+                # A Manhattan lower bound is conservative even when terrain,
+                # encounter weighting, or the transition itself adds cost.
+                # Once the incumbent cannot be beaten, skip this boundary.
+                encounter_objective_complete = (
+                    navigation_goal.encounter_mode in (EncounterMode.AVOID, EncounterMode.NORMAL)
+                    and best_encounters == 0
+                )
+                weighted_objective_complete = navigation_goal.encounter_mode is EncounterMode.MOSTLY_AVOID
+                if (
+                    best_cost is not None
+                    and (encounter_objective_complete or weighted_objective_complete)
+                    and lower_bound >= best_cost
+                ):
+                    diagnostic_print(
+                        lambda: (
+                            "CAMPAIGN_EXACT_WARP_CHAIN: "
+                            f"status='pruned' edge_index={edge_index!r} "
+                            f"entry={transition.entry!r} lower_bound={lower_bound!r} "
+                            f"incumbent_cost={best_cost!r}"
+                        ),
+                        trace=True,
+                        prefix="CAMPAIGN_EXACT_WARP_CHAIN",
+                    )
+                    continue
+            # Each segment has one executable terminal transition.  Keeping
+            # unrelated world transitions out of the local search prevents a
+            # Route 116 search from repeatedly considering every warp and
+            # connection in the enriched Emerald world.
+            segment_world = replace(world, transitions=(transition,), warps=())
+            segment_goal = NavigationGoal(
+                ReachWarp(
+                    destination_map=transition.destination[0],
+                    destination=transition.destination,
+                    warp=transition,
+                ),
+                constraints=navigation_goal.constraints,
+                encounter_mode=navigation_goal.encounter_mode,
+                encounter_penalty=navigation_goal.encounter_penalty,
+            )
+            remaining_cost = (
+                None if max_route_cost is None else max_route_cost - total_cost
+            )
+            if remaining_cost is not None and remaining_cost < 0:
+                continue
+            try:
+                if shared_local_plans is not None:
+                    approach = transition_approach_position(transition)
+                    local_plan = shared_local_plans.get(approach) if approach is not None else None
+                    if local_plan is None:
+                        continue
+                    boundary_move = NavigationAction(
+                        NavigationActionType.MOVE,
+                        transition.required_facing,
+                        approach,
+                        transition.entry,
+                    )
+                    crossing = NavigationAction(
+                        NavigationActionType.WARP,
+                        transition.required_facing,
+                        transition.entry,
+                        transition.destination,
+                        transition_kind="map_connection",
+                    )
+                    segment_actions = local_plan.actions + (boundary_move, crossing)
+                    segment = NavigationPlan(
+                        segment_actions,
+                        transition.entry,
+                        navigator._metrics(
+                            segment_actions,
+                            navigation_goal.encounter_mode,
+                            navigation_goal.encounter_penalty,
+                        ),
+                    )
+                    _enforce_plan_limits(
+                        segment,
+                        max_route_cost=remaining_cost,
+                        cost_ceiling=(cost_ceiling if edge_index == 0 and total_cost == 0 else None),
+                    )
+                else:
+                    segment = plan_observed_warp_locally(
+                        segment_world,
+                        current,
+                        segment_goal,
+                        caller=f"{caller}.exact_warp_chain" if caller else "navigation.exact_warp_chain",
+                        max_expansions=max_expansions,
+                        max_route_cost=remaining_cost,
+                        cost_ceiling=(cost_ceiling if edge_index == 0 and total_cost == 0 else None),
+                        cancel_check=cancel_check,
+                    )
+            except (NavigationError, NavigationSearchLimitExceeded):
+                continue
+            segment_plans.append((segment, transition))
+
+        if not segment_plans:
+            return abort(
+                "segment_unreachable",
+                edge_index=edge_index,
+                source=current,
+                candidate_count=len(candidates),
+                route_maps=getattr(route, "maps", None),
+            )
+        segment, transition = min(
+            segment_plans,
+            key=lambda item: navigation_candidate_key(
+                item[0].metrics,
+                navigation_goal.encounter_mode,
+                repr(item[1].entry),
+            )
+            if item[0].metrics is not None
+            else (float("inf"),) * 6 + (repr(item[1].entry),),
+        )
+        actions.extend(segment.actions)
+        if segment.metrics is not None:
+            total_cost += segment.metrics.total_route_cost
+        current = transition.destination
+
+    metrics = navigator._metrics(
+        tuple(actions),
+        navigation_goal.encounter_mode,
+        navigation_goal.encounter_penalty,
+    )
+    result = NavigationPlan(tuple(actions), current, metrics)
+    try:
+        _enforce_plan_limits(result, max_route_cost=max_route_cost)
+    except NavigationSearchLimitExceeded:
+        return abort(
+            "combined_plan_limit",
+            action_count=len(actions),
+            route_maps=getattr(route, "maps", None),
+        )
+    return result
+
+
+def _semantic_interaction_local_goal(world: NavigationWorld, target: SemanticTarget):
+    """Resolve a semantic interaction to the trigger visible on its map."""
+
+    if target.location is not None:
+        return ReachLocation(target.location)
+    interaction_id = target.interaction_id
+    if interaction_id is None:
+        return None
+    matching = tuple(
+        trigger
+        for trigger in world.triggers
+        if interaction_id
+        in {
+            getattr(trigger, "trigger_id", None),
+            getattr(trigger, "script_symbol", None),
+            getattr(trigger, "affordance_id", None),
+        }
+        and (
+            getattr(trigger, "activation_locations", ())
+            or getattr(trigger, "navigation_locations", ())
+        )
+    )
+    if not matching:
+        return None
+    return ReachInteractionPosition(matching[0].trigger_id)
+
+
+def _semantic_transition_candidates(
+    transitions: tuple[WorldTransition, ...],
+    edge,
+) -> tuple[WorldTransition, ...]:
+    """Return executable transitions represented by one static graph edge.
+
+    ``WorldEdge`` coordinates describe the ROM topology, while the live/static
+    transition catalog carries the executable activation geometry.  Match the
+    source boundary when it is available, but allow the destination coordinate
+    to differ because a runtime transition observation may have corrected it.
+    """
+
+    expected_kind = "map_connection" if edge.kind == "connection" else edge.kind
+    source_coordinates = frozenset(edge.source_coordinates or ())
+    candidates = []
+    for transition in transitions:
+        if transition.entry[0] != edge.source_map:
+            continue
+        if transition.destination is None or transition.destination[0] != edge.destination_map:
+            continue
+        if transition.kind != expected_kind:
+            continue
+        if source_coordinates and transition.entry[1] not in source_coordinates:
+            continue
+        candidates.append(transition)
+    return tuple(
+        sorted(
+            candidates,
+            key=lambda transition: (
+                repr(transition.entry),
+                repr(transition.destination),
+                repr(transition_approach_position(transition)),
+            ),
+        )
+    )
+
+
+def _semantic_portal_sources(transition: WorldTransition) -> tuple[Location, ...]:
+    """Return the local states from which a transition can be executed."""
+
+    if transition.kind == "map_connection":
+        approach = transition_approach_position(transition)
+        return (approach,) if approach is not None else ()
+    if transition.activation_locations:
+        return tuple(sorted(transition.activation_locations, key=repr))
+    return (transition.entry,)
+
+
+def _semantic_cost_tuple(metrics: NavigationMetrics, encounter_mode: EncounterMode) -> tuple[int, ...]:
+    """Return the additive lexicographic cost used by portal routing."""
+
+    return (
+        metrics.encounter_opportunities
+        if encounter_mode in (EncounterMode.AVOID, EncounterMode.NORMAL)
+        else 0,
+        metrics.total_route_cost,
+        metrics.movement_actions,
+        metrics.encounter_terrain_moves,
+        metrics.turns_on_encounter_terrain,
+        metrics.turns_on_non_encounter_terrain,
+    )
+
+
+def _add_semantic_cost(left: tuple[int, ...], right: tuple[int, ...]) -> tuple[int, ...]:
+    return tuple(left[index] + right[index] for index in range(len(left)))
+
+
+def _semantic_portal_segment_plan(
+    world: NavigationWorld,
+    local_plan: NavigationPlan,
+    transition: WorldTransition,
+    navigation_goal: NavigationGoal,
+) -> NavigationPlan:
+    """Add one executable transition to a local entrance-to-portal plan."""
+
+    source = local_plan.destination
+    if source is None or transition.destination is None:
+        raise NavigationError("portal segment has no executable source or destination")
+    if transition.kind == "map_connection":
+        approach = transition_approach_position(transition)
+        if approach is None or source != approach:
+            raise NavigationError("portal segment does not end at the map-connection approach")
+        direction = transition.required_facing
+        if direction is None:
+            raise NavigationError("map connection has no crossing direction")
+        actions = local_plan.actions + (
+            NavigationAction(
+                NavigationActionType.MOVE,
+                direction,
+                approach,
+                transition.entry,
+                transition_kind="map_connection",
+            ),
+            NavigationAction(
+                NavigationActionType.WARP,
+                direction,
+                transition.entry,
+                transition.destination,
+                transition_kind="map_connection",
+            ),
+        )
+    else:
+        direction = transition.activation_direction
+        if direction is None and transition.activation_locations:
+            direction = _direction_between(source[1], transition.entry[1])
+        if direction is None:
+            direction = transition.required_facing or Direction.South
+        actions = local_plan.actions + (
+            NavigationAction(
+                NavigationActionType.WARP,
+                direction,
+                source,
+                transition.destination,
+                transition_kind=transition.kind,
+            ),
+        )
+    navigator = GoalAwareNavigator(world)
+    return NavigationPlan(
+        actions,
+        transition.entry,
+        navigator._metrics(
+            actions,
+            navigation_goal.encounter_mode,
+            navigation_goal.encounter_penalty,
+        ),
+    )
+
+
+def _specialize_semantic_edge(edge, transition: WorldTransition):
+    """Keep the selected portal pair on the route returned to callers."""
+
+    return replace(
+        edge,
+        source_coordinates=(transition.entry[1],),
+        destination_coordinates=(transition.destination[1],),
+    )
+
+
+def _route_for_map_sequence(
+    graph: WorldMapGraph,
+    map_sequence: tuple[MapId, ...],
+    *,
+    start_map: MapId,
+    target_map: MapId,
+) -> WorldRoute:
+    """Resolve a caller-supplied map corridor into graph edges.
+
+    Campaign preparation already has a ROM-backed corridor selected by the
+    campaign route analysis.  Resolve that corridor once here and let the
+    semantic planner choose only among executable transitions represented by
+    each edge.  A malformed or stale corridor is rejected explicitly so the
+    caller can re-observe and choose a new one instead of silently widening
+    the search back to every map in the world.
+    """
+
+    maps = tuple(map_sequence)
+    if len(maps) < 2 or maps[0] != start_map or maps[-1] != target_map:
+        raise WorldNavigationError(
+            f"preferred map route does not connect {start_map!r} to {target_map!r}: {maps!r}"
+        )
+    edges = []
+    for source_map, destination_map in zip(maps, maps[1:]):
+        candidates = tuple(
+            edge
+            for edge in graph.outgoing(source_map)
+            if edge.destination_map == destination_map
+        )
+        if not candidates:
+            raise WorldNavigationError(
+                f"preferred map route edge is absent: {source_map!r} -> {destination_map!r}"
+            )
+        edges.append(
+            min(
+                candidates,
+                key=lambda edge: (
+                    max(1, edge.estimated_cost),
+                    edge.kind,
+                    repr(edge.source_coordinates),
+                ),
+            )
+        )
+    return WorldRoute(
+        maps,
+        tuple(edges),
+        estimated_cost=sum(max(1, edge.estimated_cost) for edge in edges),
+    )
+
+
+def _weighted_semantic_world_route(
+    world: NavigationWorld,
+    start: Location,
+    navigation_goal: NavigationGoal,
+    graph: WorldMapGraph,
+    *,
+    max_expansions: int | None = None,
+    max_route_cost: int | None = None,
+    cost_ceiling: tuple[int, ...] | int | None = None,
+    cancel_check=None,
+    corridor: WorldRoute | None = None,
+) -> WorldRoute | None:
+    """Choose a cross-map route using exact local portal costs.
+
+    The static map graph supplies directed topology.  Each search state is an
+    arrival location on a map; expanding it runs one shared local search to
+    every executable exit on that map.  The resulting transition destination
+    becomes the next state, so an intermediate map is priced from its actual
+    entrance to each possible exit instead of receiving one universal edge
+    weight.
+    """
+
+    target = navigation_goal.target
+    if not isinstance(target, SemanticTarget) or target.target_map is None:
+        return None
+
+    transitions = tuple(world.transitions or world.warps)
+    # Portal ranking is a static movement estimate.  Dynamic blockers and
+    # trainer observations remain in the supplied tile/trigger overlays, but
+    # transitions are removed so a local search cannot cross two map edges at
+    # once while pricing one map's entrance-to-exit movement.
+    local_world = replace(world, transitions=(), warps=(), facing=None)
+    local_navigator = GoalAwareNavigator(local_world)
+    zero_cost = (0, 0, 0, 0, 0, 0)
+    queue: list[tuple[tuple[int, ...], int, Location]] = [(zero_cost, 0, start)]
+    sequence = count(1)
+    best_cost: dict[Location, tuple[int, ...]] = {start: zero_cost}
+    route_records: dict[Location, tuple[tuple, tuple[WorldTransition, ...]]] = {start: ((), ())}
+
+    final_local_goal = None
+    if target.kind is SemanticTargetKind.LOCATION:
+        final_local_goal = ReachLocation(target.location) if target.location is not None else None
+    elif target.kind is SemanticTargetKind.INTERACTION:
+        final_local_goal = _semantic_interaction_local_goal(world, target)
+
+    best_terminal: tuple[tuple[int, ...], Location, tuple, tuple[WorldTransition, ...]] | None = None
+
+    def exceeds_cost_ceiling(cost: tuple[int, ...]) -> bool:
+        if cost_ceiling is None:
+            return False
+        if isinstance(cost_ceiling, int):
+            return cost[1] > cost_ceiling
+        prefix = (cost[0], cost[1])
+        return bool(cost_ceiling) and prefix[: len(cost_ceiling)] > cost_ceiling
+
+    corridor_edges: dict[MapId, tuple[WorldEdge, ...]] | None = None
+    if corridor is not None:
+        corridor_edges = {}
+        for edge in corridor.edges:
+            corridor_edges[edge.source_map] = (edge,)
+
+    while queue:
+        if cancel_check is not None:
+            cancel_check()
+        current_cost, _, current = heapq.heappop(queue)
+        if current_cost != best_cost.get(current):
+            continue
+        if best_terminal is not None and current_cost >= best_terminal[0]:
+            break
+
+        edge_path, transition_path = route_records[current]
+        if current[0] == target.target_map:
+            if target.kind is SemanticTargetKind.MAP or final_local_goal is None:
+                best_terminal = (current_cost, current, edge_path, transition_path)
+                break
+            remaining_cost = (
+                None if max_route_cost is None else max_route_cost - current_cost[1]
+            )
+            if remaining_cost is not None and remaining_cost < 0:
+                continue
+            try:
+                final_plan = local_navigator.plan(
+                    current,
+                    replace(navigation_goal, target=final_local_goal),
+                    max_expansions=max_expansions,
+                    max_route_cost=remaining_cost,
+                    cancel_check=cancel_check,
+                )
+            except NavigationSearchCancelled:
+                raise
+            except (NavigationError, NavigationSearchLimitExceeded, RuntimeError, TypeError, ValueError):
+                final_plan = None
+            if final_plan is not None and final_plan.metrics is not None:
+                final_cost = _add_semantic_cost(
+                    current_cost,
+                    _semantic_cost_tuple(final_plan.metrics, navigation_goal.encounter_mode),
+                )
+                if max_route_cost is None or final_cost[1] <= max_route_cost:
+                    if exceeds_cost_ceiling(final_cost):
+                        continue
+                    candidate = (final_cost, current, edge_path, transition_path)
+                    if best_terminal is None or candidate[0] < best_terminal[0]:
+                        best_terminal = candidate
+            continue
+
+        outgoing: list[tuple[object, WorldTransition]] = []
+        candidate_edges = (
+            corridor_edges.get(current[0], ())
+            if corridor_edges is not None
+            else graph.outgoing(current[0])
+        )
+        for edge in candidate_edges:
+            for transition in _semantic_transition_candidates(transitions, edge):
+                outgoing.append((edge, transition))
+        if not outgoing:
+            continue
+
+        target_locations = tuple(
+            dict.fromkeys(
+                source
+                for _, transition in outgoing
+                for source in _semantic_portal_sources(transition)
+            )
+        )
+        if not target_locations:
+            continue
+        remaining_cost = None if max_route_cost is None else max_route_cost - current_cost[1]
+        if remaining_cost is not None and remaining_cost < 0:
+            continue
+        try:
+            local_plans = local_navigator.plan_many_locations(
+                current,
+                target_locations,
+                encounter_mode=navigation_goal.encounter_mode,
+                encounter_penalty=navigation_goal.encounter_penalty,
+                constraints=navigation_goal.constraints,
+                max_expansions=max_expansions,
+                max_route_cost=remaining_cost,
+                cancel_check=cancel_check,
+            )
+        except NavigationSearchCancelled:
+            raise
+        except (NavigationSearchLimitExceeded, NavigationError, RuntimeError, TypeError, ValueError):
+            continue
+
+        best_for_transition: dict[WorldTransition, tuple[NavigationPlan, object]] = {}
+        for edge, transition in outgoing:
+            options = tuple(
+                (local_plans[source], source)
+                for source in _semantic_portal_sources(transition)
+                if source in local_plans
+            )
+            if not options:
+                continue
+            selected_plan, selected_source = min(
+                options,
+                key=lambda item: navigation_candidate_key(
+                    item[0].metrics,
+                    navigation_goal.encounter_mode,
+                    repr(item[1]),
+                )
+                if item[0].metrics is not None
+                else (float("inf"),) * 6 + (repr(item[1]),),
+            )
+            best_for_transition[transition] = (selected_plan, edge)
+
+        for transition, (local_plan, edge) in best_for_transition.items():
+            try:
+                segment = _semantic_portal_segment_plan(
+                    local_world,
+                    local_plan,
+                    transition,
+                    navigation_goal,
+                )
+            except (NavigationError, KeyError, RuntimeError, TypeError, ValueError):
+                continue
+            if segment.metrics is None:
+                continue
+            segment_cost = _semantic_cost_tuple(segment.metrics, navigation_goal.encounter_mode)
+            next_cost = _add_semantic_cost(current_cost, segment_cost)
+            if max_route_cost is not None and next_cost[1] > max_route_cost:
+                continue
+            if exceeds_cost_ceiling(next_cost):
+                continue
+            destination = transition.destination
+            specialized_edge = _specialize_semantic_edge(edge, transition)
+            previous = best_cost.get(destination)
+            if previous is not None and next_cost >= previous:
+                continue
+            best_cost[destination] = next_cost
+            route_records[destination] = (
+                edge_path + (specialized_edge,),
+                transition_path + (transition,),
+            )
+            heapq.heappush(queue, (next_cost, next(sequence), destination))
+
+    if best_terminal is None:
+        return None
+    final_cost, destination, edge_path, _ = best_terminal
+    maps = [start[0]]
+    for edge in edge_path:
+        if not maps or maps[-1] != edge.destination_map:
+            maps.append(edge.destination_map)
+    return WorldRoute(
+        tuple(maps),
+        tuple(edge_path),
+        estimated_cost=final_cost[1],
+        selected_transitions=best_terminal[3],
+    )
+
+
+def _plan_semantic_cross_map_chain(
+    world: NavigationWorld,
+    start: Location,
+    navigation_goal: NavigationGoal,
+    route,
+    graph: WorldMapGraph | None = None,
+    *,
+    max_expansions: int | None = None,
+    max_route_cost: int | None = None,
+    cost_ceiling: tuple[int, ...] | int | None = None,
+    cancel_check=None,
+    caller: str | None = None,
+) -> tuple[NavigationPlan, WorldRoute] | None:
+    """Plan a semantic destination by map route, then solve its final map locally.
+
+    The ROM map route already fixes the map order, so solve each boundary as
+    an exact local transition instead of searching unrelated tiles in the
+    enriched world. Map goals are complete after the final boundary; location
+    goals search only their destination map; interaction goals search only for
+    the resolved trigger position there.
+    """
+
+    target = navigation_goal.target
+    if not isinstance(target, SemanticTarget) or target.kind not in {
+        SemanticTargetKind.MAP,
+        SemanticTargetKind.LOCATION,
+        SemanticTargetKind.INTERACTION,
+    }:
+        return None
+    if graph is not None:
+        weighted_route = _weighted_semantic_world_route(
+            world,
+            start,
+            navigation_goal,
+            graph,
+            max_expansions=max_expansions,
+            max_route_cost=max_route_cost,
+            cost_ceiling=cost_ceiling,
+            cancel_check=cancel_check,
+            corridor=route if navigation_goal.preferred_map_route is not None else None,
+        )
+        if weighted_route is None:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_SEMANTIC_ROUTE: "
+                    "status='fallback' reason='no_weighted_portal_route'"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_SEMANTIC_ROUTE",
+            )
+            return None
+        route = weighted_route
+    edges = tuple(getattr(route, "edges", ()) or ())
+    if not edges:
+        return None
+
+    transitions = tuple(world.transitions or world.warps)
+    current = start
+    actions: list[NavigationAction] = []
+    total_cost = 0
+    navigator = GoalAwareNavigator(world)
+
+    for edge_index, edge in enumerate(edges):
+        if cancel_check is not None:
+            cancel_check()
+        if current[0] != edge.source_map:
+            return None
+        candidates = _semantic_transition_candidates(transitions, edge)
+        selected_transitions = tuple(getattr(route, "selected_transitions", ()) or ())
+        if edge_index < len(selected_transitions):
+            selected = selected_transitions[edge_index]
+            candidates = tuple(
+                transition
+                for transition in candidates
+                if transitions_match(transition, selected)
+            )
+        if not candidates:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_SEMANTIC_ROUTE: "
+                    f"status='fallback' reason='transition_candidates_missing' edge_index={edge_index} "
+                    f"source_map={edge.source_map!r} destination_map={edge.destination_map!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_SEMANTIC_ROUTE",
+            )
+            return None
+
+        def candidate_distance(transition):
+            approach = transition_approach_position(transition)
+            coordinate = approach[1] if approach is not None else transition.entry[1]
+            return abs(current[1][0] - coordinate[0]) + abs(current[1][1] - coordinate[1]), repr(transition.entry)
+
+        segment_plans = []
+        for transition in sorted(candidates, key=candidate_distance):
+            if cancel_check is not None:
+                cancel_check()
+            remaining_cost = None if max_route_cost is None else max_route_cost - total_cost
+            if remaining_cost is not None and remaining_cost < 0:
+                continue
+            segment_world = replace(world, transitions=(transition,), warps=())
+            segment_goal = NavigationGoal(
+                ReachWarp(
+                    destination_map=transition.destination[0],
+                    destination=transition.destination,
+                    warp=transition,
+                ),
+                constraints=navigation_goal.constraints,
+                encounter_mode=navigation_goal.encounter_mode,
+                encounter_penalty=navigation_goal.encounter_penalty,
+            )
+            try:
+                segment = plan_observed_warp_locally(
+                    segment_world,
+                    current,
+                    segment_goal,
+                    caller=f"{caller}.semantic_warp_chain" if caller else "navigation.semantic_warp_chain",
+                    max_expansions=max_expansions,
+                    max_route_cost=remaining_cost,
+                    cost_ceiling=(cost_ceiling if edge_index == 0 and total_cost == 0 else None),
+                    cancel_check=cancel_check,
+                )
+            except NavigationSearchCancelled:
+                raise
+            except (NavigationError, NavigationSearchLimitExceeded, RuntimeError, TypeError, ValueError) as error:
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_SEMANTIC_ROUTE: "
+                        f"status='segment_candidate_rejected' edge_index={edge_index} "
+                        f"transition={transition!r} error_type={type(error).__name__!r} error={str(error)!r}"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_SEMANTIC_ROUTE",
+                )
+                continue
+            segment_plans.append((segment, transition))
+        if not segment_plans:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_SEMANTIC_ROUTE: "
+                    f"status='fallback' reason='segment_unreachable' edge_index={edge_index} "
+                    f"source={current!r} candidate_count={len(candidates)}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_SEMANTIC_ROUTE",
+            )
+            return None
+        segment, transition = min(
+            segment_plans,
+            key=lambda item: (
+                getattr(getattr(item[0], "metrics", None), "encounter_opportunities", float("inf")),
+                getattr(getattr(item[0], "metrics", None), "total_route_cost", float("inf")),
+                repr(item[1].entry),
+            ),
+        )
+        actions.extend(segment.actions)
+        total_cost += getattr(getattr(segment, "metrics", None), "total_route_cost", 0) or 0
+        current = transition.destination
+
+    if current[0] != target.target_map:
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_SEMANTIC_ROUTE: "
+                f"status='fallback' reason='destination_map_not_reached' "
+                f"map={current[0]!r} target_map={target.target_map!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_SEMANTIC_ROUTE",
+        )
+        return None
+
+    if target.kind is SemanticTargetKind.MAP:
+        result = NavigationPlan(
+            tuple(actions),
+            current,
+            navigator._metrics(
+                tuple(actions),
+                navigation_goal.encounter_mode,
+                navigation_goal.encounter_penalty,
+            ),
+        )
+        _enforce_plan_limits(result, max_route_cost=max_route_cost, cost_ceiling=cost_ceiling)
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_SEMANTIC_ROUTE: "
+                f"status='composed' maps={getattr(route, 'maps', None)!r} "
+                f"target_kind='MAP' actions={len(result.actions)} "
+                f"cost={getattr(result.metrics, 'total_route_cost', None)!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_SEMANTIC_ROUTE",
+        )
+        return result, route
+
+    local_target = _semantic_interaction_local_goal(world, target)
+    if local_target is None:
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_SEMANTIC_ROUTE: "
+                f"status='fallback' reason='destination_interaction_geometry_unresolved' "
+                f"map={current[0]!r} interaction={target.interaction_id!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_SEMANTIC_ROUTE",
+        )
+        return None
+    local_goal = replace(navigation_goal, target=local_target)
+    try:
+        final_plan = navigator.plan(
+            current,
+            local_goal,
+            max_expansions=max_expansions,
+            max_route_cost=(None if max_route_cost is None else max_route_cost - total_cost),
+            cancel_check=cancel_check,
+            caller=caller,
+        )
+    except NavigationSearchCancelled:
+        raise
+    except (NavigationError, NavigationSearchLimitExceeded, RuntimeError, TypeError, ValueError) as error:
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_SEMANTIC_ROUTE: "
+                f"status='final_interaction_rejected' error_type={type(error).__name__!r} error={str(error)!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_SEMANTIC_ROUTE",
+        )
+        return None
+    actions.extend(final_plan.actions)
+    result = NavigationPlan(
+        tuple(actions),
+        final_plan.destination,
+        navigator._metrics(tuple(actions), navigation_goal.encounter_mode, navigation_goal.encounter_penalty),
+    )
+    _enforce_plan_limits(result, max_route_cost=max_route_cost, cost_ceiling=cost_ceiling)
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_SEMANTIC_ROUTE: "
+            f"status='composed' maps={getattr(route, 'maps', None)!r} "
+            f"interaction={target.interaction_id!r} actions={len(result.actions)} "
+            f"cost={getattr(result.metrics, 'total_route_cost', None)!r}"
+        ),
+        trace=True,
+        prefix="CAMPAIGN_SEMANTIC_ROUTE",
+    )
+    return result, route
 
 
 @traced("world_map_and_candidate_planning")
@@ -1107,6 +2830,7 @@ def plan_with_world_navigation(
     graph: WorldMapGraph | None = None,
     *,
     algorithm: str = "dijkstra",
+    caller: str | None = None,
     max_expansions: int | None = None,
     max_route_cost: int | None = None,
     cost_ceiling: tuple[int, ...] | int | None = None,
@@ -1121,43 +2845,71 @@ def plan_with_world_navigation(
     already been found; ``max_route_cost`` is an absolute safety budget.
     """
     navigation_goal = goal if isinstance(goal, NavigationGoal) else NavigationGoal(goal)
+    diagnostic_print(
+        lambda: (
+            "NAVIGATION_REQUEST: "
+            f"caller={caller or 'unspecified'!r} start={start!r} "
+            f"goal={navigation_goal.target!r} "
+            f"trainer_mode={getattr(navigation_goal.constraints.trainer_mode, 'name', None)!r} "
+            f"encounter_mode={getattr(navigation_goal.encounter_mode, 'name', None)!r}"
+        ),
+        trace=True,
+        prefix="NAVIGATION_REQUEST",
+    )
     target_map = goal_target_map(world, goal)
     # A concrete observed boundary is already the runtime transition to use.
     # Plan only its local approach here; global graph search is for unresolved
     # semantic destinations.  This also makes dynamic occupancy fail fast
     # instead of exploring every map while an NPC temporarily blocks the
     # boundary.
-    if (
-        isinstance(navigation_goal.target, ReachWarp)
-        and navigation_goal.target.warp is not None
-        and target_map != start[0]
-    ):
-        # ``_observed_exit_goal`` has already selected an executable ROM
-        # transition from the current perception.  Searching the global world
-        # again for that exact door/arrow warp is both redundant and costly:
-        # every expanded state would compare its transition set against the
-        # selected transition.  More importantly, a large Emerald world can
-        # spend long enough in that comparison that the frame loop stops
-        # advancing.  Exact observed transitions are local tactical goals;
-        # reserve global search for unresolved semantic destinations.
-        return (
-            plan_observed_warp_locally(
-                world,
-                start,
-                navigation_goal,
-                max_expansions=max_expansions,
-                max_route_cost=max_route_cost,
-                cost_ceiling=cost_ceiling,
-                cancel_check=cancel_check,
-            ),
-            None,
+    if isinstance(navigation_goal.target, ReachWarp) and target_map != start[0]:
+        target = navigation_goal.target
+        observed_warps = target.warps or ((target.warp,) if target.warp is not None else ())
+        local_observed_warp = bool(observed_warps) and all(
+            warp is not None
+            and warp.entry[0] == start[0]
+            and warp.destination is not None
+            for warp in observed_warps
         )
+        if local_observed_warp:
+            # ``_observed_exit_goal`` has already selected one or more
+            # executable ROM transitions from the current perception.
+            # Searching the global world again for an exact door/arrow warp is
+            # redundant and can lose the live transition identity when a
+            # grouped goal contains equivalent exits.  Keep both single and
+            # grouped observed exits in the local tactical planner; reserve
+            # global search for unresolved destinations.
+            local_plan = (
+                plan_observed_warp_locally(
+                    world,
+                    start,
+                    navigation_goal,
+                    max_expansions=max_expansions,
+                    max_route_cost=max_route_cost,
+                    cost_ceiling=cost_ceiling,
+                    cancel_check=cancel_check,
+                    caller=caller,
+                )
+                if target.warp is not None
+                else GoalAwareNavigator(world).plan(
+                    start,
+                    navigation_goal,
+                    algorithm=algorithm,
+                    caller=caller,
+                    max_expansions=max_expansions,
+                    max_route_cost=max_route_cost,
+                    cost_ceiling=cost_ceiling,
+                    cancel_check=cancel_check,
+                )
+            )
+            return local_plan, None
     if target_map is None or target_map == start[0]:
         return (
             GoalAwareNavigator(world).plan(
                 start,
                 goal,
                 algorithm=algorithm,
+                caller=caller,
                 max_expansions=max_expansions,
                 max_route_cost=max_route_cost,
                 cost_ceiling=cost_ceiling,
@@ -1173,7 +2925,15 @@ def plan_with_world_navigation(
         trace.duration("world_map_graph_lookup_duration_ms", trace_graph_start)
     trace_route_start = trace.now() if trace is not None else 0
     try:
-        route = graph.route(start[0], target_map)
+        if navigation_goal.preferred_map_route is not None:
+            route = _route_for_map_sequence(
+                graph,
+                navigation_goal.preferred_map_route,
+                start_map=start[0],
+                target_map=target_map,
+            )
+        else:
+            route = graph.route(start[0], target_map)
     except WorldNavigationError as error:
         diagnostic_print(
             lambda: (
@@ -1222,57 +2982,106 @@ def plan_with_world_navigation(
     global_world = _global_navigation_world(
         world,
         graph,
-        enrich_maps=tuple(route.maps[:-1]),
+        # Include the terminal map as well: a destination encounter area can
+        # contain a trainer before the selected grass tile.
+        enrich_maps=tuple(route.maps),
+        allow_pokemon_center_destination=_goal_allows_pokemon_center_destination(navigation_goal),
     )
+    observed_current_connections = tuple(
+        transition
+        for transition in (world.transitions or world.warps)
+        if transition.entry[0] == start[0] and transition.kind == "map_connection"
+    )
+    if observed_current_connections:
+        # The live overlay has already filtered map-boundary endpoints for
+        # collision, objects, and the current map state. Static metadata can
+        # contain every geometric boundary row, including endpoints that are
+        # not executable from this observation. Keep those static fallbacks on
+        # destination maps, but do not make them compete with the live source
+        # map candidates.
+        global_world = replace(
+            global_world,
+            transitions=tuple(
+                transition
+                for transition in global_world.transitions
+                if transition.entry[0] != start[0]
+                or transition.kind != "map_connection"
+                or transition in observed_current_connections
+            ),
+        )
+    if isinstance(navigation_goal.target, SemanticTarget):
+        composed = _plan_semantic_cross_map_chain(
+            global_world,
+            start,
+            navigation_goal,
+            route,
+            graph,
+            max_expansions=max_expansions,
+            max_route_cost=max_route_cost,
+            cost_ceiling=cost_ceiling,
+            cancel_check=cancel_check,
+            caller=caller,
+        )
+        if composed is not None:
+            composed_plan, composed_route = composed
+            if cache_key is not None:
+                _semantic_cross_map_plan_cache[cache_key] = (composed_plan, composed_route)
+            return composed_plan, composed_route
+        if navigation_goal.preferred_map_route is not None:
+            raise NavigationError(
+                f"preferred map route is currently unreachable: {navigation_goal.preferred_map_route!r}"
+            )
     if isinstance(navigation_goal.target, ReachWarp):
         # Keep the complete NavigationGoal wrapper.  Unwrapping the target
         # here silently restored the default TrainerMode.IGNORE, which made
         # planner-composed recovery routes cross live trainer sight lines
         # despite being requested with TrainerMode.AVOID.
         global_goal = navigation_goal
-        # The static graph's connection direction is map metadata, while the
-        # live observation carries the executable facing.  They can disagree
-        # at edge endpoints (the metadata direction describes the adjoining
-        # map, not the input direction on the current map).  Ensure the
-        # selected observed transition is present in the global state model so
-        # a specific ReachWarp is not rendered unreachable by that mismatch.
+        # The static graph's transition metadata may omit executable details
+        # from the live catalog (for example the activation side of a Center
+        # door). Ensure the selected transition replaces its graph-generated
+        # equivalent so a specific ReachWarp retains the exact ROM contract.
         selected = navigation_goal.target.warp
-        if selected is not None and selected.kind == "map_connection":
+        if selected is not None:
             transitions = list(global_world.transitions)
-            selected_source = transition_approach_position(selected)
             transitions = [
                 transition
                 for transition in transitions
-                if not (
-                    transition.kind == "map_connection"
-                    and transition_approach_position(transition) == selected_source
-                    and transition.destination == selected.destination
-                )
+                if not transitions_match(transition, selected)
             ]
             transitions.append(selected)
             global_world = replace(global_world, transitions=tuple(transitions))
+        if navigation_goal.target.warp is not None:
+            chained = _plan_exact_cross_map_warp_chain(
+                global_world,
+                start,
+                navigation_goal,
+                route,
+                max_expansions=max_expansions,
+                max_route_cost=max_route_cost,
+                cost_ceiling=cost_ceiling,
+                cancel_check=cancel_check,
+                caller=caller,
+            )
+            if chained is not None:
+                return chained, route
     else:
         # An unresolved interaction is intentionally a map-boundary goal.
         # Runtime observation resolves its interaction after arrival.
         global_goal = replace(navigation_goal, target=normalized_target)
         if normalized_target.location is not None:
             global_goal = replace(navigation_goal, target=ReachLocation(normalized_target.location))
-    # Cross-map semantic searches are the expensive case.  The heuristic is
-    # conservative for this search: encounter exposure remains the primary
-    # zero lower bound, while movement cost is bounded by the distance to an
-    # executable transition plus map-hop count.  Keep an explicitly supplied
-    # algorithm authoritative for benchmark and diagnostic callers, but use
-    # the admissible A* path for the normal production default.
-    search_algorithm = (
-        "astar"
-        if algorithm == "dijkstra" and isinstance(global_goal.target, (SemanticTarget, ReachWarp))
-        else algorithm
-    )
+    # Keep the caller's algorithm authoritative. Production callers use the
+    # default Dijkstra search so one lexicographic cost model applies to local
+    # routes, shared objectives, and cross-map transition chains. Explicit A*
+    # remains available to benchmarks and diagnostic callers.
+    search_algorithm = algorithm
     try:
         plan = GoalAwareNavigator(global_world).plan(
             start,
             global_goal,
             algorithm=search_algorithm,
+            caller=caller,
             max_expansions=max_expansions,
             max_route_cost=max_route_cost,
             cost_ceiling=cost_ceiling,
@@ -1301,6 +3110,16 @@ def plan_with_world_navigation(
             trace=True,
             prefix="CAMPAIGN_WORLD_ROUTE_DEBUG",
         )
+        if isinstance(error, NavigationSearchLimitExceeded):
+            # Preserve the specific failure class through the diagnostic
+            # context added here. Recovery uses this distinction to make one
+            # bounded emergency search with a less rigid encounter policy;
+            # converting it to NavigationError makes an exhausted search
+            # indistinguishable from a proven unreachable route.
+            raise NavigationSearchLimitExceeded(
+                f"{error}; current tile count={len(current_tiles)}, "
+                f"current transition count={len(current_transitions)}"
+            ) from error
         if isinstance(error, NavigationError):
             raise NavigationError(
                 f"{error}; current tile count={len(current_tiles)}, "
@@ -1404,34 +3223,69 @@ def plan_with_world_navigation(
         candidate_attempt_count += len(choice_tuple)
 
     navigator = GoalAwareNavigator(world)
-    shared_target_groups = tuple(
-        tuple((start[0], (choice[0], choice[1])) for choice in choices_for_candidate)
+
+    def completed_local_plan(item):
+        local_plan, source_coordinates, activation_direction, _ = item
+        if (
+            activation_direction is not None
+            and world.facing is not None
+            and local_plan.metrics is not None
+            and local_plan.metrics.final_facing is not activation_direction
+        ):
+            runtime_warp = runtime_transitions.get(source_coordinates)
+            activation_position = (
+                source_coordinates[0]
+                - (activation_direction is Direction.East)
+                + (activation_direction is Direction.West),
+                source_coordinates[1]
+                - (activation_direction is Direction.South)
+                + (activation_direction is Direction.North),
+            )
+            turn_location = (
+                (start[0], activation_position)
+                if edge.kind == "connection"
+                else (start[0], source_coordinates if runtime_warp is not None else activation_position)
+            )
+            actions = local_plan.actions + (
+                NavigationAction(NavigationActionType.TURN, activation_direction, turn_location, turn_location),
+            )
+            return NavigationPlan(
+                actions,
+                local_plan.destination,
+                navigator._metrics(
+                    actions,
+                    navigation_goal.encounter_mode,
+                    navigation_goal.encounter_penalty,
+                ),
+            )
+        return local_plan
+
+    def activation_candidate_key(item):
+        completed = completed_local_plan(item)
+        metrics = completed.metrics
+        if metrics is None:
+            return (float("inf"),) * 6 + (item[3],)
+        return navigation_candidate_key(metrics, navigation_goal.encounter_mode, item[3])
+
+    shared_targets = tuple(
+        (start[0], (choice[0], choice[1]))
         for _, _, choices_for_candidate in candidate_choices
+        for choice in choices_for_candidate
     )
-    shared_targets = tuple(location for group in shared_target_groups for location in group)
     shared_plans = navigator.plan_many_locations(
         start,
         tuple(dict.fromkeys(shared_targets)),
         encounter_mode=navigation_goal.encounter_mode,
         encounter_penalty=navigation_goal.encounter_penalty,
         algorithm=algorithm,
-        target_groups=shared_target_groups,
         max_expansions=max_expansions,
         max_route_cost=max_route_cost,
     )
     for candidate_id, coordinates, choices_for_candidate in candidate_choices:
-        selected_index = next(
-            (
-                index
-                for index, choice in enumerate(choices_for_candidate)
-                if (start[0], (choice[0], choice[1])) in shared_plans
-            ),
-            None,
-        )
+        reachable_choices = []
         for choice_index, choice in enumerate(choices_for_candidate):
-            if selected_index is not None and choice_index > selected_index:
-                break
-            if selected_index is None or choice_index < selected_index:
+            local_plan = shared_plans.get((start[0], (choice[0], choice[1])))
+            if local_plan is None:
                 candidate_records.append(
                     {
                         "candidate_id": f"{candidate_id}:{choice_index}",
@@ -1442,32 +3296,46 @@ def plan_with_world_navigation(
                         "reason": "shared_local_search_exhausted",
                     }
                 )
-        if selected_index is None:
+                continue
+            activation_direction = choice[2]
+            candidate_item = (
+                local_plan,
+                coordinates,
+                activation_direction,
+                f"{candidate_id}:{choice_index}",
+            )
+            completed = completed_local_plan(candidate_item)
+            metrics = completed.metrics
+            candidate_records.append(
+                {
+                    "candidate_id": candidate_item[3],
+                    "source_coordinates": coordinates,
+                    "activation_coordinates": (choice[0], choice[1]),
+                    "activation_direction": getattr(activation_direction, "name", None),
+                    "status": "pathfound",
+                    "reason": "reachable_activation_side",
+                    "pathfinding_calls": 1,
+                    "nodes_expanded": None,
+                    "encounter_opportunities": metrics.encounter_opportunities if metrics else None,
+                    "route_cost": metrics.total_route_cost if metrics else None,
+                }
+            )
+            reachable_choices.append(candidate_item)
+        if not reachable_choices:
             continue
-        selected_choice = choices_for_candidate[selected_index]
-        x, y, activation_direction = selected_choice
-        local_plan = shared_plans[(start[0], (x, y))]
-        candidate_records.append(
-            {
-                "candidate_id": f"{candidate_id}:{selected_index}",
-                "source_coordinates": coordinates,
-                "activation_coordinates": (x, y),
-                "activation_direction": getattr(activation_direction, "name", None),
-                "status": "pathfound",
-                "reason": "first_reachable_activation_side",
-                "pathfinding_calls": 1,
-                "nodes_expanded": None,
-                "encounter_opportunities": local_plan.metrics.encounter_opportunities if local_plan.metrics else None,
-                "route_cost": local_plan.metrics.total_route_cost if local_plan.metrics else None,
-            }
-        )
-        candidate_plans.append((local_plan, coordinates, activation_direction, f"{candidate_id}:{selected_index}"))
-        if local_plan.metrics is not None:
-            if best_encounters is None or local_plan.metrics.encounter_opportunities < best_encounters:
-                best_encounters = local_plan.metrics.encounter_opportunities
-                best_route_cost = local_plan.metrics.total_route_cost
-            elif local_plan.metrics.encounter_opportunities == best_encounters:
-                best_route_cost = min(best_route_cost, local_plan.metrics.total_route_cost)
+        selected_item = min(reachable_choices, key=activation_candidate_key)
+        candidate_plans.append(selected_item)
+        selected_activation = selected_item[3]
+        for candidate_record in candidate_records:
+            if candidate_record["candidate_id"] == selected_activation:
+                candidate_record["reason"] = "cheapest_reachable_activation_side"
+        selected_metrics = completed_local_plan(selected_item).metrics
+        if selected_metrics is not None:
+            if best_encounters is None or selected_metrics.encounter_opportunities < best_encounters:
+                best_encounters = selected_metrics.encounter_opportunities
+                best_route_cost = selected_metrics.total_route_cost
+            elif selected_metrics.encounter_opportunities == best_encounters:
+                best_route_cost = min(best_route_cost, selected_metrics.total_route_cost)
     if not candidate_plans:
         if profiling_enabled():
             group_records = pathfinding_searches()[profile_start_index:]
@@ -1512,36 +3380,6 @@ def plan_with_world_navigation(
         record["cross_map_total_nodes_expanded"] = group_total_nodes
         record["cross_map_fastest_ms"] = round(group_fastest_ms, 3)
         record["cross_map_slowest_ms"] = round(group_slowest_ms, 3)
-
-    def completed_local_plan(item):
-        local_plan, source_coordinates, activation_direction, _ = item
-        if (
-            activation_direction is not None
-            and world.facing is not None
-            and local_plan.metrics is not None
-            and local_plan.metrics.final_facing is not activation_direction
-        ):
-            runtime_warp = runtime_transitions.get(source_coordinates)
-            activation_position = (
-                source_coordinates[0]
-                - (activation_direction is Direction.East)
-                + (activation_direction is Direction.West),
-                source_coordinates[1]
-                - (activation_direction is Direction.South)
-                + (activation_direction is Direction.North),
-            )
-            turn_location = (
-                (start[0], activation_position)
-                if edge.kind == "connection"
-                else (start[0], source_coordinates if runtime_warp is not None else activation_position)
-            )
-            actions = local_plan.actions + (
-                NavigationAction(NavigationActionType.TURN, activation_direction, turn_location, turn_location),
-            )
-            return NavigationPlan(
-                actions, local_plan.destination, navigator._metrics(actions, navigation_goal.encounter_mode)
-            )
-        return local_plan
 
     def candidate_key(item):
         local_plan, _, _, candidate_id = item
@@ -1719,7 +3557,13 @@ def plan_with_world_navigation(
     actions = local_plan.actions + (transition,)
     return (
         NavigationPlan(
-            actions, local_plan.destination, GoalAwareNavigator(world)._metrics(actions, navigation_goal.encounter_mode)
+            actions,
+            local_plan.destination,
+            GoalAwareNavigator(world)._metrics(
+                actions,
+                navigation_goal.encounter_mode,
+                navigation_goal.encounter_penalty,
+            ),
         ),
         route,
     )
@@ -1734,6 +3578,7 @@ def plan_observed_warp_locally(
     max_route_cost: int | None = None,
     cost_ceiling: tuple[int, ...] | int | None = None,
     cancel_check=None,
+    caller: str | None = None,
 ) -> NavigationPlan:
     """Plan to an exact observed warp without consulting the map graph."""
     navigation_goal = goal if isinstance(goal, NavigationGoal) else NavigationGoal(goal)
@@ -1767,11 +3612,16 @@ def plan_observed_warp_locally(
             max_route_cost=max_route_cost,
             cost_ceiling=cost_ceiling,
             cancel_check=cancel_check,
+            caller=f"{caller}.observed_warp" if caller else "navigation.observed_warp",
         )
         result = NavigationPlan(
             local_plan.actions,
             selected.entry,
-            GoalAwareNavigator(world)._metrics(local_plan.actions),
+            GoalAwareNavigator(world)._metrics(
+                local_plan.actions,
+                navigation_goal.encounter_mode,
+                navigation_goal.encounter_penalty,
+            ),
         )
         _enforce_plan_limits(result, max_route_cost=max_route_cost, cost_ceiling=cost_ceiling)
         return result
@@ -1801,6 +3651,7 @@ def plan_observed_warp_locally(
                 max_route_cost=max_route_cost,
                 cost_ceiling=cost_ceiling,
                 cancel_check=cancel_check,
+                caller=f"{caller}.observed_warp" if caller else "navigation.observed_warp",
             )
             boundary_move = NavigationAction(
                 NavigationActionType.MOVE,
@@ -1820,7 +3671,11 @@ def plan_observed_warp_locally(
         result = NavigationPlan(
             actions,
             selected.entry,
-            GoalAwareNavigator(world)._metrics(actions),
+            GoalAwareNavigator(world)._metrics(
+                actions,
+                navigation_goal.encounter_mode,
+                navigation_goal.encounter_penalty,
+            ),
         )
         _enforce_plan_limits(result, max_route_cost=max_route_cost, cost_ceiling=cost_ceiling)
         return result
@@ -1831,6 +3686,7 @@ def plan_observed_warp_locally(
         max_route_cost=max_route_cost,
         cost_ceiling=cost_ceiling,
         cancel_check=cancel_check,
+        caller=f"{caller}.observed_warp" if caller else "navigation.observed_warp",
     )
     # A recovery handoff can arrive on a step-on door tile via a
     # ReachLocation goal.  In that case the local planner may regard the
@@ -1864,7 +3720,11 @@ def plan_observed_warp_locally(
         result = NavigationPlan(
             local_plan.actions + (crossing,),
             selected.entry,
-            GoalAwareNavigator(world)._metrics(local_plan.actions + (crossing,)),
+            GoalAwareNavigator(world)._metrics(
+                local_plan.actions + (crossing,),
+                navigation_goal.encounter_mode,
+                navigation_goal.encounter_penalty,
+            ),
         )
         _enforce_plan_limits(result, max_route_cost=max_route_cost, cost_ceiling=cost_ceiling)
         return result
@@ -1897,7 +3757,11 @@ def plan_observed_warp_locally(
         result = NavigationPlan(
             actions,
             local_plan.destination,
-            GoalAwareNavigator(world)._metrics(actions),
+            GoalAwareNavigator(world)._metrics(
+                actions,
+                navigation_goal.encounter_mode,
+                navigation_goal.encounter_penalty,
+            ),
         )
         _enforce_plan_limits(result, max_route_cost=max_route_cost, cost_ceiling=cost_ceiling)
         return result
@@ -2000,12 +3864,21 @@ def navigation_diagnostics(world: NavigationWorld, start: Location, goal: Goal) 
             "STATIC_TARGET_AMBIGUOUS"
             if any(binding.static_ambiguous for binding in matching_bindings)
             else (
-                "STATIC_TARGET_HIDDEN"
-                if any(binding.static_match and not binding.static_available for binding in matching_bindings)
+                "STATIC_TARGET_UNAVAILABLE"
+                if any(
+                    binding.static_match
+                    and not binding.static_available
+                    and binding.static_availability is None
+                    for binding in matching_bindings
+                )
                 else (
-                    "CROSS_MAP_GOAL_NOT_SUPPORTED"
-                    if target_maps and not current_map_goal
-                    else "NO_ROUTE_IN_CURRENT_MAP"
+                    "STATIC_TARGET_HIDDEN"
+                    if any(binding.static_match and not binding.static_available for binding in matching_bindings)
+                    else (
+                        "CROSS_MAP_GOAL_NOT_SUPPORTED"
+                        if target_maps and not current_map_goal
+                        else "NO_ROUTE_IN_CURRENT_MAP"
+                    )
                 )
             )
         )
@@ -2050,6 +3923,7 @@ class GoalAwareNavigator:
         goal: NavigationGoal | Goal,
         *,
         algorithm: str = "dijkstra",
+        caller: str | None = None,
         connection_source_is_approach: bool | None = None,
         max_expansions: int | None = None,
         max_route_cost: int | None = None,
@@ -2057,6 +3931,19 @@ class GoalAwareNavigator:
         cancel_check=None,
     ) -> NavigationPlan:
         navigation_goal = goal if isinstance(goal, NavigationGoal) else NavigationGoal(goal)
+        target = navigation_goal.target
+        orientation_required = self.world.facing is not None and _goal_requires_orientation(target)
+        pathfinding_call_id = next(_pathfinding_call_ids)
+        print_navigation_pathfinding(
+            phase="start",
+            call_id=pathfinding_call_id,
+            algorithm=algorithm,
+            start=start,
+            goal=repr(navigation_goal.target),
+            goal_type=type(navigation_goal.target).__name__,
+            orientation_required=orientation_required,
+            caller=caller,
+        )
         _validate_search_limit(max_expansions, "max_expansions")
         _validate_search_limit(max_route_cost, "max_route_cost")
         if isinstance(cost_ceiling, bool) or (
@@ -2077,27 +3964,22 @@ class GoalAwareNavigator:
                 ),
                 trace=True,
             )
-        # Keep ordinary location routing compatible with the established
-        # movement pipeline.  Orientation becomes a search dimension when the
-        # goal's semantics actually depend on it (NPC/tile interaction or a
-        # directional warp).
-        # Facing is a state dimension for every plan when it is observed. A
-        # directional input while facing elsewhere is a TURN, not a MOVE;
-        # this is required for accurate action diagnostics even for location
-        # goals. Interaction and warp goals additionally use the final facing
-        # to determine whether the goal is satisfied.
-        target = navigation_goal.target
+        # Keep ordinary location routing compact. A directional input while
+        # facing elsewhere is still handled by the execution layer as a
+        # turn-only input followed by a retry; it does not need to become a
+        # graph state for a location goal. Interaction and transition goals
+        # retain facing because their activation preconditions depend on it.
         if connection_source_is_approach is None:
             connection_source_is_approach = isinstance(target, SemanticTarget)
-        orientation_required = self.world.facing is not None
-        emit_orientation_actions = isinstance(
-            target, (ActivateTrigger, ReachInteractionPosition, EngageTrainer, ReachWarp)
-        )
+        emit_orientation_actions = _goal_requires_orientation(target)
         executable_orientation = orientation_required
         if algorithm not in ("dijkstra", "astar"):
             raise ValueError(f"Unknown navigation search algorithm: {algorithm!r}")
         profiling = profiling_enabled()
-        search_started = perf_counter_ns() if profiling else 0
+        # Keep timing the search even when the optional profiler is disabled.
+        # The Rich boundary records are used to explain visible frame-loop
+        # stalls, so their elapsed time must not depend on profiler settings.
+        search_started = perf_counter_ns()
         expanded = generated = frontier_max = 0
         diagnostic_search_started = perf_counter_ns()
         diagnostic_last_emit = diagnostic_search_started
@@ -2136,7 +4018,27 @@ class GoalAwareNavigator:
             heuristic = self._heuristic(state[0], navigation_goal.target, navigation_goal.encounter_mode)
             return tuple(cost[index] + heuristic[index] for index in range(6))
 
-        def record(found, metrics=None):
+        def record(found, metrics=None, error=None):
+            duration_ms = round((perf_counter_ns() - search_started) / 1_000_000, 3)
+            print_navigation_pathfinding(
+                phase="complete",
+                call_id=pathfinding_call_id,
+                algorithm=algorithm,
+                start=start,
+                goal=repr(navigation_goal.target),
+                goal_type=type(navigation_goal.target).__name__,
+                orientation_required=orientation_required,
+                nodes_expanded=expanded,
+                nodes_generated=generated,
+                duration_ms=duration_ms,
+                path_found=found,
+                action_count=getattr(metrics, "movement_actions", None) if metrics is not None else None,
+                route_cost=getattr(metrics, "total_route_cost", None) if metrics is not None else None,
+                error=(f"{type(error).__name__}: {error}" if error is not None else None),
+                caller=caller,
+            )
+            if not found and isinstance(navigation_goal.target, ReachWarp):
+                _log_failed_reach_warp_diagnostic(self.world, start, navigation_goal.target)
             if profiling:
                 record_pathfinding_search(
                     algorithm=algorithm,
@@ -2147,7 +4049,7 @@ class GoalAwareNavigator:
                     nodes_expanded=expanded,
                     nodes_generated=generated,
                     max_frontier_size=frontier_max,
-                    duration_ms=round((perf_counter_ns() - search_started) / 1_000_000, 3),
+                    duration_ms=duration_ms,
                     path_found=found,
                     final_encounter_opportunity_count=(metrics.encounter_opportunities if metrics else None),
                     final_route_cost=(metrics.total_route_cost if metrics else None),
@@ -2157,9 +4059,21 @@ class GoalAwareNavigator:
         if algorithm == "astar":
             queue[0] = (priority(initial_cost, initial_state), queue[0][1], initial_state, initial_cost)
         generated = 1
-        while queue:
-            if cancel_check is not None:
+        def check_cancel():
+            if cancel_check is None:
+                return
+            try:
                 cancel_check()
+            except Exception as error:
+                # A superseded or timed-out worker used to leave only a
+                # ``phase=start`` panel behind. Emit the matching terminal
+                # record before propagating the cancellation so every
+                # pathfinding call remains explainable in the Rich console.
+                record(False, error=error)
+                raise
+
+        while queue:
+            check_cancel()
             if max_expansions is not None and expanded >= max_expansions:
                 record(False)
                 raise NavigationSearchLimitExceeded(
@@ -2183,7 +4097,14 @@ class GoalAwareNavigator:
             frontier_max = max(frontier_max, len(queue))
             diagnostic_maps.add(current[0])
             diagnostic_goal_checks += 1
-            if self._satisfies(current, facing, navigation_goal.target):
+            # A target tile can itself be part of an undefeated trainer's
+            # sight line (most notably a map-connection approach tile).  Do
+            # not let goal completion bypass the AVOID boundary: reaching
+            # that tile is already exposure even if no successor needs to
+            # enter it.
+            if self._satisfies(current, facing, navigation_goal.target) and not self._is_undesirable(
+                current, navigation_goal.constraints
+            ):
                 diagnostic_goal_matches += 1
                 actions = self._unroll(
                     came_from,
@@ -2193,7 +4114,11 @@ class GoalAwareNavigator:
                 )
                 if isinstance(navigation_goal.target, ReachWarp):
                     actions, current = self._append_warp_activation(actions, current, facing, navigation_goal.target)
-                metrics = self._metrics(actions, navigation_goal.encounter_mode)
+                metrics = self._metrics(
+                    actions,
+                    navigation_goal.encounter_mode,
+                    navigation_goal.encounter_penalty,
+                )
                 if max_route_cost is not None and metrics.total_route_cost > max_route_cost:
                     limit_pruned = True
                     continue
@@ -2331,11 +4256,16 @@ class GoalAwareNavigator:
             )
         if limit_pruned:
             raise NavigationSearchLimitExceeded("navigation search reached its configured cost bound")
-        # Trainer avoidance is a preference, not a reason to strand the
-        # controller. If every route crosses a sight line, retry once with
-        # trainer hazards disabled and make that decision visible to callers.
+        # Trainer avoidance is a safety boundary for campaign navigation. A
+        # caller must explicitly opt in before accepting a forced battle;
+        # otherwise the failure belongs to readiness, which can identify and
+        # prepare for the specific ROM-backed trainer checkpoint.
         trainer_mode = getattr(navigation_goal.constraints, "trainer_mode", None)
-        if trainer_mode is not None and trainer_mode.name == "AVOID":
+        if (
+            trainer_mode is not None
+            and trainer_mode.name == "AVOID"
+            and getattr(navigation_goal.constraints, "allow_forced_trainer_exposure", False)
+        ):
             fallback_constraints = replace(navigation_goal.constraints, trainer_mode=type(trainer_mode).IGNORE)
             fallback_goal = replace(navigation_goal, constraints=fallback_constraints)
             fallback = self.plan(
@@ -2360,16 +4290,21 @@ class GoalAwareNavigator:
         *,
         encounter_mode: EncounterMode = EncounterMode.NORMAL,
         encounter_penalty: int = 8,
+        constraints: GoalConstraints | None = None,
         algorithm: str = "dijkstra",
         target_groups: tuple[tuple[Location, ...], ...] | None = None,
         max_expansions: int | None = None,
         max_route_cost: int | None = None,
+        cancel_check=None,
     ) -> dict[Location, NavigationPlan]:
         """Resolve several ReachLocation goals from one shared state search.
 
         Cross-map planning has several terminal activation positions, but all
         of them have the same predecessor graph and the same ``(Location,
-        facing)`` state.  This deliberately searches the reachable graph once
+        None)`` state.  Facing is intentionally excluded because these are
+        ordinary ReachLocation goals; candidate-specific activation turns
+        are added by the caller afterwards.
+        This deliberately searches the reachable graph once
         and reconstructs the best state for each requested coordinate.  The
         search is exhaustive: unlike arbitrary goal pruning, this is safe for
         the lexicographic objective and for candidates that have no route.
@@ -2383,12 +4318,38 @@ class GoalAwareNavigator:
         _validate_search_limit(max_expansions, "max_expansions")
         _validate_search_limit(max_route_cost, "max_route_cost")
         requested = frozenset(targets)
+        pathfinding_call_id = next(_pathfinding_call_ids)
+        print_navigation_pathfinding(
+            phase="start",
+            call_id=pathfinding_call_id,
+            algorithm=algorithm,
+            start=start,
+            goal=f"shared ReachLocation targets={len(requested)}",
+            goal_type="SharedReachLocation",
+            orientation_required=False,
+        )
         if not requested:
+            print_navigation_pathfinding(
+                phase="complete",
+                call_id=pathfinding_call_id,
+                algorithm=algorithm,
+                start=start,
+                goal="shared ReachLocation targets=0",
+                goal_type="SharedReachLocation",
+                orientation_required=False,
+                nodes_expanded=0,
+                nodes_generated=0,
+                path_found=False,
+            )
             return {}
         profiling = profiling_enabled()
-        search_started = perf_counter_ns() if profiling else 0
+        search_started = perf_counter_ns()
         sequence = count()
-        initial_state = (start, self.world.facing if self.world.facing is not None else None)
+        # Shared searches resolve ordinary ReachLocation targets.  Keep one
+        # graph state per tile and let execution perform any required first
+        # turn.  This is the high-volume cross-map path where four facing
+        # variants per tile are particularly expensive.
+        initial_state = (start, None)
         initial_cost = (0, 0, 0, 0, 0, 0)
         costs = {initial_state: initial_cost}
         came_from: dict[tuple[Location, Direction | None], tuple | None] = {initial_state: None}
@@ -2409,7 +4370,10 @@ class GoalAwareNavigator:
         expanded = generated = frontier_max = 0
         results: dict[Location, NavigationPlan] = {}
         groups = target_groups or tuple((target,) for target in requested)
+        target_constraints = constraints or GoalConstraints()
         while queue:
+            if cancel_check is not None:
+                cancel_check()
             if max_expansions is not None and expanded >= max_expansions:
                 raise NavigationSearchLimitExceeded(
                     f"navigation search exceeded max_expansions {max_expansions}"
@@ -2423,22 +4387,29 @@ class GoalAwareNavigator:
             self._yield_to_frame_loop(expanded)
             frontier_max = max(frontier_max, len(queue))
             current, facing = state
-            if current in requested:
+            # Shared ReachLocation searches are used for cross-map approach
+            # candidates.  Apply the same safety check before accepting an
+            # approach tile, otherwise a trainer sight-line endpoint can be
+            # returned as a supposedly safe candidate.
+            if current in requested and not self._is_undesirable(
+                current,
+                target_constraints,
+            ):
                 # ReachLocation deliberately completes on the first state
                 # popped by the ordered frontier.  This is also the old
                 # single-goal planner's completion rule; candidate-specific
                 # activation turns are appended by the caller afterwards.
                 if current not in results:
                     actions = self._unroll(came_from, state, False)
-                    results[current] = NavigationPlan(actions, current, self._metrics(actions, encounter_mode))
+                    results[current] = NavigationPlan(
+                        actions,
+                        current,
+                        self._metrics(actions, encounter_mode, encounter_penalty),
+                    )
                     if all(any(location in results for location in group) for group in groups):
                         break
-            if self._is_undesirable(current, NavigationGoal(ReachLocation(current)).constraints):
+            if self._is_undesirable(current, NavigationGoal(ReachLocation(current), constraints=target_constraints).constraints):
                 continue
-            if self.world.facing is not None and current in self.world.tiles:
-                # ReachLocation plans do not emit turns, but their implicit
-                # directional input costs are already represented below.
-                pass
             for direction, neighbour, is_warp in self.world.neighbors(current):
                 if is_warp:
                     step_cost = 1
@@ -2447,10 +4418,14 @@ class GoalAwareNavigator:
                     tile = self.world.tiles[neighbour]
                     step_cost = tile.traversal_cost - int(tile.has_encounters)
                     encounter = int(tile.has_encounters)
-                turn_cost = int(self.world.facing is not None and facing is not direction)
-                turn_on_encounter = int(turn_cost and self.world.tiles[current].has_encounters)
-                turn_on_non_encounter = int(turn_cost and not self.world.tiles[current].has_encounters)
-                opportunity = encounter + turn_on_encounter
+                # ReachLocation searches deliberately ignore turn costs and
+                # facing.  The resulting MOVE action is still executable:
+                # the controller observes and retries a turn-only first
+                # input before advancing.
+                turn_cost = 0
+                turn_on_encounter = 0
+                turn_on_non_encounter = 0
+                opportunity = encounter
                 exposure_cost, opportunity_cost = encounter_cost_components(encounter_mode, encounter_penalty)
                 new_cost = (
                     current_cost[0] + exposure_cost * opportunity,
@@ -2460,7 +4435,7 @@ class GoalAwareNavigator:
                     current_cost[4] + turn_on_encounter,
                     current_cost[5] + turn_on_non_encounter,
                 )
-                next_state = (neighbour, direction)
+                next_state = (neighbour, None)
                 if new_cost >= costs.get(next_state, (float("inf"),) * 6):
                     continue
                 costs[next_state] = new_cost
@@ -2485,6 +4460,19 @@ class GoalAwareNavigator:
                 final_route_cost=None,
                 candidate_searches_for_goal=1,
             )
+        print_navigation_pathfinding(
+            phase="complete",
+            call_id=pathfinding_call_id,
+            algorithm=algorithm,
+            start=start,
+            goal=f"shared ReachLocation targets={len(requested)}",
+            goal_type="SharedReachLocation",
+            orientation_required=False,
+            nodes_expanded=expanded,
+            nodes_generated=generated,
+            duration_ms=round((perf_counter_ns() - search_started) / 1_000_000, 3),
+            path_found=bool(results),
+        )
         return results
 
     def _map_hop_distances_to(self, target_map: MapId) -> dict[MapId, int]:
@@ -2623,8 +4611,11 @@ class GoalAwareNavigator:
                     else trigger.trigger_id == target.trigger_id
                 )
                 if matches:
+                    positions_for_engagement = (
+                        getattr(trigger, "engagement_locations", ())
+                    )
                     positions.extend(
-                        trigger.hazard_locations
+                        positions_for_engagement
                         if isinstance(target, EngageTrainer)
                         else (trigger.activation_locations or trigger.navigation_locations)
                     )
@@ -2649,11 +4640,7 @@ class GoalAwareNavigator:
         if isinstance(target, EngageTrainer):
             return any(
                 trigger.affordance_id == target.trainer_id
-                and (
-                    location in trigger.hazard_locations
-                    if trigger.hazard_locations
-                    else self._activation_matches(trigger, location, facing)
-                )
+                and location in getattr(trigger, "engagement_locations", ())
                 for trigger in self.world.triggers
             )
         if isinstance(target, ActivateTrigger):
@@ -2705,9 +4692,16 @@ class GoalAwareNavigator:
                     target.destination_map is None
                     or (warp.destination is not None and warp.destination[0] == target.destination_map)
                 )
-                and (target.warp is None or transitions_match(warp, target.warp))
-                and (not target.warps or any(transitions_match(warp, allowed) for allowed in target.warps))
-                and any(transitions_match(warp, allowed) for allowed in allowed_transitions)
+                and _reach_warp_transition_matches(warp, target)
+                and any(
+                    transitions_match(warp, allowed)
+                    or (
+                        target.destination is None
+                        and target.warps
+                        and transition_source_matches(warp, allowed)
+                    )
+                    for allowed in allowed_transitions
+                )
                 for warp in transitions
             )
             return matched
@@ -2718,14 +4712,24 @@ class GoalAwareNavigator:
         transitions = self.world.transitions or self.world.warps
         allowed_transitions = target.warps or ((target.warp,) if target.warp is not None else transitions)
         for transition in transitions:
-            if not any(transitions_match(transition, allowed) for allowed in allowed_transitions):
+            if not any(
+                transitions_match(transition, allowed)
+                or (
+                    target.destination is None
+                    and target.warps
+                    and transition_source_matches(transition, allowed)
+                )
+                for allowed in allowed_transitions
+            ):
                 continue
             approach = transition_approach_position(transition)
             source = (
                 approach
                 if transition.kind == "map_connection"
                 else (
-                    next(iter(transition.activation_locations), transition.entry)
+                    current
+                    if current in transition.activation_locations
+                    else next(iter(transition.activation_locations), transition.entry)
                     if transition.activation_locations
                     else transition.entry
                 )
@@ -2739,6 +4743,8 @@ class GoalAwareNavigator:
             if target.warp is not None and not transitions_match(transition, target.warp):
                 continue
             direction = transition.activation_direction
+            if direction is None and transition.activation_locations:
+                direction = _direction_between(source[1], transition.entry[1])
             if direction is None:
                 direction = transition.required_facing
             if direction is None:
@@ -2784,8 +4790,30 @@ class GoalAwareNavigator:
         trainer_mode = getattr(constraints, "trainer_mode", None)
         if trainer_mode is not None and trainer_mode.name == "AVOID":
             if any(
-                location in trigger.hazard_locations
-                or (getattr(trigger, "hazard_kind", None) == "trainer" and location in trigger.activation_locations)
+                (
+                    not getattr(constraints, "avoid_trainer_ids", ())
+                    or getattr(trigger, "affordance_id", None) in getattr(constraints, "avoid_trainer_ids", ())
+                )
+                and (
+                    getattr(trigger, "hazard_kind", None) == "trainer"
+                    or str(getattr(trigger, "affordance_id", "")).startswith(("trainer:", "rom_trainer:"))
+                )
+                and (
+                    location in trigger.hazard_locations
+                    # An adjacent interaction position is only a movement
+                    # hazard while the trainer's sight-line geometry is
+                    # unresolved.  Once a positive sight-line envelope is
+                    # available, walking past an NPC without pressing A is
+                    # safe; treating every adjacent tile as hazardous can
+                    # close the only trainer-free corridor on a map. Keep
+                    # the empty-envelope case fail-closed so unknown
+                    # trainer geometry never becomes implicit permission.
+                    or (
+                        getattr(trigger, "hazard_kind", None) == "trainer"
+                        and not getattr(trigger, "hazard_locations", ())
+                        and location in trigger.activation_locations
+                    )
+                )
                 for trigger in self.world.triggers
             ):
                 return True
@@ -2881,7 +4909,10 @@ class GoalAwareNavigator:
         return tuple(actions)
 
     def _metrics(
-        self, actions: tuple[NavigationAction, ...], encounter_mode: EncounterMode = EncounterMode.NORMAL
+        self,
+        actions: tuple[NavigationAction, ...],
+        encounter_mode: EncounterMode = EncounterMode.NORMAL,
+        encounter_penalty: int = 8,
     ) -> NavigationMetrics:
         movement_actions = sum(action.action_type is NavigationActionType.MOVE for action in actions)
         encounter_terrain_moves = sum(
@@ -2926,7 +4957,7 @@ class GoalAwareNavigator:
         )
         total_route_cost += sum(1 for action in actions if action.action_type is NavigationActionType.WARP)
         total_route_cost += turns_on_encounter + turns_on_non_encounter
-        _, opportunity_cost = encounter_cost_components(encounter_mode)
+        _, opportunity_cost = encounter_cost_components(encounter_mode, encounter_penalty)
         total_route_cost += encounter_opportunities * opportunity_cost
         for action in actions:
             if action.action_type in (NavigationActionType.MOVE, NavigationActionType.TURN, NavigationActionType.WARP):

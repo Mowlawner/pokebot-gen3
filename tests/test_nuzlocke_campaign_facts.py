@@ -73,6 +73,39 @@ class CampaignFactsTests(unittest.TestCase):
         ).campaign_facts
         self.assertFalse(facts.starter_obtained.value)
 
+    def test_early_rom_state_variables_are_retained_for_source_backed_guards(self):
+        facts = self.state(
+            variables=(
+                NamedVariable("LITTLEROOT_INTRO_STATE", 7),
+                NamedVariable("LITTLEROOT_RIVAL_STATE", 3),
+                NamedVariable("LITTLEROOT_TOWN_STATE", 2),
+                NamedVariable("ROUTE101_STATE", 3),
+                NamedVariable("BIRCH_LAB_STATE", 3),
+                NamedVariable("OLDALE_RIVAL_STATE", 0),
+            ),
+        ).campaign_facts
+
+        self.assertEqual(facts.littleroot_intro_state.value, 7)
+        self.assertEqual(facts.littleroot_rival_state.value, 3)
+        self.assertEqual(facts.littleroot_town_state.value, 2)
+        self.assertEqual(facts.route101_state.value, 3)
+        self.assertEqual(facts.birch_lab_state.value, 3)
+        self.assertEqual(facts.oldale_rival_state.value, 0)
+
+    def test_early_rom_state_variables_preserve_unknown_and_unavailable(self):
+        unknown = self.state().campaign_facts
+        unavailable = self.state(available=False).campaign_facts
+        for name in (
+            "littleroot_intro_state",
+            "littleroot_rival_state",
+            "littleroot_town_state",
+            "route101_state",
+            "birch_lab_state",
+            "oldale_rival_state",
+        ):
+            self.assertEqual(unknown[name].status, FactStatus.UNKNOWN, name)
+            self.assertEqual(unavailable[name].status, FactStatus.UNAVAILABLE, name)
+
     def test_pokeball_receipt_survives_inventory_depletion(self):
         facts = self.state(
             balls=0,
@@ -93,17 +126,42 @@ class CampaignFactsTests(unittest.TestCase):
         self.assertTrue(at_threshold.pokeballs_sufficient.value)
         self.assertFalse(below_threshold.pokeballs_sufficient.value)
 
-    def test_intro_rival_completion_accepts_post_scene_hide_flag(self):
+    def test_intro_rival_completion_ignores_object_visibility_flag(self):
         facts = self.state(
             flags=(
                 NamedFlag("DEFEATED_RIVAL_ROUTE103", False),
                 NamedFlag("HIDE_ROUTE_103_RIVAL", True),
-            )
+            ),
+            variables=(NamedVariable("BIRCH_LAB_STATE", 3),),
+        ).campaign_facts
+
+        self.assertFalse(facts.intro_rival_battle_complete.value)
+
+    def test_intro_rival_completion_accepts_birch_lab_state_boundary(self):
+        facts = self.state(
+            flags=(NamedFlag("DEFEATED_RIVAL_ROUTE103", False),),
+            variables=(NamedVariable("BIRCH_LAB_STATE", 4),),
         ).campaign_facts
 
         self.assertTrue(facts.intro_rival_battle_complete.value)
 
-    def test_selector_advances_to_pokedex_after_rival_is_hidden(self):
+    def test_intro_rival_completion_accepts_later_birch_lab_state(self):
+        facts = self.state(
+            flags=(NamedFlag("DEFEATED_RIVAL_ROUTE103", False),),
+            variables=(NamedVariable("BIRCH_LAB_STATE", 5),),
+        ).campaign_facts
+
+        self.assertTrue(facts.intro_rival_battle_complete.value)
+
+    def test_intro_rival_completion_flag_wins_over_pre_rival_lab_state(self):
+        facts = self.state(
+            flags=(NamedFlag("DEFEATED_RIVAL_ROUTE103", True),),
+            variables=(NamedVariable("BIRCH_LAB_STATE", 3),),
+        ).campaign_facts
+
+        self.assertTrue(facts.intro_rival_battle_complete.value)
+
+    def test_selector_advances_to_pokedex_after_rival_completion_boundary(self):
         state = self.state(
             flags=tuple(
                 NamedFlag(name, value)
@@ -120,7 +178,7 @@ class CampaignFactsTests(unittest.TestCase):
             variables=(
                 NamedVariable("LITTLEROOT_INTRO_STATE", 3),
                 NamedVariable("LITTLEROOT_RIVAL_STATE", 3),
-                NamedVariable("BIRCH_LAB_STATE", 3),
+                NamedVariable("BIRCH_LAB_STATE", 4),
             ),
             balls=5,
         )
@@ -130,17 +188,23 @@ class CampaignFactsTests(unittest.TestCase):
         self.assertEqual(selection.objective.objective_id, "receive_pokedex")
         self.assertEqual(selection.status, ObjectiveStatus.READY)
 
-    def test_intro_rival_completion_is_unknown_when_hide_signal_is_unavailable(self):
+    def test_intro_rival_completion_is_unknown_when_completion_signals_are_unavailable(self):
         facts = self.state(flags=(NamedFlag("DEFEATED_RIVAL_ROUTE103", False),)).campaign_facts
 
         self.assertEqual(facts.intro_rival_battle_complete.status, FactStatus.UNKNOWN)
 
-    def test_intro_rival_completion_is_known_false_when_both_flags_are_false(self):
+    def test_intro_rival_completion_is_unavailable_when_save_reads_are_unavailable(self):
+        facts = self.state(available=False).campaign_facts
+
+        self.assertEqual(facts.intro_rival_battle_complete.status, FactStatus.UNAVAILABLE)
+
+    def test_intro_rival_completion_is_known_false_before_rival_end(self):
         facts = self.state(
             flags=(
                 NamedFlag("DEFEATED_RIVAL_ROUTE103", False),
                 NamedFlag("HIDE_ROUTE_103_RIVAL", False),
-            )
+            ),
+            variables=(NamedVariable("BIRCH_LAB_STATE", 3),),
         ).campaign_facts
 
         self.assertEqual(facts.intro_rival_battle_complete.status, FactStatus.KNOWN)
@@ -292,10 +356,8 @@ class CampaignFactsTests(unittest.TestCase):
                 "obtain_starter",
                 "complete_intro_rival",
                 "receive_pokedex",
-                "reach_petalburg",
                 "complete_petalburg_wally",
                 "complete_petalburg_woods",
-                "reach_rustboro",
                 "complete_rustboro_goods_stolen",
                 "report_devon_goods",
                 "recover_devon_goods",

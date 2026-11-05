@@ -11,6 +11,7 @@ from modules.navigation import (
     NavigationWorld,
     NavigableTile,
     _global_navigation_world,
+    plan_with_world_navigation,
 )
 from modules.overworld import MapConnectionObservation, WarpActivation, WarpObservation
 from modules.world_navigation import WorldEdge, WorldMapGraph
@@ -125,6 +126,69 @@ class ReachWarpActivationTests(unittest.TestCase):
         target = SemanticTarget.interaction((101, 1), "Route101_EventScript_BirchsBag")
         self.assertIsNone(target.location)
         self.assertEqual(target.target_map, (101, 1))
+
+    def test_grouped_observed_warps_stay_in_local_planner(self):
+        source, destination = (7, 1), (8, 1)
+        first = WarpObservation(
+            (source, (2, 0)),
+            (destination, (0, 0)),
+            activation_locations=frozenset({(source, (1, 0))}),
+        )
+        second = WarpObservation(
+            (source, (0, 2)),
+            (destination, (0, 0)),
+            activation_locations=frozenset({(source, (0, 1))}),
+        )
+        world = NavigationWorld(
+            tiles(
+                (source, (0, 0)),
+                (source, (1, 0)),
+                (source, (2, 0)),
+                (source, (0, 1)),
+                (source, (0, 2)),
+            ),
+            transitions=(first, second),
+            facing=Direction.East,
+        )
+
+        plan, route = plan_with_world_navigation(
+            world,
+            (source, (0, 0)),
+            ReachWarp(destination_map=destination, warps=(first, second)),
+        )
+
+        self.assertIsNone(route)
+        self.assertEqual(plan.actions[-1].action_type, NavigationActionType.WARP)
+        self.assertEqual(plan.actions[-1].source, (source, (1, 0)))
+
+    def test_grouped_observed_warp_accepts_reconciled_destination(self):
+        source, destination = (17, 1), (18, 1)
+        observed = WarpObservation(
+            (source, (1, 0)),
+            (destination, (0, 0)),
+            activation_locations=frozenset({(source, (0, 0))}),
+        )
+        reconciled = WarpObservation(
+            observed.entry,
+            (destination, (4, 4)),
+            activation_locations=observed.activation_locations,
+        )
+        world = NavigationWorld(
+            tiles((source, (0, 0)), (source, (1, 0))),
+            warps=(observed,),
+            transitions=(reconciled,),
+            facing=Direction.East,
+        )
+
+        plan, route = plan_with_world_navigation(
+            world,
+            (source, (0, 0)),
+            ReachWarp(destination_map=destination, warps=(observed,)),
+        )
+
+        self.assertIsNone(route)
+        self.assertEqual(plan.actions[-1].action_type, NavigationActionType.WARP)
+        self.assertEqual(plan.actions[-1].destination, reconciled.destination)
 
 
 if __name__ == "__main__":

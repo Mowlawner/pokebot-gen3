@@ -5,19 +5,84 @@ from unittest.mock import patch
 from modules.map_data import MapRSE, PokemonCenter
 from modules.map_path import Direction, PathFindingError
 from modules.modes import BotModeError
+from modules.goals import EncounterMode
 from modules.navigation import (
     NavigationAction,
     NavigationActionType,
     NavigationPlan,
     NavigationSearchLimitExceeded,
 )
+from modules.overworld import WorldTransition
 from modules.nuzlocke.resource_policy import RouteRecovery
-from modules.nuzlocke.resource_runtime import observe_route_recovery, prepare_route_recovery
+from modules.nuzlocke.resource_runtime import (
+    RecoveryPlanningError,
+    RouteRecoveryRequest,
+    _cataloged_healing_warp,
+    observe_route_recovery,
+    plan_route_recovery,
+    prepare_route_recovery,
+)
 from modules.nuzlocke.emerald_healing_catalog import HealingSourceRSE
 from modules.modes.util.map import find_closest_pokemon_center, pokemon_center_candidates
 
 
 class RouteRecoveryObservationTests(unittest.TestCase):
+    def test_cataloged_healing_warp_normalizes_enum_map_cache_keys(self):
+        door = WorldTransition(
+            (MapRSE.OLDALE_TOWN.value, (6, 16)),
+            (MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value, (7, 8)),
+        )
+        source = SimpleNamespace(
+            interior_map=MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F,
+            outdoor_location=(MapRSE.OLDALE_TOWN, (6, 16)),
+        )
+        with patch(
+            "modules.nuzlocke.resource_runtime.static_map_transitions",
+            return_value=(door,),
+        ) as transitions:
+            self.assertIs(_cataloged_healing_warp(source.outdoor_location, source), door)
+
+        transitions.assert_called_once_with(MapRSE.OLDALE_TOWN.value)
+
+    def test_recovery_snapshot_includes_candidate_outdoor_and_interior_maps(self):
+        location = (MapRSE.ROUTE103.value, (14, 11))
+        source = SimpleNamespace(
+            source_id="pokemon_center:oldale",
+            outdoor_location=(MapRSE.OLDALE_TOWN, (6, 16)),
+            interior_map=MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F,
+        )
+        door = WorldTransition(
+            (MapRSE.OLDALE_TOWN.value, (6, 16)),
+            (MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value, (7, 8)),
+        )
+        graph = SimpleNamespace(
+            route=lambda _source, _target: SimpleNamespace(
+                maps=(MapRSE.ROUTE103.value, MapRSE.OLDALE_TOWN.value),
+                estimated_cost=43,
+            ),
+        )
+        with (
+            patch(
+                "modules.nuzlocke.resource_runtime.context",
+                SimpleNamespace(rom=SimpleNamespace(is_rse=True), stutter_trace=None),
+            ),
+            patch("modules.nuzlocke.resource_runtime.get_player_location", return_value=location),
+            patch("modules.nuzlocke.resource_runtime.pokemon_center_candidates", return_value=(PokemonCenter.OldaleTown,)),
+            patch("modules.nuzlocke.resource_runtime.emerald_healing_sources", return_value=(source,)),
+            patch("modules.nuzlocke.resource_runtime.perceive_overworld", return_value=object()),
+            patch("modules.nuzlocke.resource_runtime.NavigationWorld.from_overworld", return_value=object()),
+            patch("modules.nuzlocke.resource_runtime.get_world_map_graph", return_value=graph),
+            patch("modules.nuzlocke.resource_runtime.static_map_transitions", return_value=(door,)),
+            patch("modules.nuzlocke.resource_runtime.prewarm_static_map_observation", return_value=()),
+            patch("modules.nuzlocke.resource_runtime.static_navigation_tile_snapshot", return_value=()),
+        ):
+            request = prepare_route_recovery(candidate_limit=1)
+
+        catalog_maps = {map_id for map_id, _tiles in request.static_tile_catalog}
+        self.assertIn(MapRSE.ROUTE103.value, catalog_maps)
+        self.assertIn(MapRSE.OLDALE_TOWN.value, catalog_maps)
+        self.assertIn(MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value, catalog_maps)
+
     def test_route_102_recovery_keeps_both_nearby_centers_as_candidates(self):
         location = (MapRSE.ROUTE102, (16, 20))
         graph = SimpleNamespace(route=lambda _source, _target: SimpleNamespace(estimated_cost=10))
@@ -340,7 +405,309 @@ class RouteRecoveryObservationTests(unittest.TestCase):
         self.assertEqual(result.distance_to_center, 20)
         self.assertEqual(world_plan.call_args_list[0].kwargs["cost_ceiling"], None)
         self.assertEqual(world_plan.call_args_list[1].kwargs["cost_ceiling"], None)
-        self.assertEqual(world_plan.call_args_list[2].kwargs["cost_ceiling"], (1, 20))
+        self.assertEqual(world_plan.call_args_list[2].kwargs["cost_ceiling"], 20)
+
+    def test_zero_exposure_nearby_recovery_does_not_search_later_centers(self):
+        first = SimpleNamespace(
+            source_id="pokemon_center:petalburg",
+            outdoor_location=(MapRSE.PETALBURG_CITY, (8, 18)),
+            interior_map=MapRSE.PETALBURG_CITY_POKEMON_CENTER_1F,
+        )
+        second = SimpleNamespace(
+            source_id="pokemon_center:rustboro",
+            outdoor_location=(MapRSE.RUSTBORO_CITY, (8, 18)),
+            interior_map=MapRSE.RUSTBORO_CITY_POKEMON_CENTER_1F,
+        )
+        first_plan = SimpleNamespace(
+            metrics=SimpleNamespace(encounter_opportunities=0, total_route_cost=18),
+            destination=(MapRSE.PETALBURG_CITY_POKEMON_CENTER_1F.value, (6, 8)),
+            forced_trainer_exposure=False,
+        )
+        request = RouteRecoveryRequest(
+            location=(MapRSE.ROUTE104, (8, 18)),
+            world=object(),
+            graph=object(),
+            ordered_sources=((0, first), (1, second)),
+            center_location=first.outdoor_location,
+            candidate_limit=2,
+            critical=False,
+        )
+        with patch(
+            "modules.nuzlocke.resource_runtime.plan_with_world_navigation",
+            return_value=(first_plan, object()),
+        ) as world_plan:
+            result = plan_route_recovery(request)
+
+        self.assertEqual(world_plan.call_count, 2)
+        self.assertEqual(result.center_location, first.outdoor_location)
+
+    def test_recovery_plan_uses_the_cataloged_center_door_transition(self):
+        source = SimpleNamespace(
+            source_id="pokemon_center:rustboro",
+            outdoor_location=(MapRSE.RUSTBORO_CITY, (16, 38)),
+            interior_map=MapRSE.RUSTBORO_CITY_POKEMON_CENTER_1F,
+        )
+        door = WorldTransition(
+            source.outdoor_location,
+            (MapRSE.RUSTBORO_CITY_POKEMON_CENTER_1F, (6, 8)),
+        )
+        request = RouteRecoveryRequest(
+            location=(MapRSE.ROUTE116, (37, 13)),
+            world=object(),
+            graph=object(),
+            ordered_sources=((0, source),),
+            center_location=source.outdoor_location,
+            candidate_limit=1,
+            healing_warps=((0, door),),
+        )
+        plan = SimpleNamespace(
+            metrics=SimpleNamespace(encounter_opportunities=0, total_route_cost=12),
+            destination=door.destination,
+            forced_trainer_exposure=False,
+        )
+        with patch(
+            "modules.nuzlocke.resource_runtime.plan_with_world_navigation",
+            return_value=(plan, object()),
+        ) as world_plan:
+            result = plan_route_recovery(request)
+
+        self.assertIs(result.navigation_goal.target.warp, door)
+        self.assertEqual(world_plan.call_args.args[2].target.destination, door.destination)
+        self.assertEqual(world_plan.call_args.args[2].target.destination_map, door.destination[0].value)
+
+    def test_critical_recovery_prefers_fewer_encounters_over_a_shorter_exposed_route(self):
+        first = SimpleNamespace(
+            source_id="pokemon_center:near",
+            outdoor_location=(MapRSE.ROUTE104, (8, 18)),
+            interior_map=MapRSE.PETALBURG_CITY_POKEMON_CENTER_1F,
+        )
+        second = SimpleNamespace(
+            source_id="pokemon_center:safer",
+            outdoor_location=(MapRSE.ROUTE104, (20, 18)),
+            interior_map=MapRSE.RUSTBORO_CITY_POKEMON_CENTER_1F,
+        )
+        plans = (
+            (
+                SimpleNamespace(
+                    metrics=SimpleNamespace(encounter_opportunities=2, total_route_cost=10),
+                    destination=(MapRSE.PETALBURG_CITY_POKEMON_CENTER_1F.value, (6, 8)),
+                    forced_trainer_exposure=False,
+                ),
+                object(),
+            ),
+            (
+                SimpleNamespace(
+                    metrics=SimpleNamespace(encounter_opportunities=0, total_route_cost=30),
+                    destination=(MapRSE.RUSTBORO_CITY_POKEMON_CENTER_1F.value, (6, 8)),
+                    forced_trainer_exposure=False,
+                ),
+                object(),
+            ),
+        )
+        request = RouteRecoveryRequest(
+            location=(MapRSE.ROUTE104, (8, 18)),
+            world=object(),
+            graph=object(),
+            ordered_sources=((0, first), (1, second)),
+            center_location=first.outdoor_location,
+            candidate_limit=2,
+            critical=True,
+        )
+        with patch(
+            "modules.nuzlocke.resource_runtime.plan_with_world_navigation",
+            side_effect=plans,
+        ):
+            result = plan_route_recovery(request)
+
+        self.assertEqual(result.center_location, second.outdoor_location)
+        self.assertEqual(result.encounter_opportunities, 0)
+
+    def test_recovery_keeps_completed_incumbent_when_later_candidate_times_out(self):
+        first = SimpleNamespace(
+            source_id="pokemon_center:petalburg",
+            outdoor_location=(MapRSE.PETALBURG_CITY, (8, 18)),
+            interior_map=MapRSE.PETALBURG_CITY_POKEMON_CENTER_1F,
+        )
+        second = SimpleNamespace(
+            source_id="pokemon_center:rustboro",
+            outdoor_location=(MapRSE.RUSTBORO_CITY, (16, 38)),
+            interior_map=MapRSE.RUSTBORO_CITY_POKEMON_CENTER_1F,
+        )
+        first_plan = SimpleNamespace(
+            metrics=SimpleNamespace(encounter_opportunities=0, total_route_cost=24),
+            destination=(MapRSE.PETALBURG_CITY_POKEMON_CENTER_1F.value, (6, 8)),
+            forced_trainer_exposure=False,
+        )
+        request = RouteRecoveryRequest(
+            location=(MapRSE.ROUTE104, (8, 18)),
+            world=object(),
+            graph=object(),
+            ordered_sources=((0, first), (1, second)),
+            center_location=first.outdoor_location,
+            candidate_limit=2,
+            critical=False,
+        )
+        with patch(
+            "modules.nuzlocke.resource_runtime.plan_with_world_navigation",
+            side_effect=((first_plan, object()), TimeoutError("candidate budget exhausted")),
+        ):
+            result = plan_route_recovery(request)
+
+        self.assertEqual(result.center_location, first.outdoor_location)
+        self.assertTrue(result.calculation_timed_out)
+        self.assertEqual(
+            [(item.source_id, item.outcome) for item in result.candidate_diagnostics],
+            [("pokemon_center:petalburg", "success"), ("pokemon_center:rustboro", "timed_out")],
+        )
+
+    def test_opportunistic_recovery_uses_weighted_route_cost_for_center_selection(self):
+        nearby = SimpleNamespace(
+            source_id="pokemon_center:petalburg",
+            outdoor_location=(MapRSE.PETALBURG_CITY, (8, 18)),
+            interior_map=MapRSE.PETALBURG_CITY_POKEMON_CENTER_1F,
+        )
+        distant = SimpleNamespace(
+            source_id="pokemon_center:oldale",
+            outdoor_location=(MapRSE.OLDALE_TOWN, (6, 16)),
+            interior_map=MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F,
+        )
+        plans = (
+            (
+                SimpleNamespace(
+                    metrics=SimpleNamespace(encounter_opportunities=7, total_route_cost=93),
+                    destination=(MapRSE.PETALBURG_CITY_POKEMON_CENTER_1F.value, (6, 8)),
+                    forced_trainer_exposure=False,
+                ),
+                object(),
+            ),
+            (
+                SimpleNamespace(
+                    metrics=SimpleNamespace(encounter_opportunities=1, total_route_cost=96),
+                    destination=(MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value, (6, 8)),
+                    forced_trainer_exposure=False,
+                ),
+                object(),
+            ),
+        )
+        request = RouteRecoveryRequest(
+            location=(MapRSE.ROUTE104, (8, 18)),
+            world=object(),
+            graph=object(),
+            ordered_sources=((0, nearby), (1, distant)),
+            center_location=nearby.outdoor_location,
+            candidate_limit=2,
+            critical=False,
+        )
+        with patch(
+            "modules.nuzlocke.resource_runtime.plan_with_world_navigation",
+            side_effect=plans,
+        ) as world_plan:
+            result = plan_route_recovery(request)
+
+        self.assertEqual(result.center_location, nearby.outdoor_location)
+        self.assertEqual(result.encounter_opportunities, 7)
+        self.assertEqual(
+            [item.args[2].encounter_mode for item in world_plan.call_args_list],
+            [EncounterMode.MOSTLY_AVOID, EncounterMode.MOSTLY_AVOID],
+        )
+        self.assertEqual(
+            [(item.distance, item.encounter_opportunities) for item in result.candidate_diagnostics],
+            [(93, 7), (96, 1)],
+        )
+        self.assertIsNone(world_plan.call_args_list[0].kwargs["cost_ceiling"])
+        self.assertEqual(world_plan.call_args_list[1].kwargs["cost_ceiling"], 93)
+
+    def test_critical_recovery_retries_search_exhaustion_with_mostly_avoid(self):
+        source = SimpleNamespace(
+            source_id="pokemon_center:petalburg",
+            outdoor_location=(MapRSE.PETALBURG_CITY, (8, 18)),
+            interior_map=MapRSE.PETALBURG_CITY_POKEMON_CENTER_1F,
+        )
+        plan = SimpleNamespace(
+            metrics=SimpleNamespace(encounter_opportunities=1, total_route_cost=24),
+            destination=(MapRSE.PETALBURG_CITY_POKEMON_CENTER_1F.value, (6, 8)),
+            forced_trainer_exposure=False,
+        )
+        request = RouteRecoveryRequest(
+            location=(MapRSE.ROUTE104, (8, 18)),
+            world=object(),
+            graph=object(),
+            ordered_sources=((0, source),),
+            center_location=source.outdoor_location,
+            candidate_limit=1,
+            critical=True,
+        )
+        with patch(
+            "modules.nuzlocke.resource_runtime.plan_with_world_navigation",
+            side_effect=(NavigationSearchLimitExceeded("strict budget exhausted"), (plan, object())),
+        ) as world_plan:
+            result = plan_route_recovery(request)
+
+        self.assertEqual(world_plan.call_count, 2)
+        strict_goal = world_plan.call_args_list[0].args[2]
+        emergency_goal = world_plan.call_args_list[1].args[2]
+        self.assertEqual(strict_goal.encounter_mode, EncounterMode.AVOID)
+        self.assertEqual(emergency_goal.encounter_mode, EncounterMode.MOSTLY_AVOID)
+        self.assertIs(result.route, plan)
+        self.assertEqual(result.candidate_diagnostics[0].reason, "executable trainer-safe route after encounter-risk fallback")
+        self.assertEqual(world_plan.call_args_list[1].kwargs["cost_ceiling"], None)
+
+    def test_noncritical_recovery_does_not_use_emergency_search_after_budget_exhaustion(self):
+        source = SimpleNamespace(
+            source_id="pokemon_center:petalburg",
+            outdoor_location=(MapRSE.PETALBURG_CITY, (8, 18)),
+            interior_map=MapRSE.PETALBURG_CITY_POKEMON_CENTER_1F,
+        )
+        request = RouteRecoveryRequest(
+            location=(MapRSE.ROUTE104, (8, 18)),
+            world=object(),
+            graph=object(),
+            ordered_sources=((0, source),),
+            center_location=source.outdoor_location,
+            candidate_limit=1,
+            critical=False,
+        )
+        with patch(
+            "modules.nuzlocke.resource_runtime.plan_with_world_navigation",
+            side_effect=NavigationSearchLimitExceeded("candidate budget exhausted"),
+        ) as world_plan:
+            with self.assertRaises(RecoveryPlanningError):
+                plan_route_recovery(request)
+
+        world_plan.assert_called_once()
+
+    def test_failed_recovery_plan_retains_diagnostics_for_every_candidate(self):
+        sources = tuple(
+            SimpleNamespace(
+                source_id=source_id,
+                outdoor_location=(MapRSE.ROUTE104, (index, 18)),
+                interior_map=MapRSE.PETALBURG_CITY_POKEMON_CENTER_1F,
+            )
+            for index, source_id in enumerate(("pokemon_center:petalburg", "pokemon_center:oldale"))
+        )
+        request = RouteRecoveryRequest(
+            location=(MapRSE.ROUTE104, (8, 18)),
+            world=object(),
+            graph=object(),
+            ordered_sources=tuple(enumerate(sources)),
+            center_location=sources[0].outdoor_location,
+            candidate_limit=2,
+            critical=True,
+        )
+        with patch(
+            "modules.nuzlocke.resource_runtime.plan_with_world_navigation",
+            side_effect=(PathFindingError("blocked by trainer"), PathFindingError("no safe exit")),
+        ):
+            with self.assertRaises(RecoveryPlanningError) as raised:
+                plan_route_recovery(request)
+
+        self.assertEqual(
+            [(item.source_id, item.outcome, item.reason) for item in raised.exception.candidate_diagnostics],
+            [
+                ("pokemon_center:petalburg", "failed", "PathFindingError: blocked by trainer"),
+                ("pokemon_center:oldale", "failed", "PathFindingError: no safe exit"),
+            ],
+        )
 
 
 if __name__ == "__main__":

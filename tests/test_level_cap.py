@@ -29,7 +29,11 @@ class LevelCapTests(unittest.TestCase):
         self.assertFalse(assessment.legal)
 
     def test_active_cap_applies_to_any_campaign_battle_entry(self):
-        decision = evaluate_battle_entry(facts(), [SimpleNamespace(level=99)], objective_id="reach_rustboro")
+        decision = evaluate_battle_entry(
+            facts(),
+            [SimpleNamespace(level=99)],
+            objective_id="complete_rustboro_goods_stolen",
+        )
 
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.assessment.status, FactStatus.KNOWN)

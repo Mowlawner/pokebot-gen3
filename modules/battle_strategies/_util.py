@@ -60,6 +60,24 @@ class BattleStrategyUtil:
     def __init__(self, battle_state: "BattleState"):
         self._battle_state = battle_state
 
+    @staticmethod
+    def _active_party_indices(battle_state: BattleState | None) -> frozenset[int]:
+        """Return party slots currently deployed on the player's side."""
+
+        if battle_state is None:
+            return frozenset()
+
+        own_side = getattr(battle_state, "own_side", None)
+        return frozenset(
+            party_index
+            for battler in (
+                getattr(own_side, "left_battler", None),
+                getattr(own_side, "right_battler", None),
+            )
+            if battler is not None
+            and (party_index := getattr(battler, "party_index", None)) is not None
+        )
+
     def get_escape_chance(self) -> float:
         """
         Calculates the likelihood of an attempt to flee the battle will succeed.
@@ -106,12 +124,17 @@ class BattleStrategyUtil:
         if opponent.stats.speed < battler.stats.speed:
             return 1
 
-        if context.rom.is_rs:
-            escape_attempts = context.emulator.read_bytes(0x0201_6078, length=1)[0]
-        else:
-            escape_attempts = read_symbol("gBattleStruct", offset=0x4C, size=1)[0]
+        escape_attempts = self.get_escape_attempts()
         escape_chance = ((battler.stats.speed * 128) // opponent.stats.speed + (escape_attempts * 30)) % 256
         return escape_chance / 255
+
+    @staticmethod
+    def get_escape_attempts() -> int:
+        """Return the current Gen III Run Away attempt counter."""
+
+        if context.rom.is_rs:
+            return context.emulator.read_bytes(0x0201_6078, length=1)[0]
+        return read_symbol("gBattleStruct", offset=0x4C, size=1)[0]
 
     def get_best_escape_method(self) -> tuple[TurnAction, any] | None:
         """
@@ -188,7 +211,13 @@ class BattleStrategyUtil:
         defender: "BattlePokemon",
         is_critical_hit: bool = False,
     ) -> DamageRange:
-        # todo: Bide, Counter, Endeavor, Mirror Coat
+        # Bide's immediate action has no base-power damage. Its stateful
+        # stored-damage release is modeled by expectiminimax, where the
+        # accumulated HP loss and lock state are available.
+        if str(getattr(move, "name", "") or "").strip().casefold() == "bide" or str(
+            getattr(move, "effect", "") or ""
+        ).strip().upper() == "BIDE":
+            return DamageRange(0, 0)
         defender_types = defender.species.types if isinstance(defender, Pokemon) else defender.types
         attacker_types = attacker.species.types if isinstance(attacker, Pokemon) else attacker.types
 
@@ -230,6 +259,13 @@ class BattleStrategyUtil:
         # Type effectiveness
         for defender_type in defender_types:
             damage = _percentage(damage, int(100 * move_type.get_effectiveness_against(defender_type)))
+
+        # A type immunity is a real zero-damage result.  Do this before the
+        # ordinary minimum-damage clamp and before fixed-damage move handling;
+        # otherwise an immune move is misreported as dealing at least one HP
+        # and capture planning can keep selecting it forever.
+        if damage == 0:
+            return DamageRange(0)
 
         if move.name == "Dragon Rage":
             return DamageRange(40)
@@ -577,12 +613,7 @@ class BattleStrategyUtil:
         A Pokémon is considered usable if it has enough HP, is not an egg,
         is not already active, and has a valid move to damage the opponent.
         """
-        active_party_indices = []
-        if battle_state is not None:
-            if battle_state.own_side.left_battler is not None:
-                active_party_indices.append(battle_state.own_side.left_battler.party_index)
-            if battle_state.own_side.right_battler is not None:
-                active_party_indices.append(battle_state.own_side.right_battler.party_index)
+        active_party_indices = self._active_party_indices(battle_state)
 
         party = get_party()
         usable_pokemon = []
@@ -609,6 +640,8 @@ class BattleStrategyUtil:
         indices = self.get_potential_rotation_targets(battle_state)
         if len(indices) == 0:
             return None
+
+        active_party_indices = self._active_party_indices(battle_state)
 
         party = get_party()
         opponent = (

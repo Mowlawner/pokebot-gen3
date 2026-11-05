@@ -26,18 +26,42 @@ from modules.console import diagnostic_print
 from modules.context import context
 
 from .campaign_state import CampaignState, Fact, FactStatus, RunStatus
-from .resource_policy import EncounterPolicy, ReadinessImportance, RecoverySupplyPolicy, ResourceObjective
-from modules.world_navigation import WorldMapGraph, WorldNavigationError, get_world_map_graph
+from .resource_policy import (
+    EncounterPolicy,
+    PokeballRestockPolicy,
+    ReadinessImportance,
+    RecoverySupplyPolicy,
+    ResourceObjective,
+)
+from modules.overworld import static_map_transitions, WorldTransition
+from modules.world_navigation import (
+    WorldMapGraph,
+    WorldNavigationError,
+    get_world_map_graph,
+    route_with_edge_filter,
+)
 from .encounter_catalog import (
     EncounterOpportunity,
     campaign_encounter_methods,
     encounter_candidates_for_location,
     encounter_opportunities,
 )
-from .capture_policy import CapturePolicyContext, EncounterCandidate, EncounterMethod, score_encounter
+from .capture_policy import (
+    CapturePolicyContext,
+    EncounterCandidate,
+    EncounterMethod,
+    EncounterPortfolioContext,
+    choose_encounter_portfolio,
+    score_encounter,
+    score_portfolio_candidate,
+)
 from .trainer_policy import TrainerPolicyInput, choose_trainer_mode
 from .emerald_campaign_registry import emerald_bosses, evaluate_emerald_fact
 from .snapshots import CampaignObservationLifecycle
+from .campaign_reachability import (
+    CampaignReachabilityStatus,
+    assess_campaign_reachability,
+)
 
 
 class ObjectiveStatus(Enum):
@@ -101,6 +125,23 @@ class EncounterEvaluation:
     via_encounter_cost: int | None
     detour_cost: int | None
     detour_ratio: float | None
+    # A positive value means that the encounter's known species pool adds
+    # offensive coverage against the next unavoidable trainer checkpoint.
+    # This is intentionally separate from route geometry: a useful capture
+    # can justify a detour that would otherwise be deferred.
+    trainer_preparation_gain: float = 0.0
+    trainer_checkpoint_id: str | None = None
+    # Static route cost and conditioned encounter utility may still be useful
+    # for a future objective, but an unresolved dynamic gate must prevent the
+    # optional task from taking execution ownership now.
+    reachability_status: CampaignReachabilityStatus = CampaignReachabilityStatus.REACHABLE_NOW
+    reachability_blockers: tuple[str, ...] = ()
+
+    @property
+    def executable_now(self) -> bool:
+        """Return whether encounter policy may mount this task immediately."""
+
+        return self.reachability_status is CampaignReachabilityStatus.REACHABLE_NOW
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +246,14 @@ class ObjectiveSelection:
     # discovery. Consumers such as the Rich frontier can render the exact
     # executable set without running route analysis a second time.
     frontier_objective_ids: tuple[str, ...] = ()
+    # Structured evidence for the human-facing frontier report. These are
+    # immutable because the selector has already done the expensive route and
+    # encounter work by the time a selection is published.
+    selection_diagnostics: tuple[dict[str, object], ...] = ()
+    # Ordered encounter candidates produced by the same policy call that
+    # selected the optional task.  This is kept separate from per-task
+    # tradeoffs so the Rich console can show the portfolio order explicitly.
+    encounter_portfolio: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,22 +534,13 @@ def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
             destination=MapRSE.LITTLEROOT_TOWN.value,
         ),
         CampaignObjective(
-            objective_id="reach_petalburg",
-            description="Reach Petalburg City after receiving the Pokédex",
-            # The combined Birch handoff opens the ROM route west from Oldale.
-            # Poké Balls remain a safety prerequisite so the first encounter
-            # opportunity is not intentionally passed while the party cannot
-            # catch it; they are not being misrepresented as a separate ROM
-            # interaction boundary.
-            prerequisites=(birch_lab_handoff_complete(),),
-            completion=campaign_fact("visited_petalburg"),
-            execution_id="reach_petalburg",
-            destination=MapRSE.PETALBURG_CITY.value,
-        ),
-        CampaignObjective(
             objective_id="complete_petalburg_wally",
             description="Talk to Norman and complete Wally's tutorial",
-            prerequisites=(campaign_fact("visited_petalburg"),),
+            # Petalburg arrival is a consequence of pursuing this scene. The
+            # Birch handoff is the actual prerequisite that opens the route;
+            # ``visited_petalburg`` remains an observed ROM fact and is not a
+            # separate campaign milestone.
+            prerequisites=(birch_lab_handoff_complete(),),
             completion=campaign_fact("petalburg_wally_scene_complete"),
             execution_id="complete_petalburg_wally",
             destination=MapRSE.PETALBURG_CITY_GYM.value,
@@ -511,24 +551,24 @@ def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
             prerequisites=(campaign_fact("petalburg_wally_scene_complete"),),
             completion=campaign_fact("petalburg_woods_scene_complete"),
             execution_id="complete_petalburg_woods",
+            resource_policy=ResourceObjective(
+                "complete_petalburg_woods",
+                readiness=ReadinessImportance.IMPORTANT,
+                encounters=EncounterPolicy.PRESERVE,
+                mandatory_battle=True,
+            ),
             destination=MapRSE.PETALBURG_WOODS.value,
-        ),
-        CampaignObjective(
-            objective_id="reach_rustboro",
-            description="Reach Rustboro City after the Petalburg Woods progression",
-            prerequisites=(campaign_fact("petalburg_woods_scene_complete"),),
-            completion=campaign_fact("visited_rustboro"),
-            execution_id="reach_rustboro",
-            destination=MapRSE.RUSTBORO_CITY.value,
         ),
         CampaignObjective(
             objective_id="complete_rustboro_goods_stolen",
             description="Complete the Rustboro Devon Goods theft scene",
-            prerequisites=(campaign_fact("visited_rustboro"),),
+            # Rustboro arrival is a consequence of pursuing this ROM-owned
+            # scene. The scene's completion flag, rather than the map visit,
+            # is the progression boundary.
+            prerequisites=(campaign_fact("petalburg_woods_scene_complete"),),
             completion=campaign_fact("devon_goods_stolen"),
             execution_id="complete_rustboro_goods_stolen",
             destination=MapRSE.RUSTBORO_CITY.value,
-            task_kind="optional",
         ),
         CampaignObjective(
             objective_id="report_devon_goods",
@@ -545,8 +585,13 @@ def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
             prerequisites=(campaign_fact("devon_goods_stolen"),),
             completion=campaign_fact("devon_goods_recovered"),
             execution_id="recover_devon_goods",
+            resource_policy=ResourceObjective(
+                "recover_devon_goods",
+                readiness=ReadinessImportance.IMPORTANT,
+                encounters=EncounterPolicy.PRESERVE,
+                mandatory_battle=True,
+            ),
             destination=MapRSE.RUSTURF_TUNNEL.value,
-            task_kind="optional",
         ),
         CampaignObjective(
             objective_id="return_devon_goods",
@@ -569,7 +614,10 @@ def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
         CampaignObjective(
             objective_id="prepare_roxanne",
             description="Prepare the living party for Roxanne",
-            prerequisites=(campaign_fact("visited_rustboro"),),
+            # Rustboro arrival is an observed side effect of the Devon Goods
+            # corridor. The recovered-goods boundary is the durable story
+            # prerequisite that opens the gym preparation route.
+            prerequisites=(campaign_fact("devon_goods_recovered"),),
             completion=party_meets_level_target(emerald_bosses()[0].preparation_level),
             execution_id="prepare_roxanne",
             destination=MapRSE.ROUTE116.value,
@@ -584,7 +632,7 @@ def initial_emerald_campaign() -> tuple[CampaignObjective, ...]:
             # prerequisite to pass directly once the target is met.
             prerequisites=(
                 party_meets_level_target(emerald_bosses()[0].preparation_level),
-                campaign_fact("visited_rustboro"),
+                campaign_fact("devon_goods_recovered"),
             ),
             completion=campaign_fact("first_badge_obtained"),
             execution_id="defeat_roxanne",
@@ -625,11 +673,110 @@ def recovery_supply_policy() -> RecoverySupplyPolicy:
     return configured if isinstance(configured, RecoverySupplyPolicy) else RecoverySupplyPolicy()
 
 
+def pokeball_restock_policy() -> PokeballRestockPolicy:
+    """Return the configured Poké Ball reserve policy."""
+
+    runtime = getattr(context, "nuzlocke_runtime", None)
+    configured = getattr(getattr(runtime, "rule_config", None), "pokeball_policy", None)
+    return configured if isinstance(configured, PokeballRestockPolicy) else PokeballRestockPolicy()
+
+
 def _observed_recovery_quantities(state: CampaignState) -> tuple[int, int] | None:
     if not state.inventory.is_known or state.inventory.value is None:
         return None
     quantities = {item.name.casefold(): item.quantity for item in state.inventory.value.items}
     return quantities.get("antidote", 0), quantities.get("potion", 0)
+
+
+def campaign_restock_item_summary(state: CampaignState, objective_id: str | None) -> str | None:
+    """Describe the baseline transaction for a selected restock objective.
+
+    Selection runs from an already observed ``CampaignState``. Keep this
+    summary read-only and report policy-target quantities before the execution
+    layer applies the live wallet and cash-floor limits.
+    """
+
+    if objective_id not in {"restock_pokeballs", "restock_recovery_items"}:
+        return None
+    inventory = state.inventory
+    if not inventory.is_known or inventory.value is None:
+        return "Antidote, Potion, and Poké Balls (quantities unavailable)"
+
+    quantities = {}
+    for item in (*inventory.value.items, *inventory.value.poke_balls):
+        name = item.name.casefold()
+        quantities[name] = quantities.get(name, 0) + item.quantity
+
+    planned: list[tuple[str, int]] = []
+    antidotes = quantities.get("antidote", 0)
+    potions = quantities.get("potion", 0)
+    recovery = recovery_supply_policy()
+    recovery_required = recovery.needs_restock(antidotes, potions)
+    if recovery_required:
+        desired = recovery.desired_quantities(antidotes, potions)
+        planned.extend((name, quantity) for name, quantity in desired.items() if quantity)
+
+    balls = sum(
+        quantity
+        for name, quantity in quantities.items()
+        if name != "master ball" and "ball" in name
+    )
+    pokeballs = pokeball_restock_policy()
+    pokeballs_required = pokeballs.needs_restock(balls)
+    if pokeballs_required:
+        planned.append(("Poké Ball", pokeballs.quantity_to_buy(balls)))
+
+    if not planned:
+        return "No additional items (observed reserve is at target)"
+    return (
+        ", ".join(f"{quantity}x {name}" for name, quantity in planned)
+        + " (policy targets; wallet/cash-floor limits may reduce purchase)"
+    )
+
+
+def _restock_is_deferred_on_current_map(state: CampaignState, objective_id: str) -> bool:
+    """Return whether a failed funding attempt should yield this map to travel.
+
+    The dynamic restock objective is normally an immediate interrupt.  When a
+    Mart transaction is unaffordable and the live capability has already
+    established that no undefeated trainer can fund it here, remounting that
+    same objective every frame creates an ``earn_money`` standstill.  Keep the
+    deferral narrow and transient: it applies only to the objective and map
+    that produced it, and a map transition clears it.
+    """
+
+    marker = getattr(context, "campaign_restock_deferral", None)
+    if not isinstance(marker, tuple) or len(marker) != 2:
+        return False
+    deferred_objective, deferred_map = marker
+    if deferred_objective != objective_id:
+        return False
+    # A transient map-unavailable observation does not establish that the
+    # player left the map. Preserve the marker until the next coherent map
+    # observation; otherwise the controller can remount the same unfundable
+    # restock during every script/warp transition frame.
+    if not state.raw_map.is_known:
+        return True
+    if state.raw_map.value != deferred_map:
+        try:
+            context.campaign_restock_deferral = None
+        except AttributeError:
+            pass
+        return False
+    return True
+
+
+def _active_story_scene_blocks_restock(state: CampaignState) -> bool:
+    """Return whether the current map is inside the unfinished Wally scene."""
+
+    raw_map = state.raw_map
+    wally_complete = getattr(state.campaign_facts, "petalburg_wally_scene_complete", Fact.unavailable())
+    return (
+        raw_map.is_known
+        and raw_map.value in {MapRSE.PETALBURG_CITY.value, MapRSE.PETALBURG_CITY_GYM.value}
+        and wally_complete.status is FactStatus.KNOWN
+        and wally_complete.value is False
+    )
 
 
 def _recovery_restock_is_required(state: CampaignState) -> bool:
@@ -718,11 +865,115 @@ def _restock_is_required(state: CampaignState) -> bool:
     return received.status is FactStatus.KNOWN and received.value is True or count > 0
 
 
+def _campaign_progression_destination_for_restock(state: CampaignState) -> tuple[int, int] | None:
+    """Return the current required campaign destination without resource interrupts.
+
+    Poké Ball restock gating runs before the dynamic restock task is added to
+    the frontier.  Resolve the ordinary required story tasks here so the
+    encounter route can be measured against the destination the campaign is
+    already prepared to pursue.
+    """
+
+    available: list[CampaignObjective] = []
+    for task in initial_emerald_campaign():
+        completion = task.completion.evaluate(state)
+        if completion.status is not FactStatus.KNOWN or completion.value:
+            continue
+        if task.failure is not None:
+            failure = task.failure.evaluate(state)
+            if failure.status is not FactStatus.KNOWN or failure.value:
+                continue
+        prerequisites = tuple(prerequisite.evaluate(state) for prerequisite in task.prerequisites)
+        if task.task_kind == "required" and all(
+            result.status is FactStatus.KNOWN and result.value for result in prerequisites
+        ):
+            available.append(task)
+    return progression_destination(tuple(available))[0]
+
+
+def _observed_pending_encounter_opportunities(state: CampaignState) -> tuple[EncounterOpportunity, ...]:
+    """Build encounter opportunities from the authoritative observed projection."""
+
+    if not state.encounters.is_known:
+        return ()
+    return tuple(
+        EncounterOpportunity(encounter.location, True, False, True)
+        for encounter in state.encounters.value or ()
+        if encounter.eligible and encounter.status == "none"
+    )
+
+
+def _pokeball_restock_is_warranted(
+    state: CampaignState,
+    opportunities: tuple[EncounterOpportunity, ...] | None = None,
+    progression: tuple[int, int] | None = None,
+    *,
+    graph: WorldMapGraph | None = None,
+) -> bool:
+    """Return whether a low ball reserve is needed before current progression.
+
+    A low reserve alone does not justify a Mart detour.  The selector must have
+    a known required destination and an eligible, unconsumed encounter that is
+    on that route or within the normal small-detour policy.  Unknown route or
+    encounter data is treated as no planned encounter so the campaign can
+    continue and reevaluate after its next authoritative observation.
+    """
+
+    if not _restock_is_required(state) or not state.encounters.is_known:
+        return False
+    progression = progression or _campaign_progression_destination_for_restock(state)
+    if progression is None:
+        return False
+    if opportunities is None:
+        try:
+            opportunities = encounter_opportunities(state)
+        except (AttributeError, NameError, RuntimeError, TypeError, ValueError):
+            opportunities = ()
+    merged = {opportunity.location: opportunity for opportunity in opportunities}
+    for opportunity in _observed_pending_encounter_opportunities(state):
+        merged.setdefault(opportunity.location, opportunity)
+
+    preferred_locations: list[tuple[int, int]] = []
+    for opportunity in merged.values():
+        if opportunity.consumed or not opportunity.eligible:
+            continue
+        try:
+            if not _has_current_campaign_encounter(state, opportunity.location):
+                continue
+            evaluation = evaluate_encounter_opportunity(
+                state,
+                opportunity,
+                progression,
+                graph=graph,
+            )
+        except (AttributeError, NameError, RuntimeError, TypeError, ValueError):
+            continue
+        if evaluation.recommendation is EncounterRecommendation.PREFER:
+            preferred_locations.append(opportunity.location)
+
+    selected = bool(preferred_locations)
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_POKEBALL_RESTOCK_GATE: "
+            f"reserve_low=True progression={progression!r} "
+            f"candidate_count={len(merged)!r} "
+            f"preferred_locations={tuple(preferred_locations)!r} selected={selected!r}"
+        ),
+        trace=True,
+        prefix="CAMPAIGN_POKEBALL_RESTOCK_GATE",
+    )
+    return selected
+
+
 def encounter_task(
     location: tuple[int, int], *, name: str | None = None, observed: bool | None = None
 ) -> CampaignObjective:
     """Describe an opportunistic encounter without choosing encounter policy."""
     task_id = name or f"obtain_encounter:{location[0]}:{location[1]}"
+    try:
+        location_name = MapRSE(location).pretty_name
+    except (TypeError, ValueError):
+        location_name = str(location)
 
     def accessible(state: CampaignState) -> Fact[bool]:
         """Report whether this location still has an eligible encounter."""
@@ -736,7 +987,7 @@ def encounter_task(
 
     return CampaignObjective(
         task_id,
-        f"Obtain the first encounter at {location}",
+        f"Obtain the first encounter at {location_name}",
         (
             # Encounter legality begins at Pokédex receipt.  Before that ROM
             # boundary, an observed or catalogued grass table must not become
@@ -806,6 +1057,38 @@ def _has_current_campaign_encounter(state: CampaignState, location: tuple[int, i
         return False
 
 
+def _rom_backed_campaign_route(graph: WorldMapGraph, source_map, target_map):
+    """Use the ROM transition catalog when measuring campaign routes."""
+    transition_cache: dict[object, tuple[WorldTransition, ...] | None] = {}
+
+    def edge_is_executable(edge) -> bool:
+        if not getattr(edge, "source_coordinates", ()):
+            # Geometry-free WorldEdge instances are abstract planning
+            # fixtures. They intentionally model costs without requiring a
+            # live ROM transition catalog.
+            return True
+        if edge.source_map not in transition_cache:
+            try:
+                transition_cache[edge.source_map] = tuple(static_map_transitions(edge.source_map))
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                # Pure planning fixtures may provide a graph without an
+                # emulator backed transition catalog. Retain their graph
+                # semantics; live campaign runs have ROM evidence here.
+                transition_cache[edge.source_map] = None
+        transitions = transition_cache[edge.source_map]
+        if transitions is None:
+            return True
+        expected_kind = "map_connection" if edge.kind == "connection" else edge.kind
+        return any(
+            transition.destination is not None
+            and transition.destination[0] == edge.destination_map
+            and transition.kind == expected_kind
+            for transition in transitions
+        )
+
+    return route_with_edge_filter(graph, source_map, target_map, edge_is_executable)
+
+
 def measure_route_context(
     state: CampaignState,
     task: CampaignObjective,
@@ -836,18 +1119,26 @@ def measure_route_context(
             onward = reverse_costs.get(task.destination)
             if direct is None or to_task is None or onward is None:
                 raise WorldNavigationError("task route is not connected to campaign progression")
+            direct_route = _rom_backed_campaign_route(route_graph, current, progression_destination)
         except AttributeError:
             # Keep compatibility with lightweight graph doubles supplied by
             # embedders and older tests that expose only route().
             direct = route_graph.route(current, progression_destination).estimated_cost
             to_task = route_graph.route(current, task.destination).estimated_cost
             onward = route_graph.route(task.destination, progression_destination).estimated_cost
+            direct_route = route_graph.route(current, progression_destination)
     except WorldNavigationError:
         return RouteContext(
             current, progression_destination, task.destination, None, None, None, RouteRelation.UNREACHABLE
         )
     via = to_task + onward
-    detour = max(0, via - direct)
+    # Route cost alone cannot express that Route 101 is literally the first
+    # map on the Littleroot-to-Petalburg corridor.  Use the ROM-backed direct
+    # route's map sequence as the primary membership fact; a map on that
+    # corridor has no campaign detour even when its local map edge costs make
+    # the arithmetic look more expensive.
+    on_direct_corridor = task.destination in getattr(direct_route, "maps", ())
+    detour = 0 if on_direct_corridor else max(0, via - direct)
     relation = RouteRelation.ON_ROUTE if detour == 0 else RouteRelation.DETOUR
     return RouteContext(current, progression_destination, task.destination, direct, via, detour, relation)
 
@@ -860,6 +1151,7 @@ def evaluate_encounter_opportunity(
     task_id: str | None = None,
     policy: EncounterEvaluationPolicy = EncounterEvaluationPolicy(),
     graph: WorldMapGraph | None = None,
+    trainer_checkpoint=None,
 ) -> EncounterEvaluation:
     """Purely evaluate encounter logistics; never changes the projection."""
     task_id = task_id or f"obtain_encounter:{opportunity.location[0]}:{opportunity.location[1]}"
@@ -894,18 +1186,23 @@ def evaluate_encounter_opportunity(
         )
     try:
         route_graph = graph or get_world_map_graph()
-        try:
-            # Use the cached forward/reverse distance tables when discovering
-            # many future encounter locations. This keeps task generation
-            # complete without repeating a graph search for every task.
-            forward_costs = dict(route_graph.map_costs(state.raw_map.value))
-            reverse_costs = dict(route_graph.map_costs_to(progression_destination))
-            direct = forward_costs.get(progression_destination)
-            to_encounter = forward_costs.get(opportunity.location)
-            onward = reverse_costs.get(opportunity.location)
-            if direct is None or to_encounter is None or onward is None:
-                raise WorldNavigationError("encounter route is not connected to campaign progression")
-        except AttributeError:
+        reachability = assess_campaign_reachability(state, opportunity.location, graph=route_graph)
+        direct_route = None
+        if callable(getattr(route_graph, "outgoing", None)):
+            direct_route = _rom_backed_campaign_route(
+                route_graph, state.raw_map.value, progression_destination
+            )
+            direct = _rom_backed_campaign_route(
+                route_graph, state.raw_map.value, progression_destination
+            ).estimated_cost
+            to_encounter = _rom_backed_campaign_route(
+                route_graph, state.raw_map.value, opportunity.location
+            ).estimated_cost
+            onward = _rom_backed_campaign_route(
+                route_graph, opportunity.location, progression_destination
+            ).estimated_cost
+        else:
+            direct_route = route_graph.route(state.raw_map.value, progression_destination)
             direct = route_graph.route(state.raw_map.value, progression_destination).estimated_cost
             to_encounter = route_graph.route(state.raw_map.value, opportunity.location).estimated_cost
             onward = route_graph.route(opportunity.location, progression_destination).estimated_cost
@@ -920,10 +1217,27 @@ def evaluate_encounter_opportunity(
             detour_ratio=None,
             classification=EncounterClassification.UNREACHABLE,
             recommendation=EncounterRecommendation.UNAVAILABLE,
+            reachability_status=CampaignReachabilityStatus.UNREACHABLE,
+            reachability_blockers=("no executable ROM map route",),
         )
     via = to_encounter + onward
-    detour = max(0, via - direct)
+    on_direct_corridor = opportunity.location in getattr(direct_route, "maps", ())
+    detour = 0 if on_direct_corridor else max(0, via - direct)
     ratio = detour / direct if direct else (0.0 if detour == 0 else float("inf"))
+    if not reachability.executable_now:
+        return EncounterEvaluation(
+            **base,
+            direct_progression_cost=direct,
+            encounter_cost=to_encounter,
+            encounter_to_progression_cost=onward,
+            via_encounter_cost=via,
+            detour_cost=max(0, via - direct),
+            detour_ratio=ratio,
+            classification=EncounterClassification.UNREACHABLE,
+            recommendation=EncounterRecommendation.UNAVAILABLE,
+            reachability_status=reachability.status,
+            reachability_blockers=reachability.blockers,
+        )
     if detour == 0:
         classification = EncounterClassification.ON_ROUTE
         recommendation = EncounterRecommendation.PREFER
@@ -933,6 +1247,11 @@ def evaluate_encounter_opportunity(
     else:
         classification = EncounterClassification.LARGE_DETOUR
         recommendation = EncounterRecommendation.DEFER
+    preparation_gain, checkpoint_id = _encounter_trainer_preparation_gain(
+        state,
+        opportunity.location,
+        trainer_checkpoint,
+    )
     return EncounterEvaluation(
         **base,
         classification=classification,
@@ -943,7 +1262,123 @@ def evaluate_encounter_opportunity(
         via_encounter_cost=via,
         detour_cost=detour,
         detour_ratio=ratio,
+        trainer_preparation_gain=preparation_gain,
+        trainer_checkpoint_id=checkpoint_id,
+        reachability_status=reachability.status,
+        reachability_blockers=reachability.blockers,
     )
+
+
+def _encounter_trainer_preparation_gain(
+    state: CampaignState,
+    location: tuple[int, int],
+    trainer_checkpoint=None,
+) -> tuple[float, str | None]:
+    """Estimate whether an encounter can add coverage for the next forced fight.
+
+    The campaign selector does not have the eventual caught Pokémon's exact
+    level, IVs, or moveset. It therefore uses a deliberately modest proxy:
+    compare the best known level-up offensive coverage in the encounter pool
+    with the coverage already present in the observed party. A detour is
+    promoted only when the pool adds a type-effective line against a known
+    unavoidable checkpoint; unknown trainers remain unknown.
+    """
+
+    if trainer_checkpoint is None or not state.party.is_known:
+        return 0.0, getattr(trainer_checkpoint, "checkpoint_id", None)
+    try:
+        from modules.pokemon import get_move_by_name, get_species_by_name
+
+        opponents = tuple(
+            get_species_by_name(member.species)
+            for member in getattr(trainer_checkpoint, "party", ())
+        )
+        if not opponents:
+            return 0.0, getattr(trainer_checkpoint, "checkpoint_id", None)
+
+        def coverage(move_types) -> int:
+            return sum(
+                1
+                for opponent in opponents
+                if any(
+                    _move_is_effective_against(move_type, opponent)
+                    for move_type in move_types
+                )
+            )
+
+        current_move_types = []
+        for member in state.party.value or ():
+            for move in getattr(member, "moves", ()):
+                try:
+                    current_move_types.append(get_move_by_name(move.name).type)
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                    continue
+        current_coverage = coverage(current_move_types)
+        best_candidate_coverage = current_coverage
+        for candidate in _current_campaign_encounter_candidates(state, location):
+            for species_name in getattr(candidate, "species_pool", ()):
+                try:
+                    species = get_species_by_name(species_name)
+                    candidate_move_types = [
+                        entry.move.type
+                        for entry in getattr(getattr(species, "learnset", None), "level_up", ())
+                        if int(getattr(entry, "level", 0) or 0) <= 10
+                        and getattr(getattr(entry, "move", None), "base_power", 0) > 0
+                    ]
+                    best_candidate_coverage = max(best_candidate_coverage, coverage(candidate_move_types))
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                    continue
+        gain = float(max(0, best_candidate_coverage - current_coverage))
+        if gain == 0 and len(state.party.value or ()) < 6:
+            # A legal, still-open party slot is itself a meaningful
+            # probability increase before an unavoidable trainer: it adds a
+            # fresh HP pool and another chance to finish the fight. Keep this
+            # contribution below type-effective coverage so a real matchup
+            # improvement always wins the detour comparison.
+            gain = 0.25
+        return gain, getattr(trainer_checkpoint, "checkpoint_id", None)
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        return 0.0, getattr(trainer_checkpoint, "checkpoint_id", None)
+
+
+def _move_is_effective_against(move_type, opponent) -> bool:
+    """Return whether one move type deals super-effective damage."""
+
+    try:
+        effectiveness = 1.0
+        for defender_type in opponent.types:
+            effectiveness *= move_type.get_effectiveness_against(defender_type)
+        return effectiveness > 1.0
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _next_unavoidable_trainer_checkpoint(state: CampaignState, progression):
+    """Find the registered trainer on the current map before progression."""
+
+    if not state.raw_map.is_known or progression is None:
+        return None
+    try:
+        from modules.trainer_checkpoints import KNOWN_TRAINER_CHECKPOINTS
+
+        current_map = state.raw_map.value
+        return next(
+            (
+                checkpoint
+                for checkpoint in KNOWN_TRAINER_CHECKPOINTS
+                if checkpoint.map_id == current_map
+                and getattr(checkpoint, "mandatory", False)
+                and not (
+                    getattr(checkpoint, "clearance_fact", None)
+                    and getattr(state.campaign_facts, checkpoint.clearance_fact, None) is not None
+                    and getattr(state.campaign_facts, checkpoint.clearance_fact).status is FactStatus.KNOWN
+                    and getattr(state.campaign_facts, checkpoint.clearance_fact).value is True
+                )
+            ),
+            None,
+        )
+    except (AttributeError, ImportError, RuntimeError, TypeError, ValueError):
+        return None
 
 
 def progression_destination(
@@ -1027,20 +1462,21 @@ def available_campaign_tasks(
     # mutable resource and a low-ball observation should create a task only
     # when it is actually needed.
     if tasks is None:
-        if _recovery_restock_is_required(state):
+        if (
+            _recovery_restock_is_required(state)
+            and not _active_story_scene_blocks_restock(state)
+            and not _restock_is_deferred_on_current_map(state, "restock_recovery_items")
+        ):
             recovery_restock = restock_recovery_items_objective()
             insertion = next(
-                (index for index, candidate in enumerate(candidates) if candidate.objective_id == "reach_petalburg"),
+                (
+                    index
+                    for index, candidate in enumerate(candidates)
+                    if candidate.objective_id == "complete_petalburg_wally"
+                ),
                 len(candidates),
             )
             candidates = candidates[:insertion] + (recovery_restock,) + candidates[insertion:]
-        if _restock_is_required(state):
-            restock = restock_pokeballs_objective()
-            insertion = next(
-                (index for index, candidate in enumerate(candidates) if candidate.objective_id == "reach_petalburg"),
-                len(candidates),
-            )
-            candidates = candidates[:insertion] + (restock,) + candidates[insertion:]
 
     def task_is_available(task: CampaignObjective) -> bool:
         """Return whether one task is complete, safe, and executable now."""
@@ -1106,6 +1542,33 @@ def available_campaign_tasks(
         # An unavailable encounter projection is not safe to use for task
         # discovery, even if the campaign facts are otherwise complete.
         catalog_count = 0
+
+    # Unlike recovery supplies, Poké Balls are only an immediate campaign
+    # requirement when a legal encounter is planned on the current route.
+    # Evaluate this after encounter discovery so a low reserve cannot create a
+    # Mart detour with no encounter between the current map and progression.
+    if (
+        tasks is None
+        and _restock_is_required(state)
+        and not _active_story_scene_blocks_restock(state)
+        and not _restock_is_deferred_on_current_map(state, "restock_pokeballs")
+        and _pokeball_restock_is_warranted(
+            state,
+            opportunities=opportunities,
+            progression=progression,
+            graph=route_graph,
+        )
+    ):
+        restock = restock_pokeballs_objective()
+        insertion = next(
+            (
+                index
+                for index, candidate in enumerate(candidates)
+                if candidate.objective_id == "complete_petalburg_wally"
+            ),
+            len(candidates),
+        )
+        candidates = candidates[:insertion] + (restock,) + candidates[insertion:]
     diagnostic_print(
         lambda: (
             "CAMPAIGN_ENCOUNTER_DISCOVERY: "
@@ -1131,6 +1594,7 @@ def available_campaign_tasks(
         if task_is_available(task):
             available.append(task)
     progression, _ = progression_destination(tuple(available))
+    imminent_trainer = _next_unavoidable_trainer_checkpoint(state, progression)
     result = []
     for task in available:
         route = (
@@ -1151,12 +1615,13 @@ def available_campaign_tasks(
                 progression,
                 task_id=task.objective_id,
                 graph=route_graph,
+                trainer_checkpoint=imminent_trainer,
             )
         result.append(replace(task, route_context=route, encounter_evaluation=evaluation))
     diagnostic_print(
         lambda: (
             "CAMPAIGN_ENCOUNTER_FRONTIER: "
-            f"optional={[{'id': task.objective_id, 'recommendation': task.encounter_evaluation.recommendation.value if task.encounter_evaluation else None, 'classification': task.encounter_evaluation.classification.value if task.encounter_evaluation else None} for task in result if task.task_kind == 'optional']!r}"
+            f"optional={[{'id': task.objective_id, 'recommendation': task.encounter_evaluation.recommendation.value if task.encounter_evaluation else None, 'classification': task.encounter_evaluation.classification.value if task.encounter_evaluation else None, 'reachability': task.encounter_evaluation.reachability_status.value if task.encounter_evaluation else None, 'blockers': task.encounter_evaluation.reachability_blockers if task.encounter_evaluation else (), 'trainer_preparation_gain': task.encounter_evaluation.trainer_preparation_gain if task.encounter_evaluation else None, 'trainer_checkpoint': task.encounter_evaluation.trainer_checkpoint_id if task.encounter_evaluation else None} for task in result if task.task_kind == 'optional']!r}"
         ),
         trace=True,
     )
@@ -1169,19 +1634,26 @@ def _select_available_campaign_tasks(
     """Select the deterministic best task from one discovery result."""
 
     required = tuple(task for task in available if task.task_kind == "required")
-    # Optional legal encounters may be strategic prerequisites for required
-    # progression.  Prefer an encounter that is on-route or a small detour
-    # when its species table contributes useful coverage; otherwise required
-    # progression retains ownership.
+    # Optional legal encounters form one policy frontier.  Route geometry still
+    # contributes to each candidate's score, but a large detour is no longer a
+    # hard exclusion that can disagree with the ordered portfolio displayed to
+    # the operator.
     strategic_optional = tuple(
         task
         for task in available
         if task.task_kind == "optional"
         and task.encounter_evaluation is not None
-        and task.encounter_evaluation.recommendation is EncounterRecommendation.PREFER
+        and task.encounter_evaluation.executable_now
+        and task.encounter_evaluation.recommendation
+        in {EncounterRecommendation.PREFER, EncounterRecommendation.DEFER}
         and task.encounter_evaluation.classification
-        in {EncounterClassification.ON_ROUTE, EncounterClassification.SMALL_DETOUR}
+        in {
+            EncounterClassification.ON_ROUTE,
+            EncounterClassification.SMALL_DETOUR,
+            EncounterClassification.LARGE_DETOUR,
+        }
     )
+    encounter_portfolio: tuple[dict[str, object], ...] = ()
 
     def strategic_candidate(task: CampaignObjective):
         try:
@@ -1190,6 +1662,27 @@ def _select_available_campaign_tasks(
             candidates = ()
         if not candidates:
             return None
+        evaluation = getattr(task, "encounter_evaluation", None)
+        # Route measurements belong to the objective evaluation, while the
+        # pure capture policy owns the encounter distribution. Join them at
+        # this boundary so detour cost is priced by the same score used for
+        # species-clause conditioning.
+        if evaluation is not None:
+            candidates = tuple(
+                replace(
+                    candidate,
+                    route_cost=evaluation.encounter_cost,
+                    detour_cost=evaluation.detour_cost,
+                    # The route evaluator already has the best available
+                    # proxy for trainer preparation value: known type
+                    # coverage and the value of an additional living party
+                    # slot against the next checkpoint. Carry it into the
+                    # portfolio scorer instead of allowing the encounter
+                    # ranking to discard that campaign fact.
+                    training_value=evaluation.trainer_preparation_gain,
+                )
+                for candidate in candidates
+            )
         policy_context = _capture_policy_context(state)
         return max(
             candidates,
@@ -1201,7 +1694,239 @@ def _select_available_campaign_tasks(
 
     def strategic_score(task: CampaignObjective) -> float:
         candidate = strategic_candidate(task)
-        return score_encounter(candidate, _capture_policy_context(state)) if candidate is not None else float("-inf")
+        if candidate is None:
+            return float("-inf")
+        current_level = None
+        if state is not None and state.party.is_known:
+            levels = tuple(
+                int(getattr(member, "level", 0) or 0)
+                for member in (state.party.value or ())
+                if int(getattr(member, "level", 0) or 0) > 0
+            )
+            current_level = max(levels, default=None)
+        return score_portfolio_candidate(
+            candidate,
+            EncounterPortfolioContext(
+                capture=_capture_policy_context(state),
+                current_level=current_level,
+                max_encounters=1,
+            ),
+        )
+
+    def portfolio_task(tasks: tuple[CampaignObjective, ...]):
+        """Select one task from a joint encounter portfolio."""
+
+        nonlocal encounter_portfolio
+
+        entries = []
+        for task in tasks:
+            candidate = strategic_candidate(task)
+            if candidate is not None:
+                entries.append((task, candidate))
+        entries = tuple(entries)
+        if not entries:
+            encounter_portfolio = ()
+            return None, None
+        portfolio_capture_context = _capture_policy_context(state)
+        current_level = None
+        if state is not None and state.party.is_known:
+            levels = tuple(
+                int(getattr(member, "level", 0) or 0)
+                for member in (state.party.value or ())
+                if int(getattr(member, "level", 0) or 0) > 0
+            )
+            current_level = max(levels, default=None)
+        plan = choose_encounter_portfolio(
+            tuple(candidate for _, candidate in entries),
+            EncounterPortfolioContext(
+                capture=portfolio_capture_context,
+                current_level=current_level,
+                # Keep the full ordered frontier available for diagnostics,
+                # while mounting only its first task. The next capture
+                # re-plans because Species Clause history changes the legal
+                # portfolio.
+                max_encounters=max(1, portfolio_capture_context.open_party_slots or 1),
+            ),
+        )
+        task_by_candidate = {candidate: task for task, candidate in entries}
+        portfolio_context = EncounterPortfolioContext(
+            capture=portfolio_capture_context,
+            current_level=current_level,
+            max_encounters=1,
+        )
+        portfolio_rows = []
+        for rank, candidate in enumerate(plan.ordered_candidates, 1):
+            task = task_by_candidate[candidate]
+            evaluation = task.encounter_evaluation
+            portfolio_rows.append(
+                {
+                    "rank": rank,
+                    "task_id": task.objective_id,
+                    "area": candidate.area,
+                    "method": candidate.method.value,
+                    "selected": candidate == plan.selected,
+                    "portfolio_selected": candidate in plan.candidates,
+                    "score": score_portfolio_candidate(candidate, portfolio_context),
+                    "policy": evaluation.recommendation.value if evaluation is not None else "unknown",
+                    "classification": evaluation.classification.value if evaluation is not None else "unknown",
+                    "route_cost": candidate.route_cost,
+                    "detour_cost": candidate.detour_cost,
+                    "trainer_preparation_gain": candidate.training_value,
+                    "species": candidate.species_pool,
+                }
+            )
+        encounter_portfolio = tuple(portfolio_rows)
+        selected = plan.selected
+        if selected is None:
+            return None, None
+        return next(
+            ((task, candidate) for task, candidate in entries if candidate == selected),
+            (None, None),
+        )
+
+    def party_has_open_slot() -> bool:
+        return bool(
+            state is not None
+            and state.party.is_known
+            and len(state.party.value or ()) < 6
+        )
+
+    def nearest_preferred_encounter(tasks: tuple[CampaignObjective, ...]) -> CampaignObjective:
+        return min(
+            tasks,
+            key=lambda task: (
+                task.encounter_evaluation.detour_cost
+                if task.encounter_evaluation and task.encounter_evaluation.detour_cost is not None
+                else float("inf"),
+                task.encounter_evaluation.encounter_cost
+                if task.encounter_evaluation and task.encounter_evaluation.encounter_cost is not None
+                else float("inf"),
+                task.objective_id,
+            ),
+        )
+
+    def finish(objective: CampaignObjective | None, status: ObjectiveStatus, reason: str) -> ObjectiveSelection:
+        """Attach the evidence that explains this frontier decision.
+
+        Encounter selection is intentionally policy-owned by this function.
+        The diagnostics are therefore assembled at the same boundary as the
+        decision instead of asking the console to infer intent from a route
+        table after the fact.
+        """
+
+        selected_id = objective.objective_id if objective is not None else None
+        diagnostics: list[dict[str, object]] = []
+        for task in available:
+            evaluation = task.encounter_evaluation
+            if task.task_kind != "optional" or evaluation is None:
+                continue
+            candidate = strategic_candidate(task)
+            score = strategic_score(task) if candidate is not None else None
+            if task.objective_id == selected_id:
+                task_reason = "selected by the campaign encounter policy"
+            elif not evaluation.executable_now:
+                blockers = ", ".join(evaluation.reachability_blockers) or evaluation.reachability_status.value
+                task_reason = f"skipped because it is not executable now ({blockers})"
+            elif objective is not None and objective.task_kind == "required":
+                if evaluation.recommendation is EncounterRecommendation.DEFER:
+                    task_reason = "deferred because its detour is not worth interrupting required progression"
+                else:
+                    task_reason = "skipped because required progression retained ownership of the route"
+            elif evaluation.recommendation is EncounterRecommendation.DEFER:
+                task_reason = "deferred by encounter policy"
+            else:
+                task_reason = "skipped because another available task ranked higher"
+            diagnostics.append(
+                {
+                    "task_id": task.objective_id,
+                    "selected": task.objective_id == selected_id,
+                    "reason": task_reason,
+                    "classification": evaluation.classification.value,
+                    "recommendation": evaluation.recommendation.value,
+                    "reachability_status": evaluation.reachability_status.value,
+                    "reachability_blockers": evaluation.reachability_blockers,
+                    "route_cost": evaluation.encounter_cost,
+                    "detour_cost": evaluation.detour_cost,
+                    "direct_progression_cost": evaluation.direct_progression_cost,
+                    "via_encounter_cost": evaluation.via_encounter_cost,
+                    "detour_ratio": evaluation.detour_ratio,
+                    "trainer_preparation_gain": evaluation.trainer_preparation_gain,
+                    "trainer_checkpoint_id": evaluation.trainer_checkpoint_id,
+                    "strategic_score": score,
+                    "candidate_method": candidate.method.value if candidate is not None else None,
+                    "candidate_species": candidate.species_pool if candidate is not None else (),
+                    "candidate_training_value": candidate.training_value if candidate is not None else None,
+                }
+            )
+        # The task selector may have evaluated only the narrow executable
+        # subset needed for its branch (for example, the current on-route
+        # encounter). Rebuild a read-only full portfolio for the report so
+        # deferred but legal locations remain visible beside the selected
+        # task. This does not feed back into selection.
+        portfolio_entries = []
+        for task in available:
+            if task.task_kind != "optional" or task.encounter_evaluation is None:
+                continue
+            if not task.encounter_evaluation.executable_now:
+                continue
+            candidate = strategic_candidate(task)
+            if candidate is not None:
+                portfolio_entries.append((task, candidate))
+        display_portfolio = encounter_portfolio
+        if portfolio_entries:
+            capture_context = _capture_policy_context(state)
+            current_level = None
+            if state is not None and state.party.is_known:
+                levels = tuple(
+                    int(getattr(member, "level", 0) or 0)
+                    for member in (state.party.value or ())
+                    if int(getattr(member, "level", 0) or 0) > 0
+                )
+                current_level = max(levels, default=None)
+            display_context = EncounterPortfolioContext(
+                capture=capture_context,
+                current_level=current_level,
+                max_encounters=None,
+            )
+            task_by_candidate = {candidate: task for task, candidate in portfolio_entries}
+            display_plan = choose_encounter_portfolio(
+                tuple(candidate for _, candidate in portfolio_entries),
+                display_context,
+            )
+            decision_ids = {
+                str(detail.get("task_id"))
+                for detail in encounter_portfolio
+                if isinstance(detail, dict)
+            }
+            display_rows = []
+            for rank, candidate in enumerate(display_plan.ordered_candidates, 1):
+                task = task_by_candidate[candidate]
+                evaluation = task.encounter_evaluation
+                display_rows.append(
+                    {
+                        "rank": rank,
+                        "task_id": task.objective_id,
+                        "area": candidate.area,
+                        "method": candidate.method.value,
+                        "selected": task.objective_id == selected_id,
+                        "portfolio_selected": task.objective_id in decision_ids,
+                        "score": score_portfolio_candidate(candidate, display_context),
+                        "policy": evaluation.recommendation.value if evaluation is not None else "unknown",
+                        "classification": evaluation.classification.value if evaluation is not None else "unknown",
+                        "route_cost": candidate.route_cost,
+                        "detour_cost": candidate.detour_cost,
+                        "trainer_preparation_gain": candidate.training_value,
+                        "species": candidate.species_pool,
+                    }
+                )
+            display_portfolio = tuple(display_rows)
+        return ObjectiveSelection(
+            objective,
+            status,
+            reason,
+            selection_diagnostics=tuple(diagnostics),
+            encounter_portfolio=display_portfolio,
+        )
 
     # Restocking is an explicit resource interrupt. It must take ownership
     # immediately when it is available, even if an encounter or story task
@@ -1217,22 +1942,114 @@ def _select_available_campaign_tasks(
             if restock.objective_id == "restock_recovery_items"
             else "selected required Poké Ball restock task"
         )
-        return ObjectiveSelection(restock, ObjectiveStatus.READY, reason)
+        return finish(restock, ObjectiveStatus.READY, reason)
 
-    if strategic_optional and required:
-        selected_optional = max(strategic_optional, key=lambda item: (strategic_score(item), item.objective_id))
-        selected_candidate = strategic_candidate(selected_optional)
-        if selected_candidate is not None and strategic_score(selected_optional) > 0:
-            return ObjectiveSelection(
+    progression_anchor, _ = progression_destination(available)
+    raw_map = getattr(state, "raw_map", None) if state is not None else None
+    current_map = (
+        getattr(raw_map, "value", None)
+        if raw_map is not None and getattr(raw_map, "is_known", False)
+        else None
+    )
+    # When the live party is already on a zero-detour map immediately before
+    # the next required map, evaluate that encounter in the same portfolio as
+    # the required-map encounter. This is the Route 104 -> Petalburg Woods
+    # boundary: consuming Route 104 first preserves a legal party slot and
+    # avoids treating the woods encounter as an exclusive side quest.
+    progression_encounters = tuple(
+        task
+        for task in available
+        if task.task_kind == "optional"
+        and task.encounter_evaluation is not None
+        and task.encounter_evaluation.executable_now
+        and task.encounter_evaluation.recommendation
+        in {EncounterRecommendation.PREFER, EncounterRecommendation.DEFER}
+        and (
+            task.destination == progression_anchor
+            or (
+                current_map is not None
+                and task.destination == current_map
+                and task.encounter_evaluation.detour_cost == 0
+            )
+        )
+    )
+    if party_has_open_slot() and progression_encounters:
+        selected_optional, selected_candidate = portfolio_task(progression_encounters)
+        if selected_candidate is not None:
+            return finish(
                 replace(selected_optional, encounter_method=selected_candidate.method),
                 ObjectiveStatus.READY,
-                "selected strategic encounter before required progression",
+                "selected encounter on the current required progression map",
             )
+
+    # An encounter already on the map the campaign is traversing does not
+    # create the kind of detour that DEFER normally describes.  This is the
+    # Route 102/Calvin case: if the party has room and is already there, take
+    # the legal encounter before walking into the mandatory checkpoint.
+    current_map_encounters = tuple(
+        task
+        for task in available
+        if (
+            party_has_open_slot()
+            and current_map is not None
+            and task.task_kind == "optional"
+            and task.destination == current_map
+            and task.encounter_evaluation is not None
+            and task.encounter_evaluation.executable_now
+            and strategic_candidate(task) is not None
+            and strategic_score(task) > 0
+        )
+    )
+    if current_map_encounters:
+        selected_optional, selected_candidate = portfolio_task(current_map_encounters)
+        if selected_candidate is not None:
+            return finish(
+                replace(selected_optional, encounter_method=selected_candidate.method),
+                ObjectiveStatus.READY,
+                "selected encounter on the current required progression map",
+            )
+
+    # The same portfolio now ranks on-route, small-detour, and legal large-
+    # detour encounters together.  Route cost, level fit, species-clause
+    # conditioning, trainer preparation value, and party capacity are priced
+    # by the capture policy instead of being split across mutually exclusive
+    # selector branches.
+    if party_has_open_slot() and strategic_optional:
+        selected_optional, selected_candidate = portfolio_task(strategic_optional)
+        if selected_candidate is not None:
+            evaluation = selected_optional.encounter_evaluation
+            if evaluation is not None and evaluation.trainer_preparation_gain > 0:
+                reason = (
+                    "selected encounter detour to improve odds against "
+                    f"{evaluation.trainer_checkpoint_id}"
+                )
+            elif evaluation is not None and evaluation.recommendation is EncounterRecommendation.DEFER:
+                reason = (
+                    "selected deferred encounter from the legal encounter portfolio"
+                    if required
+                    else "selected deferred encounter because no required task is executable"
+                )
+            else:
+                reason = (
+                    "selected nearest on-route encounter while party has an open slot"
+                    if all(
+                        task.encounter_evaluation.recommendation is EncounterRecommendation.PREFER
+                        for task in strategic_optional
+                        if task.encounter_evaluation is not None
+                    )
+                    else "selected strategic encounter from the legal encounter portfolio"
+                )
+            return finish(
+                replace(selected_optional, encounter_method=selected_candidate.method),
+                ObjectiveStatus.READY,
+                reason,
+            )
+
     if required:
-        # Required progression remains the primary task. Preferred encounter
-        # work is retained on the same discovery result as opportunistic work.
+        # Required progression is the executable fallback when no encounter
+        # has enough utility, capacity, or route safety to own the frontier.
         task = required[0]
-        return ObjectiveSelection(task, ObjectiveStatus.READY, "selected required campaign progression task")
+        return finish(task, ObjectiveStatus.READY, "selected required campaign progression task")
     selectable = tuple(
         task
         for task in available
@@ -1263,7 +2080,7 @@ def _select_available_campaign_tasks(
         candidate = strategic_candidate(task)
         if candidate is not None:
             task = replace(task, encounter_method=candidate.method)
-        return ObjectiveSelection(
+        return finish(
             task,
             ObjectiveStatus.READY,
             (
@@ -1273,7 +2090,7 @@ def _select_available_campaign_tasks(
                 else "selected deferred encounter because no required task is executable"
             ),
         )
-    return ObjectiveSelection(None, ObjectiveStatus.COMPLETE, "no campaign task is currently available")
+    return finish(None, ObjectiveStatus.COMPLETE, "no campaign task is currently available")
 
 
 def _capture_policy_context(state: CampaignState | None = None) -> CapturePolicyContext:
@@ -1284,7 +2101,11 @@ def _capture_policy_context(state: CampaignState | None = None) -> CapturePolicy
     """
 
     team_types: set[str] = set()
+    captured_species: frozenset[str] = frozenset()
+    open_party_slots: int | None = None
+    species_clause_enabled = False
     if state is not None and state.party.is_known:
+        open_party_slots = max(0, 6 - len(state.party.value or ()))
         from modules.pokemon import get_species_by_name
 
         for member in state.party.value or ():
@@ -1292,9 +2113,17 @@ def _capture_policy_context(state: CampaignState | None = None) -> CapturePolicy
                 team_types.update(type_.name.lower() for type_ in get_species_by_name(member.species).types)
             except (KeyError, AttributeError, RuntimeError, TypeError, ValueError):
                 continue
+    if state is not None:
+        species_clause_enabled = bool(getattr(state, "species_clause_enabled", False))
+        captured_fact = getattr(state, "captured_species", None)
+        if captured_fact is not None and captured_fact.is_known:
+            captured_species = frozenset(captured_fact.value or ())
     return CapturePolicyContext(
         boss_weakness_types=frozenset({"grass", "water", "fighting", "ground", "steel"}),
         team_types=frozenset(team_types),
+        species_clause_enabled=species_clause_enabled,
+        captured_species=captured_species,
+        open_party_slots=open_party_slots,
     )
 
 
@@ -1344,6 +2173,7 @@ def campaign_planning_signature(state: CampaignState) -> tuple[object, ...]:
                         encounter.location,
                         encounter.status,
                         encounter.eligible,
+                        encounter.species,
                     )
                     for encounter in state.encounters.value or ()
                 )
@@ -1363,6 +2193,8 @@ def campaign_planning_signature(state: CampaignState) -> tuple[object, ...]:
         party_signature,
         encounter_signature,
         campaign_fact_signature,
+        fact_signature(state.captured_species),
+        state.species_clause_enabled,
         getattr(state.campaign_lifecycle, "value", state.campaign_lifecycle),
     )
 
@@ -1380,7 +2212,19 @@ def select_available_campaign_task(
 
     available = available_campaign_tasks(state, tasks, encounter_locations)
     selection = _select_available_campaign_tasks(available, state)
-    return replace(selection, frontier_objective_ids=tuple(task.objective_id for task in available))
+    # Keep the full discovered set available to the policy so a deferred
+    # encounter can become valuable after a capability/story transition. The
+    # human-facing frontier should describe immediate locations only; future
+    # encounter locations otherwise make an early-game run look as though it
+    # has executable choices that the route model explicitly rejected.
+    visible = tuple(
+        task.objective_id
+        for task in available
+        if task.task_kind != "optional"
+        or task.encounter_evaluation is None
+        or task.encounter_evaluation.executable_now
+    )
+    return replace(selection, frontier_objective_ids=visible)
 
 
 def campaign_frontier_summary(
@@ -1437,13 +2281,19 @@ def campaign_task_diagnostics(
     # discovery pass performs route and encounter analysis; recomputing it
     # here doubled that cost on every controller refresh.
     selection = _select_available_campaign_tasks(available, state)
+    selection_details = {
+        detail["task_id"]: detail
+        for detail in selection.selection_diagnostics
+        if isinstance(detail, dict) and "task_id" in detail
+    }
     preferred = sorted(
         (
-            task
-            for task in available
-            if task.task_kind == "optional"
-            and task.encounter_evaluation is not None
-            and task.encounter_evaluation.recommendation is EncounterRecommendation.PREFER
+        task
+        for task in available
+        if task.task_kind == "optional"
+        and task.encounter_evaluation is not None
+        and task.encounter_evaluation.executable_now
+        and task.encounter_evaluation.recommendation is EncounterRecommendation.PREFER
         ),
         key=lambda item: (
             item.encounter_evaluation.detour_cost,
@@ -1499,6 +2349,10 @@ def campaign_task_diagnostics(
                         "via_encounter_cost": task.encounter_evaluation.via_encounter_cost,
                         "detour_cost": task.encounter_evaluation.detour_cost,
                         "detour_ratio": task.encounter_evaluation.detour_ratio,
+                        "trainer_preparation_gain": task.encounter_evaluation.trainer_preparation_gain,
+                        "trainer_checkpoint_id": task.encounter_evaluation.trainer_checkpoint_id,
+                        "reachability_status": task.encounter_evaluation.reachability_status.value,
+                        "reachability_blockers": task.encounter_evaluation.reachability_blockers,
                     }
                     if task.encounter_evaluation
                     else None
@@ -1510,6 +2364,7 @@ def campaign_task_diagnostics(
                     and selection.objective.encounter_method is not None
                     else None
                 ),
+                "selection_diagnostic": selection_details.get(task.objective_id),
             }
         )
     return tuple(rows)
@@ -1651,13 +2506,18 @@ def plan_campaign(
             f"campaign goal {target.goal_id} is complete",
         )
 
-    # Restocking is a mutable-resource interrupt, not a prerequisite encoded
-    # into every future encounter objective.  Campaign Progression mounts this
-    # dependency-aware planner directly, so it must see the interrupt here as
-    # well as through the available-task compatibility selector. Without this
-    # early return the recursive story frontier can keep the bot travelling
-    # while encounter tasks are correctly suppressed by the low reserve.
-    if objectives is None and _recovery_restock_is_required(state):
+    # Recovery restocking is a mutable-resource interrupt, not a prerequisite
+    # encoded into every future objective. Campaign Progression mounts this
+    # dependency-aware planner directly, so it must see the safety interrupt
+    # here as well as through the available-task compatibility selector.
+    # Poké Ball restocking is deliberately gated later, after route encounter
+    # evaluation, because a low reserve alone does not justify a Mart detour.
+    if (
+        objectives is None
+        and _recovery_restock_is_required(state)
+        and not _active_story_scene_blocks_restock(state)
+        and not _restock_is_deferred_on_current_map(state, "restock_recovery_items")
+    ):
         restock = restock_recovery_items_objective()
         diagnostic_print(
             lambda: (
@@ -1673,24 +2533,33 @@ def plan_campaign(
             ObjectiveStatus.READY,
             "selected required recovery-item restock task",
         )
-    if objectives is None and _restock_is_required(state):
+    if (
+        objectives is None
+        and _restock_is_required(state)
+        and not _active_story_scene_blocks_restock(state)
+        and not _restock_is_deferred_on_current_map(state, "restock_pokeballs")
+        and _pokeball_restock_is_warranted(state)
+    ):
+        # This interrupt must be checked before dependency recursion. The
+        # ordinary story graph can reach the parent Wally/Woods objective
+        # before its shared optional frontier is consulted, which used to
+        # mount story travel with too few balls even though discovery had
+        # already exposed the Mart task.
         restock = restock_pokeballs_objective()
         diagnostic_print(
             lambda: (
-                "CAMPAIGN_RESTOCK_DECISION: "
+                "CAMPAIGN_POKEBALL_RESTOCK_DECISION: "
                 f"selected=True objective={restock.objective_id!r} "
-                f"pokeball_count={_observed_pokeball_count(state)!r} "
-                f"reason='reserve below lower threshold'"
+                "reason='planned encounter requires reserve before dependency recursion'"
             ),
             trace=True,
-            prefix="CAMPAIGN_RESTOCK_DECISION",
+            prefix="CAMPAIGN_POKEBALL_RESTOCK_DECISION",
         )
         return ObjectiveSelection(
             restock,
             ObjectiveStatus.READY,
             "selected required Poké Ball restock task",
         )
-
     visiting: set[str] = set()
 
     def resolve(objective: CampaignObjective) -> ObjectiveSelection:
@@ -1785,6 +2654,8 @@ def plan_campaign(
                 ObjectiveStatus.READY,
                 f"resolved executable frontier for campaign goal {target.goal_id}",
                 frontier.frontier_objective_ids,
+                frontier.selection_diagnostics,
+                frontier.encounter_portfolio,
             )
         finally:
             visiting.remove(objective.objective_id)

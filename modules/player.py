@@ -334,7 +334,13 @@ def player_avatar_is_controllable() -> bool:
     # RSE uses Task_ExitDoor/sub_8080B9C for animated exits, while house
     # warps use Task_ExitNonAnimDoor.  The latter still owns the post-warp
     # movement/transition and must be allowed to finish before navigation.
-    if task_is_active("Task_ExitDoor") or task_is_active("sub_8080B9C") or task_is_active("Task_ExitNonAnimDoor"):
+    if (
+        task_is_active("Task_WarpAndLoadMap")
+        or task_is_active("Task_ExitDoor")
+        or task_is_active("sub_8080B9C")
+        or task_is_active("Task_ExitNonAnimDoor")
+        or task_is_active("Task_ExitNonDoor")
+    ):
         return False
 
     return True

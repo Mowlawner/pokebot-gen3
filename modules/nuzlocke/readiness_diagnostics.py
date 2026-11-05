@@ -27,9 +27,10 @@ class Availability(Enum):
 
 
 class ReadinessDecision(Enum):
-    """Pure first-stage decision for continuing or recovering."""
+    """Pure first-stage decision for continuing, preparing, or recovering."""
 
     CONTINUE = "CONTINUE"
+    PREPARE = "PREPARE"
     RECOVER = "RECOVER"
     UNKNOWN = "UNKNOWN"
 
@@ -46,12 +47,17 @@ class ReadinessReason(Enum):
     RECOVERY_CAPABILITY_UNKNOWN = "RECOVERY_CAPABILITY_UNKNOWN"
     FAINTED_PARTY_MEMBER = "FAINTED_PARTY_MEMBER"
     POISONED_PARTY = "POISONED_PARTY"
+    STATUS_CONDITION = "STATUS_CONDITION"
     NO_IMMINENT_TRAINER = "NO_IMMINENT_TRAINER"
     PARTY_HEALTHY = "PARTY_HEALTHY"
     OVERWORLD_UNAVAILABLE = "OVERWORLD_UNAVAILABLE"
     RESOURCE_INFORMATION_UNKNOWN = "RESOURCE_INFORMATION_UNKNOWN"
     OPPORTUNISTIC_ROUTE_UNAVAILABLE = "OPPORTUNISTIC_ROUTE_UNAVAILABLE"
     OPPORTUNISTIC_ROUTE_NOT_WITHIN_THRESHOLD = "OPPORTUNISTIC_ROUTE_NOT_WITHIN_THRESHOLD"
+    TRAINER_BATTLE_UNREADY = "TRAINER_BATTLE_UNREADY"
+    TRAINER_BATTLE_UNKNOWN = "TRAINER_BATTLE_UNKNOWN"
+    TRAINER_ROSTER_CHANGE = "TRAINER_ROSTER_CHANGE"
+    TRAINER_PREPARATION_CEILING = "TRAINER_PREPARATION_CEILING"
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +131,25 @@ class ProgressionReadinessDiagnostic:
     # campaign in UNKNOWN / OPPORTUNISTIC_ROUTE_UNAVAILABLE.
     route_analysis_timed_out: bool = False
     resource_snapshot: ResourceSnapshot | None = None
+    trainer_checkpoint: Any = None
+    trainer_readiness: Any = None
+    # True when the selected route or explicit tactical goal is expected to
+    # expose an undefeated trainer before the next readiness boundary. This
+    # is separate from ``navigation_goal`` because a normal map traversal can
+    # encounter a trainer without being represented as EngageTrainer.
+    trainer_engagement_required: bool = False
+    # Per-trainer route risk evidence. This remains available even when the
+    # selected route successfully avoids every trainer.
+    trainer_risks: tuple = ()
+    # Encounter-stage AVOID/IGNORE evidence is retained separately from the
+    # generic route analyzer because the stage owner may discover the choke
+    # point only after its first tactical probe returns.
+    encounter_stage: Any = None
+    # When preparation stops at the intentional trainer ceiling, retain the
+    # levels that justified the handoff so console and trace diagnostics can
+    # distinguish it from an unexplained end to training.
+    preparation_current_level: int | None = None
+    preparation_ceiling_level: int | None = None
 
     @property
     def party_count(self) -> int | None:
@@ -159,6 +184,20 @@ class ProgressionReadinessDiagnostic:
             else None
         )
 
+    @property
+    def needs_status_recovery(self) -> bool:
+        """Return whether a living observed member has a curable status."""
+
+        party_needs_recovery = any(
+            _status_is_curable(member.status)
+            for member in self.party
+            if member.usable
+        )
+        resource_needs_recovery = bool(
+            self.resource_snapshot and self.resource_snapshot.needs_status_recovery
+        )
+        return party_needs_recovery or resource_needs_recovery
+
     def as_dict(self) -> dict[str, Any]:
         """Return deterministic, emulator-independent trace data."""
         value = asdict(self)
@@ -183,6 +222,8 @@ class ProgressionReadinessDiagnostic:
         value["recovery"] = repr(self.recovery)
         value["readiness_decision"] = self.readiness_decision.value if self.readiness_decision else None
         value["readiness_reason"] = self.readiness_reason.value if self.readiness_reason else None
+        value["trainer_checkpoint"] = repr(self.trainer_checkpoint)
+        value["trainer_readiness"] = repr(self.trainer_readiness)
         return value
 
 
@@ -208,15 +249,31 @@ class ReadinessScheduleState:
 class ReadinessObservationScheduler:
     """Small bounded scheduler for expensive readiness observations."""
 
-    def __init__(self, provider, cheap_context, *, max_age_ticks: int = 15, unknown_max_age_ticks: int = 90):
+    def __init__(
+        self,
+        provider,
+        cheap_context,
+        *,
+        max_age_ticks: int = 15,
+        unknown_max_age_ticks: int = 90,
+        transient_context=None,
+    ):
         """Create a bounded scheduler around expensive readiness observations."""
 
         self._provider = provider
         self._cheap_context = cheap_context
+        # Stable readiness is deliberately coordinate-free so walking does
+        # not repeatedly run the expensive recovery analysis.  Transient
+        # unavailable observations need a narrower boundary: a result read
+        # during a map warp must not survive until the avatar is standing on
+        # a valid overworld tile.  The optional callback supplies that cheap,
+        # live boundary without changing the stable cache key.
+        self._transient_context = transient_context
         self._max_age_ticks = max_age_ticks
         self._unknown_max_age_ticks = max(max_age_ticks, unknown_max_age_ticks)
         self._cached: ProgressionReadinessDiagnostic | None = None
         self._cached_key = None
+        self._cached_transient_context = None
         self._age = None
         self._tick_count = 0
         self._refresh_count = 0
@@ -230,6 +287,7 @@ class ReadinessObservationScheduler:
 
         self._cached = None
         self._cached_key = None
+        self._cached_transient_context = None
         self._age = None
         self._invalidation_reason = reason
         self._transient_result = None
@@ -241,14 +299,22 @@ class ReadinessObservationScheduler:
         Party/resource transitions are represented by the cheap context key
         supplied by Campaign Progression, while battle and recovery
         boundaries call :meth:`invalidate` explicitly. A frame-age timeout is
-        intentionally not a correctness boundary: walking does not change
-        readiness, and periodic synchronous re-evaluation was the source of
-        avoidable post-battle stalls.
+        intentionally not a correctness boundary for stable observations:
+        walking does not change readiness, and periodic synchronous
+        re-evaluation was the source of avoidable post-battle stalls.
+        Transient unavailable observations use the live boundary callback
+        above so a map warp cannot strand the controller on stale data.
         """
 
         self._tick_count += 1
         cheap = self._cheap_context()
         key = (getattr(objective, "objective_id", None), repr(goal), cheap)
+        transient_context = None
+        if self._cached is not None and _readiness_observation_is_transient(self._cached):
+            try:
+                transient_context = self._transient_context() if self._transient_context is not None else None
+            except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+                transient_context = None
         if self._cached is None and self._transient_result is not None and self._tick_count < self._retry_after_tick:
             self._last_observation_was_cache_hit = True
             return self._transient_result
@@ -256,6 +322,19 @@ class ReadinessObservationScheduler:
             self._cached is not None
             and self._cached_key == key
         )
+        cache_miss_reason = None
+        if can_reuse and _readiness_observation_is_transient(self._cached):
+            if self._transient_context is not None:
+                can_reuse = self._cached_transient_context == transient_context
+                if not can_reuse:
+                    cache_miss_reason = "transient_context_changed"
+            else:
+                # Lightweight embedders may not have a live coordinate
+                # callback. Keep their historical behavior bounded rather
+                # than allowing an unavailable result to live forever.
+                can_reuse = self._age < self._unknown_max_age_ticks
+                if not can_reuse:
+                    cache_miss_reason = "transient_cache_expired"
         self._last_observation_was_cache_hit = can_reuse
         if can_reuse:
             self._age += 1
@@ -264,7 +343,11 @@ class ReadinessObservationScheduler:
             # movement and are not useful boundary diagnostics.
             return self._cached
         diagnostic_print(
-            lambda: f"READINESS_SCHEDULER_REFRESH: cache=miss tick={self._tick_count} objective={getattr(objective, 'objective_id', None)!r}",
+            lambda: (
+                "READINESS_SCHEDULER_REFRESH: "
+                f"cache=miss tick={self._tick_count} objective={getattr(objective, 'objective_id', None)!r} "
+                f"reason={cache_miss_reason!r}"
+            ),
             trace=True,
             prefix="READINESS_SCHEDULER_REFRESH",
         )
@@ -276,6 +359,7 @@ class ReadinessObservationScheduler:
             # otherwise strand readiness in UNKNOWN forever.
             self._cached = None
             self._cached_key = None
+            self._cached_transient_context = None
             self._age = None
             self._invalidation_reason = "calculation_pending"
             self._refresh_count += 1
@@ -287,6 +371,7 @@ class ReadinessObservationScheduler:
             # with a bounded cooldown rather than a per-frame busy loop.
             self._cached = None
             self._cached_key = None
+            self._cached_transient_context = None
             self._age = None
             self._transient_result = result
             self._retry_after_tick = self._tick_count + 60
@@ -295,18 +380,22 @@ class ReadinessObservationScheduler:
             return result
         self._cached = result
         self._cached_key = key
+        if _readiness_observation_is_transient(result) and self._transient_context is not None:
+            try:
+                self._cached_transient_context = self._transient_context()
+            except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+                self._cached_transient_context = None
+        else:
+            self._cached_transient_context = None
         self._age = 0
         self._refresh_count += 1
         self._invalidation_reason = None
         self._transient_result = None
         self._retry_after_tick = 0
-        # An unavailable observation is still a useful synchronization result:
-        # it tells the controller to keep campaign ownership while a battle,
-        # script, or warp settles.  Dropping it here causes the controller to
-        # repeat all ROM reads on every frame of a long scripted sequence,
-        # which can reduce the emulator to a crawl. Semantic context changes
-        # and explicit lifecycle invalidation provide the re-observation
-        # boundaries instead of a blind frame-age timeout.
+        # An unavailable observation is still a useful synchronization result
+        # while a battle, script, or warp settles. It is cached briefly, but
+        # the live transient context above prevents a warp-time coordinate
+        # from being reused after the avatar reaches the next map tile.
         return result
 
     @property
@@ -333,12 +422,13 @@ class ReadinessObservationScheduler:
 
 def _readiness_observation_is_transient(value) -> bool:
     """Return whether a cached observation lacks a stable decision input."""
-    if not isinstance(value, ProgressionReadinessDiagnostic):
-        return False
-    return any(
-        getattr(value, field, Availability.UNKNOWN) is not Availability.KNOWN
-        for field in ("overworld_availability", "resource_availability", "party_availability")
-    )
+    for field in ("overworld_availability", "resource_availability", "party_availability"):
+        availability = getattr(value, field, None)
+        if availability is None:
+            continue
+        if getattr(availability, "value", availability) != Availability.KNOWN.value:
+            return True
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,11 +436,72 @@ class CampaignReadinessPolicy:
     """Pure first-stage progression policy; it performs no recovery action."""
 
     critical_hp_ratio: float = 0.25
+    # Training for a boss exposes the party to repeated trainer battles. Keep
+    # a larger health margin for that objective so one damaged member cannot
+    # enter the next fight at a survivability boundary.
+    boss_preparation_hp_ratio: float = 0.5
+    # Status conditions other than poison impair battle reliability. Use a
+    # higher floor for them, while allowing a healthy paralyzed/burned/frozen
+    # member to continue toward the current objective.
+    status_hp_ratio: float = 0.5
     # Reuse the existing important-objective minimum-health concept for
     # opportunistic recovery, but only when a nearby Center makes recovery a
     # small tactical detour rather than a general healing mandate.
     opportunistic_hp_ratio: float = 0.75
     opportunistic_detour_threshold: int = 50
+    # Some exposed routes deserve a deliberate recovery margin before the
+    # ordinary global critical threshold. Petalburg Woods is the first such
+    # area: its route and wild encounters make a half-health party member a
+    # recovery concern even when the next battle is not yet visible.
+    high_risk_area_hp_ratios: tuple[tuple[object, float], ...] = (((24, 11), 0.51),)
+    # A route may be able to avoid a trainer while the detour is still so
+    # large that treating the battle as optional creates worse campaign
+    # behavior.  Cheap and moderate detours remain preferred avoidance; this
+    # threshold promotes only the high-cost route cases to deliberate
+    # preparation and engagement.
+    trainer_risk_prepare_at: str = "practically_unavoidable"
+    _RESTOCK_OBJECTIVE_IDS = frozenset(
+        {
+            "restock_pokeballs",
+            "restock_recovery_items",
+        }
+    )
+
+    _TRAINER_RISK_ORDER = {
+        "avoidable": 0,
+        "costly": 1,
+        "practically_unavoidable": 2,
+        "unavoidable": 3,
+        "imminent": 4,
+    }
+
+    def trainer_risk_requires_engagement(self, risk) -> bool:
+        """Return whether route risk justifies mounting trainer preparation."""
+
+        avoidability = getattr(getattr(risk, "avoidability", None), "value", None)
+        threshold_name = getattr(self.trainer_risk_prepare_at, "value", self.trainer_risk_prepare_at)
+        threshold = self._TRAINER_RISK_ORDER.get(threshold_name)
+        value = self._TRAINER_RISK_ORDER.get(avoidability)
+        return threshold is not None and value is not None and value >= threshold
+
+    def critical_hp_ratio_for(self, objective_id: str | None, current_map=None) -> float:
+        """Return the critical HP threshold for the active campaign objective."""
+
+        base_threshold = self.critical_hp_ratio
+        if isinstance(objective_id, str) and objective_id.startswith("prepare_"):
+            base_threshold = self.boss_preparation_hp_ratio
+        normalized_map = getattr(current_map, "value", current_map)
+        for configured_map, threshold in self.high_risk_area_hp_ratios:
+            if normalized_map == getattr(configured_map, "value", configured_map):
+                return max(base_threshold, threshold)
+        return base_threshold
+
+    def status_hp_ratio_for(self, objective_id: str | None) -> float:
+        """Return the HP floor at which non-poison status becomes urgent."""
+
+        if isinstance(objective_id, str) and objective_id.startswith("prepare_"):
+            return max(self.status_hp_ratio, self.boss_preparation_hp_ratio)
+        return self.status_hp_ratio
 
     def evaluate(self, readiness: ProgressionReadinessDiagnostic) -> ReadinessResult:
         """Choose continue, recover, or unknown from observed readiness facts."""
@@ -358,7 +509,17 @@ class CampaignReadinessPolicy:
         evaluation_id = id(readiness)
         recovery = getattr(readiness, "recovery", None)
         lowest_hp_ratio = getattr(readiness, "lowest_hp_ratio", None)
-        critical = lowest_hp_ratio is not None and lowest_hp_ratio < self.critical_hp_ratio
+        critical_threshold = self.critical_hp_ratio_for(
+            getattr(readiness, "objective_id", None), getattr(readiness, "current_map", None)
+        )
+        status_threshold = self.status_hp_ratio_for(getattr(readiness, "objective_id", None))
+        critical = lowest_hp_ratio is not None and lowest_hp_ratio < critical_threshold
+        # Restocking owns the route through the Mart, including purchase
+        # confirmations and the clerk's exit dialogue. Do not turn ordinary
+        # damage into an opportunistic Center detour before that transaction
+        # has completed. Critical HP, poison, fainted members, and urgent
+        # status recovery are handled above and remain authoritative.
+        restock_transaction_active = getattr(readiness, "objective_id", None) in self._RESTOCK_OBJECTIVE_IDS
         opportunistic_threshold = lowest_hp_ratio is not None and lowest_hp_ratio <= self.opportunistic_hp_ratio
         recovery_known = getattr(readiness, "recovery_availability", Availability.UNKNOWN) is Availability.KNOWN
         center_available = bool(recovery and recovery.center_available)
@@ -369,7 +530,8 @@ class CampaignReadinessPolicy:
                 "READINESS_POLICY_BEFORE: "
                 f"evaluation_id={evaluation_id} frame={getattr(readiness, 'frame', None)!r} "
                 f"map={getattr(readiness, 'current_map', None)!r} location={getattr(readiness, 'current_coordinates', None)!r} "
-                f"lowest_hp_ratio={lowest_hp_ratio!r} critical_threshold={self.critical_hp_ratio!r} "
+                f"lowest_hp_ratio={lowest_hp_ratio!r} critical_threshold={critical_threshold!r} "
+                f"status_threshold={status_threshold!r} "
                 f"opportunistic_threshold={self.opportunistic_hp_ratio!r} critical={critical} "
                 f"imminent_trainer={imminent} recovery_availability_known={recovery_known} "
                 f"center_available={center_available} center_safe={center_safe} "
@@ -397,7 +559,7 @@ class CampaignReadinessPolicy:
         if getattr(readiness, "fainted_count", None) > 0:
             return self._recovery_result(readiness, ReadinessReason.FAINTED_PARTY_MEMBER)
         if any(
-            (getattr(member, "status", None) or "none") in {"poisoned", "badly poisoned", "poison", "bad_poison"}
+            _status_is_poison(getattr(member, "status", None))
             for member in getattr(readiness, "party", ())
             if not getattr(member, "fainted", False)
         ):
@@ -406,18 +568,167 @@ class CampaignReadinessPolicy:
             # HP is still high; waiting for the ordinary HP threshold can
             # consume the last safe steps before the Center.
             return self._recovery_result(readiness, ReadinessReason.POISONED_PARTY)
+        if (
+            getattr(readiness, "needs_status_recovery", False)
+            and readiness.lowest_hp_ratio is not None
+            and readiness.lowest_hp_ratio < status_threshold
+        ):
+            return self._recovery_result(readiness, ReadinessReason.STATUS_CONDITION)
         if getattr(readiness, "lowest_hp_ratio", None) is None:
             return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.PARTY_INFORMATION_UNKNOWN)
 
-        critical = readiness.lowest_hp_ratio < self.critical_hp_ratio
+        critical = readiness.lowest_hp_ratio < critical_threshold
         if critical:
             return self._recovery_result(readiness, ReadinessReason.CRITICAL_PARTY_HP)
+        trainer_readiness = getattr(readiness, "trainer_readiness", None)
+        trainer_targeted = (
+            _is_trainer_engagement_goal(getattr(readiness, "navigation_goal", None))
+            or getattr(readiness, "trainer_engagement_required", False)
+        )
+        # A known trainer supplies a modeled health floor. The generic 25%
+        # emergency threshold is intentionally too late for a party member
+        # that may need to absorb a switch response or serve as a reserve
+        # after the first member has taken damage. Use the checkpoint's
+        # readiness requirement when the route exposes one, while still
+        # requiring the recovery route to be safe and within the configured
+        # detour budget.
+        modeled_trainer_floor = getattr(trainer_readiness, "required_hp_ratio", None)
+        trainer_margin_needed = (
+            trainer_targeted
+            and getattr(readiness, "trainer_checkpoint", None) is not None
+            and isinstance(modeled_trainer_floor, (int, float))
+            and not isinstance(modeled_trainer_floor, bool)
+            and lowest_hp_ratio is not None
+            and lowest_hp_ratio < max(critical_threshold, float(modeled_trainer_floor))
+        )
+        if trainer_margin_needed and not restock_transaction_active:
+            # A known trainer health floor is a safety requirement, not an
+            # opportunistic preference.  Route composition may still be
+            # pending at the exact frame where a trainer objective is
+            # remounted.  Waiting for that optional comparison used to let
+            # the controller fall through to CONTINUE and walk into the
+            # battle at 9 HP.  _recovery_result deliberately converts an
+            # incomplete recovery capability into UNKNOWN, which keeps the
+            # trainer objective mounted until a safe recovery route is known.
+            return self._recovery_result(readiness, ReadinessReason.OPPORTUNISTIC_RECOVERY)
+        # The recovery worker has already produced an executable, trainer-safe
+        # route.  That route is a valid safety decision in its own right; do
+        # not hold the campaign owner in UNKNOWN while an advisory parent
+        # route comparison searches for a cheaper continuation.  The parent
+        # objective is deliberately replanned after healing.
+        if (
+            opportunistic_threshold
+            and not restock_transaction_active
+            and getattr(readiness, "targetless", False)
+            and self._completed_recovery_route_available(readiness)
+        ):
+            diagnostic_print(
+                lambda: (
+                    "OPPORTUNISTIC_HEAL_ROUTE_ACCEPTED: "
+                    f"targetless={getattr(readiness, 'targetless', False)!r} "
+                    f"destination={getattr(recovery, 'center_location', None)!r} "
+                    f"distance={getattr(recovery, 'distance_to_center', None)!r} "
+                    "reason='completed_safe_route_authoritative'"
+                ),
+                trace=True,
+                prefix="OPPORTUNISTIC_HEAL_ROUTE_ACCEPTED",
+            )
+            return self._recovery_result(readiness, ReadinessReason.OPPORTUNISTIC_RECOVERY)
+        trainer_checkpoint_known = (
+            getattr(readiness, "trainer_checkpoint", None) is not None
+            or getattr(trainer_readiness, "checkpoint_id", None) is not None
+        )
+        if trainer_targeted and (not trainer_checkpoint_known or trainer_readiness is None):
+            # A route that is known to expose a trainer cannot continue on
+            # generic party-health evidence alone.  The checkpoint is the
+            # input that makes preparation, EXP budgeting, and lead selection
+            # possible; without it, readiness must wait for a complete fact
+            # boundary instead of walking into the battle.
+            return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.TRAINER_BATTLE_UNKNOWN)
+        # Route analysis is a campaign-level safety supplement.  The live
+        # tactical navigator continues to validate its route against the
+        # current trainer envelope, so a healthy party can keep walking while
+        # the background comparison is being prepared.  Recovery and explicit
+        # trainer preparation remain blocking decisions above; allowing those
+        # to continue would turn unfinished evidence into unsafe execution.
+        if (
+            getattr(readiness, "route_analysis_pending", False)
+            and not trainer_targeted
+            and not critical
+            and readiness.lowest_hp_ratio is not None
+            and readiness.lowest_hp_ratio > self.opportunistic_hp_ratio
+        ):
+            return ReadinessResult(ReadinessDecision.CONTINUE, ReadinessReason.PARTY_HEALTHY)
+        # Optional recovery and parent-route comparison are advisory while a
+        # tactical owner is already moving.  A pending result must not turn
+        # ordinary damage into a controller-wide wait; critical recovery and
+        # mandatory trainer floors have already returned above.
+        if (
+            (
+                getattr(getattr(readiness, "recovery", None), "calculation_pending", False)
+                or getattr(readiness, "route_analysis_pending", False)
+            )
+            and not trainer_targeted
+            and not imminent
+            and not critical
+        ):
+            return ReadinessResult(ReadinessDecision.CONTINUE, ReadinessReason.OPPORTUNISTIC_ROUTE_UNAVAILABLE)
+        unknown_route_hazard = any(
+            getattr(risk, "confidence", "known") == "unknown"
+            and getattr(risk, "exposed_on_normal_route", False)
+            for risk in getattr(readiness, "trainer_risks", ())
+        )
+        if unknown_route_hazard:
+            # The route analyzer has identified a trainer trigger but cannot
+            # prove its sight-line or defeat state.  This is a route-safety
+            # unknown, distinct from an identified trainer whose battle roster
+            # is unavailable.  Wait for a better observation and let the
+            # controller retry autonomously.
+            return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.TRAINER_HAZARD_UNKNOWN)
+        if trainer_targeted and trainer_readiness is not None:
+            if getattr(trainer_readiness, "roster_action", None) == "withdraw_pc_candidate":
+                return ReadinessResult(ReadinessDecision.PREPARE, ReadinessReason.TRAINER_ROSTER_CHANGE)
+            status = getattr(getattr(trainer_readiness, "status", None), "value", None)
+            if status == "unknown":
+                return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.TRAINER_BATTLE_UNKNOWN)
+            if status == "prepare":
+                # Healing is useful when the party is genuinely hurt, but it
+                # cannot change a healthy party's matchup. Send healthy,
+                # underprepared parties to the bounded training capability so
+                # the same readiness result cannot repeat forever.
+                if (
+                    not restock_transaction_active
+                    and readiness.lowest_hp_ratio is not None
+                    and readiness.lowest_hp_ratio <= self.opportunistic_hp_ratio
+                ):
+                    if self._opportunistic_recovery_available(readiness):
+                        return self._recovery_result(readiness, ReadinessReason.OPPORTUNISTIC_RECOVERY)
+                return ReadinessResult(ReadinessDecision.PREPARE, ReadinessReason.TRAINER_BATTLE_UNREADY)
         # An imminent trainer interaction is part of the active campaign
         # objective.  Do not divert for optional healing immediately before
         # it; critical HP recovery above remains authoritative.
         if readiness.route_analysis is None or readiness.route_analysis.normal_cost is None:
+            if getattr(getattr(readiness, "recovery", None), "calculation_timed_out", False):
+                # The recovery worker can time out while already holding a
+                # valid bounded route to a nearby Center. That route is an
+                # executable fallback and must win over the timeout marker;
+                # otherwise the parent capability is left waiting even though
+                # the safety action has been fully determined.
+                if (
+                    getattr(readiness, "targetless", False)
+                    and readiness.lowest_hp_ratio <= self.opportunistic_hp_ratio
+                    and self._completed_nearby_recovery_available(readiness)
+                ):
+                    return self._recovery_result(readiness, ReadinessReason.OPPORTUNISTIC_RECOVERY)
+                # A failed opportunistic search must never clear the tactical
+                # owner and leave the bot motionless. Critical recovery was
+                # handled above; for this lower-priority case, keep moving and
+                # allow the bounded scheduler to retry at its next boundary.
+                return ReadinessResult(ReadinessDecision.CONTINUE, ReadinessReason.OPPORTUNISTIC_ROUTE_UNAVAILABLE)
             if getattr(readiness, "route_analysis_timed_out", False):
                 if (
+                    getattr(readiness, "targetless", False)
+                    and
                     readiness.lowest_hp_ratio <= self.opportunistic_hp_ratio
                     and center_available
                     and center_safe
@@ -429,7 +740,7 @@ class CampaignReadinessPolicy:
                 # prerequisite. Keep the existing tactical owner moving while
                 # the scheduler retries the bounded worker request.
                 return ReadinessResult(ReadinessDecision.CONTINUE, ReadinessReason.OPPORTUNISTIC_ROUTE_UNAVAILABLE)
-            if readiness.lowest_hp_ratio <= self.opportunistic_hp_ratio:
+            if readiness.lowest_hp_ratio <= self.opportunistic_hp_ratio and not restock_transaction_active:
                 # A completed recovery observation already contains an
                 # executable, trainer-safe route to a nearby healing source.
                 # Normal-vs-recovery composition is useful for deciding
@@ -438,7 +749,10 @@ class CampaignReadinessPolicy:
                 # into an indefinite wait when the parent route is not yet
                 # analyzable. The route object is required here so a mere
                 # catalog/distance hint cannot mount an unexecutable stop.
-                if self._completed_nearby_recovery_available(readiness):
+                if (
+                    getattr(readiness, "targetless", False)
+                    and self._completed_nearby_recovery_available(readiness)
+                ):
                     return self._recovery_result(readiness, ReadinessReason.OPPORTUNISTIC_RECOVERY)
                 # A trainer ahead is a reason to perform this safety check,
                 # not a reason to skip it. A known nearby healing source is
@@ -452,8 +766,10 @@ class CampaignReadinessPolicy:
                     and readiness.recovery.distance_to_center <= self.opportunistic_detour_threshold
                 ):
                     return self._recovery_result(readiness, ReadinessReason.OPPORTUNISTIC_RECOVERY)
-                return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.OPPORTUNISTIC_ROUTE_UNAVAILABLE)
-        elif self._opportunistic_recovery_available(readiness):
+                if imminent or trainer_targeted:
+                    return ReadinessResult(ReadinessDecision.UNKNOWN, ReadinessReason.OPPORTUNISTIC_ROUTE_UNAVAILABLE)
+                return ReadinessResult(ReadinessDecision.CONTINUE, ReadinessReason.OPPORTUNISTIC_ROUTE_UNAVAILABLE)
+        elif not restock_transaction_active and self._opportunistic_recovery_available(readiness):
             return self._recovery_result(readiness, ReadinessReason.OPPORTUNISTIC_RECOVERY)
         if not critical:
             return ReadinessResult(ReadinessDecision.CONTINUE, ReadinessReason.PARTY_HEALTHY)
@@ -468,11 +784,19 @@ class CampaignReadinessPolicy:
             diagnostic_print(
                 lambda: (
                     "OPPORTUNISTIC_HEAL_ANALYSIS: "
-                    f"route_analysis_unavailable completed_recovery_route={self._completed_nearby_recovery_available(readiness)}"
+                    f"route_analysis_unavailable targetless={getattr(readiness, 'targetless', False)!r} "
+                    f"completed_recovery_route={self._completed_nearby_recovery_available(readiness) if getattr(readiness, 'targetless', False) else False}"
                 ),
                 trace=True,
             )
-            return self._completed_nearby_recovery_available(readiness)
+            # A targetful capability needs proof that the outbound route
+            # still reaches its parent destination after the Center visit.
+            # The selected Center route is sufficient only for a targetless
+            # capability, where there is no continuation to preserve.
+            return bool(
+                getattr(readiness, "targetless", False)
+                and self._completed_nearby_recovery_available(readiness)
+            )
         candidates = tuple(
             candidate for candidate in analysis.candidates if candidate.reachable and candidate.detour is not None
         )
@@ -481,7 +805,10 @@ class CampaignReadinessPolicy:
             # already produced a safe executable route. Do not discard that
             # route merely because the parent objective has no comparable
             # continuation (a common boundary near a map entrance).
-            return self._completed_nearby_recovery_available(readiness)
+            return bool(
+                getattr(readiness, "targetless", False)
+                and self._completed_nearby_recovery_available(readiness)
+            )
         selected = (
             min(candidates, key=lambda candidate: (candidate.detour, candidate.total_cost)) if candidates else None
         )
@@ -503,16 +830,22 @@ class CampaignReadinessPolicy:
     def _completed_nearby_recovery_available(self, readiness: ProgressionReadinessDiagnostic) -> bool:
         """Return whether recovery has a bounded, executable nearby route."""
 
+        if not self._completed_recovery_route_available(readiness):
+            return False
+        distance = getattr(getattr(readiness, "recovery", None), "distance_to_center", None)
+        return bool(distance is not None and distance <= self.opportunistic_detour_threshold)
+
+    @staticmethod
+    def _completed_recovery_route_available(readiness: ProgressionReadinessDiagnostic) -> bool:
+        """Return whether the recovery worker supplied an executable safe route."""
+
         recovery = getattr(readiness, "recovery", None)
         available = bool(recovery and recovery.center_available)
         safe = bool(recovery and recovery.safe_to_reach_center)
-        distance = getattr(recovery, "distance_to_center", None)
         return bool(
             available
             and safe
             and getattr(recovery, "route", None) is not None
-            and distance is not None
-            and distance <= self.opportunistic_detour_threshold
         )
 
     @staticmethod
@@ -536,6 +869,29 @@ def _has_imminent_trainer(readiness: ProgressionReadinessDiagnostic) -> bool:
         if trainer.distance <= trainer.trainer_range and trainer.relationship == "nearby":
             return True
     return False
+
+
+def _is_trainer_engagement_goal(goal: Any) -> bool:
+    """Return whether a navigation goal intentionally approaches a trainer."""
+
+    target = goal if getattr(goal, "trainer_id", None) is not None else getattr(goal, "target", None)
+    return getattr(target, "trainer_id", None) is not None
+
+
+def _status_is_curable(status: str | None) -> bool:
+    """Return whether a status value represents an active living condition."""
+
+    normalized = getattr(status, "value", status)
+    normalized = str(normalized or "none").strip().casefold().replace(" ", "_")
+    return normalized not in {"", "none", "normal", "healthy"}
+
+
+def _status_is_poison(status: str | None) -> bool:
+    """Return whether a status drains HP during overworld movement."""
+
+    normalized = getattr(status, "value", status)
+    normalized = str(normalized or "none").strip().casefold().replace(" ", "_")
+    return normalized in {"poison", "poisoned", "bad_poison", "badly_poisoned"}
 
 
 def _party(snapshot: NuzlockeSnapshot) -> tuple[PartyReadinessMember, ...]:
@@ -596,6 +952,11 @@ def build_progression_readiness_diagnostic(
     targetless: bool = False,
     route_analysis_pending: bool = False,
     route_analysis_timed_out: bool = False,
+    trainer_checkpoint: Any = None,
+    trainer_readiness: Any = None,
+    trainer_engagement_required: bool = False,
+    trainer_risks: tuple = (),
+    encounter_stage: Any = None,
 ) -> ProgressionReadinessDiagnostic:
     """Build a point-in-time diagnostic without applying a survival policy."""
     members = _party(snapshot)
@@ -687,6 +1048,11 @@ def build_progression_readiness_diagnostic(
         route_analysis_pending,
         route_analysis_timed_out,
         resource_snapshot,
+        trainer_checkpoint,
+        trainer_readiness,
+        trainer_engagement_required,
+        trainer_risks,
+        encounter_stage,
     )
 
 
@@ -721,9 +1087,10 @@ def evaluate_progression_readiness(
             "READINESS_POLICY_AFTER: "
             f"evaluation_id={id(readiness)} map={readiness.current_map!r} "
             f"location={readiness.current_coordinates!r} lowest_hp_ratio={readiness.lowest_hp_ratio!r} "
-            f"critical_threshold={active_policy.critical_hp_ratio!r} "
+            f"critical_threshold={active_policy.critical_hp_ratio_for(readiness.objective_id)!r} "
+            f"status_threshold={active_policy.status_hp_ratio_for(readiness.objective_id)!r} "
             f"opportunistic_threshold={active_policy.opportunistic_hp_ratio!r} "
-            f"critical={readiness.lowest_hp_ratio is not None and readiness.lowest_hp_ratio < active_policy.critical_hp_ratio} "
+            f"critical={readiness.lowest_hp_ratio is not None and readiness.lowest_hp_ratio < active_policy.critical_hp_ratio_for(readiness.objective_id)} "
             f"opportunistic_threshold_met={readiness.lowest_hp_ratio is not None and readiness.lowest_hp_ratio <= active_policy.opportunistic_hp_ratio} "
             f"imminent_trainer={_has_imminent_trainer(readiness)} "
             f"recovery_availability_known={readiness.recovery_availability is Availability.KNOWN} "

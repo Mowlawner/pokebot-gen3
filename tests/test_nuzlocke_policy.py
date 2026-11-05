@@ -12,6 +12,7 @@ from modules.nuzlocke.events import (
     PartyChanged,
     PokemonFainted,
     WhiteoutOccurred,
+    RunFailed,
 )
 from modules.nuzlocke.persistence import EventStoreCorruptionError, JsonEventStore
 from modules.nuzlocke.policy import PersistenceClass, classify_event
@@ -53,6 +54,7 @@ class TestNuzlockePolicy(unittest.TestCase):
             classify_event(PokemonFainted(2, 0, "Poochyena", "Pup", 1, "battle")), PersistenceClass.DURABLE
         )
         self.assertEqual(classify_event(WhiteoutOccurred(3)), PersistenceClass.DURABLE)
+        self.assertEqual(classify_event(RunFailed(4, "whiteout")), PersistenceClass.DURABLE)
         self.assertEqual(classify_event(PartyChanged(4, (0,), (), False, ())), PersistenceClass.DURABLE)
         self.assertEqual(classify_event(PartyChanged(5, (), (), False, (0,))), PersistenceClass.EPHEMERAL)
 

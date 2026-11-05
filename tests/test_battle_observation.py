@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from modules.battle_observation import (
     BattleEnded,
     BattleKnowledge,
+    BattleKnowledgeRecorder,
     BattleObservation,
     BattlePhase,
     DamageOccurred,
@@ -128,19 +129,46 @@ class BattleObservationTests(unittest.TestCase):
         new = observation(
             2,
             ready=False,
-            player=(pokemon("player", 2, 0, stages=(("attack", 1),)),),
+            player=(pokemon("player", 0, 12, stages=(("attack", 1),)),),
             opponent=(pokemon("opponent", 0, 12, status="Poison"),),
         )
         events = events_between(old, new)
 
         self.assertTrue(any(isinstance(event, DamageOccurred) and event.amount == 8 for event in events))
         self.assertTrue(any(isinstance(event, StatusChanged) and event.after == "Poison" for event in events))
-        self.assertTrue(any(isinstance(event, PokemonSwitched) for event in events))
         self.assertTrue(any(event.__class__.__name__ == "StatStageChanged" for event in events))
-        self.assertTrue(any(event.__class__.__name__ == "PokemonFainted" for event in events))
 
-        ended = observation(3, active=False, ready=False, outcome="Won")
+        switched = events_between(
+            observation(3, player=(pokemon("player", 0, 12),)),
+            observation(4, player=(pokemon("player", 1, 12),)),
+        )
+        self.assertTrue(any(isinstance(event, PokemonSwitched) for event in switched))
+        self.assertFalse(any(isinstance(event, DamageOccurred) for event in switched))
+
+        fainted = events_between(
+            observation(5, player=(pokemon("player", 0, 12),)),
+            observation(6, player=(pokemon("player", 0, 0),)),
+        )
+        self.assertTrue(any(event.__class__.__name__ == "PokemonFainted" for event in fainted))
+
+        ended = observation(7, active=False, ready=False, outcome="Won")
         self.assertTrue(any(isinstance(event, BattleEnded) for event in events_between(new, ended)))
+
+    def test_same_party_slot_identity_refresh_is_not_a_switch(self):
+        old = PokemonObservation(
+            "player", 0, "Treecko", 5, 20, 20, None, personality_value=11
+        )
+        refreshed = PokemonObservation(
+            "player", 0, "Treecko", 5, 20, 20, None, personality_value=22
+        )
+
+        events = events_between(
+            observation(1, player=(old,)),
+            observation(2, player=(refreshed,)),
+        )
+
+        self.assertFalse(any(isinstance(event, PokemonSwitched) for event in events))
+        self.assertFalse(any(isinstance(event, DamageOccurred) for event in events))
 
     def test_ambiguous_initial_and_resolution_frames_do_not_invent_move_events(self):
         current = observation(
@@ -231,6 +259,43 @@ class BattleObservationTests(unittest.TestCase):
         self.assertEqual(knowledge.opponent_move_status("Ember"), KnowledgeStatus.OBSERVED)
         # Seeing Ember does not make an unobserved move appear in the set.
         self.assertEqual(knowledge.opponent_move_status("Flamethrower"), KnowledgeStatus.UNKNOWN)
+
+    def test_recorder_keeps_selected_moves_items_and_switches_for_battle_summary(self):
+        recorder = BattleKnowledgeRecorder(KnowledgePolicy.HUMAN_KNOWLEDGE)
+        recorder.record(observation(1, player=(pokemon("player", 0, 20),), opponent=(pokemon("opponent", 0, 20),)))
+        recorder.record_selected_action("move", "UseMove(Pound)")
+        recorder.record_selected_action("item", "UseItem(Potion -> Treecko)")
+        recorder.record_selected_action("switch", "RotateLead(Mudkip)")
+        recorder.record(observation(2, active=False, ready=False, outcome="Won"))
+
+        self.assertEqual(
+            recorder.last_completed_selected_actions,
+            (
+                ("move", "UseMove(Pound)"),
+                ("item", "UseItem(Potion -> Treecko)"),
+                ("switch", "RotateLead(Mudkip)"),
+            ),
+        )
+
+    def test_explicit_battle_boundary_discards_previous_battle_damage_without_inactive_frame(self):
+        recorder = BattleKnowledgeRecorder(KnowledgePolicy.HUMAN_KNOWLEDGE)
+        recorder.record(
+            observation(1, player=(pokemon("player", 0, 20),), opponent=(pokemon("opponent", 0, 20),))
+        )
+        first = recorder.record(
+            observation(2, player=(pokemon("player", 0, 12),), opponent=(pokemon("opponent", 0, 20),))
+        )
+        self.assertEqual([event.amount for event in first.damage_history], [8])
+
+        recorder.begin_battle("battle-2")
+        recorder.record(
+            observation(3, player=(pokemon("player", 0, 20),), opponent=(pokemon("opponent", 0, 20),))
+        )
+        second = recorder.record(
+            observation(4, player=(pokemon("player", 0, 18),), opponent=(pokemon("opponent", 0, 20),))
+        )
+
+        self.assertEqual([event.amount for event in second.damage_history], [2])
 
 
 if __name__ == "__main__":

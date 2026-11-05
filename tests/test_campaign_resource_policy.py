@@ -12,6 +12,7 @@ from modules.nuzlocke.resource_policy import (
     RouteRecovery,
     assess_campaign_resources,
     assess_wild_encounter,
+    best_hp_recovery_item,
 )
 from modules.nuzlocke.resource_runtime import CampaignCapability
 from modules.goals import ActivateTrigger
@@ -81,10 +82,102 @@ def test_damaged_party_uses_bag_item_when_center_is_unsafe():
     assert assess_campaign_resources(IMPORTANT, snapshot, route) is ResourceDecision.USE_HEALING_ITEM
 
 
+def test_hp_item_selection_penalizes_wasted_healing_without_forbidding_recovery():
+    snapshot = ResourceSnapshot(
+        (PartyResource(75, 100),),
+        (
+            HealingResource("Potion", 1, 20),
+            HealingResource("Super Potion", 1, 50),
+        ),
+    )
+
+    # Potion restores 20 with no waste; Super Potion restores 25 but wastes 25,
+    # so the smaller medicine is the better resource decision.
+    assert best_hp_recovery_item(snapshot).name == "Potion"
+
+
+def test_hp_item_selection_uses_the_only_available_item_even_when_it_overheals():
+    snapshot = ResourceSnapshot(
+        (PartyResource(99, 100),),
+        (HealingResource("Super Potion", 1, 50),),
+    )
+
+    assert best_hp_recovery_item(snapshot).name == "Super Potion"
+
+
 def test_status_items_are_classified_separately_from_hp_items():
     assert HealingResource("Antidote", 2, 0).kind is RecoveryKind.POISON
     assert HealingResource("Potion", 2, 20).kind is RecoveryKind.HP
     assert HealingResource("Full Heal", 1, 0).kind is RecoveryKind.UNIVERSAL_STATUS
+
+
+def test_full_hp_items_have_explicit_compound_effects():
+    max_potion = HealingResource("Max Potion", 1, 255)
+    full_restore = HealingResource("Full Restore", 1, 255)
+
+    assert max_potion.heals_to_full
+    assert max_potion.amount_healed == 0
+    assert max_potion.hp_restored_for(1, 100) == 99
+    assert not max_potion.cures("poison")
+    assert full_restore.heals_to_full
+    assert full_restore.cures("poison")
+    assert full_restore.has_hp_effect
+    assert full_restore.has_status_effect
+
+
+def test_hp_policy_preserves_max_potion_when_super_potion_reaches_floor():
+    snapshot = ResourceSnapshot(
+        (PartyResource(10, 100),),
+        (
+            HealingResource("Super Potion", 1, 50),
+            HealingResource("Max Potion", 1, 255),
+        ),
+    )
+
+    assert best_hp_recovery_item(snapshot).name == "Super Potion"
+
+
+def test_hp_policy_uses_max_potion_when_lower_tier_cannot_reach_floor():
+    snapshot = ResourceSnapshot(
+        (PartyResource(10, 500),),
+        (
+            HealingResource("Hyper Potion", 1, 200),
+            HealingResource("Max Potion", 1, 255),
+        ),
+    )
+
+    assert best_hp_recovery_item(snapshot).name == "Max Potion"
+
+
+def test_rom_status_names_match_their_field_cures():
+    assert HealingResource("Parlyz Heal", 1, 0).cures("paralysed")
+    assert HealingResource("Burn Heal", 1, 0).cures("burned")
+    assert HealingResource("Ice Heal", 1, 0).cures("frozen")
+    assert HealingResource("Awakening", 1, 0).cures("asleep")
+
+
+def test_healthy_paralyzed_party_can_continue_without_immediate_status_detour():
+    snapshot = ResourceSnapshot(
+        (PartyResource(20, 20, "paralysed"),),
+        (HealingResource("Parlyz Heal", 1, 0),),
+    )
+    assert assess_campaign_resources(
+        IMPORTANT,
+        snapshot,
+        RouteRecovery(center_available=True, safe_to_reach_center=True),
+    ) is ResourceDecision.CONTINUE
+
+
+def test_weakened_paralyzed_party_selects_a_parlyz_heal_before_center_travel():
+    snapshot = ResourceSnapshot(
+        (PartyResource(8, 20, "paralysed"),),
+        (HealingResource("Parlyz Heal", 1, 0),),
+    )
+    assert assess_campaign_resources(
+        IMPORTANT,
+        snapshot,
+        RouteRecovery(center_available=True, safe_to_reach_center=True),
+    ) is ResourceDecision.USE_HEALING_ITEM
 
 
 def test_poison_uses_bag_antidote_before_center_travel():

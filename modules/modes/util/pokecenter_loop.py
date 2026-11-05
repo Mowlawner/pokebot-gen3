@@ -28,10 +28,14 @@ class PokecenterLoopController:
         self,
         focus_on_lead_pokemon: bool = False,
         recovery_handler: Callable[[PokemonCenter], Iterator[object]] | None = None,
+        center_finder: Callable[[object], PokemonCenter] | None = None,
+        activity_handler: Callable[[], None] | None = None,
     ):
         self.battle_strategy = DefaultBattleStrategy
         self._focus_on_lead_pokemon = focus_on_lead_pokemon
         self._recovery_handler = recovery_handler
+        self._center_finder = center_finder or find_closest_pokemon_center
+        self._activity_handler = activity_handler
         self._needs_healing = False
         self._leave_pokemon_center = False
 
@@ -83,7 +87,7 @@ class PokecenterLoopController:
 
         # This will check whether there is a valid path to and from a
         # Pokémon Center.
-        find_closest_pokemon_center(current_location)
+        self._center_finder(current_location)
 
     @debug.track
     def run(
@@ -92,7 +96,7 @@ class PokecenterLoopController:
         activity: Literal["spin", "fish"] = "spin",
     ):
         encounter_spot = get_map_data_for_current_position()
-        pokemon_center = find_closest_pokemon_center(encounter_spot)
+        pokemon_center = self._center_finder(encounter_spot)
 
         # We need to heal at the start of the battle to make sure that
         # we will respawn at the chosen Pokémon Center in case of a
@@ -132,4 +136,9 @@ class PokecenterLoopController:
                 yield from fish(stop_condition=activity_stop_condition, loop=True)
             else:
                 yield from apply_white_flute_if_available()
-                yield from spin(stop_condition=activity_stop_condition)
+                if self._activity_handler is None:
+                    yield from spin(stop_condition=activity_stop_condition)
+                else:
+                    while not activity_stop_condition():
+                        self._activity_handler()
+                        yield

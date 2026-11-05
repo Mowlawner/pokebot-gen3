@@ -124,6 +124,11 @@ class StateCache:
         invalidate_shared_overworld_observation()
         for item in (
             self._party,
+            # A new wild battle can begin on the same emulator frame that the
+            # previous enemy-party snapshot was checked. Keep this cache in
+            # the runtime invalidation set so HP normalization does not reuse
+            # an old or temporarily empty gEnemyParty buffer.
+            self._opponent,
             self._item_bag,
             self._player,
             self._player_avatar,

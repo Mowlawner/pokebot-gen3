@@ -21,6 +21,7 @@ from .events import (
     PartyChanged,
     PokemonCaptured,
     PokemonFainted,
+    RunFailed,
     StorageChanged,
     WhiteoutOccurred,
 )
@@ -45,6 +46,7 @@ _DURABLE_TYPES = (
     PokemonFainted,
     StorageChanged,
     WhiteoutOccurred,
+    RunFailed,
 )
 
 

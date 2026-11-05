@@ -20,6 +20,15 @@ gui = None
 # For those cases, we register an `atexit` handler that will wait for user input before closing
 # the terminal window.
 def on_exit() -> None:
+    try:
+        from modules.context import context
+
+        observer = getattr(context, "gate_live_observer", None)
+        flush = getattr(observer, "flush", None)
+        if callable(flush):
+            flush()
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        pass
     if OS_NAME == "Windows":
         import psutil
         import os
@@ -52,7 +61,9 @@ class StartupSettings:
     debug_profile: bool = False
     stutter_trace: bool = False
     stutter_threshold_ms: float = 50.0
+    debug_log_path: pathlib.Path | None = None
     no_save_state: bool = False
+    gate_live_config: pathlib.Path | None = None
     profile_source: str = "unknown"
 
 
@@ -151,9 +162,23 @@ def parse_arguments(bot_mode_names: list[str]) -> StartupSettings:
         help="Stutter trace total-frame threshold in milliseconds (default: 50).",
     )
     parser.add_argument(
+        "--debug-log",
+        "--log-file",
+        dest="debug_log_path",
+        type=pathlib.Path,
+        metavar="PATH",
+        help="Also write console output to PATH; combine with --debug-trace for diagnostic logs.",
+    )
+    parser.add_argument(
         "--no-save-state",
         action="store_true",
         help="Do not write a save state when the bot shuts down.",
+    )
+    parser.add_argument(
+        "--gate-live-config",
+        type=pathlib.Path,
+        metavar="PATH",
+        help="Arm explicit source-gate edge evidence from a JSON configuration.",
     )
     parser.add_argument("-c", "--config", type=directory_arg, dest="config_path", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -180,7 +205,9 @@ def parse_arguments(bot_mode_names: list[str]) -> StartupSettings:
         debug_profile=bool(args.debug_profile),
         stutter_trace=bool(args.stutter_trace),
         stutter_threshold_ms=float(args.stutter_threshold_ms),
+        debug_log_path=args.debug_log_path,
         no_save_state=bool(args.no_save_state),
+        gate_live_config=args.gate_live_config,
         profile_source=profile_source,
     )
 
@@ -191,7 +218,7 @@ if __name__ == "__main__":
 
         check_requirements()
     from modules.context import context
-    from modules.console import console
+    from modules.console import configure_console_log, console
     from modules.exceptions_hook import register_exception_hook
     from modules.main import main_loop
     from modules.modes import get_bot_mode_names
@@ -215,6 +242,11 @@ if __name__ == "__main__":
         win32api.SetConsoleCtrlHandler(win32_signal_handler, True)
 
     startup_settings = parse_arguments(get_bot_mode_names())
+    if startup_settings.gate_live_config is not None:
+        from modules.nuzlocke.gate_live_observation import load_gate_live_observer
+
+        context.gate_live_observer = load_gate_live_observer(startup_settings.gate_live_config)
+    configure_console_log(startup_settings.debug_log_path)
     console.print(f"Starting [bold cyan]{pokebot_name} {pokebot_version}![/]")
 
     if not is_bundled_app() and not (get_base_path() / ".git").is_dir():

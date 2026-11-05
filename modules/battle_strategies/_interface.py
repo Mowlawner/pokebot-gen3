@@ -6,6 +6,16 @@ from modules.pokemon import Pokemon, Move
 
 
 class BattleStrategy:
+    def allows_legacy_fallback(self) -> bool:
+        """Return whether compatibility battle fallbacks may be used.
+
+        Older modes still rely on the generic strongest-move and unhandled
+        battle-state fallbacks. A strategy that owns a strict planner policy
+        can disable those fallbacks and force an explicit safety outcome.
+        """
+
+        return True
+
     def party_can_battle(self) -> bool:
         """
         Decides whether the party is in good enough shape to battle, or whether it needs healing.
@@ -13,6 +23,21 @@ class BattleStrategy:
                  soon as possible,
         """
         raise NotImplementedError
+
+    def is_switch_target_valid(self, battle_state: BattleState, party_index: int) -> bool:
+        """Return whether a voluntary switch is legal at the menu boundary."""
+
+        raise NotImplementedError
+
+    def switch_target_validation_reason(self, battle_state: BattleState, party_index: int) -> str:
+        """Explain a rejected switch for action and GUI diagnostics."""
+
+        try:
+            if self.is_switch_target_valid(battle_state, party_index):
+                return "validated"
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError, KeyError):
+            return "switch validator raised while checking the target"
+        return "strategy validator rejected the target"
 
     def pokemon_can_battle(self, pokemon: Pokemon) -> bool:
         """

@@ -41,6 +41,21 @@ class ReadinessSchedulerTests(unittest.TestCase):
         scheduler.observe("objective", "goal")
         self.assertEqual(len(calls), 1)
 
+    def test_semantic_encounter_stage_change_refreshes(self):
+        context = [("OVERWORLD", (1, 2), None)]
+        calls = []
+        scheduler = ReadinessObservationScheduler(
+            lambda *_: calls.append(len(calls)) or calls[-1],
+            lambda: context[0],
+            max_age_ticks=30,
+        )
+
+        self.assertEqual(scheduler.observe("objective", "goal"), 0)
+        context[0] = ("OVERWORLD", (1, 2), ("blocked-stage", "trainer:one"))
+        self.assertEqual(scheduler.observe("objective", "goal"), 1)
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(scheduler.last_observation_was_cache_hit)
+
     def test_map_or_game_state_change_refreshes_immediately(self):
         context = [("OVERWORLD", (1, 2))]
         calls = []
@@ -96,6 +111,39 @@ class ReadinessSchedulerTests(unittest.TestCase):
         self.assertIs(scheduler.observe("objective", "goal"), valid)
         self.assertEqual(len(calls), 2)
         self.assertEqual(scheduler.state.status, "fresh")
+
+    def test_transient_observation_refreshes_when_live_position_changes(self):
+        calls = []
+        position = [(10, -1)]
+        unavailable = SimpleNamespace(overworld_availability=Availability.UNKNOWN)
+        valid = SimpleNamespace(overworld_availability=Availability.KNOWN)
+        scheduler = ReadinessObservationScheduler(
+            lambda *_: calls.append(1) or (unavailable if len(calls) == 1 else valid),
+            lambda: "same",
+            transient_context=lambda: position[0],
+        )
+
+        self.assertIs(scheduler.observe("objective", "goal"), unavailable)
+        position[0] = (14, 10)
+        self.assertIs(scheduler.observe("objective", "goal"), valid)
+        self.assertFalse(scheduler.last_observation_was_cache_hit)
+        self.assertEqual(len(calls), 2)
+
+    def test_stable_observation_ignores_transient_position_changes(self):
+        calls = []
+        position = [(10, -1)]
+        valid = SimpleNamespace(overworld_availability=Availability.KNOWN)
+        scheduler = ReadinessObservationScheduler(
+            lambda *_: calls.append(1) or valid,
+            lambda: "same",
+            transient_context=lambda: position[0],
+        )
+
+        scheduler.observe("objective", "goal")
+        position[0] = (14, 10)
+        self.assertIs(scheduler.observe("objective", "goal"), valid)
+        self.assertTrue(scheduler.last_observation_was_cache_hit)
+        self.assertEqual(len(calls), 1)
 
     def test_unknown_overworld_blocks_readiness(self):
         readiness = SimpleNamespace(

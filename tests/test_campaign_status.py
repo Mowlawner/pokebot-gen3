@@ -16,6 +16,12 @@ class CampaignStatusTests(unittest.TestCase):
         self.assertIn("Target: NONE", text)
         self.assertIn("Targetless fallback", text)
 
+    def test_location_target_includes_map_name_and_coordinates(self):
+        text = format_campaign_status(
+            CampaignStatus("Prepare Roxanne", SemanticTarget.at(((0, 31), (12, 17))), "Train")
+        )
+        self.assertIn("Target: map (0, 31) (Route 116) at (12, 17)", text)
+
     def test_no_objective_and_complete_are_explicit(self):
         self.assertEqual(
             format_campaign_status(None),

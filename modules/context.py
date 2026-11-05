@@ -63,6 +63,80 @@ class BotContext:
         self.testing: bool = False
         self.battle_decision_source: str | None = None
         self.battle_decision_detail: str | None = None
+        self.battle_evaluation_method: str | None = None
+        # Temporary live callback used by objective-aware capture search. The
+        # capture strategy clears these after each planner call so no battle
+        # closure survives into ordinary defeat planning.
+        self.battle_capture_success_probability = None
+        self.battle_capture_probability_for_state = None
+        self.battle_readiness = None
+        self.campaign_trainer_checkpoint = None
+        self.campaign_trainer_readiness = None
+        # Campaign lead rotation owns the party menu while a trainer
+        # exposure generator is suspended.  Readiness may temporarily lose
+        # the overworld during that menu transaction, but must not replace
+        # the generator that will close the menu and resume exposure.
+        self.campaign_trainer_lead_rotation = None
+        self.campaign_readiness_diagnostic = None
+        # ROM-backed facts for all undefeated trainer hazards visible at the
+        # current readiness boundary. The singular checkpoint above remains
+        # the trainer that owns preparation and battle entry.
+        self.campaign_trainer_facts = ()
+        self.campaign_defeated_trainer_ids: set[tuple] = set()
+        self.campaign_defeated_trainer_session_id = None
+        self.campaign_active_trainer_checkpoint = None
+        # Immutable AVOID-versus-IGNORE evidence from the encounter-stage
+        # owner. Campaign readiness consumes this at the next boundary to
+        # promote a known choke-point trainer or preserve an explicit unknown.
+        self.campaign_encounter_stage = None
+        self.campaign_capability_completion_latch: str | None = None
+        self.campaign_preparation_exp_budget = None
+        # Voluntary switch requests are matched against the next observed
+        # PokemonSwitched event by the battle handler.  This is diagnostic
+        # state used to reconcile one dispatched switch with the observed
+        # active-slot transition before another planner switch is dispatched.
+        self.battle_pending_switches: list[dict] = []
+        self.battle_switch_transaction_sequence: int = 0
+        self.battle_switch_reconciliation_status: str = "idle"
+        self.battle_switch_replan_required: bool = False
+        # A battle can reach its first action callback before the ROM-backed
+        # battler and inventory snapshots are coherent. Campaign ownership
+        # permits one fresh observation/replan at that boundary; repeated
+        # empty roots remain a safety stop.
+        self.battle_empty_root_replan_used: bool = False
+        self.battle_planner_retry_requested: bool = False
+        self.battle_planner_retry_count: int = 0
+        self.campaign_preparation_target: str | None = None
+        # Campaign-owned wild-battle intent consumed by the normalized
+        # expectiminimax adapter.  ``None`` means no battle is mounted.
+        self.campaign_wild_battle_intent: str | None = None
+        # Routine EXP tagging is deliberately disabled.  The campaign
+        # training scheduler should lead the intended trainee directly;
+        # callers must opt in explicitly for an exceptional free-switch plan.
+        self.campaign_allow_exp_tag: bool = False
+        # Recovery and navigation handoffs are explicit session state. Keep
+        # them initialized so a fresh context cannot inherit a stale marker
+        # from a previous controller or recovery attempt.
+        self.campaign_recovery_phase = None
+        self.campaign_recovery_observed_triggers = None
+        self.campaign_recovery_pc_target = None
+        self.campaign_recovery_pc_status = None
+        self.campaign_recovery_retry_count = 0
+        self.campaign_continuation_route = None
+        self.battle_authoritative_faints = []
+        # A resource capability may defer an unaffordable restock after it has
+        # verified that no fundable trainer is available on the current map.
+        # Campaign selection clears/ignores this marker when the map changes.
+        self.campaign_restock_deferral: tuple[str, tuple[int, int]] | None = None
+        # The currently suspended AgentControlLoop, if any. Campaign
+        # capabilities often yield through a navigation loop, so the campaign
+        # controller cannot inspect that loop directly from its outer
+        # generator. AgentControlLoop owns this marker only while its run
+        # generator is active and restores the previous value on exit.
+        self.active_agent_control_loop = None
+        # Optional source-gate evidence recorder.  It is armed externally for
+        # a reviewed candidate and remains inert during ordinary navigation.
+        self.gate_live_observer = None
 
         self._current_message: str = ""
         self._campaign_status = None

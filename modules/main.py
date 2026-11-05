@@ -21,7 +21,9 @@ from modules.stats import StatsDatabase
 from modules.tasks import get_global_script_context, get_tasks
 from modules.nuzlocke.runtime import NuzlockeRuntime
 from modules.nuzlocke.rule_config import CampaignRulesConfig
+from modules.nuzlocke.events import RunFailed
 from modules.nuzlocke.persistence import JsonEventStore
+from modules.modes.util.soft_reset import soft_reset
 from modules.profiler import count as profile_count
 from modules.profiler import (
     enabled as profiling_enabled,
@@ -298,7 +300,8 @@ def main_loop() -> None:
             # bot modes, listeners, GUI rendering, and HTTP consumers.
             stage_start = profile_now()
             trace_nuzlocke_start = trace.now() if trace is not None else 0
-            context.nuzlocke_runtime.update()
+            nuzlocke_events = context.nuzlocke_runtime.update()
+            run_failure = next((event for event in nuzlocke_events if isinstance(event, RunFailed)), None)
             if trace is not None and trace.enabled:
                 trace.duration("nuzlocke_duration_ms", trace_nuzlocke_start)
             if profiling_enabled():
@@ -332,10 +335,43 @@ def main_loop() -> None:
             try:
                 stage_start = profile_now()
                 trace_controller_start = trace.now() if trace is not None else 0
-                for listener in context.bot_listeners.copy():
-                    listener.handle_frame(context.bot_mode_instance, frame_info)
+                # A configured campaign failure is terminal for the current
+                # controller. Do not let a battle or whiteout listener emit
+                # one more input before the reset handoff below.
+                if run_failure is None or context.bot_mode != "Campaign Progression":
+                    for listener in context.bot_listeners.copy():
+                        listener.handle_frame(context.bot_mode_instance, frame_info)
                 if context.bot_mode == "Manual":
                     context.controller_stack = []
+                if run_failure is not None and context.bot_mode == "Campaign Progression":
+                    committed = context.nuzlocke_runtime.commit_pending_events("run_failure")
+                    archived = nuzlocke_event_store.quarantine(label="failed")
+                    diagnostic_print(
+                        lambda: (
+                            "NUZLOCKE_RUN_ARCHIVED: "
+                            f"frame={run_failure.frame!r} reason={run_failure.reason!r} "
+                            f"committed={committed!r} archived={str(archived)!r}"
+                        ),
+                        trace=True,
+                    )
+                    console.print(
+                        "[bold red]Nuzlocke run failed[/] "
+                        f"({run_failure.reason}); archived history at {archived or nuzlocke_event_store.path}. "
+                        "Soft resetting."
+                    )
+                    # The whiteout listener may have placed its normal
+                    # dialogue handler on this stack. A terminal campaign
+                    # failure owns the handoff, so discard all old tactical
+                    # and listener generators before resetting the emulator.
+                    context.controller_stack.clear()
+                    context.emulator.reset_held_buttons()
+                    context.campaign_recovery_phase = None
+                    context.campaign_recovery_observed_triggers = None
+                    context.campaign_recovery_pc_target = None
+                    context.campaign_recovery_pc_status = None
+                    context.campaign_recovery_retry_count = 0
+                    context.campaign_continuation_route = None
+                    context.controller_stack.append(soft_reset())
                 if len(context.controller_stack) > 0:
                     profile_count("controller_next_calls")
                     if new_starters_mode_created:

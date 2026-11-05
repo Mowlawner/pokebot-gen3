@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from modules.goals import Goal, SemanticTarget, SemanticTargetKind
 from modules.map_data import MapRSE
+from modules.nuzlocke.preparation_status import map_display_name
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,7 +34,11 @@ def _target_text(target: SemanticTarget | None) -> str:
     if target.kind is SemanticTargetKind.INTERACTION:
         return target.interaction_id or "interaction"
     if target.kind is SemanticTargetKind.LOCATION:
-        return f"location {target.location}"
+        map_name = map_display_name(target.target_map)
+        location = target.location[1] if target.location is not None else None
+        return f"map {target.target_map}" + (f" ({map_name})" if map_name is not None else "") + (
+            f" at {location}" if location is not None else ""
+        )
     map_name = next(
         (member.name.replace("_", " ").title() for member in MapRSE if member.value == target.target_map), None
     )

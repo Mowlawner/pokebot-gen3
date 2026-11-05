@@ -60,3 +60,79 @@ def test_rotate_pokemon_exit_closes_reopened_start_menu_with_fresh_b():
     assert emulator.press_button_fresh.call_count == 3
     assert emulator.press_button_fresh.call_args_list == [(("B",),), (("B",),), (("B",),)]
     emulator.press_button.assert_not_called()
+
+
+def test_rotate_pokemon_replacement_cursor_timeout_is_bounded():
+    navigator = RotatePokemon.__new__(RotatePokemon)
+    navigator.party = (object(), object())
+    navigator._first_party_index = 1
+    navigator._second_party_index = 0
+    navigator.completed = False
+    navigator.failure = None
+    navigator.last_input = None
+    navigator._diagnostic_phase = None
+
+    emulator = SimpleNamespace(press_button=Mock())
+    fake_context = SimpleNamespace(emulator=emulator, bot_mode="Campaign Progression")
+
+    def drive(generator):
+        while True:
+            try:
+                next(generator)
+            except StopIteration as result:
+                return result.value
+
+    with (
+        patch("modules.menuing.context", fake_context),
+        patch(
+            "modules.menuing.get_party_menu_cursor_pos",
+            return_value={"slot_id_2": 1},
+        ),
+        patch("modules.menuing.diagnostic_print"),
+    ):
+        result = drive(navigator.select_replacement())
+
+    assert result is False
+    assert navigator.failure is not None
+    assert navigator.failure.phase == "select_second_pokemon"
+    assert "cursor" in navigator.failure.reason
+    assert emulator.press_button.call_count == 180
+
+
+def test_rotate_pokemon_reports_success_after_all_menu_phases():
+    navigator = RotatePokemon.__new__(RotatePokemon)
+    navigator.party = (object(), object())
+    navigator._first_party_index = 1
+    navigator._second_party_index = 0
+    navigator.completed = False
+    navigator.failure = None
+    navigator.last_input = None
+    navigator._diagnostic_phase = None
+    navigator._diagnostic_state = lambda: (GameState.OVERWORLD, (), None)
+
+    fake_context = SimpleNamespace(bot_mode="Campaign Progression")
+
+    def frames():
+        yield
+
+    with (
+        patch("modules.menuing.context", fake_context),
+        patch("modules.menuing.diagnostic_print"),
+        patch("modules.menuing.StartMenuNavigator") as start_menu,
+        patch("modules.menuing.PokemonPartyMenuNavigator") as party_menu,
+        patch.object(navigator, "select_replacement", return_value=frames()),
+        patch.object(navigator, "exit_to_overworld", return_value=frames()),
+    ):
+        start_menu.return_value.step.return_value = frames()
+        party_menu.return_value.step.return_value = frames()
+        controller = navigator.step()
+        for _ in range(20):
+            try:
+                next(controller)
+            except StopIteration:
+                break
+        else:
+            pytest.fail("successful lead rotation did not finish")
+
+    assert navigator.completed is True
+    assert navigator.failure is None

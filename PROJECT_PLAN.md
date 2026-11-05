@@ -53,12 +53,11 @@ Nuzbot is complete when, for each supported Gen 3 game:
 The supported fresh-run Emerald path currently reaches Petalburg City, which
 the user confirmed from a fresh startup with no save data. The declarative
 objective model and Emerald registry now form an executable early graph rather
-than relying on the synthetic `start_nuzlocke` boundary. `reach_petalburg` is
-retained as a useful observed traversal objective: it requires Pokédex receipt
-and Poké Balls, then completes from the ROM's Petalburg visit fact. The
-meaningful Petalburg gate is Norman's Wally tutorial, represented by the
-ROM-backed `PETALBURG_CITY_STATE`/`PETALBURG_GYM_STATE` boundary that opens the
-Petalburg Woods progression toward Rustboro.
+than relying on the synthetic `start_nuzlocke` boundary. Petalburg arrival is
+kept as an observed ROM fact and route boundary. The meaningful Petalburg gate
+is Norman's Wally tutorial, represented by the ROM-backed
+`PETALBURG_CITY_STATE`/`PETALBURG_GYM_STATE` boundary that opens the Petalburg
+Woods progression toward Rustboro.
 
 `plan_campaign()` already walks from a goal to producers of unmet predicates;
 the intended architecture is to make that recursive producer/task model the
@@ -155,6 +154,14 @@ foundations, not complete whole-game campaign coverage. The world planner
 still needs dynamic story/HM/badge gates, puzzles, scripted and forced
 movement, bikes, currents, waterfalls, diving, caves, one-way exits, trainer
 sight lines, and interaction sequences across the whole game.
+
+The plan for discovering those gates from ROM evidence is recorded in
+[campaign-story-gate-discovery-plan.md](docs/campaign-story-gate-discovery-plan.md).
+The proposed scanner feeds candidate guards and trainer checkpoints into the
+existing reachability contracts, while verified registry entries retain
+semantic names and overrides for ambiguous scripts. This preserves ROM-derived
+encounter discovery and prevents map visits or incidental flag checks from
+becoming campaign objectives.
 
 ### Battles and resources
 
@@ -270,6 +277,12 @@ species result.
 5. Add authoritative completion facts and executable capabilities for every
    registered objective.
 6. Replace the placeholder ultimate goal with verified completion state.
+
+The registry expansion should be paired with the ROM-derived gate discovery
+work: scan candidate guards and producers first, use route impact to identify
+which candidates affect campaign reachability, and promote only verified
+semantics into the registry. See
+[campaign-story-gate-discovery-plan.md](docs/campaign-story-gate-discovery-plan.md).
 
 Exit criteria: an Emerald run can progress from a fresh game through the Hall
 of Fame with objective transitions verified from observations.

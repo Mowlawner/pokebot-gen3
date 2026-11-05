@@ -496,6 +496,7 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
             for name in (
                 "SET_WALL_CLOCK",
                 "RESCUED_BIRCH",
+                "ADVENTURE_STARTED",
                 "DEFEATED_RIVAL_ROUTE103",
                 "HIDE_ROUTE_103_RIVAL",
                 "SYS_POKEMON_GET",
@@ -516,7 +517,10 @@ def get_nuzlocke_snapshot() -> NuzlockeSnapshot:
             for name in (
                 "LITTLEROOT_INTRO_STATE",
                 "LITTLEROOT_RIVAL_STATE",
+                "LITTLEROOT_TOWN_STATE",
+                "ROUTE101_STATE",
                 "BIRCH_LAB_STATE",
+                "OLDALE_RIVAL_STATE",
                 "PETALBURG_CITY_STATE",
                 "PETALBURG_GYM_STATE",
                 "PETALBURG_WOODS_STATE",

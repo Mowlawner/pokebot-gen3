@@ -9,12 +9,14 @@ as local Python measurements only.
 import statistics
 import time
 import unittest
+from unittest.mock import patch
 
 from modules.context import context
 from modules.goals import ActivateTrigger, EncounterMode, NavigationGoal, ReachLocation, ReachWarp
 from modules.map_path import Direction
 from modules.navigation import (
     GoalAwareNavigator,
+    NavigationSearchCancelled,
     NavigationWorld,
     NavigableTile,
     NavigationMetrics,
@@ -57,7 +59,11 @@ class TestAStarComparison(unittest.TestCase):
     def compare(self, world, start, goal):
         dijkstra = GoalAwareNavigator(world).plan(start, goal, algorithm="dijkstra")
         astar = GoalAwareNavigator(world).plan(start, goal, algorithm="astar")
-        self.assertEqual(dijkstra.actions, astar.actions)
+        # A* and Dijkstra may choose different equal-cost branches once
+        # ordinary movement no longer treats facing as a search dimension.
+        # Compare the route objective and destination, not incidental tie
+        # ordering between the two frontier policies.
+        self.assertEqual(dijkstra.destination, astar.destination)
         self.assertEqual(dijkstra.metrics.encounter_opportunities, astar.metrics.encounter_opportunities)
         self.assertEqual(dijkstra.metrics.total_route_cost, astar.metrics.total_route_cost)
         return dijkstra, astar
@@ -162,6 +168,47 @@ class TestAStarComparison(unittest.TestCase):
         finally:
             context.debug_profile = previous
 
+    def test_cancelled_search_emits_terminal_diagnostic(self):
+        world = grid(10, 5)
+
+        def cancel_check():
+            raise NavigationSearchCancelled("superseded")
+
+        with patch("modules.navigation.print_navigation_pathfinding") as print_pathfinding:
+            with self.assertRaises(NavigationSearchCancelled):
+                GoalAwareNavigator(world).plan(
+                    (MAP, (0, 2)),
+                    ReachLocation((MAP, (9, 2))),
+                    algorithm="dijkstra",
+                    cancel_check=cancel_check,
+                )
+
+        phases = [call.kwargs["phase"] for call in print_pathfinding.call_args_list]
+        self.assertEqual(phases, ["start", "complete"])
+        terminal = print_pathfinding.call_args_list[-1].kwargs
+        self.assertFalse(terminal["path_found"])
+        self.assertEqual(terminal["error"], "NavigationSearchCancelled: superseded")
+
+    def test_reach_location_search_ignores_facing_dimension(self):
+        previous = getattr(context, "debug_profile", False)
+        context.debug_profile = True
+        try:
+            clear_pathfinding_searches()
+            world = grid(2, 1, facing=Direction.North)
+            plan = GoalAwareNavigator(world).plan(
+                (MAP, (0, 0)),
+                ReachLocation((MAP, (1, 0))),
+                algorithm="dijkstra",
+            )
+            record = pathfinding_searches()[-1]
+            self.assertEqual(record["start_state"], ((MAP, (0, 0)), None))
+            self.assertEqual(plan.actions[0].direction, Direction.East)
+            # The executor still reports the real turn required by the first
+            # input even though the planner does not search over turn states.
+            self.assertEqual(plan.metrics.turns_on_non_encounter_terrain, 1)
+        finally:
+            context.debug_profile = previous
+
     def test_cross_map_candidate_fixture_records_each_search(self):
         source = (1, 0)
         target = (2, 0)
@@ -191,7 +238,7 @@ class TestAStarComparison(unittest.TestCase):
         finally:
             context.debug_profile = previous
 
-    def test_default_cross_map_semantic_planning_uses_astar(self):
+    def test_default_cross_map_semantic_planning_uses_dijkstra(self):
         source = (991, 0)
         target = (992, 0)
         transition = WarpObservation((source, (4, 0)), (target, (0, 0)))
@@ -211,7 +258,7 @@ class TestAStarComparison(unittest.TestCase):
             plan_with_world_navigation(world, (source, (0, 0)), ReachLocation((target, (0, 0))), graph)
             records = pathfinding_searches()
             self.assertEqual(len(records), 1)
-            self.assertEqual(records[0]["algorithm"], "astar")
+            self.assertEqual(records[0]["algorithm"], "dijkstra")
             self.assertTrue(records[0]["path_found"])
         finally:
             context.debug_profile = previous

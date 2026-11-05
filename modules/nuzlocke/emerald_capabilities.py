@@ -15,7 +15,18 @@ import random
 from typing import Callable, Iterator
 
 from modules.context import context
-from modules.console import diagnostic_print
+from modules.console import (
+    diagnostic_print,
+    print_money_trainer_attempt,
+    print_money_trainer_destinations,
+    print_money_trainer_failure,
+    print_money_trainer_request,
+    print_money_trainer_success,
+    print_restock_attempt,
+    print_restock_failure,
+    print_restock_request,
+    print_restock_success,
+)
 from modules.agent_control import (
     AgentActionExecutor,
     AgentActionType,
@@ -52,15 +63,20 @@ from modules.map import get_map_metadata
 from modules.map_data import MapRSE
 from modules.memory import GameState, get_event_flag, get_event_var, get_game_state, get_save_block, unpack_uint16
 from modules.overworld import (
+    ObjectObservation,
     OverworldObservationResult,
     OverworldObservationStatus,
     perceive_overworld,
     shared_overworld_observation_for_current_frame,
+    static_trainer_observations,
     WorldTransition,
 )
 from modules.interaction_state import InteractionPhase, InteractionType, classify_interaction, observe_interaction
 from modules.player import player_avatar_is_controllable, player_avatar_is_rom_owned_movement
 from modules.player import get_player
+from modules.pokemon_party import get_party
+from modules.trainer_checkpoints import trainer_checkpoint_for_source
+from modules.trainer_readiness import assess_live_trainer_checkpoint
 from modules.start_game import resolve_start_game_initialization
 from .emerald_clock import (
     _current_map_id,
@@ -78,6 +94,7 @@ from .emerald_pokeball_catalog import (
     emerald_pokeball_sources,
     emerald_pokeball_source_entrances,
 )
+from .emerald_healing_catalog import emerald_healing_sources
 from modules.tasks import (
     get_global_script_context,
     get_task,
@@ -101,6 +118,7 @@ from .emerald_confirmation import (
     observe_emerald_confirmation,
 )
 from .emerald_campaign_registry import emerald_capability_definition
+from .campaign_state import intro_rival_battle_completion_value
 from .emerald_dialogue import advance_dialogue, dialogue_state_snapshot, observe_dialogue
 from .resource_policy import PokeballRestockPolicy, RecoverySupplyPolicy
 
@@ -108,6 +126,63 @@ from .resource_policy import PokeballRestockPolicy, RecoverySupplyPolicy
 # names now resolve to the extracted, phase-free dialogue implementation; they
 # are not imports from the legacy opening mode.
 _advance_scripted_input = advance_dialogue
+
+
+class NavigationLoopDetected(NavigationError):
+    """A mounted campaign route repeated the same transition cycle."""
+
+    navigation_loop = True
+
+
+def _transition_history_token(transition) -> tuple:
+    """Return a stable token for one observed executable transition."""
+
+    return (
+        getattr(transition, "kind", None),
+        getattr(transition, "entry", None),
+        _canonical_location(getattr(transition, "destination", None)),
+    )
+
+
+def _canonical_map_id(map_id):
+    return getattr(map_id, "value", map_id)
+
+
+def _canonical_location(location):
+    if not isinstance(location, tuple) or len(location) != 2:
+        return location
+    return _canonical_map_id(location[0]), location[1]
+
+
+def _record_completed_navigation_transition(progress: dict, transition, semantic_target) -> None:
+    """Detect an ABAB map-transition cycle before selecting another exit."""
+
+    token = _transition_history_token(transition)
+    history = progress.setdefault("transition_history", [])
+    if history and history[-1] == token:
+        return
+    history.append(token)
+    del history[:-12]
+    if len(history) < 4:
+        return
+    cycle = tuple(history[-4:])
+    if cycle[0] != cycle[1] and cycle[0] == cycle[2] and cycle[1] == cycle[3]:
+        target_map = getattr(semantic_target, "target_map", None)
+        current_map = _canonical_map_id(getattr(transition, "destination", (None,))[0])
+        target_map = _canonical_map_id(target_map)
+        if target_map is not None and current_map == target_map:
+            return
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_NAVIGATION_LOOP: "
+                f"target={target_map!r} cycle={cycle!r} current_map={current_map!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_NAVIGATION_LOOP",
+        )
+        raise NavigationLoopDetected(
+            f"navigation repeated transition cycle {cycle!r} before reaching {target_map!r}"
+        )
 
 
 class EmeraldOpeningCapability:
@@ -456,6 +531,15 @@ def choose_emerald_observation_action(observation: EmeraldObservation) -> Emeral
             if task_name == "Task_SetClock_HandleInput":
                 return EmeraldCampaignAction.ADVANCE_CLOCK
             return EmeraldCampaignAction.WAIT
+    # A controllable avatar does not prove that the frame belongs to the
+    # campaign navigator.  Emerald can restore avatar control while a native
+    # script wait is still active (the Birch lab handoff is one example), and
+    # the overworld projection is still useful for diagnostics in that state.
+    # Semantic UI actions above, including the wall-clock task, retain
+    # ownership; only navigation must yield at this boundary.
+    native_task_state = getattr(observation, "native_task_state", ()) or ()
+    if len(native_task_state) >= 3 and native_task_state[2] is True:
+        return EmeraldCampaignAction.WAIT
     if observation.rom_owned_movement:
         return EmeraldCampaignAction.WAIT
     if (
@@ -519,11 +603,38 @@ def _observed_exit_goal(
         and not (
             transition.kind == "map_connection"
             and transition_approach_position(transition)
-            in {(world.map_id, coordinate) for coordinate in getattr(world, "dynamic_blocked_coordinates", ())}
+            in {
+                (world.map_id, coordinate)
+                for coordinate in (
+                    set(getattr(world, "dynamic_blocked_coordinates", ()))
+                    | set(getattr(world, "static_blocked_coordinates", ()))
+                )
+            }
         )
     )
     if not exits:
         return None
+
+    failure_signature = _observed_exit_failure_signature(
+        world,
+        semantic_target,
+        navigation_policy,
+    )
+    if navigation_progress is not None:
+        previous_failure = navigation_progress.get("failed_exit_search")
+        if previous_failure == failure_signature:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_NAVIGATION_TRACE: exit_search_suppressed "
+                    f"frame={getattr(context, 'frame', None)!r} "
+                    f"current={(world.map_id, world.player_coordinates)!r} "
+                    "reason='identical failed exit search'"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_NAVIGATION_TRACE",
+            )
+            return None
+        navigation_progress.pop("failed_exit_search", None)
 
     # Sort by Manhattan distance to minimize the number of expensive pathfinding
     # calls.  A warp already under the player or very close is likely the
@@ -690,22 +801,18 @@ def _observed_exit_goal(
         """Identify the ROM connection strip represented by aligned entries."""
         if transition.kind != "map_connection" or transition.destination is None:
             return None
-        source_x, source_y = transition.entry[1]
-        destination_x, destination_y = transition.destination[1]
-        direction = transition.required_facing
-        # A connection's offset is the alignment delta on the axis parallel
-        # to its boundary.  Keeping it in the key prevents distinct strips to
-        # the same map/direction from being merged.
-        offset = (
-            destination_x - source_x if direction in (Direction.North, Direction.South) else destination_y - source_y
-        )
+        # Every row generated from one ROM MapConnection is one executable
+        # transition family.  The previous offset-based key treated rows on
+        # Route 102's west boundary as separate problems when the live
+        # destination coordinates were normalized differently, producing one
+        # full Dijkstra search per row. Group by the stable ROM edge identity;
+        # the final action source/destination reconciliation below still picks
+        # the exact row that the returned plan can execute.
         return (
             transition.entry[0],
             transition.destination[0],
-            direction,
-            offset,
-            transition.activation,
-            transition.activation_direction,
+            transition.required_facing,
+            transition.kind,
         )
 
     downstream_routes: dict[object, object] = {}
@@ -758,8 +865,16 @@ def _observed_exit_goal(
         # combined route score is compared.
     planning_groups: list[tuple[object, ...]] = []
     connection_groups: dict[tuple, list[object]] = {}
+    # Ordinary door/stair warps can expose several source tiles for one ROM
+    # destination.  They must be one navigation problem: evaluating them as
+    # separate ReachWarp goals lets the anti-reversal filter discard the
+    # cheapest exit before the final comparison, even though both exits land
+    # at the same outdoor location.  Map connections retain their existing
+    # strip grouping because their alignment offsets are meaningful.
     for transition in candidates:
         key = connection_key(transition)
+        if key is None and transition.kind != "map_connection" and transition.destination is not None:
+            key = ("same_destination_warp", transition.kind, transition.destination)
         if key is None:
             planning_groups.append((transition,))
         elif key not in connection_groups:
@@ -815,17 +930,28 @@ def _observed_exit_goal(
         try:
             diagnostic_print(
                 lambda: (
+                    "NAVIGATION_REQUEST: caller='emerald_capabilities.exit_candidate' "
+                    f"start={(world.map_id, world.player_coordinates)!r} "
+                    f"goal={target!r} "
+                    f"trainer_mode={getattr(getattr(getattr(tactical_goal(target), 'constraints', None), 'trainer_mode', None), 'name', None)!r}"
+                ),
+                trace=True,
+                prefix="NAVIGATION_REQUEST",
+            )
+            diagnostic_print(
+                lambda: (
                     "CAMPAIGN_PLAN_TRACE: phase=exit_candidate_begin "
                     f"frame={getattr(context, 'frame', None)!r} current={world.map_id, world.player_coordinates!r} "
                     f"goal={target!r}"
                 ),
                 trace=True,
             )
-            # Use A* for faster heuristic-guided search.
+            # Use the production Dijkstra cost model so exit candidates are
+            # comparable with the rest of campaign navigation.
             plan = navigator.plan(
                 (world.map_id, world.player_coordinates),
                 tactical_goal(target),
-                algorithm="astar",
+                algorithm="dijkstra",
             )
             diagnostic_print(lambda: ("CAMPAIGN_PLAN_TRACE: phase=exit_candidate_end " f"plan={plan!r}"), trace=True)
         except NavigationError as error:
@@ -847,13 +973,37 @@ def _observed_exit_goal(
             continue
         warp = representative
         if len(group) > 1:
+            final_action = plan.actions[-1] if plan.actions else None
+            final_source = getattr(final_action, "source", None)
+
+            def action_source_matches(transition) -> bool:
+                approach = transition_approach_position(transition)
+                approach_source = approach[1] if isinstance(approach, tuple) and len(approach) == 2 else None
+                return (
+                    final_source == transition.entry
+                    or final_source in tuple(getattr(transition, "activation_locations", ()) or ())
+                    or final_source == approach_source
+                )
+
             matching = tuple(
                 transition
                 for transition in group
                 if plan.actions
                 and plan.actions[-1].action_type.name == "WARP"
                 and plan.actions[-1].destination == transition.destination
+                and action_source_matches(transition)
             )
+            # A few legacy transition records do not expose their activation
+            # side in the action source.  Destination equality is still a
+            # valid fallback when the group has a single equal-cost identity;
+            # preserve deterministic source ordering rather than discarding
+            # an otherwise executable plan.
+            if not matching and plan.actions and plan.actions[-1].action_type.name == "WARP":
+                matching = tuple(
+                    transition
+                    for transition in group
+                    if plan.actions[-1].destination == transition.destination
+                )[:1]
             if not matching:
                 continue
             warp = matching[0]
@@ -947,7 +1097,21 @@ def _observed_exit_goal(
         # locally blocked relevant transition is explicit rather than an
         # excuse to choose an unrelated exit.
         if semantic_target is not None:
+            if navigation_progress is not None:
+                navigation_progress["failed_exit_search"] = failure_signature
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_NAVIGATION_TRACE: exit_search_failed "
+                    f"frame={getattr(context, 'frame', None)!r} "
+                    f"current={(world.map_id, world.player_coordinates)!r} "
+                    "reason='no locally reachable candidate under current constraints'"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_NAVIGATION_TRACE",
+            )
             return None
+        if navigation_progress is not None:
+            navigation_progress["failed_exit_search"] = failure_signature
         selected = candidates[0]
     else:
         # Prefer continuing through a relevant, locally reachable exit over
@@ -967,7 +1131,104 @@ def _observed_exit_goal(
                 "relevance": relevance[selected].name,
             },
         )
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_NAVIGATION_TRACE: phase=exit_selection "
+            f"frame={getattr(context, 'frame', None)!r} "
+            f"current={(world.map_id, world.player_coordinates)!r} "
+            f"target={getattr(semantic_target, 'target_map', None)!r} "
+            f"candidates={tuple({
+                'entry': item[1].entry,
+                'destination': item[1].destination,
+                'cost': item[0][1],
+                'local_cost': item[0][4],
+                'reverse': item[2],
+                'selected': item[1] is selected,
+            } for item in ranked)!r}"
+        ),
+        trace=True,
+        prefix="CAMPAIGN_NAVIGATION_TRACE",
+    )
     return ReachWarp(destination_map=selected.destination[0], destination=selected.destination, warp=selected)
+
+
+def _observed_exit_failure_signature(world, semantic_target, navigation_policy):
+    """Identify one failed local-exit search without hiding live changes.
+
+    Exit selection is re-entered on every capability frame.  A blocked trainer
+    boundary used to make that loop rerun the same expensive search for every
+    observed connection row and then repeat the whole batch on the next frame.
+    Keep the suppression key tied to the movement-relevant observation: a new
+    tile, transition topology, dynamic blocker, trainer geometry, or policy
+    must permit a fresh attempt.
+    """
+
+    revision_getter = getattr(world, "revision_key", None)
+    try:
+        revisions = revision_getter() if callable(revision_getter) else None
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        revisions = None
+
+    def transition_signature(transition):
+        return (
+            getattr(transition, "kind", None),
+            getattr(transition, "entry", None),
+            getattr(transition, "destination", None),
+            getattr(transition, "required_facing", None),
+            getattr(transition, "activation", None),
+            tuple(sorted(getattr(transition, "activation_locations", ()) or (), key=repr)),
+            getattr(transition, "activation_direction", None),
+        )
+
+    def trigger_signature(trigger):
+        return (
+            getattr(trigger, "trigger_id", None),
+            getattr(trigger, "affordance_id", None),
+            getattr(trigger, "condition_active", None),
+            getattr(trigger, "trainer_defeated", None),
+            tuple(sorted(getattr(trigger, "hazard_locations", ()) or (), key=repr)),
+            tuple(sorted(getattr(trigger, "activation_locations", ()) or (), key=repr)),
+            tuple(sorted(getattr(trigger, "engagement_locations", ()) or (), key=repr)),
+        )
+
+    return (
+        (getattr(world, "map_id", None), getattr(world, "player_coordinates", None)),
+        repr(semantic_target),
+        repr(navigation_policy),
+        revisions,
+        tuple(sorted(getattr(world, "dynamic_blocked_coordinates", ()) or (), key=repr)),
+        tuple(sorted(getattr(world, "static_blocked_coordinates", ()) or (), key=repr)),
+        tuple(sorted((transition_signature(item) for item in (getattr(world, "transitions", ()) or getattr(world, "warps", ()))), key=repr)),
+        tuple(sorted((trigger_signature(item) for item in getattr(world, "triggers", ()) or ()), key=repr)),
+        tuple(
+            sorted(
+                (
+                    (
+                        getattr(obj, "local_id", None),
+                        getattr(obj, "location", None),
+                        getattr(obj, "trainer_defeated", None),
+                    )
+                    for obj in getattr(world, "objects", ()) or ()
+                ),
+                key=repr,
+            )
+        ),
+    )
+
+
+def _scripted_interruption_is_actionable() -> bool:
+    """Return whether a ROM-owned interaction currently owns the frame."""
+
+    try:
+        return classify_interaction(observe_interaction()) in {
+            InteractionType.DIALOGUE,
+            InteractionType.CHOICE,
+            InteractionType.MENU,
+            InteractionType.BATTLE,
+            InteractionType.SPECIAL_INTERACTION,
+        }
+    except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+        return False
 
 
 def observation_driven_overworld_progression(
@@ -978,6 +1239,7 @@ def observation_driven_overworld_progression(
     navigation_policy: NavigationGoal | None = None,
     completion_observed: bool | None = None,
     initial_observation=None,
+    interruption_handler: Callable[[], Iterator[object]] | None = None,
 ) -> Iterator[object]:
     """Advance through observed overworld affordances one input at a time.
 
@@ -1016,6 +1278,32 @@ def observation_driven_overworld_progression(
         # cannot consume an input after dialogue/menu/naming/confirmation has
         # become actionable.
         if interrupt is not None and interrupt():
+            if interruption_handler is not None:
+                yield from interruption_handler()
+            else:
+                yield
+            continue
+        # ``player_avatar_is_controllable`` can become true before the ROM
+        # releases its native script context.  In that handoff window the
+        # overworld snapshot is diagnostic only: planning from it produces
+        # repeated zero-action or full-route searches while the interaction
+        # executor correctly refuses to issue movement input.  Close any
+        # cached tactical loop and preserve this capability until the script
+        # is settled.
+        if _rom_script_is_active():
+            cached = execution_cache.pop("overworld", None)
+            close = getattr(cached[1], "close", None) if cached is not None else None
+            if callable(close):
+                close()
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_NAVIGATION_WAIT: "
+                    f"frame={getattr(context, 'frame', None)!r} "
+                    "reason='rom_script_owns_frame' action='preserve_capability'"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_NAVIGATION_WAIT",
+            )
             yield
             continue
         if use_initial_observation:
@@ -1072,10 +1360,19 @@ def observation_driven_overworld_progression(
                         )
                         yield
                         continue
+                    _record_completed_navigation_transition(
+                        progress,
+                        pending_transition,
+                        semantic_target,
+                    )
                     progress["previous_transition"] = pending_transition
                     progress.pop("pending_transition", None)
                     progress.pop("settling_observations", None)
-            elif current.map_id == pending_transition[1] and current.map_id != pending_transition[0]:
+            elif (
+                _canonical_map_id(current.map_id) == _canonical_map_id(pending_transition[1])
+                and _canonical_map_id(current.map_id) != _canonical_map_id(pending_transition[0])
+            ):
+                _record_completed_navigation_transition(progress, pending_transition, semantic_target)
                 progress["previous_transition"] = pending_transition
                 progress.pop("pending_transition", None)
         # A tactical plan is deliberately local to this observation.  The
@@ -1085,6 +1382,53 @@ def observation_driven_overworld_progression(
             continue
         navigator = GoalAwareNavigator(NavigationWorld.from_overworld(current))
         cache_key = (semantic_target, current.map_id)
+        continuation_route = execution_cache.get("continuation_route")
+        if continuation_route is not None:
+            actions = tuple(getattr(continuation_route, "actions", ()) or ())
+            origin = actions[0].source if actions else getattr(continuation_route, "destination", None)
+            current_location = (_canonical_map_id(current.map_id), current.player_coordinates)
+            normalized_origin = (
+                _canonical_map_id(origin[0]), origin[1]
+            ) if isinstance(origin, tuple) and len(origin) == 2 else None
+            if normalized_origin == current_location:
+                continuation_goal = navigation_policy or NavigationGoal(semantic_target)
+                loop = AgentControlLoop(
+                    lambda: navigation_observation(continuation_goal),
+                    goal=continuation_goal,
+                    navigation_plan=continuation_route,
+                ).run()
+                execution_cache["overworld"] = (cache_key, loop)
+                execution_cache.pop("continuation_route", None)
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_RECOVERY_HANDOFF: continuation_route_adopted=True "
+                        f"origin={normalized_origin!r} destination={getattr(continuation_route, 'destination', None)!r}"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_RECOVERY_HANDOFF",
+                )
+                try:
+                    next(loop)
+                except StopIteration:
+                    execution_cache.pop("overworld", None)
+                    yield
+                    continue
+                yield
+                continue
+            if normalized_origin != current_location:
+                # The parent route was composed from a stale coordinate,
+                # different map, or different Center exit. Drop it only after
+                # the fresh observation proves that its first action cannot
+                # apply.
+                execution_cache.pop("continuation_route", None)
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_RECOVERY_HANDOFF: continuation_route_discarded=True "
+                        f"reason='origin_mismatch' origin={normalized_origin!r} current={current_location!r}"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_RECOVERY_HANDOFF",
+                )
         cached = execution_cache.get("overworld")
         if cached is not None and cached[0] != cache_key:
             evicted = execution_cache.pop("overworld", None)
@@ -1092,6 +1436,41 @@ def observation_driven_overworld_progression(
             if callable(close):
                 close()
                 cached = None
+        # A current-map interaction owns this capability only while its ROM
+        # affordance is positively observed.  A static object can disappear
+        # for a frame while its hide flag/object table is settling.  If an
+        # older tactical loop remains mounted, it will keep planning the raw
+        # semantic trigger and turn that observation gap into repeated
+        # ``not found`` searches.  Release that loop at the boundary so the
+        # controller can obtain a fresh, conservative observation.
+        if (
+            not getattr(current, "transition_in_progress", False)
+            and semantic_target is not None
+            and semantic_target.kind is SemanticTargetKind.INTERACTION
+            and semantic_target.target_map == current.map_id
+            and _observed_interaction_goal(
+                current,
+                semantic_target,
+                completion_observed=completion_observed,
+            )
+            is None
+        ):
+            evicted = execution_cache.pop("overworld", None)
+            close = getattr(evicted[1], "close", None) if evicted is not None else None
+            if callable(close):
+                close()
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_NAVIGATION_BOUNDARY: "
+                    f"frame={getattr(context, 'frame', None)!r} "
+                    f"map={current.map_id!r} "
+                    f"interaction={semantic_target.interaction_id!r} "
+                    "reason='semantic_affordance_not_observed' "
+                    "action='discard_cached_tactical_loop'"
+                ),
+                trace=True,
+            )
+            return
         if cached is not None:
             loop = cached[1]
             try:
@@ -1179,23 +1558,17 @@ def observation_driven_overworld_progression(
                 continue
             yield
             continue
-        # A map connection can be geometrically valid while its approach tile
-        # is occupied by a ROM-spawned gatekeeper.  In that case the gatekeeper
-        # is the executable next step (for example, the Petalburg opening
-        # scene), not a reason to choose another exit such as the east route.
-        # Resolve this before selecting a generic exit so a blocked campaign
-        # route cannot oscillate against the NPC.
-        boundary_interaction_goal = _observed_boundary_interaction_goal(current, semantic_target)
-        if boundary_interaction_goal is not None:
-            _publish_navigation_intent(semantic_target, "INTERACT BLOCKING GATE")
-            boundary_tactical_goal = (
-                replace(navigation_policy, target=boundary_interaction_goal)
+        blocking_boundary_gate_goal = _observed_blocking_boundary_gate_goal(current, semantic_target)
+        if blocking_boundary_gate_goal is not None:
+            _publish_navigation_intent(semantic_target, "INTERACT BLOCKING BOUNDARY GATE")
+            gate_tactical_goal = (
+                replace(navigation_policy, target=blocking_boundary_gate_goal)
                 if navigation_policy is not None
-                else boundary_interaction_goal
+                else blocking_boundary_gate_goal
             )
             loop = AgentControlLoop(
-                lambda: navigation_observation(boundary_tactical_goal),
-                goal=boundary_tactical_goal,
+                lambda: navigation_observation(gate_tactical_goal),
+                goal=gate_tactical_goal,
             ).run()
             execution_cache["overworld"] = (cache_key, loop)
             try:
@@ -1293,7 +1666,7 @@ def _observed_local_destination_goal(
             warp=transition,
         )
         try:
-            plan = navigator.plan((world.map_id, world.player_coordinates), goal, algorithm="astar")
+            plan = navigator.plan((world.map_id, world.player_coordinates), goal, algorithm="dijkstra")
         except NavigationError:
             continue
         if plan is None:
@@ -1489,54 +1862,75 @@ def _observed_petalburg_wally_gate_goal(
     return None
 
 
-def _observed_boundary_interaction_goal(
+def _observed_blocking_boundary_gate_goal(
     world: OverworldObservation,
     semantic_target: SemanticTarget | None,
-) -> ActivateTrigger | None:
-    """Resolve an observed NPC occupying the approach to a target connection.
+) -> ActivateTrigger | ReachInteractionPosition | None:
+    """Resolve an actionable ROM gate that owns a blocked target boundary.
 
-    Some Emerald opening boundaries are script gates: the player must talk to
-    the NPC standing on the connection approach tile before the connection can
-    be traversed.  Keep this observation-driven and generic; the campaign
-    target remains the eventual semantic interaction on the destination map.
+    A map connection can be locally blocked by a coordinate event whose
+    activation tile is the player's current tile.  Asking the generic route
+    scorer to solve that boundary first either produces an avoidable failed
+    search or mounts a route that cannot cross the event.  Claim the frame
+    only when the target boundary is directly relevant, its approach tile is
+    positively blocked, and the ROM trigger is positively active at the
+    player's location. Unknown trigger conditions remain unresolved.
     """
-    if semantic_target is None or semantic_target.target_map is None:
+    if (
+        world is None
+        or not getattr(world, "controllable", False)
+        or semantic_target is None
+        or semantic_target.target_map is None
+    ):
         return None
-    target_connections = tuple(
+    current_location = (world.map_id, world.player_coordinates)
+    blocked = set(getattr(world, "dynamic_blocked_coordinates", ()) or ())
+    blocked.update(getattr(world, "static_blocked_coordinates", ()) or ())
+    target_transitions = tuple(
         transition
-        for transition in (getattr(world, "transitions", ()) or world.warps)
+        for transition in (getattr(world, "transitions", ()) or getattr(world, "warps", ()))
         if getattr(transition, "kind", None) == "map_connection"
         and getattr(transition, "destination", None) is not None
         and transition.destination[0] == semantic_target.target_map
+        and transition_approach_position(transition) in {
+            (world.map_id, coordinate) for coordinate in blocked
+        }
     )
-    approach_tiles = {
-        transition_approach_position(transition)
-        for transition in target_connections
-        if transition_approach_position(transition) is not None
-    }
-    blocked = set(getattr(world, "dynamic_blocked_coordinates", ()))
-    blocked_locations = {(world.map_id, coordinate) for coordinate in blocked}
-    occupied_approaches = approach_tiles & blocked_locations
-    if not occupied_approaches:
+    if not target_transitions:
         return None
-    for trigger in world.triggers:
-        if trigger.condition_active is False:
-            continue
-        if (
-            trigger.locations & blocked_locations
-            and (world.map_id, world.player_coordinates) in trigger.activation_locations
-        ):
-            diagnostic_print(
-                lambda: (
-                    "CAMPAIGN_NAVIGATION_TRACE: boundary_interaction_required "
-                    f"frame={getattr(context, 'frame', None)!r} map={world.map_id!r} "
-                    f"player={world.player_coordinates!r} target_map={semantic_target.target_map!r} "
-                    f"trigger={trigger.trigger_id!r} occupied_approaches={occupied_approaches!r}"
-                ),
-                trace=True,
-            )
-            return ActivateTrigger(trigger.trigger_id)
-    return None
+    candidates = tuple(
+        trigger
+        for trigger in getattr(world, "triggers", ()) or ()
+        if getattr(trigger, "condition_active", None) is True
+        and getattr(trigger, "currently_actionable", None) is not False
+        and current_location in (getattr(trigger, "activation_locations", ()) or ())
+    )
+    if not candidates:
+        return None
+    trigger = next(
+        (
+            candidate
+            for candidate in candidates
+            if str(getattr(candidate, "kind", "")).startswith(("semantic_", "coordinate"))
+        ),
+        candidates[0],
+    )
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_NAVIGATION_TRACE: blocking_boundary_gate_required "
+            f"frame={getattr(context, 'frame', None)!r} "
+            f"map={world.map_id!r} player={world.player_coordinates!r} "
+            f"trigger={trigger.trigger_id!r} "
+            f"boundary_destinations={tuple(item.destination for item in target_transitions)!r}"
+        ),
+        trace=True,
+        prefix="CAMPAIGN_NAVIGATION_TRACE",
+    )
+    return (
+        ActivateTrigger(trigger.trigger_id)
+        if getattr(trigger, "requires_input", True)
+        else ReachInteractionPosition(trigger.trigger_id)
+    )
 
 
 def _start_game_values() -> tuple[str, str]:
@@ -1920,11 +2314,10 @@ def _emerald_observation(
     )
     if objective_id == "complete_intro_rival":
         defeated_rival = _safe_event_flag("DEFEATED_RIVAL_ROUTE103")
-        hidden_rival = _safe_event_flag("HIDE_ROUTE_103_RIVAL")
-        rival_complete = (
-            True
-            if defeated_rival is True or hidden_rival is True
-            else False if defeated_rival is False and hidden_rival is False else None
+        birch_lab_state = _safe_event_var("BIRCH_LAB_STATE")
+        rival_complete = intro_rival_battle_completion_value(
+            defeated_rival,
+            birch_lab_state,
         )
         facts += (("intro_rival_battle_complete", rival_complete),)
     if live_context and objective_id == "receive_pokedex":
@@ -1998,15 +2391,13 @@ def _emerald_observation(
         try:
             defeated_rival = _safe_event_flag("DEFEATED_RIVAL_ROUTE103")
             hidden_rival = _safe_event_flag("HIDE_ROUTE_103_RIVAL")
+            birch_lab_state = _safe_event_var("BIRCH_LAB_STATE")
             trace.mark("defeated_rival_route103", defeated_rival)
             trace.mark("hide_route_103_rival", hidden_rival)
+            trace.mark("birch_lab_state", birch_lab_state)
             trace.mark(
                 "intro_rival_battle_complete",
-                (
-                    True
-                    if defeated_rival is True or hidden_rival is True
-                    else False if defeated_rival is False and hidden_rival is False else None
-                ),
+                intro_rival_battle_completion_value(defeated_rival, birch_lab_state),
             )
             trace.mark("littleroot_intro_state", get_event_var("LITTLEROOT_INTRO_STATE"))
             trace.mark("littleroot_rival_state", get_event_var("LITTLEROOT_RIVAL_STATE"))
@@ -2069,12 +2460,6 @@ def _semantic_target_for_objective(objective_id: str | None) -> SemanticTarget |
         # sequence.  The campaign supplies only the destination map and keeps
         # completion authoritative through the existing Pokédex flags.
         result = SemanticTarget.map(MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value)
-        diagnostic_print(
-            lambda: f"CAMPAIGN_SEMANTIC_TARGET_RESULT: objective_id={objective_id!r} target={result!r}", trace=True
-        )
-        return result
-    if objective_id == "reach_petalburg":
-        result = SemanticTarget.map(MapRSE.PETALBURG_CITY.value)
         diagnostic_print(
             lambda: f"CAMPAIGN_SEMANTIC_TARGET_RESULT: objective_id={objective_id!r} target={result!r}", trace=True
         )
@@ -2166,10 +2551,8 @@ def _publish_campaign_status(
         "obtain_starter": "Obtain Starter Pokémon",
         "complete_intro_rival": "Complete Introductory Rival Battle",
         "receive_pokedex": "Receive Pokédex and initial Poké Balls",
-        "reach_petalburg": "Reach Petalburg City",
         "complete_petalburg_wally": "Complete Wally's Tutorial",
         "complete_petalburg_woods": "Complete Petalburg Woods Scene",
-        "reach_rustboro": "Reach Rustboro City",
         "complete_rustboro_goods_stolen": "Complete Rustboro Goods Theft Scene",
         "report_devon_goods": "Report the Stolen Devon Goods",
         "recover_devon_goods": "Recover the Devon Goods",
@@ -2396,11 +2779,30 @@ def _shop_main_menu_is_active() -> bool:
         return False
 
 
+def _shop_transition_script_is_active() -> bool:
+    """Return whether Emerald is between Mart tasks while its shop script owns control."""
+
+    try:
+        script_context = get_global_script_context()
+        if script_context is None or not getattr(script_context, "is_active", False):
+            return False
+        names = (
+            getattr(script_context, "script_function_name", None),
+            *getattr(script_context, "stack", ()),
+        )
+        # The clerk's field-message script must remain available to the shared
+        # dialogue executor. ExpandedItems is the ROM script that owns the
+        # short no-task windows around Task_ShopMenu and the buy-menu tasks.
+        return any(isinstance(name, str) and name.endswith("_Mart_ExpandedItems") for name in names)
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+        return False
+
+
 def _shop_task_is_active() -> bool:
     """Return whether any Emerald Poké Mart task owns the current frame."""
 
     try:
-        return any(task_is_active(task_name) for task_name in _POKEMART_TASK_NAMES)
+        return _shop_transition_script_is_active() or any(task_is_active(task_name) for task_name in _POKEMART_TASK_NAMES)
     except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
         return False
 
@@ -2420,8 +2822,8 @@ def _leave_shop_menu() -> Iterator[object]:
     raise RuntimeError("Poké Ball restock could not close the Mart menu")
 
 
-def _finish_shop_exit_dialogue() -> Iterator[object]:
-    """Consume the clerk's post-menu farewell before releasing the capability."""
+def _finish_scripted_interruption(*, accept_shop_menu_boundary: bool = True) -> Iterator[object]:
+    """Consume a scripted field interaction before resuming navigation."""
 
     executor = AgentActionExecutor()
     dialogue_input_in_flight: tuple[object, ...] | None = None
@@ -2449,6 +2851,13 @@ def _finish_shop_exit_dialogue() -> Iterator[object]:
         )
 
     for _ in range(120):
+        # The clerk can hand control directly to ``Task_ShopMenu`` while the
+        # navigation capability is still finishing its interruption handler.
+        # An open Mart menu is the successful boundary for the restock
+        # capability; waiting for an overworld observation here only creates a
+        # false timeout before the purchase loop gets control.
+        if accept_shop_menu_boundary and _shop_main_menu_is_active():
+            return
         observation = observe_agent()
         input_signature = interaction_signature(observation)
         if dialogue_input_in_flight is not None:
@@ -2486,48 +2895,332 @@ def _finish_shop_exit_dialogue() -> Iterator[object]:
             dialogue_input_in_flight = input_signature
             dialogue_input_issued = True
         yield
-    raise RuntimeError("Poké Ball restock could not finish the Mart exit dialogue")
+    # ROM-owned scenes can legitimately outlive this local input budget. This
+    # is common for the automatic Running Shoes sequence that starts while a
+    # restock route is leaving Littleroot. Keep the mounted capability as the
+    # owner and let its next observation resume the interaction. Raising here
+    # makes CampaignController tear down and remount the same objective,
+    # which repeats the dialogue rescue and creates avoidable stutter.
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_SCRIPTED_INTERRUPTION_DEFERRED: "
+            "ROM-owned interaction did not settle within the local input budget; "
+            "retaining capability ownership"
+        ),
+        trace=True,
+        prefix="CAMPAIGN_SCRIPTED_INTERRUPTION_DEFERRED",
+    )
+    return
+
+
+def _finish_shop_exit_dialogue() -> Iterator[object]:
+    """Consume the clerk's post-menu farewell before releasing the capability."""
+
+    yield from _finish_scripted_interruption(accept_shop_menu_boundary=False)
+
+
+def _baseline_shopping_plan(
+    *,
+    include_pokeballs: bool = True,
+    buyable_items=None,
+) -> tuple[list[tuple[object, int]], bool, bool]:
+    """Build one Mart transaction for the configured item baseline.
+
+    The recovery policy owns its cash floor.  When recovery is required, the
+    Poké Ball portion spends only the money left after the medicine purchase,
+    which keeps that floor intact.  A Poké Ball-only purchase retains its
+    historical behavior and may spend the full wallet.
+    """
+
+    from modules.items import get_item_bag, get_item_by_name
+    from modules.player import get_player
+
+    antidote = get_item_by_name("Antidote")
+    potion = get_item_by_name("Potion")
+    bag = get_item_bag()
+    antidote_count = bag.quantity_of(antidote)
+    potion_count = bag.quantity_of(potion)
+    recovery_policy = _recovery_supply_policy()
+    recovery_required = recovery_policy.needs_restock(antidote_count, potion_count)
+
+    ball = None
+    pokeball_required = False
+    pokeball_policy = _pokeball_restock_policy()
+    if include_pokeballs:
+        ball = get_item_by_name("Poké Ball")
+        pokeball_required = pokeball_policy.needs_restock(bag.quantity_of(ball))
+
+    if not recovery_required and not pokeball_required:
+        return [], recovery_required, pokeball_required
+
+    # The route planner calls this before the player reaches a Mart. The ROM's
+    # current-shop catalog is only meaningful while a shop menu is open;
+    # reading it in the overworld can report an empty or stale list and abort
+    # the capability before it creates a navigation route. Use the known
+    # baseline items while planning the route, then pass the live catalog from
+    # the open Mart menu for the final transaction check.
+    buyable = (
+        tuple(item for item in (antidote, potion, ball) if item is not None)
+        if buyable_items is None
+        else tuple(buyable_items)
+    )
+    if recovery_required and antidote not in buyable and potion not in buyable:
+        raise RuntimeError("The current Poké Mart sells neither Antidote nor Potion")
+    if pokeball_required and ball not in buyable:
+        raise RuntimeError("The current Poké Mart does not sell Poké Balls")
+
+    money = getattr(get_player(), "money", 0)
+    shopping: list[tuple[object, int]] = []
+    recovery_spend = 0
+    if recovery_required:
+        quantities = recovery_policy.affordable_quantities(
+            antidote_count,
+            potion_count,
+            money,
+            {
+                name: item.price
+                for name, item in (("Antidote", antidote), ("Potion", potion))
+                if item in buyable
+            },
+        )
+        for name, quantity in quantities.items():
+            item = get_item_by_name(name)
+            shopping.append((item, quantity))
+            recovery_spend += item.price * quantity
+
+    if pokeball_required:
+        desired = pokeball_policy.quantity_to_buy(bag.quantity_of(ball))
+        ball_budget = (
+            max(0, money - recovery_policy.cash_floor - recovery_spend)
+            if recovery_required
+            else money
+        )
+        ball_quantity = (
+            desired if ball.price == 0 else min(desired, ball_budget // ball.price)
+        )
+        if ball_quantity:
+            shopping.append((ball, ball_quantity))
+
+    return shopping, recovery_required, pokeball_required
+
+
+def _restock_location():
+    """Return the live map/coordinate pair for a restock panel when available."""
+
+    from modules.player import get_player_avatar
+
+    try:
+        avatar = get_player_avatar()
+        return avatar.map_group_and_number, avatar.local_coordinates
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+        return None
+
+
+def _purchase_shopping_plan(
+    plan: tuple[list[tuple[object, int]], bool, bool],
+    *,
+    objective_id: str | None = None,
+) -> Iterator[object]:
+    """Execute one planned multi-item Mart transaction."""
+
+    from modules.modes.util.higher_level_actions import buy_in_shop
+    from modules.player import get_player as get_current_player
+
+    shopping, recovery_required, pokeball_required = plan
+    try:
+        wallet = getattr(get_current_player(), "money", 0)
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+        # The purchase plan is already authoritative for execution. Keep a
+        # partial diagnostic usable in lightweight callers and during an
+        # emulator lifecycle boundary where the wallet read is unavailable.
+        wallet = None
+    cash_floor = _recovery_supply_policy().cash_floor if recovery_required else 0
+    required_categories = tuple(
+        category
+        for required, category in (
+            (recovery_required, "recovery items"),
+            (pokeball_required, "Poké Balls"),
+        )
+        if required
+    )
+    item_details = tuple(
+        f"{quantity}x {getattr(item, 'name', str(item))}"
+        for item, quantity in shopping
+    )
+    total_cost = sum(getattr(item, "price", 0) * quantity for item, quantity in shopping)
+    plan_text = ", ".join(item_details) or "none affordable"
+    required_text = ", ".join(required_categories) or "none"
+    wallet_text = "unknown" if wallet is None else f"${wallet:,}"
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_SHOPPING_PLAN: "
+            f"objective={objective_id!r} "
+            f"required={required_text!r} items={plan_text!r} "
+            f"total_cost=${total_cost:,} wallet={wallet_text} cash_floor=${cash_floor:,}"
+        ),
+        trace=True,
+        prefix="CAMPAIGN_SHOPPING_PLAN",
+    )
+    if not shopping:
+        if recovery_required and pokeball_required:
+            reason = "Cannot restock Poké Balls and recovery items without violating the cash floor."
+        elif recovery_required:
+            reason = "Cannot restock recovery items without violating the cash floor."
+        elif pokeball_required:
+            reason = "Cannot restock Poké Balls: insufficient money."
+        else:
+            reason = "No item restock is required."
+        context.message = (
+            f"{reason}\n"
+            f"Plan: {plan_text}; wallet {wallet_text}; cash floor ${cash_floor:,}"
+        )
+        if recovery_required or pokeball_required:
+            print_restock_failure(
+                method="Poké Mart purchase",
+                error=reason,
+                action="seek trainer funding",
+            )
+        else:
+            print_restock_success(
+                method="Poké Mart purchase",
+                destination=_restock_location(),
+                detail="no purchase required; inventory is already at policy targets",
+            )
+        return False
+
+    context.message = (
+        f"Restocking: {plan_text}\n"
+        f"Total: ${total_cost:,}; wallet: {wallet_text}; cash floor: ${cash_floor:,}"
+    )
+    destination = _restock_location()
+    print_restock_attempt(
+        method="Poké Mart purchase",
+        destination=destination,
+        items=item_details,
+        total_cost=total_cost,
+    )
+    try:
+        yield from buy_in_shop(shopping)
+    except Exception as error:
+        print_restock_failure(
+            method="Poké Mart purchase",
+            error=f"{type(error).__name__}: {error}",
+            action="release purchase and replan",
+        )
+        raise
+    wallet_after = _restock_wallet()
+    print_restock_success(
+        method="Poké Mart purchase",
+        destination=destination,
+        detail=(
+            f"purchased {plan_text}; wallet after {wallet_after:,}"
+            if wallet_after is not None
+            else f"purchased {plan_text}"
+        ),
+    )
+    return True
 
 
 def _purchase_recovery_items_in_shop() -> Iterator[object]:
     """Purchase medicine deficits while preserving the configured cash floor."""
 
-    from modules.items import get_item_bag, get_item_by_name
     from modules.mart import get_mart_buyable_items
-    from modules.modes.util.higher_level_actions import buy_in_shop
-    from modules.player import get_player
 
-    policy = _recovery_supply_policy()
-    antidote = get_item_by_name("Antidote")
-    potion = get_item_by_name("Potion")
-    buyable = get_mart_buyable_items()
-    if antidote not in buyable and potion not in buyable:
-        raise RuntimeError("The current Poké Mart sells neither Antidote nor Potion")
-    quantities = policy.affordable_quantities(
-        get_item_bag().quantity_of(antidote),
-        get_item_bag().quantity_of(potion),
-        getattr(get_player(), "money", 0),
-        {
-            name: item.price
-            for name, item in (("Antidote", antidote), ("Potion", potion))
-            if item in buyable
-        },
+    plan = _baseline_shopping_plan(
+        include_pokeballs=False,
+        buyable_items=get_mart_buyable_items(),
     )
-    shopping = [(get_item_by_name(name), quantity) for name, quantity in quantities.items()]
-    if not shopping:
-        context.message = "Cannot restock recovery items without violating the cash floor."
+    purchased = yield from _purchase_shopping_plan(plan, objective_id="restock_recovery_items")
+    return purchased
+
+
+@dataclass(frozen=True, slots=True)
+class _MoneyTrainerTarget:
+    """A reachable trainer that can fund a deferred restock."""
+
+    map_id: tuple[int, int]
+    trainer_id: str
+    estimated_route_cost: int
+    source: str
+    script_symbol: str | None = None
+    readiness_status: str | None = None
+    readiness_reason: str | None = None
+
+
+_NON_PAYOUT_TRAINER_SCRIPT_SYMBOLS = frozenset(
+    {
+        # This object uses a trainer-shaped event and a real roster, but the
+        # battle is owned by Norman's story tutorial.  It is marked as a
+        # Wally tutorial battle at runtime and awards no ordinary trainer
+        # payout.
+        "petalburgcity_eventscript_wallytutorial",
+    }
+)
+
+
+def _is_non_payout_trainer_script(script_symbol: str | None) -> bool:
+    """Return whether a source script names a scripted non-payout battle."""
+
+    if not script_symbol:
         return False
-    context.message = "Restocking recovery items"
-    yield from buy_in_shop(shopping)
-    return True
+    normalized = str(script_symbol).casefold().replace("-", "_")
+    if normalized in _NON_PAYOUT_TRAINER_SCRIPT_SYMBOLS:
+        return True
+    # Source symbols are stable semantic identities.  Preserve the explicit
+    # Wally entry above, while also covering source revisions that prepend a
+    # map/module qualifier to the same tutorial name.
+    return normalized.endswith("_wallytutorial") or normalized.endswith("_tutorial")
 
 
-def _undefeated_money_trainer(observation):
-    """Select the nearest observed undefeated trainer on the current map."""
+def _money_trainer_source_is_payout_capable(
+    trainer_id: str,
+    *,
+    script_symbol: str | None,
+) -> bool | None:
+    """Classify whether a trainer source can produce an ordinary payout.
+
+    A trainer-shaped object is not sufficient evidence for funding.  Emerald
+    also uses trainer object fields for scripted scenes such as Wally's
+    tutorial, whose battle has no ordinary trainer payout.  A source script
+    is positive evidence only when the bounded trainer-checkpoint resolver
+    finds a real roster through an ordinary ``trainerbattle`` command.  The
+    ``None`` result is retained for lightweight adapters that do not expose a
+    source script at all; those callers predate source-backed discovery and
+    are covered by their own injected target contract.
+    """
+
+    if _is_non_payout_trainer_script(script_symbol):
+        return False
+    if not script_symbol:
+        return None
+    try:
+        checkpoint = trainer_checkpoint_for_source(
+            trainer_id,
+            script_symbol=script_symbol,
+        )
+    except (AttributeError, ImportError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+        return False
+    if getattr(checkpoint, "checkpoint_kind", None) == "story":
+        return False
+    return bool(checkpoint is not None and getattr(checkpoint, "party", ()))
+
+
+def _money_trainer_source_symbol(trigger, trainer) -> str | None:
+    """Return the ROM script identity associated with a live trainer."""
+
+    return (
+        getattr(trigger, "script_symbol", None)
+        or getattr(trigger, "script", None)
+        or getattr(trainer, "script", None)
+    )
+
+
+def _observed_money_trainer_candidates(observation) -> tuple[_MoneyTrainerTarget, ...]:
+    """Return undefeated trainers that are live and actionable on this map."""
 
     overworld = getattr(observation, "overworld", None)
     if overworld is None:
-        return None
+        return ()
     # TriggerObservation carries the stable affordance ID and sight-line
     # geometry, while ObjectObservation carries the live save-backed defeat
     # flag. Join them by trainer ID instead of reading a field that does not
@@ -2540,7 +3233,7 @@ def _undefeated_money_trainer(observation):
         if getattr(obj, "trainer_id", None) is not None
     }
     current = getattr(overworld, "player_coordinates", None)
-    candidates = []
+    candidates: list[_MoneyTrainerTarget] = []
     for trigger in getattr(overworld, "triggers", ()):
         trainer_id = getattr(trigger, "affordance_id", None)
         if not trainer_id or not getattr(trigger, "hazard_locations", ()):
@@ -2550,14 +3243,292 @@ def _undefeated_money_trainer(observation):
             continue
         if getattr(trigger, "currently_actionable", True) is False:
             continue
+        script_symbol = _money_trainer_source_symbol(trigger, trainer)
+        payout_capable = _money_trainer_source_is_payout_capable(
+            str(trainer_id),
+            script_symbol=script_symbol,
+        )
+        source_is_explicit = isinstance(trainer, ObjectObservation) or bool(script_symbol)
+        if payout_capable is False or (payout_capable is None and source_is_explicit):
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_MONEY_TRAINER_FILTER: "
+                    f"trainer={trainer_id!r} script={script_symbol!r} "
+                    "result='not_ordinary_payout_source'"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_MONEY_TRAINER_FILTER",
+            )
+            continue
         distances = []
         for location in getattr(trigger, "activation_locations", ()):
             if isinstance(location, tuple) and len(location) == 2 and location[0] == overworld.map_id:
                 coordinate = location[1]
                 if current is not None:
                     distances.append(abs(current[0] - coordinate[0]) + abs(current[1] - coordinate[1]))
-        candidates.append((min(distances, default=10**9), str(trainer_id), trainer_id))
-    return min(candidates, default=None)[2] if candidates else None
+        candidates.append(
+            _MoneyTrainerTarget(
+                overworld.map_id,
+                str(trainer_id),
+                min(distances, default=10**9),
+                "current map observation",
+                script_symbol,
+            )
+        )
+    return tuple(sorted(candidates, key=lambda item: (item.estimated_route_cost, item.trainer_id)))
+
+
+def _catalogued_money_trainer_candidate_batches(observation) -> Iterator[tuple[_MoneyTrainerTarget, ...]]:
+    """Yield reachable undefeated trainers one map batch at a time.
+
+    Runtime object events are lazy and only describe the map around the
+    player.  Static trainer templates are ROM-owned, include the persistent
+    defeat flag, and give the world navigator enough identity to travel to a
+    different route before resolving the live interaction there.  The batch
+    boundary is deliberately cooperative: a full ROM catalog must not block
+    the emulator frame loop while funding candidates are being discovered.
+    """
+
+    overworld = getattr(observation, "overworld", None)
+    current_map = getattr(overworld, "map_id", None)
+    current_coordinates = getattr(overworld, "player_coordinates", None)
+    if current_map is None:
+        return
+
+    try:
+        from modules.world_navigation import get_world_map_graph
+
+        graph = get_world_map_graph()
+        map_costs = dict(graph.map_costs(current_map))
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        return
+
+    for map_address in MapRSE:
+        map_id = map_address.value
+        if map_id not in map_costs:
+            continue
+        try:
+            if getattr(getattr(context, "rom", None), "is_rs", False) and not map_address.exists_on_rs:
+                continue
+            metadata = get_map_metadata(map_id)
+            trainers = static_trainer_observations(map_id, metadata)
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+            # Map metadata is allowed to be incomplete during ROM/map
+            # transitions. One unresolved map must not hide other candidates.
+            yield ()
+            continue
+
+        map_candidates: list[_MoneyTrainerTarget] = []
+        for trainer in trainers:
+            trainer_id = getattr(trainer, "trainer_id", None)
+            if not trainer_id or getattr(trainer, "trainer_defeated", None) is not False:
+                continue
+            trainer_location = getattr(trainer, "location", None)
+            if (
+                not isinstance(trainer_location, tuple)
+                or len(trainer_location) != 2
+                or not isinstance(trainer_location[1], tuple)
+                or len(trainer_location[1]) != 2
+            ):
+                continue
+            script_symbol = getattr(trainer, "script", None)
+            payout_capable = _money_trainer_source_is_payout_capable(
+                str(trainer_id),
+                script_symbol=script_symbol,
+            )
+            # Keep source-less synthetic adapters usable in capability tests
+            # and embedders. A real static ObjectObservation always carries a
+            # ROM script field, so an unknown explicit source remains
+            # excluded conservatively.
+            source_is_explicit = isinstance(trainer, ObjectObservation) or bool(script_symbol)
+            if payout_capable is False or (payout_capable is None and source_is_explicit):
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_MONEY_TRAINER_FILTER: "
+                        f"trainer={trainer_id!r} map={map_id!r} script={script_symbol!r} "
+                        "result='not_ordinary_payout_source'"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_MONEY_TRAINER_FILTER",
+                )
+                continue
+            estimated_cost = None
+            if isinstance(current_coordinates, tuple) and len(current_coordinates) == 2:
+                try:
+                    estimated_cost = graph.estimate_location_cost(
+                        (current_map, current_coordinates),
+                        (map_id, trainer_location[1]),
+                    )
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+                    estimated_cost = None
+            if estimated_cost is None:
+                estimated_cost = map_costs[map_id]
+            map_candidates.append(
+                _MoneyTrainerTarget(
+                    map_id,
+                    str(trainer_id),
+                    int(estimated_cost),
+                    "static reachable map catalog",
+                    script_symbol,
+                )
+            )
+
+        # Yield even an empty batch. Most reachable maps do not contain an
+        # undefeated trainer, and skipping those boundaries would recreate a
+        # long synchronous scan before the next campaign frame.
+        yield tuple(map_candidates)
+
+
+def _catalogued_money_trainer_candidates(observation) -> tuple[_MoneyTrainerTarget, ...]:
+    """Find reachable undefeated trainers from the ROM map catalog."""
+
+    candidates = tuple(
+        candidate
+        for batch in _catalogued_money_trainer_candidate_batches(observation)
+        for candidate in batch
+    )
+    return tuple(sorted(candidates, key=lambda item: (item.estimated_route_cost, item.map_id, item.trainer_id)))
+
+
+def _annotate_money_trainer_readiness(candidate: _MoneyTrainerTarget) -> _MoneyTrainerTarget:
+    """Attach the shared live trainer-checkpoint readiness result."""
+
+    try:
+        checkpoint = trainer_checkpoint_for_source(
+            candidate.trainer_id,
+            script_symbol=candidate.script_symbol,
+        )
+    except (AttributeError, ImportError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+        checkpoint = None
+    if checkpoint is None or not getattr(checkpoint, "party", ()):
+        annotated = replace(
+            candidate,
+            readiness_status="unknown",
+            readiness_reason="trainer roster/checkpoint is unavailable",
+        )
+    else:
+        try:
+            from .trainer_preparation import projected_trainer_experience
+
+            readiness = assess_live_trainer_checkpoint(
+                checkpoint,
+                get_party(),
+                expected_exp=projected_trainer_experience(checkpoint),
+            )
+            status = getattr(getattr(readiness, "status", None), "value", None) or "unknown"
+            reason = getattr(readiness, "reason", None)
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError) as error:
+            status = "unknown"
+            reason = f"readiness assessment failed: {type(error).__name__}: {error}"
+        annotated = replace(
+            candidate,
+            readiness_status=status,
+            readiness_reason=reason,
+        )
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_MONEY_TRAINER_READINESS: "
+            f"trainer={candidate.trainer_id!r} map={candidate.map_id!r} "
+            f"status={annotated.readiness_status!r} reason={annotated.readiness_reason!r}"
+        ),
+        trace=True,
+        prefix="CAMPAIGN_MONEY_TRAINER_READINESS",
+    )
+    return annotated
+
+
+def _cooperative_money_trainer_candidates(observation) -> Iterator[object]:
+    """Discover and assess money trainers across multiple campaign frames."""
+
+    observed = _observed_money_trainer_candidates(observation)
+    if observed:
+        candidates = observed
+    else:
+        discovered: list[_MoneyTrainerTarget] = []
+        for batch in _catalogued_money_trainer_candidate_batches(observation):
+            discovered.extend(batch)
+            diagnostic_print(
+                lambda batch=batch, count=len(discovered): (
+                    "CAMPAIGN_MONEY_TRAINER_SEARCH: "
+                    f"phase='catalog' batch={len(batch)!r} discovered={count!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_MONEY_TRAINER_SEARCH",
+            )
+            yield None
+        candidates = tuple(
+            sorted(
+                discovered,
+                key=lambda item: (item.estimated_route_cost, item.map_id, item.trainer_id),
+            )
+        )
+
+    annotated = []
+    for candidate in candidates:
+        annotated.append(_annotate_money_trainer_readiness(candidate))
+        # Readiness can perform a bounded battle projection. Keep it outside
+        # the frame that discovered the target so a large catalog remains
+        # responsive as well as observable.
+        yield None
+    return tuple(annotated)
+
+
+def _money_trainer_candidates(
+    observation,
+    *,
+    cooperative: bool = False,
+) -> tuple[_MoneyTrainerTarget, ...] | Iterator[object]:
+    """Return reachable funding targets with trainer readiness attached.
+
+    Funding is a real trainer engagement. Every ROM-resolved candidate goes
+    through the same live checkpoint readiness assessment used by campaign
+    routing; an unknown roster or a ``prepare`` result is retained for
+    diagnostics but cannot be selected. The default adapter remains
+    synchronous for pure callers; live campaign execution opts into the
+    cooperative generator.
+    """
+
+    if cooperative:
+        return _cooperative_money_trainer_candidates(observation)
+    observed = _observed_money_trainer_candidates(observation)
+    candidates = observed or _catalogued_money_trainer_candidates(observation)
+    return tuple(_annotate_money_trainer_readiness(candidate) for candidate in candidates)
+
+
+def _money_trainer_is_ready(candidate) -> bool:
+    """Return whether a funding candidate passed the checkpoint gate."""
+
+    status = getattr(candidate, "readiness_status", None)
+    # Compatibility callers that inject already-selected targets predate the
+    # readiness annotation. Live discovery always sets the field, including
+    # ``unknown`` for unresolved source facts.
+    if status in {None, "ready"}:
+        return True
+    # Lightweight capability tests inject synthetic trainer IDs without a
+    # campaign runtime or ROM roster. Preserve that adapter compatibility;
+    # live Campaign Progression always has a runtime and therefore rejects an
+    # unknown checkpoint conservatively.
+    return status == "unknown" and getattr(context, "nuzlocke_runtime", None) is None
+
+
+def _rom_script_is_active() -> bool:
+    """Return whether a ROM-owned script currently owns the emulator frame."""
+
+    try:
+        interaction = observe_interaction()
+        return bool(
+            getattr(interaction, "script_active", False)
+            or getattr(interaction, "interaction_phase", None) is InteractionPhase.SCRIPT_NATIVE_WAIT
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+        return False
+
+
+def _undefeated_money_trainer(observation):
+    """Select the nearest observed undefeated trainer on the current map."""
+
+    candidates = _observed_money_trainer_candidates(observation)
+    return candidates[0].trainer_id if candidates else None
 
 
 def _earn_money_from_safe_trainer() -> Iterator[object]:
@@ -2566,85 +3537,321 @@ def _earn_money_from_safe_trainer() -> Iterator[object]:
     from modules.player import get_player
 
     observation = _emerald_observation(False, "earn_money")
-    trainer_id = _undefeated_money_trainer(observation)
-    if trainer_id is None:
-        raise RuntimeError("No observed safe undefeated trainer is available to fund recovery supplies")
     overworld = observation.overworld
-    semantic_target = SemanticTarget.interaction(overworld.map_id, trainer_id)
-    navigation_policy = NavigationGoal(
-        EngageTrainer(trainer_id),
-        constraints=GoalConstraints(trainer_mode=TrainerMode.ENGAGE),
-        encounter_mode=EncounterMode.AVOID,
-    )
     starting_money = getattr(get_player(), "money", 0)
-    navigation = observation_driven_overworld_progression(
-        semantic_target=semantic_target,
-        navigation_policy=navigation_policy,
-        execution_cache={},
-        objective_id="earn_money",
-        initial_observation=overworld,
+    current_location = (
+        (overworld.map_id, overworld.player_coordinates)
+        if getattr(overworld, "map_id", None) is not None
+        and getattr(overworld, "player_coordinates", None) is not None
+        else _restock_location()
     )
-    for _ in range(1200):
-        if getattr(get_player(), "money", 0) > starting_money:
-            return
-        next(navigation)
-        yield
+    print_money_trainer_request(
+        location=current_location,
+        wallet=starting_money,
+        reason="restock plan is unaffordable; searching reachable undefeated trainers",
+    )
+    # Publish the request before entering catalog discovery. The cooperative
+    # stream then yields between map scans and readiness projections so the
+    # emulator continues advancing frames while funding targets are resolved.
+    yield None
+    candidate_stream = _money_trainer_candidates(observation, cooperative=True)
+    if isinstance(candidate_stream, tuple):
+        # Preserve the injected synchronous adapter used by lightweight
+        # capability callers and tests.
+        candidates = candidate_stream
+    else:
+        candidates = yield from candidate_stream
+    ready_candidates = tuple(candidate for candidate in candidates if _money_trainer_is_ready(candidate))
+    selected_id = ready_candidates[0].trainer_id if ready_candidates else None
+    print_money_trainer_destinations(candidates, selected=selected_id)
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_MONEY_TRAINER_SEARCH: "
+            f"readiness={ {item.trainer_id: item.readiness_status for item in candidates}!r} "
+            f"selected={selected_id!r}"
+        ),
+        trace=True,
+        prefix="CAMPAIGN_MONEY_TRAINER_SEARCH",
+    )
+    if not ready_candidates:
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_MONEY_TRAINER_SEARCH: "
+                f"current_map={getattr(getattr(observation, 'overworld', None), 'map_id', None)!r} "
+                "candidates=() result='none reachable'"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_MONEY_TRAINER_SEARCH",
+        )
+        print_money_trainer_failure(
+            trainer=None,
+            error="No readiness-approved undefeated trainer is available to fund recovery supplies",
+            action="release restock and resume campaign travel",
+        )
+        raise RuntimeError("No readiness-approved undefeated trainer is available to fund recovery supplies")
+
+    attempted: set[tuple[object, str]] = set()
+    route_failures: list[str] = []
+    candidates = ready_candidates
+    while candidates:
+        trainer = next(
+            (
+                candidate
+                for candidate in candidates
+                if (candidate.map_id, candidate.trainer_id) not in attempted
+            ),
+            None,
+        )
+        if trainer is None:
+            break
+        attempted.add((trainer.map_id, trainer.trainer_id))
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_MONEY_TRAINER_SEARCH: "
+                f"current_map={getattr(getattr(observation, 'overworld', None), 'map_id', None)!r} "
+                f"candidates={tuple((item.map_id, item.trainer_id, item.estimated_route_cost, item.source) for item in candidates)!r} "
+                f"selected={(trainer.map_id, trainer.trainer_id)!r}"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_MONEY_TRAINER_SEARCH",
+        )
+        semantic_target = SemanticTarget.interaction(trainer.map_id, trainer.trainer_id)
+        navigation_policy = NavigationGoal(
+            EngageTrainer(trainer.trainer_id),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.ENGAGE),
+            encounter_mode=EncounterMode.AVOID,
+        )
+        print_money_trainer_attempt(
+            trainer=trainer.trainer_id,
+            destination=trainer.map_id,
+            wallet=starting_money,
+            reason=f"selected lowest estimated route cost ({trainer.estimated_route_cost})",
+        )
+        context.campaign_status = CampaignStatus(
+            "earn_money",
+            semantic_target,
+            f"Navigate to undefeated trainer ({trainer.source})",
+            navigation_policy,
+        )
+        context.message = (
+            f"Restock deferred until trainer payout.\n"
+            f"Target: {trainer.trainer_id} on {trainer.map_id}; estimated route cost {trainer.estimated_route_cost}."
+        )
+        navigation = observation_driven_overworld_progression(
+            interrupt=_scripted_interruption_is_actionable,
+            semantic_target=semantic_target,
+            navigation_policy=navigation_policy,
+            execution_cache={},
+            objective_id="earn_money",
+            initial_observation=overworld,
+            interruption_handler=_finish_scripted_interruption,
+        )
+        route_completed_without_payout = True
+        for _ in range(1200):
+            current_money = getattr(get_player(), "money", 0)
+            if current_money > starting_money:
+                print_money_trainer_success(
+                    trainer=trainer.trainer_id,
+                    wallet_before=starting_money,
+                    wallet_after=current_money,
+                    detail="trainer payout observed; returning to restock planning",
+                )
+                return
+            try:
+                next(navigation)
+            except Exception as error:
+                detail = f"{type(error).__name__}: {error}"
+                route_failures.append(f"{trainer.trainer_id}: {detail}")
+                route_completed_without_payout = False
+                print_money_trainer_failure(
+                    trainer=trainer.trainer_id,
+                    error=detail,
+                    action="try next reachable trainer candidate",
+                )
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_MONEY_TRAINER_SEARCH: "
+                        f"trainer={(trainer.map_id, trainer.trainer_id)!r} result='route_failed' error={detail!r}"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_MONEY_TRAINER_SEARCH",
+                )
+                break
+            yield
+        if route_completed_without_payout:
+            route_failures.append(f"{trainer.trainer_id}: trainer route completed without an observed payout")
+            print_money_trainer_failure(
+                trainer=trainer.trainer_id,
+                error="trainer route completed without an observed payout",
+                action="try next reachable trainer candidate",
+            )
+
+        # Refresh the catalog after every failed route.  A failed interaction
+        # can have changed the current map or the defeated-trainer projection,
+        # and the original static ordering is not proof that the next target is
+        # executable.
+        try:
+            observation = _emerald_observation(False, "earn_money")
+            overworld = observation.overworld
+            yield None
+            refresh_stream = _money_trainer_candidates(observation, cooperative=True)
+            if isinstance(refresh_stream, tuple):
+                refreshed = refresh_stream
+            else:
+                refreshed = yield from refresh_stream
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+            refreshed = ()
+        remaining_original = tuple(
+            candidate
+            for candidate in candidates
+            if (candidate.map_id, candidate.trainer_id) not in attempted
+        )
+        refreshed_by_identity = {
+            (candidate.map_id, candidate.trainer_id): candidate for candidate in refreshed
+        }
+        candidates = tuple(
+            refreshed_by_identity.get((candidate.map_id, candidate.trainer_id), candidate)
+            for candidate in remaining_original
+        ) + tuple(
+            candidate
+            for identity, candidate in refreshed_by_identity.items()
+            if identity not in {(item.map_id, item.trainer_id) for item in remaining_original}
+            and identity not in attempted
+        )
+
+    detail = "; ".join(route_failures) or "no candidate remained after route validation"
+    print_money_trainer_failure(
+        trainer=None,
+        error=detail,
+        action="release restock and resume campaign travel",
+    )
     raise RuntimeError("Trainer money objective did not produce an observed payout")
+
+
+def _restock_wallet() -> int | None:
+    """Return the live wallet when it can be read during restock planning."""
+
+    from modules.player import get_player
+
+    try:
+        return getattr(get_player(), "money", None)
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+        return None
+
+
+def _defer_restock_on_current_map(objective_id: str, reason: str) -> None:
+    """Release an unfundable restock so campaign travel can resume."""
+
+    try:
+        map_id = get_player().map_group_and_number
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+        map_id = None
+    if not isinstance(map_id, tuple) or len(map_id) != 2:
+        return
+    context.campaign_restock_deferral = (objective_id, map_id)
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_RESTOCK_DEFERRED: "
+            f"objective={objective_id!r} map={map_id!r} reason={reason!r} "
+            "resume='campaign progression'"
+        ),
+        trace=True,
+        prefix="CAMPAIGN_RESTOCK_DEFERRED",
+    )
 
 
 def execute_pokeball_restock(objective_id: str = "restock_pokeballs") -> Iterator[object]:
     """Navigate to a reachable Emerald shop and restore the capture reserve."""
 
-    from modules.items import get_item_bag, get_item_by_name
-    from modules.mart import get_mart_buyable_items
-    from modules.player import get_player
-
+    # This marker is deliberately independent of campaign objective selection.
+    # Inventory facts can become sufficient before the Mart menu is closed,
+    # and a refresh during route travel must not hand the controller to an
+    # encounter capability in the middle of this transaction.
+    context.campaign_restock_phase = "planned"
+    context.campaign_restock_owner = objective_id
     execution_cache: dict = {}
     navigation = None
     source = None
-    policy = _pokeball_restock_policy()
+    deferred_signature = None
+    restock_request_panel_key = None
+
+    def publish_restock_request(plan, *, reason: str) -> None:
+        """Publish one Rich request panel per distinct live restock plan."""
+
+        nonlocal restock_request_panel_key
+        shopping, recovery_required, pokeball_required = plan
+        wallet = _restock_wallet()
+        item_details = tuple(
+            f"{quantity}x {getattr(item, 'name', str(item))}"
+            for item, quantity in shopping
+        )
+        key = (
+            objective_id,
+            wallet,
+            recovery_required,
+            pokeball_required,
+            item_details,
+            _restock_location(),
+        )
+        if key == restock_request_panel_key:
+            return
+        restock_request_panel_key = key
+        required = tuple(
+            category
+            for enabled, category in (
+                (recovery_required, "recovery items"),
+                (pokeball_required, "Poké Balls"),
+            )
+            if enabled
+        )
+        cash_floor = _recovery_supply_policy().cash_floor if recovery_required else 0
+        print_restock_request(
+            objective=objective_id,
+            location=key[-1],
+            wallet=wallet,
+            cash_floor=cash_floor,
+            required=required,
+            items=item_details,
+            reason=reason,
+        )
+
     while True:
         # The clerk interaction hands control to the ROM's shop task. Check
         # this before rebuilding the broader Emerald observation so the
         # generic overworld navigator cannot press into an open menu.
         if _shop_main_menu_is_active():
-            if objective_id == "restock_recovery_items":
-                purchased = yield from _purchase_recovery_items_in_shop()
-                yield from _leave_shop_menu()
-                yield from _finish_shop_exit_dialogue()
-                if not purchased:
-                    execution_cache.clear()
-                    source = None
-                    navigation = None
-                    yield from _earn_money_from_safe_trainer()
-                    continue
-                return
-            ball = get_item_by_name("Poké Ball")
-            current = get_item_bag().quantity_of(ball)
-            required = policy.quantity_to_buy(current)
-            if required <= 0:
-                yield from _leave_shop_menu()
-                yield from _finish_shop_exit_dialogue()
-                return
+            context.campaign_restock_phase = "shop_interaction"
+            from modules.mart import get_mart_buyable_items
 
-            buyable_items = get_mart_buyable_items()
-            if ball not in buyable_items:
-                raise RuntimeError("The current Poké Mart does not sell Poké Balls")
-            price = ball.price
-            money = getattr(get_player(), "money", 0)
-            affordable = policy.affordable_quantity(current, money, price)
-            if affordable <= 0:
-                context.message = "Cannot restock Poké Balls: insufficient money."
-                yield from _leave_shop_menu()
-                yield from _finish_shop_exit_dialogue()
-                return
-
-            from modules.modes.util.higher_level_actions import buy_in_shop
-
-            context.message = f"Restocking Poké Balls ({affordable})"
-            yield from buy_in_shop([(ball, affordable)])
+            try:
+                buyable_items = get_mart_buyable_items()
+            except (AttributeError, RuntimeError, TypeError, ValueError, IndexError, KeyError):
+                # A single ROM handoff frame may not expose the catalog even
+                # though the shop task is active. Wait for a coherent menu
+                # observation instead of sending purchase inputs against an
+                # unknown item list.
+                yield
+                continue
+            plan = _baseline_shopping_plan(buyable_items=buyable_items)
+            publish_restock_request(plan, reason="shop menu is open; validating the live purchase plan")
+            purchased = yield from _purchase_shopping_plan(plan, objective_id=objective_id)
+            context.campaign_restock_phase = "purchase_complete"
             yield from _leave_shop_menu()
             yield from _finish_shop_exit_dialogue()
+            context.campaign_restock_phase = "mart_exit_complete"
+            # Let the controller evaluate the post-restock readiness boundary
+            # before another campaign task can claim the frame. It will mount
+            # recovery when needed, then clear this transaction marker.
+            context.campaign_restock_phase = "recovery_pending"
+            if not purchased and any(plan[1:]):
+                execution_cache.clear()
+                source = None
+                navigation = None
+                # Re-enter the frame-local preflight below. It will either
+                # fund the purchase once or keep the capability deferred;
+                # returning here would make CampaignController remount the
+                # same low-ball objective and reopen the Mart.
+                continue
             return
 
         # The clerk installs a short-lived transition task before the main
@@ -2654,15 +3861,131 @@ def execute_pokeball_restock(objective_id: str = "restock_pokeballs") -> Iterato
         # newly opened shop UI.  The exact main-menu check above remains the
         # only branch that starts purchasing.
         if _shop_task_is_active():
+            context.campaign_restock_phase = "shop_interaction"
             yield
             continue
 
+        # A story scene can begin while the restock route is in flight. Let
+        # the shared interaction executor finish it before the navigator sees
+        # the next overworld observation; otherwise a mother/Running Shoes
+        # dialogue leaves the route yielding forever with no dialogue input.
+        if _scripted_interruption_is_actionable():
+            yield from _finish_scripted_interruption()
+            continue
+
+        # ``SCRIPT_NATIVE_WAIT`` is intentionally classified as UNKNOWN by
+        # the interaction classifier because it has no direct input action.
+        # It is still ROM-owned, however.  Rebuilding a funding search here
+        # can make recovery restock reclaim an active story boundary and can
+        # expose a scripted trainer as a money target.  Release the temporary
+        # restock owner and let the campaign story capability settle first.
+        if _rom_script_is_active():
+            _defer_restock_on_current_map(
+                objective_id,
+                "ROM-owned story script is active; resume campaign interaction",
+            )
+            context.campaign_restock_phase = "campaign_resume"
+            context.campaign_restock_owner = None
+            context.message = "Restock deferred while the active story script settles; resuming campaign travel."
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_RESTOCK_DEFERRED: "
+                    f"objective={objective_id!r} reason='active_rom_script' action='release_capability'"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_RESTOCK_DEFERRED",
+            )
+            return
+
+        # Inventory can reach its targets while this capability is still
+        # mounted (for example after another objective buys the same supplies
+        # or after a recovery boundary refreshes the bag).  Do not start a new
+        # route to the Mart for an empty transaction.  A required but wholly
+        # unaffordable plan is also handled here, before navigation can reach
+        # the clerk.  Otherwise the capability would open and close the same
+        # menu on every controller refresh while the reserve stayed below its
+        # threshold.
+        if navigation is None:
+            context.campaign_restock_phase = "traveling"
+            try:
+                plan = _baseline_shopping_plan()
+            except AttributeError:
+                # Lightweight capability callers can mount this generator
+                # before an emulator-backed inventory cache exists. Defer the
+                # preflight until the next observed frame in that case.
+                plan = None
+            if plan is not None and not plan[0]:
+                publish_restock_request(plan, reason="reserve is below policy target; planning restock funding")
+                if not any(plan[1:]):
+                    diagnostic_print(
+                        lambda: (
+                            "CAMPAIGN_SHOPPING_PLAN_SKIPPED: "
+                            f"objective={objective_id!r} reason='inventory_at_policy_targets'"
+                        ),
+                        trace=True,
+                        prefix="CAMPAIGN_SHOPPING_PLAN_SKIPPED",
+                    )
+                    context.message = "No item restock is required; skipping the Poké Mart."
+                    context.campaign_restock_phase = "campaign_resume"
+                    return
+
+                wallet = _restock_wallet()
+                signature = (objective_id, wallet, plan[1], plan[2])
+                if signature != deferred_signature:
+                    deferred_signature = signature
+                    # Reuse the transaction diagnostic so the GUI and rich
+                    # trace explain the exact unaffordable requirement.
+                    yield from _purchase_shopping_plan(plan, objective_id=objective_id)
+                    try:
+                        yield from _earn_money_from_safe_trainer()
+                    except RuntimeError as error:
+                        # No safe payout is available, or the attempted
+                        # trainer route did not complete. Release this
+                        # capability so the campaign can continue toward the
+                        # next route instead of standing forever in an
+                        # ``earn_money`` subtask. The selector suppresses the
+                        # same restock only on this map; a map transition can
+                        # expose another fundable trainer and retry it.
+                        _defer_restock_on_current_map(
+                            objective_id,
+                            "no reachable fundable undefeated trainer available"
+                            if "No observed safe undefeated trainer" in str(error)
+                            else "trainer funding route did not complete",
+                        )
+                        diagnostic_print(
+                            lambda: (
+                                "CAMPAIGN_RESTOCK_DEFERRED: "
+                                f"objective={objective_id!r} wallet={wallet!r} "
+                                f"reason={str(error)!r} action='release_capability'"
+                            ),
+                            trace=True,
+                            prefix="CAMPAIGN_RESTOCK_DEFERRED",
+                        )
+                        context.message = (
+                            f"{context.message}\n"
+                            "No reachable fundable trainer is available; resuming campaign travel."
+                        )
+                        context.campaign_status = CampaignStatus(
+                            None,
+                            None,
+                            "Restock deferred; resuming campaign travel",
+                        )
+                        context.campaign_restock_phase = "campaign_resume"
+                        return
+                    context.campaign_restock_deferral = None
+                    yield
+                else:
+                    # Do not repeatedly rescan the map or remount a funding
+                    # route while the wallet and required categories are
+                    # unchanged. The generator remains the objective owner,
+                    # so an external payout is observed on the next frame.
+                    yield
+                continue
+
         # Once the clerk interaction has mounted tactical navigation, let it
-        # advance before rebuilding the higher-level Emerald observation.  A
-        # currently actionable field message intentionally suppresses
-        # ``observation.overworld``; yielding on that suppression would strand
-        # the already-mounted navigator before it can send the dialogue A.
+        # advance before rebuilding the higher-level Emerald observation.
         if navigation is not None:
+            context.campaign_restock_phase = "traveling"
             try:
                 next(navigation)
             except StopIteration:
@@ -2683,14 +4006,30 @@ def execute_pokeball_restock(objective_id: str = "restock_pokeballs") -> Iterato
             semantic_target = _pokeball_source_target(source)
             execution_cache["pokeball_source"] = source.source_id
             execution_cache["pokeball_source_entrances"] = emerald_pokeball_source_entrances(source)
+            _publish_navigation_intent(semantic_target, "Navigate to Poké Mart")
         else:
             semantic_target = _pokeball_source_target(source)
         if navigation is None:
+            # Restocking is a temporary resource objective, but its travel
+            # still crosses the campaign world. Keep undefeated trainer sight
+            # lines out of that route unless a separate, explicit trainer
+            # objective owns the exposure. Without this policy the
+            # observation-driven navigator receives a bare ReachWarp and its
+            # default TrainerMode.IGNORE lets a Mart route cross Billy before
+            # a later Center-recovery path has a chance to enforce safety.
+            navigation_policy = NavigationGoal(
+                semantic_target,
+                constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+                encounter_mode=EncounterMode.AVOID,
+            )
             navigation = observation_driven_overworld_progression(
+                interrupt=_scripted_interruption_is_actionable,
                 semantic_target=semantic_target,
                 execution_cache=execution_cache,
                 objective_id=objective_id,
+                navigation_policy=navigation_policy,
                 initial_observation=observation.overworld,
+                interruption_handler=_finish_scripted_interruption,
             )
         try:
             next(navigation)
@@ -2702,10 +4041,42 @@ def execute_pokeball_restock(objective_id: str = "restock_pokeballs") -> Iterato
         yield
 
 
+def _campaign_can_check_pc_supply(observation) -> bool:
+    """Return whether the current frame can expose an item PC.
+
+    Opportunistic medicine withdrawal is subordinate to campaign navigation.
+    It may run on a controllable Pokémon Center map, or on a map that
+    positively exposes an Emerald PC trigger.  Scripted transition frames and
+    ordinary outdoor maps must pass through the campaign dispatcher instead of
+    entering the recovery-only PC helper.
+    """
+
+    overworld = getattr(observation, "overworld", None)
+    if overworld is None:
+        return False
+    if not getattr(observation, "controllable", False) or not getattr(overworld, "controllable", False):
+        return False
+
+    for trigger in getattr(overworld, "triggers", ()) or ():
+        if getattr(trigger, "kind", None) != "object_interaction":
+            continue
+        identity = getattr(trigger, "affordance_id", None) or getattr(trigger, "script_symbol", None) or ""
+        if identity == "EventScript_PC" or identity.endswith("_EventScript_PC"):
+            return True
+
+    map_id = _canonical_map_id(getattr(overworld, "map_id", None))
+    for source in emerald_healing_sources():
+        approach = getattr(source, "center_pc_approach", None)
+        if approach is not None and _canonical_map_id(approach[0][0]) == map_id:
+            return True
+    return False
+
+
 def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iterator[object]:
     """Execute at most one bounded action, then yield for fresh perception."""
     field_message_lifecycle_active = False
     last_stable_map_id = None
+    pc_supply_checked_map = None
 
     def higher_priority_actionable() -> bool:
         """Check whether a non-movement action currently owns the frame."""
@@ -2713,22 +4084,17 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
         # Navigation only needs the interaction classifier here. Rebuilding
         # the full Emerald observation would repeat map metadata, runtime
         # object, and trigger perception twice around every navigation step.
-        try:
-            return classify_interaction(observe_interaction()) in {
-                InteractionType.DIALOGUE,
-                InteractionType.CHOICE,
-                InteractionType.MENU,
-                InteractionType.BATTLE,
-                InteractionType.SPECIAL_INTERACTION,
-            }
-        except (AttributeError, RuntimeError, ValueError, TypeError, IndexError):
-            return False
+        return _scripted_interruption_is_actionable()
 
     resolved_player_initialization: StartGameInitialization | None = None
     session_id = getattr(getattr(context, "nuzlocke_runtime", None), "session_id", None)
     rng = random.Random(session_id)
     clock_target_time = None
     tactical_execution_cache: dict = {}
+    handoff = getattr(context, "campaign_continuation_route", None)
+    if isinstance(handoff, tuple) and len(handoff) == 2 and handoff[0] == objective_id:
+        tactical_execution_cache["continuation_route"] = handoff[1]
+        context.campaign_continuation_route = None
     resolved_starter = None
     pending_starter_signature = None
     pending_starter_quiet_frames = 0
@@ -2768,6 +4134,24 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
         if observation.map_id is not None:
             last_stable_map_id = observation.map_id
         field_message_lifecycle_active = observation.dialogue_lifecycle_active
+        observed_semantic_target = getattr(observation, "semantic_target", None)
+        if navigation_policy is None and observed_semantic_target is not None:
+            # Campaign travel should prefer trainer-free paths, but it must be
+            # able to proceed when the map topology leaves no such path. The
+            # recovery planner supplies its own strict policy and therefore
+            # keeps the default hard safety boundary. The introductory rival
+            # is different: the ROM-owned scene is itself a mandatory trainer
+            # checkpoint. Readiness has already prepared that checkpoint
+            # before this capability is mounted, so allow the navigator to
+            # use its explicit forced-exposure fallback if the only route to
+            # the guarded scene ends on the rival's activation tile.
+            navigation_policy = NavigationGoal(
+                observed_semantic_target,
+                constraints=GoalConstraints(
+                    trainer_mode=TrainerMode.AVOID,
+                    allow_forced_trainer_exposure=objective_id == "complete_intro_rival",
+                ),
+            )
         if (
             objective_id == "complete_intro_rival"
             and dict(observation.campaign_facts).get("intro_rival_battle_complete") is True
@@ -2790,6 +4174,10 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
             objective_id == "receive_pokedex"
             and dict(observation.campaign_facts).get("pokedex_received") is True
             and dict(observation.campaign_facts).get("pokeballs_ready") is True
+            and not (
+                len(getattr(observation, "native_task_state", ()) or ()) >= 3
+                and getattr(observation, "native_task_state", (None, None, None))[2] is True
+            )
         ):
             diagnostic_print(
                 lambda: (
@@ -2817,7 +4205,37 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
                 ),
                 trace=True,
             )
+            # This capability reads the ROM-owned completion fact directly.
+            # The runtime campaign projection can publish it one frame later;
+            # CampaignController uses this latch to fence the old script owner
+            # until that projection catches up.
+            context.campaign_capability_completion_latch = objective_id
             return
+        # A stored Potion is useful before the first battle. Reuse the same
+        # observation-driven PC helper used by recovery when campaign travel
+        # reaches a usable item PC, without creating a medicine-only detour.
+        if (
+            observation.overworld is not None
+            and getattr(observation.overworld, "map_id", None) is not None
+            and getattr(observation.overworld, "player_coordinates", None) is not None
+            and observation.game_state is GameState.OVERWORLD
+            and not observation.dialogue_actionable
+            and _campaign_can_check_pc_supply(observation)
+            and observation.map_id != pc_supply_checked_map
+        ):
+            from .resource_runtime import _withdraw_pc_healing_item_at_current_location
+
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_HEALING_SUPPLY: action='check' "
+                    f"objective={objective_id!r} map={observation.map_id!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_HEALING_SUPPLY",
+            )
+            yield from _withdraw_pc_healing_item_at_current_location()
+            pc_supply_checked_map = observation.map_id
+            continue
         action = choose_emerald_observation_action(observation)
         diagnostic_print(
             lambda: (
@@ -3317,7 +4735,11 @@ def observation_driven_emerald_campaign(objective_id: str | None = None) -> Iter
                                     and dict(observation.campaign_facts).get("pokeballs_ready") is True
                                 )
                                 if objective_id == "receive_pokedex"
-                                else None
+                                else (
+                                    dict(observation.campaign_facts).get("petalburg_wally_scene_complete") is True
+                                    if objective_id == "complete_petalburg_wally"
+                                    else None
+                                )
                             )
                         ),
                         observation.overworld,

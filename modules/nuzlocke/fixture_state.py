@@ -92,6 +92,7 @@ def load_offline_normalized_snapshot(profile: str | Path) -> NuzlockeSnapshot:
     flag_names = (
         "SET_WALL_CLOCK",
         "RESCUED_BIRCH",
+        "ADVENTURE_STARTED",
         "DEFEATED_RIVAL_ROUTE103",
         "HIDE_ROUTE_103_RIVAL",
         "SYS_POKEMON_GET",
@@ -109,7 +110,10 @@ def load_offline_normalized_snapshot(profile: str | Path) -> NuzlockeSnapshot:
     variable_names = (
         "LITTLEROOT_INTRO_STATE",
         "LITTLEROOT_RIVAL_STATE",
+        "LITTLEROOT_TOWN_STATE",
+        "ROUTE101_STATE",
         "BIRCH_LAB_STATE",
+        "OLDALE_RIVAL_STATE",
         "PETALBURG_CITY_STATE",
         "PETALBURG_GYM_STATE",
         "PETALBURG_WOODS_STATE",

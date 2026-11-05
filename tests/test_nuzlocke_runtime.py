@@ -4,20 +4,26 @@ from enum import Enum
 import json
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
-from modules.nuzlocke.events import BattleStarted, MapChanged, NuzlockeStarted
+from modules.nuzlocke.events import BattleStarted, MapChanged, NuzlockeStarted, RunFailed
+from modules.nuzlocke.rule_config import CampaignRulesConfig
 from modules.nuzlocke.campaign_objectives import ObjectiveStatus, plan_campaign, select_campaign_objective
 from modules.nuzlocke.campaign_state import CampaignState, derive_campaign_facts, Fact
 from modules.nuzlocke.persistence import JsonEventStore
 from modules.nuzlocke.projection import load_campaign_projection
 from modules.nuzlocke.rules import NuzlockeRulesProjection
 from modules.nuzlocke.runtime import NuzlockeRuntime
+from modules.nuzlocke.identity import PokemonIdentity
 from modules.nuzlocke.snapshots import (
     BattleSnapshot,
     InventorySnapshot,
     NuzlockeSnapshot,
+    PartyPokemonSnapshot,
     PlayerSnapshot,
     ProgressionSnapshot,
+    PokemonSnapshot,
+    StoragePokemonSnapshot,
     StorageSnapshot,
     ItemQuantity,
     CampaignObservationSnapshot,
@@ -32,6 +38,7 @@ class State(Enum):
     BATTLE = 2
     TITLE_SCREEN = 3
     NAMING_SCREEN = 4
+    WHITEOUT = 5
 
 
 def complete_campaign_observation(*, pokedex_received: bool) -> CampaignObservationSnapshot:
@@ -55,14 +62,20 @@ def complete_campaign_observation(*, pokedex_received: bool) -> CampaignObservat
     )
 
 
-def snapshot(frame: int, map_number: int = 2, *, pokedex_received: bool | None = None) -> NuzlockeSnapshot:
+def snapshot(
+    frame: int,
+    map_number: int = 2,
+    *,
+    state: State = State.OVERWORLD,
+    pokedex_received: bool | None = None,
+) -> NuzlockeSnapshot:
     observation = CampaignObservationSnapshot()
     if pokedex_received is not None:
         observation = complete_campaign_observation(pokedex_received=pokedex_received)
     return NuzlockeSnapshot(
         frame,
         "test",
-        State.OVERWORLD,
+        state,
         PlayerSnapshot("May", 1, map_number, "MAP", (1, 1), "Down", True),
         (),
         InventorySnapshot((), (), ()),
@@ -101,6 +114,81 @@ def opening_snapshot(frame: int, *, wall_clock: bool = True) -> NuzlockeSnapshot
 
 
 class TestNuzlockeRuntime(unittest.TestCase):
+    def test_enabled_whiteout_rule_emits_one_terminal_run_failure(self):
+        runtime = NuzlockeRuntime()
+
+        runtime.update(snapshot(1, state=State.OVERWORLD))
+        events = runtime.update(snapshot(2, state=State.WHITEOUT))
+
+        failures = tuple(event for event in events if isinstance(event, RunFailed))
+        self.assertEqual(failures, (RunFailed(2, "whiteout"),))
+        self.assertTrue(runtime.rules_projection.state.run_lost)
+        self.assertEqual(
+            tuple(event for event in runtime.update(snapshot(3, state=State.WHITEOUT)) if isinstance(event, RunFailed)),
+            (),
+        )
+
+    def test_disabled_whiteout_rule_does_not_emit_terminal_run_failure(self):
+        runtime = NuzlockeRuntime(rule_config=CampaignRulesConfig.unrestricted())
+
+        runtime.update(snapshot(1, state=State.OVERWORLD))
+        events = runtime.update(snapshot(2, state=State.WHITEOUT))
+
+        self.assertFalse(any(isinstance(event, RunFailed) for event in events))
+        self.assertFalse(runtime.rules_projection.state.run_lost)
+
+    def test_whiteout_with_a_living_pc_pokemon_keeps_the_run_active(self):
+        runtime = NuzlockeRuntime()
+        identity = PokemonIdentity(1, 2, 3)
+        pc_pokemon = PokemonSnapshot(
+            "Zigzagoon",
+            "Scout",
+            4,
+            12,
+            12,
+            "None",
+            identity.personality_value,
+            identity.original_trainer_id,
+            identity.original_trainer_secret_id,
+            "May",
+            (),
+            None,
+            False,
+            False,
+            identity=identity,
+        )
+        pc_snapshot = replace(
+            snapshot(2, state=State.WHITEOUT),
+            pc=StorageSnapshot(0, (StoragePokemonSnapshot(0, 0, pc_pokemon),)),
+        )
+
+        runtime.update(snapshot(1, state=State.OVERWORLD))
+        events = runtime.update(pc_snapshot)
+
+        self.assertFalse(any(isinstance(event, RunFailed) for event in events))
+        self.assertFalse(runtime.rules_projection.state.run_lost)
+
+    @staticmethod
+    def party_member(identity, party_index):
+        return PartyPokemonSnapshot(
+            "Mudkip",
+            "Mud",
+            5,
+            20,
+            20,
+            "None",
+            identity.personality_value,
+            identity.original_trainer_id,
+            identity.original_trainer_secret_id,
+            "May",
+            (),
+            None,
+            False,
+            False,
+            party_index=party_index,
+            identity=identity,
+        )
+
     @staticmethod
     def fresh_start_snapshot(frame: int = 1) -> NuzlockeSnapshot:
         """Represent mGBA's title screen with an uninitialized save buffer."""
@@ -214,12 +302,19 @@ class TestNuzlockeRuntime(unittest.TestCase):
         runtime.update(snapshot(1, pokedex_received=True))
         failed_battle = self.wild_battle(2, pokedex_received=True)
         failed_battle = replace(failed_battle, battle=replace(failed_battle.battle, outcome="RanAway"))
-        runtime.update(failed_battle)
-        runtime.update(snapshot(3, pokedex_received=True))
+        with patch("modules.nuzlocke.runtime.diagnostic_print") as diagnostic:
+            runtime.update(failed_battle)
+            runtime.update(snapshot(3, pokedex_received=True))
 
         eligibility = runtime.capture_eligibility_for((1, 2), is_wild=True, is_trainer=False)
         self.assertFalse(eligibility.eligible)
         self.assertEqual(eligibility.reason, "failed to catch first eligible encounter")
+        rendered = [
+            call.args[0]() if callable(call.args[0]) else call.args[0]
+            for call in diagnostic.call_args_list
+        ]
+        self.assertTrue(any("NUZLOCKE_ENCOUNTER_TRANSITION" in message for message in rendered))
+        self.assertTrue(any("lost_without_capture" in message for message in rendered))
 
     def test_pokedex_receipt_not_ball_quantity_makes_wild_battle_eligible(self):
         runtime = NuzlockeRuntime()
@@ -533,6 +628,40 @@ class TestNuzlockeRuntime(unittest.TestCase):
             self.assertTrue(runtime.campaign_history_compatible)
             self.assertEqual(len(tuple(path.parent.glob("events.json.stale-*"))), 0)
             self.assertEqual(store.last_sequence(), 0)
+
+    def test_party_reordering_does_not_quarantine_campaign_history(self):
+        """Lead rotation must not make a save look like a new campaign."""
+        from modules.nuzlocke.identity import PokemonIdentity
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            store = JsonEventStore(path)
+            first_identity = PokemonIdentity(101, 1234, 5678)
+            second_identity = PokemonIdentity(202, 1234, 5678)
+            first = replace(
+                opening_snapshot(1),
+                party=(
+                    self.party_member(first_identity, 0),
+                    self.party_member(second_identity, 1),
+                ),
+            )
+            runtime = NuzlockeRuntime(event_sink=store, event_store=store)
+            runtime.update(first)
+            runtime.mark_nuzlocke_started()
+
+            reordered = replace(
+                opening_snapshot(2),
+                party=(
+                    self.party_member(second_identity, 0),
+                    self.party_member(first_identity, 1),
+                ),
+            )
+            restored = NuzlockeRuntime(event_store=JsonEventStore(path))
+            restored.update(reordered)
+
+            self.assertTrue(restored.campaign_history_compatible)
+            self.assertTrue(restored.observed_projection.state.nuzlocke_started)
+            self.assertEqual(len(tuple(path.parent.glob("events.json.stale-*"))), 0)
 
     def test_runtime_hydrates_campaign_and_rules_projections_from_event_store(self):
         with tempfile.TemporaryDirectory() as directory:

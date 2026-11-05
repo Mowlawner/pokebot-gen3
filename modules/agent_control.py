@@ -9,12 +9,21 @@ is ready to do so.
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from contextlib import nullcontext
-from time import perf_counter_ns
+from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from threading import Event
+from time import monotonic, perf_counter_ns
 import traceback
 from typing import Callable, Generator
 
 from modules.context import context
-from modules.console import diagnostic_print, profile_print
+from modules.console import (
+    diagnostic_print,
+    print_navigation_cancellation,
+    print_navigation_invalidation,
+    print_recovery_handoff,
+    profile_print,
+)
 from modules.goals import (
     ActivateTrigger,
     EngageTrainer,
@@ -24,6 +33,8 @@ from modules.goals import (
     ReachLocation,
     ReachWarp,
     SemanticTarget,
+    TrainerEngagementMode,
+    TrainerEngagementPlan,
     TrainerMode,
 )
 from modules.interaction_state import (
@@ -44,17 +55,20 @@ from modules.navigation import (
     NavigationAction,
     NavigationActionType,
     NavigationError,
+    NavigationSearchCancelled,
     NavigationPlan,
     RoutePlan,
     RouteCheckpoint,
     record_runtime_transition_observation,
     NavigationWorld,
+    canonical_location,
     WorldNavigationError,
     goal_target_map,
     plan_with_world_navigation,
     plan_observed_warp_locally,
     navigation_diagnostics,
     prewarm_navigation_tiles,
+    resolve_trainer_engagement_plan,
 )
 from modules.overworld import (
     MovementState,
@@ -66,6 +80,7 @@ from modules.player import get_player_avatar
 from modules.profiler import count, invalidation, now, profiled, timing, format_snapshot
 from modules.tasks import get_global_script_context, is_field_message_waiting_for_input
 from modules.state_cache import state_cache
+from modules.stutter_trace import suppress_background_instrumentation
 from modules.nuzlocke.readiness_diagnostics import (
     build_progression_readiness_diagnostic,
     evaluate_progression_readiness,
@@ -77,6 +92,580 @@ _last_universal_observation_frame: int | None = None
 _battle_end_generation = 0
 _last_battle_end_emulator_frame: int | None = None
 _recent_battle_return_window = 120
+
+
+_NAVIGATION_PLAN_UNSET = object()
+_NAVIGATION_PLAN_PENDING = object()
+_DEFAULT_NAVIGATION_OWNER = object()
+
+
+def _gate_observation_frame() -> int | None:
+    """Return the emulator frame at a live gate evidence boundary."""
+
+    emulator = getattr(context, "emulator", None)
+    get_frame_count = getattr(emulator, "get_frame_count", None)
+    if callable(get_frame_count):
+        try:
+            frame = get_frame_count()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            frame = None
+        if isinstance(frame, int) and not isinstance(frame, bool):
+            return frame
+    frame = getattr(context, "frame", None)
+    return frame if isinstance(frame, int) and not isinstance(frame, bool) else None
+
+
+def _gate_observer_call(method_name: str, *args, **kwargs) -> None:
+    """Call optional live evidence instrumentation without affecting control."""
+
+    observer = getattr(context, "gate_live_observer", None)
+    method = getattr(observer, method_name, None)
+    if not callable(method):
+        return
+    if getattr(context, "debug_trace", False):
+        diagnostic_print(
+            lambda: f"GATE_LIVE_HOOK: method={method_name!r} "
+            f"navigation={getattr(args[0], 'action_type', None)!r} "
+            f"source={getattr(args[0], 'source', None)!r} "
+            f"destination={getattr(args[0], 'destination', None)!r} "
+            f"outcome={args[1] if method_name == 'record_navigation_outcome' and len(args) > 1 else None!r}",
+            trace=True,
+        )
+    try:
+        method(*args, **kwargs)
+    except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+        # Evidence collection is diagnostic. A malformed observer must never
+        # change the action selected by the controller.
+        diagnostics = getattr(observer, "_diagnostics", None)
+        if isinstance(diagnostics, set):
+            diagnostics.add(f"observer hook {method_name!r} failed: {type(error).__name__}: {error}")
+        return
+
+
+class _SingleFlightNavigationPlanner:
+    """Run one tactical world search away from the emulator frame thread."""
+
+    DEFAULT_SEARCH_TIMEOUT_SECONDS = 10.0
+
+    def __init__(self, *, search_timeout_seconds: float | None = None):
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pokebot-navigation")
+        self._search_timeout_seconds = (
+            self.DEFAULT_SEARCH_TIMEOUT_SECONDS
+            if search_timeout_seconds is None
+            else float(search_timeout_seconds)
+        )
+        if self._search_timeout_seconds <= 0:
+            raise ValueError("search_timeout_seconds must be positive")
+        self._key = None
+        self._failure_key = None
+        self._future = None
+        self._owner = None
+        self._owner_label = None
+        self._cancel_event: Event | None = None
+        self._started_at: float | None = None
+        # A failed search is often observed on many consecutive controller
+        # frames. Remember it for the exact immutable request so an impossible
+        # route does not consume the worker again every frame. The request
+        # key includes the start, goal, and stable transition topology at the
+        # call site. Transient runtime occupancy is deliberately excluded;
+        # the selected action is validated against the current observation
+        # before an input reaches the emulator.
+        self._failed_results: dict[object, tuple] = {}
+        self._last_discard_reason: str | None = None
+        self._last_event: tuple | None = None
+
+    def _event(self, event: str, **details) -> None:
+        """Retain one concise lifecycle event for the frame-thread logger."""
+
+        self._last_event = (event, tuple(sorted(details.items(), key=lambda item: item[0])))
+
+    def _future_result(self, future, key, failure_key=None):
+        try:
+            result = future.result()
+        except (NavigationError, WorldNavigationError) as error:
+            result = (None, None, error)
+        except Exception as error:
+            result = (None, None, error)
+        failure_key = key if failure_key is None else failure_key
+        # Cooperative cancellation is a scheduling outcome, not evidence that
+        # this route is impossible.  Caching it under the immutable request
+        # key turns one superseded worker into a permanent failure: every new
+        # controller sees the cached NavigationSearchCancelled and tears down
+        # before it can submit a fresh search.
+        if result[0] is None and not isinstance(result[2], NavigationSearchCancelled):
+            self._failed_results[failure_key] = result
+            if len(self._failed_results) > 64:
+                self._failed_results.pop(next(iter(self._failed_results)))
+        else:
+            self._failed_results.pop(failure_key, None)
+        return result
+
+    def poll(self, key, operation, *, failure_key=None, owner=None, owner_label=None):
+        # ThreadPoolExecutor cannot interrupt a search that is already
+        # running. Replacing that future for every new player tile therefore
+        # queues searches behind one another while the control loop keeps
+        # changing its start key. Keep one in-flight search, discard its
+        # result when the requested key has moved on, and submit only the
+        # newest request once the worker is actually free.
+        self._last_discard_reason = None
+        self._last_event = None
+        owner = _DEFAULT_NAVIGATION_OWNER if owner is None else owner
+        owner_label = owner_label or ("default" if owner is _DEFAULT_NAVIGATION_OWNER else repr(owner))
+        failure_key = key if failure_key is None else failure_key
+        cached_failure = self._failed_results.get(failure_key)
+        if cached_failure is not None:
+            self._event("failure_cached", owner=owner_label, key=key)
+            return cached_failure
+
+        # The process-wide worker is shared by campaign loops, recovery loops,
+        # and tests.  A loop boundary therefore has to be an ownership
+        # boundary as well; otherwise a finished search from an old loop can
+        # be handed to a newly mounted controller with an equivalent goal.
+        if self._future is not None and not self._future.done() and self._owner != owner:
+            self._cancel_active(
+                reason="navigation request owner changed",
+                replacement_owner=owner_label,
+            )
+
+        if self._future is not None and self._future.done():
+            future = self._future
+            completed_key = self._key
+            completed_failure_key = self._failure_key
+            completed_owner = self._owner
+            completed_owner_label = self._owner_label
+            self._future = None
+            self._key = None
+            self._failure_key = None
+            self._owner = None
+            self._owner_label = None
+            self._cancel_event = None
+            self._started_at = None
+            if completed_owner == owner and _navigation_request_keys_equivalent(completed_key, key):
+                self._event("result_adopted", owner=owner_label, key=key)
+                return self._future_result(future, completed_key, completed_failure_key)
+            # The search was composed from an older start tile, goal, or
+            # transition topology. Its route can be structurally valid while
+            # still being unusable from the current observation, so never
+            # expose it to action selection.
+            self._last_discard_reason = (
+                "request_key_changed "
+                f"changed={_navigation_request_key_changes(completed_key, key)!r}"
+            )
+            if completed_owner != owner:
+                self._last_discard_reason = (
+                    "request_owner_changed "
+                    f"owner={completed_owner_label!r} replacement={owner_label!r}"
+                )
+            self._event(
+                "result_discarded",
+                owner=completed_owner_label,
+                replacement_owner=owner_label,
+                changed=_navigation_request_key_changes(completed_key, key),
+            )
+            self._future_result(future, completed_key, completed_failure_key)
+
+        # A goal or topology change invalidates the worker immediately. A
+        # start-only change is ordinary frame progress and is allowed to
+        # finish below; the exact key still prevents its result from being
+        # exposed from the wrong origin.
+        if self._future is not None and not self._future.done() and (
+            self._key != key or self._owner != owner
+        ):
+            changed = _navigation_request_key_changes(self._key, key)
+            # The exact start remains in the key so a completed route can
+            # never be accepted from the wrong origin. While a search is
+            # running, however, a start-only change is normal frame progress;
+            # let the current worker finish and submit the newest exact-start
+            # request only after that result is harvested. This preserves one
+            # worker without repeatedly canceling the same search as the
+            # avatar advances.
+            if (
+                (changed != ("start",) or self._owner != owner)
+                and self._cancel_event is not None
+                and not self._cancel_event.is_set()
+            ):
+                previous_key = self._key
+                elapsed_ms = (
+                    (monotonic() - self._started_at) * 1000.0
+                    if self._started_at is not None
+                    else None
+                )
+                self._cancel_event.set()
+                self._last_discard_reason = (
+                    (
+                        "request_owner_changed "
+                        f"owner={self._owner_label!r} replacement={owner_label!r}"
+                    )
+                    if self._owner != owner
+                    else (
+                        "request_superseded "
+                        f"changed={_navigation_request_key_changes(previous_key, key)!r}"
+                    )
+                )
+                self._event(
+                    "request_cancelled",
+                    owner=self._owner_label,
+                    replacement_owner=owner_label,
+                    changed=changed,
+                )
+                print_navigation_cancellation(
+                    phase="requested",
+                    reason=(
+                        "navigation request owner changed"
+                        if self._owner != owner
+                        else "newer navigation request superseded the active request"
+                    ),
+                    request_key=previous_key,
+                    replacement_key=key,
+                    changed=_navigation_request_key_changes(previous_key, key),
+                    duration_ms=elapsed_ms,
+                    request_label=self._owner_label,
+                    replacement_label=owner_label,
+                    worker="agent_control.navigation",
+                )
+
+        if self._future is None:
+            self._key = key
+            self._failure_key = failure_key
+            self._owner = owner
+            self._owner_label = owner_label
+            self._cancel_event = Event()
+            self._started_at = monotonic()
+            self._future = self._executor.submit(self._run, operation, self._cancel_event, key)
+            self._event("search_started", owner=owner_label, key=key)
+        if not self._future.done():
+            return _NAVIGATION_PLAN_PENDING
+        future = self._future
+        completed_key = self._key
+        completed_failure_key = self._failure_key
+        self._future = None
+        self._key = None
+        self._failure_key = None
+        self._owner = None
+        self._owner_label = None
+        self._cancel_event = None
+        self._started_at = None
+        self._event("result_ready", owner=owner_label, key=completed_key)
+        return self._future_result(future, completed_key, completed_failure_key)
+
+    def take_discard_reason(self) -> str | None:
+        """Return and clear the most recent stale-result diagnostic."""
+
+        reason = self._last_discard_reason
+        self._last_discard_reason = None
+        return reason
+
+    def take_event(self) -> tuple | None:
+        """Return and clear the most recent planner lifecycle event."""
+
+        event = self._last_event
+        self._last_event = None
+        return event
+
+    def _cancel_active(self, *, reason: str, replacement_owner: str | None = None) -> bool:
+        """Request cancellation without replacing the executor future."""
+
+        if self._future is None or self._future.done() or self._cancel_event is None:
+            return False
+        if self._cancel_event.is_set():
+            return True
+        self._cancel_event.set()
+        elapsed_ms = (
+            (monotonic() - self._started_at) * 1000.0
+            if self._started_at is not None
+            else None
+        )
+        self._last_discard_reason = (
+            f"request_cancelled reason={reason!r} owner={self._owner_label!r}"
+        )
+        self._event(
+            "request_cancelled",
+            owner=self._owner_label,
+            replacement_owner=replacement_owner,
+            reason=reason,
+        )
+        print_navigation_cancellation(
+            phase="requested",
+            reason=reason,
+            request_key=self._key,
+            replacement_label=replacement_owner,
+            duration_ms=elapsed_ms,
+            request_label=self._owner_label,
+            worker="agent_control.navigation",
+        )
+        return True
+
+    def cancel(self, owner, *, reason="navigation owner disposed", owner_label=None) -> bool:
+        """Cancel and detach a request owned by one control loop."""
+
+        owner = _DEFAULT_NAVIGATION_OWNER if owner is None else owner
+        if self._owner != owner:
+            return False
+        if self._future is None:
+            return False
+        if self._future.done():
+            # No caller remains to adopt a completed result.  Consume it and
+            # detach the logical request while leaving the executor alive for
+            # the next owner.
+            future = self._future
+            try:
+                future.result()
+            except Exception:
+                pass
+            self._future = None
+            self._key = None
+            self._failure_key = None
+            self._owner = None
+            self._owner_label = None
+            self._cancel_event = None
+            self._started_at = None
+            return True
+        return self._cancel_active(
+            reason=reason,
+            replacement_owner=owner_label or "none",
+        )
+
+    def active_key(self):
+        """Return the request currently being searched, if any."""
+
+        if self._future is None or self._future.done():
+            return None
+        return self._key
+
+    def _run(self, operation, cancel_event, key):
+        # Profiling and rolling stutter traces belong to the frame thread. The
+        # world and goal passed to this worker are immutable snapshots.
+        started_at = monotonic()
+        with suppress_background_instrumentation():
+            deadline = monotonic() + self._search_timeout_seconds
+
+            def cancel_check():
+                if cancel_event.is_set():
+                    raise NavigationSearchCancelled("navigation request superseded")
+                if monotonic() >= deadline:
+                    raise NavigationSearchCancelled(
+                        f"navigation search exceeded {self._search_timeout_seconds:g} second budget"
+                    )
+                # Preserve the simple boolean callback contract used by
+                # lower-level callers that poll for cancellation themselves.
+                return False
+
+            try:
+                plan, route = operation(cancel_check)
+            except NavigationSearchCancelled as error:
+                print_navigation_cancellation(
+                    phase="terminal",
+                    reason=str(error),
+                    request_key=key,
+                    duration_ms=(monotonic() - started_at) * 1000.0,
+                )
+                return (None, None, error)
+            except (NavigationError, WorldNavigationError) as error:
+                return (None, None, error)
+            except Exception as error:
+                return (None, None, error)
+        return (plan, route, None)
+
+
+_background_navigation_planner = _SingleFlightNavigationPlanner()
+
+
+def _navigation_request_key_changes(previous, current) -> tuple[str, ...]:
+    """Describe the stable fields that changed between tactical requests."""
+
+    if not isinstance(previous, tuple) or not isinstance(current, tuple):
+        return ("request_key",)
+    names = (
+        ("start", "goal", "transition_topology")
+        if len(previous) <= 3 and len(current) <= 3
+        else ("start", "goal", "selected_transition", "navigation_policy")
+    )
+    changed = []
+    for index, name in enumerate(names):
+        if index >= len(previous) or index >= len(current) or previous[index] != current[index]:
+            changed.append(name)
+    return tuple(changed) or ("request_key",)
+
+
+def _navigation_request_keys_equivalent(previous, current) -> bool:
+    """Return whether two canonical requests can share a completed plan."""
+
+    if previous == current:
+        return True
+    # Keep this boundary explicit so future diagnostic-only fields can be
+    # added to a request without making a completed equivalent plan stale.
+    if (
+        isinstance(previous, tuple)
+        and isinstance(current, tuple)
+        and len(previous) >= 4
+        and len(current) >= 4
+    ):
+        return tuple(previous[:4]) == tuple(current[:4])
+    return False
+
+
+def _navigation_key_value(value):
+    """Convert goal/transition values into deterministic request-key data."""
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if hasattr(value, "name") and hasattr(value, "value"):
+        return (type(value).__name__, value.name)
+    if isinstance(value, tuple):
+        return tuple(_navigation_key_value(item) for item in value)
+    if isinstance(value, (frozenset, set)):
+        return tuple(sorted((_navigation_key_value(item) for item in value), key=repr))
+    return repr(value)
+
+
+def _navigation_transition_identity(transition):
+    if transition is None:
+        return None
+    return (
+        getattr(transition, "kind", None),
+        _navigation_key_value(canonical_location(getattr(transition, "entry", None))),
+        _navigation_key_value(canonical_location(getattr(transition, "destination", None))),
+        _navigation_key_value(getattr(transition, "required_facing", None)),
+        _navigation_key_value(getattr(transition, "activation", None)),
+        _navigation_key_value(getattr(transition, "activation_locations", ())),
+        _navigation_key_value(getattr(transition, "activation_direction", None)),
+    )
+
+
+def _navigation_goal_identity(goal):
+    """Return semantic goal identity without reprs of live observations."""
+
+    if isinstance(goal, NavigationGoal):
+        constraints = goal.constraints
+        return (
+            "NavigationGoal",
+            _navigation_goal_identity(goal.target),
+            (
+                tuple(sorted(constraints.avoid_trigger_ids)),
+                tuple(sorted((_navigation_key_value(item) for item in constraints.avoid_locations), key=repr)),
+                getattr(getattr(constraints, "trainer_mode", None), "name", None),
+                bool(getattr(constraints, "allow_forced_trainer_exposure", False)),
+                tuple(sorted(getattr(constraints, "avoid_trainer_ids", ()))),
+            ),
+            getattr(goal.encounter_mode, "name", goal.encounter_mode),
+            goal.encounter_penalty,
+            _navigation_key_value(getattr(goal, "preferred_map_route", None)),
+        )
+    if isinstance(goal, SemanticTarget):
+        return (
+            "SemanticTarget",
+            getattr(goal.kind, "name", goal.kind),
+            _navigation_key_value(goal.target_map),
+            _navigation_key_value(goal.location),
+            goal.interaction_id,
+        )
+    if isinstance(goal, ReachLocation):
+        return ("ReachLocation", _navigation_key_value(canonical_location(goal.location)))
+    if isinstance(goal, ReachWarp):
+        transitions = tuple(
+            sorted(
+                (_navigation_transition_identity(transition) for transition in goal.warps),
+                key=repr,
+            )
+        )
+        return (
+            "ReachWarp",
+            _navigation_key_value(goal.destination_map),
+            _navigation_key_value(canonical_location(goal.destination)),
+            _navigation_transition_identity(goal.warp),
+            transitions,
+        )
+    if isinstance(goal, EngageTrainer):
+        return ("EngageTrainer", goal.trainer_id)
+    if isinstance(goal, ActivateTrigger):
+        return ("ActivateTrigger", goal.trigger_id)
+    if isinstance(goal, ReachInteractionPosition):
+        return ("ReachInteractionPosition", goal.trigger_id)
+    return (type(goal).__name__, _navigation_key_value(goal))
+
+
+def _navigation_policy_identity(goal) -> tuple:
+    constraints = getattr(goal, "constraints", None)
+    return (
+        getattr(getattr(constraints, "trainer_mode", None), "name", None),
+        bool(getattr(constraints, "allow_forced_trainer_exposure", False)),
+        tuple(sorted(getattr(constraints, "avoid_trigger_ids", ()))),
+        tuple(sorted(getattr(constraints, "avoid_trainer_ids", ()))),
+        getattr(getattr(goal, "encounter_mode", None), "name", None),
+        getattr(goal, "encounter_penalty", None),
+    )
+
+
+def _navigation_request_key(start, planning_goal, world) -> tuple:
+    """Build tactical identity without transient runtime occupancy.
+
+    The worker receives a complete immutable world snapshot, but the request
+    identity contains only facts that define ownership of that plan.  In
+    particular, live goal reprs and the full moving object table must not
+    turn an equivalent plan into a new request every frame.
+    """
+
+    _dynamic_blocked, transition_revision = world.revision_key()
+    target = _goal_target(planning_goal)
+    selected_transition = None
+    if isinstance(target, ReachWarp):
+        selected_transition = (
+            _navigation_transition_identity(target.warp)
+            if target.warp is not None
+            else tuple(
+                sorted(
+                    (_navigation_transition_identity(transition) for transition in target.warps),
+                    key=repr,
+                )
+            )
+        )
+    if selected_transition is None:
+        # A semantic route has no selected live transition until the global
+        # planner resolves its map edge.  Keep the executable transition
+        # catalog as a stable topology identity for those requests; dynamic
+        # occupancy remains an execution-time concern.
+        selected_transition = tuple(
+            sorted((_navigation_key_value(item) for item in transition_revision), key=repr)
+        )
+    return (
+        canonical_location(start),
+        _navigation_goal_identity(planning_goal),
+        selected_transition,
+        _navigation_policy_identity(planning_goal),
+    )
+
+
+def _navigation_failure_revision(world) -> tuple:
+    """Return world facts that can reopen a previously failed route.
+
+    The active search key intentionally ignores wandering occupancy so a
+    long-running route is not cancelled every frame. Failed results need a
+    slightly stronger boundary: a trainer hazard, trigger condition, or
+    interaction binding changing can turn an unreachable AVOID route into a
+    valid one.
+    """
+
+    def trigger_signature(trigger):
+        return (
+            getattr(trigger, "trigger_id", None),
+            getattr(trigger, "affordance_id", None),
+            getattr(trigger, "condition_active", None),
+            getattr(trigger, "trainer_defeated", None),
+            tuple(sorted(getattr(trigger, "hazard_locations", ()) or (), key=repr)),
+            tuple(sorted(getattr(trigger, "activation_locations", ()) or (), key=repr)),
+            tuple(sorted(getattr(trigger, "engagement_locations", ()) or (), key=repr)),
+        )
+
+    return (
+        tuple(sorted((trigger_signature(trigger) for trigger in getattr(world, "triggers", ())), key=repr)),
+        tuple(sorted(repr(binding) for binding in getattr(world, "bindings", ()))),
+    )
+
+
+def navigation_background_search_active() -> bool:
+    """Return whether tactical navigation currently owns a route search."""
+
+    return _background_navigation_planner.active_key() is not None
 
 
 def notify_battle_ended(*, invalidate_navigation: bool = True) -> None:
@@ -184,6 +773,7 @@ class GoalEvaluation:
     diagnostics: tuple[str, ...] = ()
     binding_diagnostics: tuple[str, ...] = ()
     world_diagnostics: tuple[str, ...] = ()
+    engagement_plan: TrainerEngagementPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -484,6 +1074,79 @@ def _goal_target(goal: Goal | None) -> Goal | None:
     return goal.target if isinstance(goal, NavigationGoal) else goal
 
 
+def _campaign_trainer_goal_is_defeated(goal: Goal | None) -> bool:
+    """Return whether campaign state has already cleared a trainer goal.
+
+    The live object table can be stale or omit the object immediately after a
+    trainer battle.  Campaign battle teardown records the stable affordance
+    identity in ``campaign_defeated_trainer_ids``; use that fact at the
+    tactical ownership boundary so a suspended trainer loop can return to
+    campaign planning without requiring the object to remain visible.
+    """
+
+    target = _goal_target(goal)
+    if not isinstance(target, EngageTrainer):
+        return False
+    defeated = set(getattr(context, "campaign_defeated_trainer_ids", ()) or ())
+    trainer_id = getattr(target, "trainer_id", None)
+    if trainer_id is None:
+        return False
+    aliases = {("trainer_affordance_id", trainer_id)}
+    # A few test and compatibility embeddings publish the trainer goal as a
+    # checkpoint ID.  Accept that alias only when campaign teardown explicitly
+    # recorded it; never infer defeat from a missing live object.
+    aliases.add(("checkpoint_id", trainer_id))
+    return bool(aliases.intersection(defeated))
+
+
+def _map_goal_completion_reason(observation: AgentObservation) -> str | None:
+    """Return a completion reason when a local navigation goal is already visible.
+
+    Background route planning may still be pending on the first frame after a
+    map transition.  Map goals can be settled locally from the observed map
+    header, so they must not wait for a stale or unnecessary worker result.
+    Exact ``ReachLocation`` goals can be settled from the observed coordinate
+    for the same reason. Interaction targets still require their normal
+    navigation evaluation.
+    """
+    if observation.overworld is None:
+        return None
+    target = _goal_target(observation.goal)
+    current_location = (observation.overworld.map_id, observation.overworld.player_coordinates)
+    if isinstance(target, ReachLocation) and current_location == target.location:
+        return "goal position reached"
+    destination_map = None
+    if isinstance(target, SemanticTarget):
+        if target.kind.name != "MAP":
+            return None
+        destination_map = target.target_map
+    elif isinstance(target, ReachWarp):
+        destination_map = target.destination_map
+        if destination_map is None and target.destination is not None:
+            destination_map = target.destination[0]
+    if destination_map is not None and observation.overworld.map_id == destination_map:
+        return "destination map reached"
+    return None
+
+
+def _effective_navigation_goal(observation: AgentObservation, world: NavigationWorld):
+    """Project a trainer goal onto the executable interaction geometry."""
+
+    goal_target = _goal_target(observation.goal)
+    if not isinstance(goal_target, EngageTrainer):
+        return observation.goal, None
+    engagement_plan = resolve_trainer_engagement_plan(world, goal_target.trainer_id)
+    interaction_target = engagement_plan.interaction_target
+    if interaction_target is None:
+        return observation.goal, engagement_plan
+    planning_goal = (
+        replace(observation.goal, target=interaction_target)
+        if isinstance(observation.goal, NavigationGoal)
+        else interaction_target
+    )
+    return planning_goal, engagement_plan
+
+
 def _observed_trigger(observation: AgentObservation, trigger_id: str):
     """Return the live affordance for a trigger goal, when it is observed."""
     if observation.overworld is None:
@@ -513,6 +1176,19 @@ def _trigger_requires_input(observation: AgentObservation, trigger_id: str) -> b
     return trigger is None or getattr(trigger, "requires_input", True)
 
 
+def _interaction_trigger_id(goal: Goal | None, evaluation: GoalEvaluation | None) -> str | None:
+    """Return the trigger currently owning an adjacent interaction goal."""
+
+    target = _goal_target(goal)
+    if isinstance(target, (ActivateTrigger, ReachInteractionPosition)):
+        return target.trigger_id
+    if isinstance(target, EngageTrainer) and evaluation is not None:
+        engagement_plan = evaluation.engagement_plan
+        if engagement_plan is not None and engagement_plan.mode is TrainerEngagementMode.INTERACTION:
+            return engagement_plan.trigger_id
+    return None
+
+
 def available_actions(observation: AgentObservation) -> tuple[AgentAction, ...]:
     """Return legal actions using a handler dedicated to the interaction state."""
 
@@ -527,22 +1203,31 @@ def available_actions(observation: AgentObservation) -> tuple[AgentAction, ...]:
 
 
 @profiled("agent_goal_evaluation", "goal_evaluations")
-def evaluate_goal(observation: AgentObservation) -> GoalEvaluation:
+def evaluate_goal(observation: AgentObservation, *, navigation_result=_NAVIGATION_PLAN_UNSET) -> GoalEvaluation:
     """Evaluate a tactical goal against the current overworld observation."""
 
     trace = getattr(context, "stutter_trace", None)
     span = trace.span("goal_evaluation") if trace is not None else nullcontext()
     with span:
-        return _evaluate_goal_instrumented(observation)
+        return _evaluate_goal_instrumented(observation, navigation_result=navigation_result)
 
 
-def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation:
+def _evaluate_goal_instrumented(observation: AgentObservation, *, navigation_result=_NAVIGATION_PLAN_UNSET) -> GoalEvaluation:
     if observation.goal is None:
         return GoalEvaluation(GoalStatus.NOT_APPLICABLE, reason="no goal supplied")
     if observation.overworld is None or observation.interaction_type is not InteractionType.OVERWORLD:
         return GoalEvaluation(GoalStatus.NOT_APPLICABLE, reason="goal requires an overworld observation")
 
     goal_target = _goal_target(observation.goal)
+    if _campaign_trainer_goal_is_defeated(observation.goal):
+        return GoalEvaluation(
+            GoalStatus.COMPLETE,
+            reason="campaign trainer clearance recorded",
+            world_diagnostics=(
+                f"trainer_id={getattr(goal_target, 'trainer_id', None)!r}",
+                "campaign_defeated_trainer_ids=True",
+            ),
+        )
     if isinstance(goal_target, ActivateTrigger) and _trigger_condition_completed(observation, goal_target.trigger_id):
         return GoalEvaluation(
             GoalStatus.COMPLETE,
@@ -616,6 +1301,7 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
             diagnostics=navigation_diagnostics(world, start, observation.goal),
             world_diagnostics=("avatar coordinate is outside the observed map topology",),
         )
+    planning_goal, engagement_plan = _effective_navigation_goal(observation, world)
     diagnostics_enabled = bool(context.debug and getattr(context, "debug_trace", False))
     binding_diagnostics = ()
     world_diagnostics = ()
@@ -636,6 +1322,7 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
                 f"runtime_match={resolution.runtime_match}" f" object_id={resolution.object_ids!r}",
                 f"static_match={resolution.static_match}"
                 f" static_available={resolution.static_available}"
+                f" static_availability={resolution.static_availability}"
                 f" static_ambiguous={resolution.static_ambiguous}"
                 f" static_location={resolution.static_location!r}",
                 f"target_positions={resolution.interaction_positions!r}",
@@ -651,7 +1338,19 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
     trace_planning_start = trace_world_start.now() if trace_world_start is not None else 0
     try:
         diagnostic_print(lambda: "CAMPAIGN_PLAN_TRACE: phase=world_plan_begin", trace=True)
-        plan, world_route = plan_with_world_navigation(world, start, observation.goal)
+        if navigation_result is _NAVIGATION_PLAN_UNSET:
+            plan, world_route = plan_with_world_navigation(
+                world,
+                start,
+                planning_goal,
+                caller="agent_control.goal_evaluation",
+            )
+        else:
+            plan, world_route, planning_error = navigation_result
+            if plan is None and planning_error is None:
+                planning_error = NavigationError("navigation planner returned no plan or error")
+            if planning_error is not None:
+                raise planning_error
         diagnostic_print(
             lambda: (
                 "CAMPAIGN_PLAN_TRACE: phase=world_plan_end "
@@ -661,9 +1360,15 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
             ),
             trace=True,
         )
+        constraints = getattr(observation.goal, "constraints", None)
+        trainer_avoidance_enabled = getattr(constraints, "trainer_mode", None) is TrainerMode.AVOID
+        forced_trainer_exposure_allowed = bool(
+            getattr(constraints, "allow_forced_trainer_exposure", False)
+        )
         if (
             getattr(plan, "forced_trainer_exposure", False)
-            and getattr(getattr(observation.goal, "constraints", None), "trainer_mode", None) is TrainerMode.AVOID
+            and trainer_avoidance_enabled
+            and not forced_trainer_exposure_allowed
         ):
             # GoalAwareNavigator retains a general-purpose fallback for
             # callers that explicitly prefer avoiding trainers but can still
@@ -676,6 +1381,7 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
                 diagnostics=navigation_diagnostics(world, start, observation.goal),
                 binding_diagnostics=binding_diagnostics,
                 world_diagnostics=world_diagnostics + ("route rejected: forced trainer exposure",),
+                engagement_plan=engagement_plan,
             )
         target_map = goal_target_map(world, observation.goal)
         if (
@@ -704,7 +1410,12 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
         # local navigator to prove only the observed movement/activation path.
         if isinstance(observation.goal, ReachWarp) and observation.goal.warp is not None:
             try:
-                local_plan = plan_observed_warp_locally(world, start, observation.goal)
+                local_plan = plan_observed_warp_locally(
+                    world,
+                    start,
+                    observation.goal,
+                    caller="agent_control.goal_evaluation.local_observed_warp",
+                )
             except NavigationError:
                 pass
             else:
@@ -715,6 +1426,7 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
                     diagnostics=navigation_diagnostics(world, start, observation.goal),
                     binding_diagnostics=binding_diagnostics,
                     world_diagnostics=("global route unavailable; using observed local transition",),
+                    engagement_plan=engagement_plan,
                 )
         timing("goal_planning", planning_start)
         count("goal_planning_attempts")
@@ -724,6 +1436,7 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
             diagnostics=navigation_diagnostics(world, start, observation.goal),
             binding_diagnostics=binding_diagnostics,
             world_diagnostics=world_diagnostics,
+            engagement_plan=engagement_plan,
         )
     timing("goal_planning", planning_start)
     if trace_world_start is not None:
@@ -739,7 +1452,12 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
             # entry.  Do not interpret that source tile as having crossed the
             # transition; recover an explicit local activation action.
             try:
-                local_plan = plan_observed_warp_locally(world, start, observation.goal)
+                local_plan = plan_observed_warp_locally(
+                    world,
+                    start,
+                    observation.goal,
+                    caller="agent_control.goal_evaluation.local_observed_warp",
+                )
             except NavigationError:
                 local_plan = None
             if local_plan is not None and local_plan.actions:
@@ -749,6 +1467,7 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
                     reason="warp entry observed; activation still required",
                     binding_diagnostics=binding_diagnostics,
                     world_diagnostics=world_diagnostics,
+                    engagement_plan=engagement_plan,
                 )
         return GoalEvaluation(
             GoalStatus.COMPLETE,
@@ -756,6 +1475,7 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
             reason="goal position reached",
             binding_diagnostics=binding_diagnostics,
             world_diagnostics=world_diagnostics,
+            engagement_plan=engagement_plan,
         )
     if isinstance(goal_target, EngageTrainer):
         trainer = next((obj for obj in observation.overworld.objects if obj.trainer_id == goal_target.trainer_id), None)
@@ -765,6 +1485,7 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
                 plan=plan,
                 reason="engaged trainer is defeated",
                 world_diagnostics=(f"trainer_id={goal_target.trainer_id!r}", "trainer_defeated=True"),
+                engagement_plan=engagement_plan,
             )
     if isinstance(goal_target, ActivateTrigger):
         activated = observation.interaction.metadata.get("activated_trigger_ids", ())
@@ -775,26 +1496,28 @@ def _evaluate_goal_instrumented(observation: AgentObservation) -> GoalEvaluation
                 reason="trigger is already activated",
                 binding_diagnostics=binding_diagnostics,
                 world_diagnostics=world_diagnostics,
+                engagement_plan=engagement_plan,
             )
     return GoalEvaluation(
         GoalStatus.REACHABLE,
         plan=plan,
         binding_diagnostics=binding_diagnostics,
         world_diagnostics=world_diagnostics,
+        engagement_plan=engagement_plan,
     )
 
 
 @profiled("agent_action_selection", "actions_selected")
-def select_action(observation: AgentObservation) -> ActionDecision:
+def select_action(observation: AgentObservation, *, navigation_result=_NAVIGATION_PLAN_UNSET) -> ActionDecision:
     """Select one deterministic action after state-specific affordance generation."""
 
     trace = getattr(context, "stutter_trace", None)
     span = trace.span("action_selection") if trace is not None else nullcontext()
     with span:
-        return _select_action_instrumented(observation)
+        return _select_action_instrumented(observation, navigation_result=navigation_result)
 
 
-def _select_action_instrumented(observation: AgentObservation) -> ActionDecision:
+def _select_action_instrumented(observation: AgentObservation, *, navigation_result=_NAVIGATION_PLAN_UNSET) -> ActionDecision:
     interaction_type = observation.interaction_type
     if interaction_type is not InteractionType.OVERWORLD:
         decision = ActionDecision(available_actions(observation)[0])
@@ -825,13 +1548,73 @@ def _select_action_instrumented(observation: AgentObservation) -> ActionDecision
                 )
             )
         return ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE, reason="player avatar is not controllable"))
-    evaluation = evaluate_goal(observation)
+    if navigation_result is _NAVIGATION_PLAN_PENDING:
+        map_completion_reason = _map_goal_completion_reason(observation)
+        if map_completion_reason is not None:
+            return ActionDecision(
+                AgentAction(AgentActionType.WAIT_REOBSERVE, reason=map_completion_reason),
+                GoalEvaluation(GoalStatus.COMPLETE, reason=map_completion_reason),
+            )
+        return ActionDecision(
+            AgentAction(
+                AgentActionType.WAIT_REOBSERVE,
+                reason="navigation plan is being calculated off the frame thread",
+            )
+        )
+    evaluation = evaluate_goal(observation, navigation_result=navigation_result)
     if evaluation.status is GoalStatus.COMPLETE:
         return ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE, reason=evaluation.reason), evaluation)
     if evaluation.status is GoalStatus.UNREACHABLE:
         return ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE, reason=evaluation.reason), evaluation)
     if evaluation.status is GoalStatus.NOT_APPLICABLE:
         return ActionDecision(AgentAction(AgentActionType.WAIT_REOBSERVE, reason=evaluation.reason), evaluation)
+    if (
+        isinstance(_goal_target(observation.goal), EngageTrainer)
+        and evaluation.status is GoalStatus.REACHABLE
+        and evaluation.plan is not None
+        and not evaluation.plan.actions
+    ):
+        if evaluation.engagement_plan is not None:
+            if evaluation.engagement_plan.mode is TrainerEngagementMode.INTERACTION:
+                trigger_id = evaluation.engagement_plan.trigger_id
+                if trigger_id is not None:
+                    world = NavigationWorld.from_overworld(observation.overworld)
+                    interaction_target = evaluation.engagement_plan.interaction_target
+                    if interaction_target is not None and GoalAwareNavigator(world).satisfies(
+                        (observation.overworld.map_id, observation.overworld.player_coordinates),
+                        observation.overworld.facing,
+                        interaction_target,
+                    ):
+                        return ActionDecision(
+                            AgentAction(
+                                AgentActionType.INTERACT,
+                                option=trigger_id,
+                                reason="trainer interaction position reached",
+                            ),
+                            evaluation,
+                        )
+                return ActionDecision(
+                    AgentAction(
+                        AgentActionType.WAIT_REOBSERVE,
+                        reason="waiting for trainer interaction position",
+                    ),
+                    evaluation,
+                )
+            if evaluation.engagement_plan.mode is TrainerEngagementMode.UNKNOWN:
+                return ActionDecision(
+                    AgentAction(
+                        AgentActionType.WAIT_REOBSERVE,
+                        reason="waiting for trainer engagement geometry",
+                    ),
+                    evaluation,
+                )
+        return ActionDecision(
+            AgentAction(
+                AgentActionType.WAIT_REOBSERVE,
+                reason="waiting for trainer sight-line activation",
+            ),
+            evaluation,
+        )
     if (
         isinstance(_goal_target(observation.goal), ActivateTrigger)
         and evaluation.status is GoalStatus.REACHABLE
@@ -1185,9 +1968,18 @@ class AgentControlLoop:
     # wait forever on that flag, but give a real movement transition enough
     # frames to advance before treating it as stale.
     _post_battle_stale_movement_limit = 8
+    # Emerald can leave the avatar's movement flag set after the logical
+    # coordinate has stopped changing. Keep the normal settling window long
+    # enough for a genuine step, but do not let a stale flag suppress an
+    # interaction route forever.
+    _stale_interaction_movement_limit = 24
     # A single delayed re-observation absorbs a stale transition/object table
     # without allowing an unreachable route to spin forever.
     _terminal_navigation_fallback_wait_frames = 20
+    # A trainer battle or script should claim the field shortly after the
+    # engagement tile is reached. Bound an unchanged automatic wait so a stale
+    # trainer trigger cannot keep the campaign generator alive forever.
+    _automatic_trainer_wait_limit = 32
 
     def __init__(
         self,
@@ -1214,11 +2006,22 @@ class AgentControlLoop:
         # so a live object moving onto a route tile is seen before the next
         # input. Ordinary campaign navigation retains the bounded fast path.
         self._use_movement_batch = use_movement_batch
+        # Campaign Progression is the live owner that can spend multiple
+        # milliseconds composing cross-map routes. Keep the pure control-loop
+        # and validation modes synchronous so their deterministic test seams
+        # remain unchanged.
+        self._background_navigation_enabled = context.bot_mode == "Campaign Progression"
+        # The global background worker is shared across mounted controllers;
+        # this token prevents a result from one loop/goal boundary from being
+        # adopted by the next loop merely because their requests look alike.
+        self._navigation_owner = object()
+        self._navigation_owner_label = f"agent_control_loop:{id(self)}"
         self._last_interaction_type: InteractionType | None = None
         self._battle_was_active = False
         self._last_navigation_diagnostics: tuple[str, ...] | None = None
         self._last_binding_diagnostics: tuple[str, ...] | None = None
         self._last_world_diagnostics: tuple[str, ...] | None = None
+        self._last_navigation_poll_report: tuple | None = None
         self._expected_world_transition: (
             tuple[
                 tuple[tuple[int, int], tuple[int, int]],
@@ -1252,6 +2055,9 @@ class AgentControlLoop:
         self._movement_failure_count = 0
         self._movement_failure_limit = 4
         self._terminal_navigation_fallback_used = False
+        self._terminal_navigation_fallback_attempts = 0
+        self._rejected_first_action_signature: tuple | None = None
+        self._rejected_first_action_count = 0
         # A failed movement is evidence of an obstacle even when the ROM's
         # object table has not exposed the object yet. Keep that evidence
         # across the immediate replan so a stale/partial observation cannot
@@ -1271,6 +2077,12 @@ class AgentControlLoop:
         self._post_battle_movement_location: Location | None = None
         self._post_battle_movement_observations = 0
         self._post_battle_movement_pending = self._recent_battle_return()
+        self._stale_interaction_movement_location: Location | None = None
+        self._stale_interaction_movement_observations = 0
+        self._automatic_trainer_wait_signature: tuple | None = None
+        self._automatic_trainer_wait_observations = 0
+        self._automatic_trainer_wait_reobserved = False
+        self._recovery_first_action_reported = False
 
     @staticmethod
     def _recent_battle_return() -> bool:
@@ -1295,6 +2107,23 @@ class AgentControlLoop:
             isinstance(frame, int)
             and frame >= _last_battle_end_emulator_frame
             and frame - _last_battle_end_emulator_frame <= _recent_battle_return_window
+        )
+
+    @property
+    def navigation_transition_active(self) -> bool:
+        """Return whether this loop still owns a map or door transition.
+
+        A transition remains owned through both the destination-map
+        observation and the short post-warp settling window. Campaign
+        planning must not replace the suspended loop during either phase,
+        because doing so prevents the loop from consuming its own transition
+        checkpoint and leaves the controller without a valid route suffix.
+        """
+
+        return (
+            self._pending_transition is not None
+            or self._expected_world_transition is not None
+            or self._warp_settling
         )
 
     def _resolve_stale_post_battle_movement(self, observation: AgentObservation) -> AgentObservation:
@@ -1362,14 +2191,104 @@ class AgentControlLoop:
         self._post_battle_movement_observations = 0
         return replace(observation, overworld=replace(world, movement_state=MovementState.STANDING))
 
+    def _resolve_stale_interaction_movement(self, observation: AgentObservation) -> AgentObservation:
+        """Bound a stale movement flag while pursuing an interaction goal.
+
+        The field engine may publish a coordinate before it clears the
+        avatar's movement state. That is normally a short, legitimate
+        settling interval. If the same coordinate remains stationary while
+        an interaction route is still active, however, waiting on ``MOVING``
+        forever prevents the route from advancing. Restrict this recovery to
+        an active interaction goal so ordinary movement retains its normal
+        settling checks, including the initial observation before a route has
+        been cached.
+        """
+
+        world = observation.overworld
+        target = _goal_target(self._goal)
+        trainer_interaction = (
+            isinstance(target, EngageTrainer)
+            and self._cached_evaluation is not None
+            and self._cached_evaluation.engagement_plan is not None
+            and self._cached_evaluation.engagement_plan.mode is TrainerEngagementMode.INTERACTION
+        )
+
+        def reset() -> AgentObservation:
+            self._stale_interaction_movement_location = None
+            self._stale_interaction_movement_observations = 0
+            return observation
+
+        if (
+            world is None
+            or observation.interaction_type is not InteractionType.OVERWORLD
+            or (not isinstance(target, (ActivateTrigger, ReachInteractionPosition)) and not trainer_interaction)
+        ):
+            return reset()
+        if world.movement_state not in (MovementState.MOVING, MovementState.TURNING):
+            return reset()
+        if (
+            not world.controllable
+            or not observation.interaction.controllable
+            or world.transition_in_progress
+            or self._pending_transition is not None
+            or (self._cached_goal is not None and self._cached_goal != self._goal)
+        ):
+            return reset()
+
+        location = (world.map_id, world.player_coordinates)
+
+        if location == self._stale_interaction_movement_location:
+            self._stale_interaction_movement_observations += 1
+        else:
+            self._stale_interaction_movement_location = location
+            self._stale_interaction_movement_observations = 1
+        if self._stale_interaction_movement_observations < self._stale_interaction_movement_limit:
+            return observation
+
+        if self._movement_batch is not None:
+            self._cancel_movement_batch("stale_interaction_movement")
+        else:
+            reset_held_buttons = getattr(context.emulator, "reset_held_buttons", None)
+            if callable(reset_held_buttons):
+                reset_held_buttons()
+        self._report(
+            "INTERACTION_MOVEMENT_WATCHDOG: treating stationary MOVING state as settled "
+            f"location={location!r} "
+            f"observations={self._stale_interaction_movement_observations} "
+            f"route_actions_remaining={len(self._cached_actions) - self._cached_action_index} "
+            f"in_flight_move={self._in_flight_move!r} "
+            f"target={target!r}"
+        )
+        self._stale_interaction_movement_location = None
+        self._stale_interaction_movement_observations = 0
+        return replace(observation, overworld=replace(world, movement_state=MovementState.STANDING))
+
     def _seed_navigation_plan(self, observation: AgentObservation) -> None:
         """Install a planner-supplied route once its origin is observable."""
 
         plan = self._initial_navigation_plan
         if plan is None or self._cached_evaluation is not None or observation.overworld is None:
             return
-        trainer_mode = getattr(getattr(self._goal, "constraints", None), "trainer_mode", None)
+        actions = tuple(getattr(plan, "actions", ()) or ())
+        origin = actions[0].source if actions else getattr(plan, "destination", None)
+        current_location = canonical_location((observation.overworld.map_id, observation.overworld.player_coordinates))
+        if canonical_location(origin) != current_location:
+            self._report(
+                "ROUTE_PLAN_REJECTED "
+                f"reason='origin mismatch' origin={origin!r} current={current_location!r}"
+            )
+            # A recovery continuation is valid only from the exact Center
+            # exit where the planner composed it. If the first observation
+            # is still inside the Center (or the world changed), clear it so
+            # the normal goal planner can build a route from the real tile.
+            self._initial_navigation_plan = None
+            return
+        constraints = getattr(self._goal, "constraints", None)
+        trainer_mode = getattr(constraints, "trainer_mode", None)
         trainer_avoidance_enabled = getattr(trainer_mode, "name", None) == "AVOID"
+        forced_trainer_exposure_allowed = bool(
+            getattr(constraints, "allow_forced_trainer_exposure", False)
+        )
         trainer_hazards = frozenset(
             location
             for trigger in getattr(observation.overworld, "triggers", ())
@@ -1394,7 +2313,7 @@ class AgentControlLoop:
             ),
             None,
         )
-        if trainer_avoidance_enabled and (
+        if trainer_avoidance_enabled and not forced_trainer_exposure_allowed and (
             hazard_conflict is not None or getattr(plan, "forced_trainer_exposure", False)
         ):
             if hazard_conflict is None:
@@ -1418,6 +2337,7 @@ class AgentControlLoop:
                 f"reason='destination currently blocked' source={blocked_action.source!r} "
                 f"destination={blocked_action.destination!r}"
             )
+            self._reject_first_action(blocked_action, "supplied route destination blocked", observation)
             # The route was composed from an earlier readiness observation.
             # Leave the goal available to the ordinary planner, which will
             # rebuild it against the current dynamic occupancy.
@@ -1443,6 +2363,7 @@ class AgentControlLoop:
             f"map={observation.overworld.map_id!r} "
             f"position={observation.overworld.player_coordinates!r} "
             f"dynamic_blocked={tuple(sorted(observation.overworld.dynamic_blocked_coordinates))!r} "
+            f"static_blocked={tuple(sorted(getattr(observation.overworld, 'static_blocked_coordinates', ())))!r} "
             f"objects={tuple((obj.local_id, obj.location, obj.trainer_defeated) for obj in observation.overworld.objects)!r} "
             f"actions={tuple((action.action_type.name, action.source, action.destination, action.direction.name) for action in plan.actions[:8])!r}"
         )
@@ -1456,7 +2377,11 @@ class AgentControlLoop:
             for object_observation in getattr(world, "objects", ())
             if object_observation.location[0] == world.map_id
         }
-        return set(getattr(world, "dynamic_blocked_coordinates", ())) | object_blocked_coordinates
+        return (
+            set(getattr(world, "dynamic_blocked_coordinates", ()))
+            | set(getattr(world, "static_blocked_coordinates", ()))
+            | object_blocked_coordinates
+        )
 
     @staticmethod
     def _trainer_hazard_coordinates(world) -> set[tuple[int, int]]:
@@ -1560,6 +2485,162 @@ class AgentControlLoop:
             f"source={action.source!r} destination={destination!r} reason={reason!r}"
         )
 
+    def _reject_first_action(self, action: NavigationAction | None, reason: str, observation) -> None:
+        """Feed a rejected route edge back into planning and bound retries."""
+
+        if action is None:
+            return
+        current = (
+            (observation.overworld.map_id, observation.overworld.player_coordinates)
+            if observation is not None and observation.overworld is not None
+            else None
+        )
+        signature = (
+            _navigation_goal_identity(self._goal),
+            current,
+            action.action_type.name,
+            action.source,
+            action.destination,
+            getattr(action.direction, "name", action.direction),
+        )
+        if signature == self._rejected_first_action_signature:
+            self._rejected_first_action_count += 1
+        else:
+            self._rejected_first_action_signature = signature
+            self._rejected_first_action_count = 1
+        self._remember_blocked_destination(action, reason)
+        self._report(
+            "ROUTE_ACTION_REJECTED "
+            f"count={self._rejected_first_action_count} reason={reason!r} "
+            f"source={action.source!r} destination={action.destination!r}"
+        )
+        if self._rejected_first_action_count >= 2:
+            # A dynamic occupancy read can be stale for one frame.  After the
+            # same edge is rejected again, force the next search to consume a
+            # fresh object table while the locally learned block prevents an
+            # identical route from being selected immediately again.
+            state_cache.invalidate_runtime_observations()
+            self._report(
+                "ROUTE_ACTION_REJECTION_BOUND "
+                f"count={self._rejected_first_action_count} action={action.destination!r}"
+            )
+
+    def _clear_rejected_first_action(self) -> None:
+        self._rejected_first_action_signature = None
+        self._rejected_first_action_count = 0
+
+    def _local_detour_around_blocked_action(
+        self,
+        observation: AgentObservation,
+        blocked_action: NavigationAction,
+    ) -> tuple[NavigationAction, ...] | None:
+        """Reuse a cached route after a safe, local occupancy change.
+
+        A wandering object can occupy the next tile after a route has already
+        been approved.  Re-running the full cross-map planner for that one
+        edge is safe but can leave the emulator waiting for several seconds.
+        Search a small same-map neighborhood for the first later source tile
+        in the cached suffix, retaining the full planner as the fallback when
+        no bounded detour exists.
+
+        Trainer hazard coordinates remain forbidden throughout this search.
+        This optimization therefore cannot turn ``TrainerMode.AVOID`` into a
+        permissive route, and it never crosses a warp while repairing a local
+        movement edge.
+        """
+
+        world_observation = observation.overworld
+        if (
+            world_observation is None
+            or blocked_action.action_type is not NavigationActionType.MOVE
+            or blocked_action.destination is None
+            or blocked_action.source[0] != world_observation.map_id
+            or blocked_action.destination[0] != world_observation.map_id
+            or self._cached_action_index >= len(self._cached_actions)
+        ):
+            return None
+
+        remaining = self._cached_actions[self._cached_action_index :]
+        if not remaining or remaining[0] != blocked_action:
+            return None
+
+        # The suffix must stay on the current map until the first warp.  A
+        # local repair ending at a later source tile can then append the
+        # already-approved suffix without invoking global pathfinding.
+        candidates: dict[tuple, tuple[int, int]] = {}
+        for index, action in enumerate(remaining[1:], start=1):
+            if action.action_type is not NavigationActionType.MOVE:
+                break
+            if action.source[0] != world_observation.map_id or action.destination[0] != world_observation.map_id:
+                break
+            # Prefer the next action's source, but also allow its destination
+            # as an anchor. The source can remain occupied by the NPC that
+            # blocked the original edge; reaching the open destination lets
+            # the repair skip that stale edge entirely.
+            candidates.setdefault(action.source, (index, index))
+            candidates.setdefault(action.destination, (index, index + 1))
+        if not candidates:
+            return None
+
+        world = NavigationWorld.from_overworld(world_observation)
+        trainer_hazards = self._trainer_hazard_coordinates(world_observation) if self._trainer_avoidance_enabled() else set()
+        start = (world_observation.map_id, world_observation.player_coordinates)
+        blocked_coordinates = self._blocked_coordinates(world_observation)
+        if start in trainer_hazards:
+            return None
+
+        queue = deque([start])
+        came_from: dict[tuple, tuple[tuple, Direction]] = {}
+        visited = {start}
+        anchor: tuple | None = None
+        append_index: int | None = None
+        # The local repair is deliberately bounded.  If a real route choice
+        # is required, the normal planner must re-evaluate the complete world.
+        while queue and len(visited) <= 128:
+            current = queue.popleft()
+            if current in candidates and current != start:
+                anchor = current
+                _anchor_index, append_index = candidates[current]
+                break
+            for direction, destination, is_warp in world.neighbors(current):
+                if is_warp or destination in visited:
+                    continue
+                if destination[0] != world_observation.map_id:
+                    continue
+                if destination[1] in blocked_coordinates or destination in trainer_hazards:
+                    continue
+                visited.add(destination)
+                came_from[destination] = (current, direction)
+                queue.append(destination)
+
+        if anchor is None or append_index is None:
+            return None
+
+        detour: list[NavigationAction] = []
+        current = anchor
+        while current != start:
+            previous, direction = came_from[current]
+            detour.append(
+                NavigationAction(
+                    NavigationActionType.MOVE,
+                    direction,
+                    previous,
+                    current,
+                    run=blocked_action.run,
+                )
+            )
+            current = previous
+        detour.reverse()
+        repaired = tuple(detour) + remaining[append_index:]
+        if not repaired or repaired[0].source != start:
+            return None
+        self._report(
+            "LOCAL_DETOUR: reused cached suffix "
+            f"blocked={blocked_action.destination!r} anchor={anchor!r} "
+            f"detour_actions={len(detour)} suffix_index={append_index}"
+        )
+        return repaired
+
     def _retain_local_blocks_for_map(self, map_id) -> None:
         """Discard collision inferences from maps no longer being traversed."""
 
@@ -1628,15 +2709,18 @@ class AgentControlLoop:
             )
             for location in locations
         }
-        # Treat the tiles occupied by, and immediately surrounding, runtime
-        # objects as checkpoints.  This keeps an NPC/trainer encounter in the
-        # normal interaction path instead of carrying the player past it.
+        # Treat occupied object tiles as hard collision boundaries. Nearby
+        # tiles only need a checkpoint when the object is a live trainer: a
+        # generic wandering NPC is already checked immediately before each
+        # cached input, and making every adjacent object a checkpoint turns a
+        # long route into repeated one- or two-step replans.
         occupied_object_locations = {obj.location for obj in world.objects if obj.location[0] == world.map_id}
         for obj in world.objects:
+            if obj.trainer_type in (None, "None") or obj.trainer_defeated:
+                continue
             x, y = obj.location[1]
             checkpoints.update(
                 {
-                    obj.location,
                     (obj.location[0], (x - 1, y)),
                     (obj.location[0], (x + 1, y)),
                     (obj.location[0], (x, y - 1)),
@@ -1708,6 +2792,13 @@ class AgentControlLoop:
         count(f"cached_route_invalidations_{reason}")
         if self._movement_batch is not None:
             self._report(f"MOVE_BATCH: interrupted reason={reason!r}")
+        if self._in_flight_move is not None:
+            _gate_observer_call(
+                "discard_navigation",
+                self._in_flight_move,
+                source_kind="movement",
+                reason=reason,
+            )
         self._movement_batch = None
         self._fast_path_frames = 0
         self._in_flight_move = None
@@ -1772,6 +2863,13 @@ class AgentControlLoop:
                 self._cancel_movement_batch("map_transition")
                 return False
             if location == action.destination:
+                _gate_observer_call(
+                    "record_navigation_outcome",
+                    action,
+                    "open",
+                    observation_frame=_gate_observation_frame(),
+                    source_kind="movement",
+                )
                 self._locally_blocked_destinations.discard(action.destination)
                 self._cached_action_index += 1
                 batch.index += 1
@@ -1828,6 +2926,13 @@ class AgentControlLoop:
             if batch.frames_waiting > 24:
                 count("cached_route_fast_path_fallback_frames")
                 self._movement_failure_count += 1
+                _gate_observer_call(
+                    "record_navigation_outcome",
+                    action,
+                    "blocked",
+                    observation_frame=_gate_observation_frame(),
+                    source_kind="movement",
+                )
                 self._remember_blocked_destination(action, "cached movement made no progress")
                 self._cancel_movement_batch("movement_blocked")
                 if self._movement_failure_count >= self._movement_failure_limit:
@@ -1850,6 +2955,12 @@ class AgentControlLoop:
                     )
                 press_direction = getattr(context.emulator, "press_direction", None)
                 if callable(press_direction):
+                    _gate_observer_call(
+                        "record_navigation_issued",
+                        action,
+                        action_frame=_gate_observation_frame(),
+                        source_kind="movement",
+                    )
                     press_direction(action.direction.button_name, run=bool(action.run))
                 else:
                     context.emulator.press_button(action.direction.button_name)
@@ -1862,12 +2973,24 @@ class AgentControlLoop:
                 # and every following frame is neutral input.
                 hold_button = getattr(context.emulator, "hold_button", None)
                 if callable(hold_button):
+                    _gate_observer_call(
+                        "record_navigation_issued",
+                        action,
+                        action_frame=_gate_observation_frame(),
+                        source_kind="movement",
+                    )
                     hold_button(action.direction.button_name)
                     if action.run:
                         hold_button("B")
                 else:
                     press_direction = getattr(context.emulator, "press_direction", None)
                     if callable(press_direction):
+                        _gate_observer_call(
+                            "record_navigation_issued",
+                            action,
+                            action_frame=_gate_observation_frame(),
+                            source_kind="movement",
+                        )
                         press_direction(action.direction.button_name, run=bool(action.run))
                     else:
                         context.emulator.press_button(action.direction.button_name)
@@ -1921,6 +3044,161 @@ class AgentControlLoop:
     def _report(self, message: str) -> None:
         self._logger(f"AGENT_{message}")
 
+    def _poll_background_navigation(self, observation: AgentObservation):
+        """Return a completed world plan without blocking the control loop."""
+
+        # A campaign loop can be constructed one frame before the mode switch
+        # is committed to BotContext. Recheck at use time so that boundary
+        # does not silently fall back to a synchronous multi-map search.
+        if not self._background_navigation_enabled and context.bot_mode == "Campaign Progression":
+            self._background_navigation_enabled = True
+        if not self._background_navigation_enabled:
+            return _NAVIGATION_PLAN_UNSET
+        if observation.overworld is None or observation.interaction_type is not InteractionType.OVERWORLD:
+            return _NAVIGATION_PLAN_UNSET
+        if self._goal is None:
+            return _NAVIGATION_PLAN_UNSET
+        world = NavigationWorld.from_overworld(observation.overworld)
+        start = (observation.overworld.map_id, observation.overworld.player_coordinates)
+        planning_goal, _ = _effective_navigation_goal(observation, world)
+        # Do not include runtime NPC coordinates in the single-flight key.
+        # Emerald updates wandering object positions every frame; using the
+        # full world signature here cancelled the worker on every such update,
+        # so a long encounter or trainer-safe route could remain permanently
+        # pending. The worker still receives the complete immutable snapshot
+        # for the search, and the resulting plan is validated against the
+        # current world before an input is emitted. Static topology and
+        # dynamic occupancy are therefore handled at the two appropriate
+        # boundaries: plan identity here, safety validation at execution.
+        # Only stable request identity belongs in the worker key. Dynamic
+        # blocked coordinates are an execution-time safety input: a wandering
+        # object can change them while a multi-second search is running, but
+        # that does not make the route's first action invalid. The cached
+        # route validator and the final destination check handle that live
+        # occupancy boundary. Transition topology remains in the key because
+        # a changed warp/connection can change the global route itself.
+        key = _navigation_request_key(start, planning_goal, world)
+        dynamic_blocked_revision, _transition_revision = world.revision_key()
+        failure_key = (key, dynamic_blocked_revision, _navigation_failure_revision(world))
+        operation = lambda cancel_check: plan_with_world_navigation(
+            world,
+            start,
+            planning_goal,
+            caller=f"agent_control.background_navigation[{self._navigation_owner_label}]",
+            cancel_check=cancel_check,
+        )
+        result = _background_navigation_planner.poll(
+            key,
+            operation,
+            failure_key=failure_key,
+            owner=self._navigation_owner,
+            owner_label=self._navigation_owner_label,
+        )
+        planner_event = _background_navigation_planner.take_event()
+        if planner_event is not None and self._diagnostics_enabled():
+            self._report(f"NAVIGATION_WORKER event={planner_event!r}")
+        discarded_reason = _background_navigation_planner.take_discard_reason()
+        expected_start_discard = discarded_reason == "request_key_changed changed=('start',)"
+        if discarded_reason is not None and not expected_start_discard:
+            self._report(f"NAVIGATION_PLAN_DISCARDED reason={discarded_reason!r}")
+        if result is _NAVIGATION_PLAN_PENDING:
+            report_key = ("pending", repr(key), None if expected_start_discard else discarded_reason)
+            if report_key != self._last_navigation_poll_report:
+                self._last_navigation_poll_report = report_key
+                self._report("NAVIGATION_PLAN_PENDING worker='single_flight'")
+        else:
+            plan = result[0]
+            error = result[2]
+            if plan is None and error is None:
+                error = NavigationError("navigation planner returned no plan or error")
+                result = (None, None, error)
+            report_key = (
+                "ready",
+                repr(key),
+                len(plan.actions) if plan is not None else None,
+                type(error).__name__ if error is not None else None,
+                None if expected_start_discard else discarded_reason,
+            )
+            if report_key != self._last_navigation_poll_report:
+                self._last_navigation_poll_report = report_key
+                self._report(
+                    "NAVIGATION_PLAN_READY "
+                    f"actions={len(plan.actions) if plan is not None else None} "
+                    f"error={type(error).__name__ if error is not None else None!r}"
+                )
+        return result
+
+    def _automatic_trainer_wait_key(self, observation: AgentObservation, decision: ActionDecision) -> tuple | None:
+        """Return a stable key for an unchanged automatic trainer wait."""
+
+        evaluation = decision.goal_evaluation
+        target = _goal_target(self._goal)
+        engagement = getattr(evaluation, "engagement_plan", None)
+        if not isinstance(target, EngageTrainer) or engagement is None:
+            return None
+        if engagement.mode not in (TrainerEngagementMode.SIGHTLINE, TrainerEngagementMode.UNKNOWN):
+            return None
+        if decision.action.action_type is not AgentActionType.WAIT_REOBSERVE:
+            return None
+        plan = getattr(evaluation, "plan", None)
+        if plan is None or getattr(plan, "actions", ()):
+            return None
+        world = observation.overworld
+        if world is None:
+            return None
+        return (
+            target.trainer_id,
+            (world.map_id, world.player_coordinates),
+            engagement.mode,
+            engagement.trigger_id,
+        )
+
+    def _apply_automatic_trainer_wait_watchdog(
+        self,
+        observation: AgentObservation,
+        decision: ActionDecision,
+    ) -> tuple[ActionDecision, ActionResult] | None:
+        """Force one fresh trainer observation, then fail boundedly.
+
+        A valid sight-line wait is normally short-lived: the ROM starts the
+        battle or changes the interaction state. If the same empty route is
+        returned for a full bounded window, invalidate runtime perception once
+        and retry. A second unchanged window raises a normal navigation error;
+        CampaignController handles that as a retryable autonomous boundary.
+        """
+
+        key = self._automatic_trainer_wait_key(observation, decision)
+        if key is None:
+            self._automatic_trainer_wait_signature = None
+            self._automatic_trainer_wait_observations = 0
+            self._automatic_trainer_wait_reobserved = False
+            return None
+        if key == self._automatic_trainer_wait_signature:
+            self._automatic_trainer_wait_observations += 1
+        else:
+            self._automatic_trainer_wait_signature = key
+            self._automatic_trainer_wait_observations = 1
+            self._automatic_trainer_wait_reobserved = False
+        if self._automatic_trainer_wait_observations < self._automatic_trainer_wait_limit:
+            return None
+
+        reason = "automatic_trainer_wait_watchdog"
+        if self._automatic_trainer_wait_reobserved:
+            raise NavigationError(
+                f"trainer engagement remained unchanged after {self._automatic_trainer_wait_limit} re-observations"
+            )
+        self._automatic_trainer_wait_reobserved = True
+        self._automatic_trainer_wait_observations = 0
+        self._invalidate_plan(reason, observation=observation)
+        state_cache.invalidate_runtime_observations()
+        self._report(
+            f"WATCHDOG: {reason} trainer={key[0]!r} location={key[1]!r} "
+            f"action='invalidate_and_reobserve'"
+        )
+        wait_action = AgentAction(AgentActionType.WAIT_REOBSERVE, reason=reason)
+        wait_decision = ActionDecision(wait_action, decision.goal_evaluation)
+        return wait_decision, self._executor.execute(wait_action, observation)
+
     @staticmethod
     def _release_transition_input(pending: _PendingTransition) -> None:
         """Release only the direction sustained by a terminal transition."""
@@ -1929,7 +3207,12 @@ class AgentControlLoop:
             release_button(pending.direction.button_name)
 
     def dispose(self) -> None:
-        """Release controller-owned transition input at a lifecycle boundary."""
+        """Release controller-owned input and cancel its background search."""
+        _background_navigation_planner.cancel(
+            self._navigation_owner,
+            reason="navigation owner disposed",
+            owner_label=self._navigation_owner_label,
+        )
         pending = self._pending_transition
         if pending is None:
             return
@@ -1937,16 +3220,45 @@ class AgentControlLoop:
         # idempotent even if adapter cleanup re-enters controller teardown.
         self._pending_transition = None
         self._expected_world_transition = None
+        _gate_observer_call(
+            "discard_navigation",
+            pending.action,
+            source_kind="transition",
+            reason="controller disposed before transition outcome",
+        )
         self._release_transition_input(pending)
 
-    def _wait_for_terminal_navigation_fallback(self, reason: str):
-        """Wait once, then allow a terminal route observation to be retried."""
+    def _terminal_navigation_fallback_limit(self) -> int:
+        """Return the bounded retry count for this controller's goal.
 
-        if self._terminal_navigation_fallback_used:
+        A preferred campaign corridor carries enough structure to retry the
+        same controller after a stale first action: its locally learned
+        blocker set remains available to the next search. Other goals retain
+        the original single delayed retry so an actually unreachable goal
+        cannot spin indefinitely.
+        """
+
+        target = _goal_target(self._goal)
+        if (
+            isinstance(self._goal, NavigationGoal)
+            and isinstance(target, SemanticTarget)
+            and target.kind.name == "MAP"
+            and self._goal.preferred_map_route
+        ):
+            return 2
+        return 1
+
+    def _wait_for_terminal_navigation_fallback(self, reason: str):
+        """Wait, then allow a bounded route observation to be retried."""
+
+        if self._terminal_navigation_fallback_attempts >= self._terminal_navigation_fallback_limit():
             return False
+        self._terminal_navigation_fallback_attempts += 1
         self._terminal_navigation_fallback_used = True
         self._report(
             "NAVIGATION_FALLBACK: "
+            f"attempt={self._terminal_navigation_fallback_attempts} "
+            f"limit={self._terminal_navigation_fallback_limit()} "
             f"waiting_frames={self._terminal_navigation_fallback_wait_frames} reason={reason!r}"
         )
         # Release all controller-owned input before yielding the delay. This
@@ -2084,15 +3396,18 @@ class AgentControlLoop:
                     trigger.requires_input,
                     trigger.hazard_locations,
                     trigger.hazard_kind,
+                    getattr(trigger, "engagement_locations", ()),
                 )
                 for trigger in world.triggers
             ),
             world.dynamic_blocked_coordinates,
+            getattr(world, "static_blocked_coordinates", ()),
             tuple((obj.local_id, obj.location, obj.script) for obj in world.objects),
             tuple(
                 (
                     binding.binding.trigger_id,
                     binding.static_location,
+                    binding.static_availability,
                     binding.runtime_match,
                     binding.interaction_positions,
                 )
@@ -2118,24 +3433,70 @@ class AgentControlLoop:
         # attempting to diff it would mask the useful recovery with a TypeError.
         if previous is None or current is None:
             return True, "missing_world_signature baseline"
-        changed = {index for index, (old, new) in enumerate(zip(previous, current)) if old != new}
+        missing = object()
+        changed = {
+            index
+            for index in range(max(len(previous), len(current)))
+            if (previous[index] if index < len(previous) else missing)
+            != (current[index] if index < len(current) else missing)
+        }
         route_locations = {location for action in remaining_actions for location in (action.source, action.destination)}
-        names = {0: "map", 1: "warps", 2: "triggers", 3: "dynamic_blocked", 4: "objects", 5: "bindings"}
-        detail = f"changed={tuple(names[index] for index in sorted(changed))!r} route_locations={len(route_locations)}"
+        next_action_locations = (
+            {
+                location
+                for location in (remaining_actions[0].source, remaining_actions[0].destination)
+                if location is not None
+            }
+            if remaining_actions
+            else set()
+        )
+        route_coordinates = {
+            location[1]
+            for location in route_locations
+            if isinstance(location, tuple)
+            and len(location) == 2
+            and location[0] == current[0]
+        }
+        names = {
+            0: "map",
+            1: "warps",
+            2: "triggers",
+            3: "dynamic_blocked",
+            4: "static_blocked",
+            5: "objects",
+            6: "bindings",
+        }
+        changed_names = tuple(names.get(index, f"field_{index}") for index in sorted(changed))
+        detail = f"changed={changed_names!r} route_locations={len(route_locations)}"
         if not changed:
             return False, detail
-        if changed - {2, 3, 4}:
+        # Unknown fields, map topology, static blockers, and bindings can all
+        # alter the route without a location-level comparison. Invalidate
+        # conservatively when any of them changes. The runtime fields below
+        # are the only fields eligible for a remaining-route comparison.
+        if changed - {2, 3, 5}:
             return True, detail + " relevant=static_or_topology"
 
         if 3 in changed:
-            changed_blocked = set(previous[3]) ^ set(current[3])
-            if changed_blocked & {location[1] for location in route_locations}:
-                return True, detail + " relevant=blocked_route_tile"
-        if 4 in changed:
-            old_objects = {item[1] for item in previous[4]}
-            new_objects = {item[1] for item in current[4]}
-            if (old_objects ^ new_objects) & route_locations:
-                return True, detail + " relevant=route_object"
+            # A moving NPC can leave the next destination while entering a
+            # later tile.  Only newly occupied coordinates can make the next
+            # input unsafe; a vacated coordinate is positive evidence that
+            # the cached edge is available again.
+            changed_blocked = set(current[3]) - set(previous[3])
+            next_action_coordinates = {
+                location[1]
+                for location in next_action_locations
+                if isinstance(location, tuple)
+                and len(location) == 2
+                and location[0] == current[0]
+            }
+            if changed_blocked & next_action_coordinates:
+                return True, detail + " relevant=immediate_blocked_route_tile"
+        if 5 in changed:
+            old_objects = {item[1] for item in previous[5]}
+            new_objects = {item[1] for item in current[5]}
+            if (new_objects - old_objects) & next_action_locations:
+                return True, detail + " relevant=immediate_route_object"
         if 2 in changed:
             old_triggers = {item[0]: item for item in previous[2]}
             new_triggers = {item[0]: item for item in current[2]}
@@ -2147,17 +3508,75 @@ class AgentControlLoop:
                 # a trainer can turn or become defeated without changing its
                 # activation geometry. Keep the lenient fallback for older
                 # injected signatures used by lightweight callers.
-                return set(trigger[1]) | set(trigger[2]) | (set(trigger[7]) if len(trigger) > 7 else set())
+                return (
+                    set(trigger[1])
+                    | set(trigger[2])
+                    | (set(trigger[7]) if len(trigger) > 7 else set())
+                    | (set(trigger[9]) if len(trigger) > 9 else set())
+                )
+
+            def is_nontrainer_runtime_object(trigger) -> bool:
+                """Return whether a moved generic NPC is the changed trigger.
+
+                Runtime objects publish interaction triggers as well as
+                occupancy.  A wandering non-trainer therefore changes both
+                the object and trigger portions of the signature while it
+                walks.  Occupancy is already checked immediately before each
+                cached input; treating its future interaction position as a
+                route-wide hazard recreates the background-search stall.
+                Trainer geometry remains conservative below.
+                """
+
+                if trigger is None or not str(trigger[0]).startswith("object:"):
+                    return False
+                hazard_locations = set(trigger[7]) if len(trigger) > 7 else set()
+                engagement_locations = set(trigger[9]) if len(trigger) > 9 else set()
+                hazard_kind = trigger[8] if len(trigger) > 8 else None
+                return not hazard_locations and not engagement_locations and hazard_kind != "trainer"
 
             for trigger_id in old_triggers.keys() | new_triggers.keys():
-                if old_triggers.get(trigger_id) == new_triggers.get(trigger_id):
+                old_trigger = old_triggers.get(trigger_id)
+                new_trigger = new_triggers.get(trigger_id)
+                if old_trigger == new_trigger:
+                    continue
+                if all(
+                    trigger is None or is_nontrainer_runtime_object(trigger)
+                    for trigger in (old_trigger, new_trigger)
+                ):
                     continue
                 for trigger in (old_triggers.get(trigger_id), new_triggers.get(trigger_id)):
                     if route_relevant_locations(trigger) & route_locations:
                         return True, detail + " relevant=route_trigger"
         return False, detail + " relevant=none"
 
-    def _invalidate_plan(self, reason: str = "unspecified") -> None:
+    def _invalidate_plan(
+        self,
+        reason: str = "unspecified",
+        *,
+        observation: AgentObservation | None = None,
+        detail: str | None = None,
+    ) -> None:
+        route_plan = self._route_plan
+        cached_action = (
+            self._cached_actions[self._cached_action_index]
+            if self._cached_action_index < len(self._cached_actions)
+            else None
+        )
+        current = self._last_observed_location
+        if observation is not None and observation.overworld is not None:
+            current = (observation.overworld.map_id, observation.overworld.player_coordinates)
+        if route_plan is not None or self._cached_actions:
+            print_navigation_invalidation(
+                reason=reason,
+                route_id=route_plan.route_id if route_plan is not None else None,
+                current=current,
+                goal=self._cached_goal if self._cached_goal is not None else self._goal,
+                action_index=self._cached_action_index,
+                remaining_actions=max(0, len(self._cached_actions) - self._cached_action_index),
+                total_actions=len(self._cached_actions),
+                cached_action=cached_action,
+                detail=detail,
+            )
         trace = getattr(context, "stutter_trace", None)
         if trace is not None:
             trace.mark("route_invalidated", True)
@@ -2204,6 +3623,15 @@ class AgentControlLoop:
     def _cached_decision_instrumented(self, observation: AgentObservation) -> ActionDecision | None:
         if self._cached_evaluation is None or self._cached_goal != self._goal:
             return None
+        if self._cached_evaluation.status is GoalStatus.COMPLETE and not self.navigation_transition_active:
+            # Preserve the authoritative terminal evaluation across one more
+            # controller observation.  This keeps a completed route from
+            # being mistaken for a fresh navigation request when a caller
+            # polls the generator again before unmounting the loop.
+            return ActionDecision(
+                AgentAction(AgentActionType.WAIT_REOBSERVE, reason="goal already complete"),
+                self._cached_evaluation,
+            )
 
         goal_target = _goal_target(self._goal)
         if isinstance(goal_target, ActivateTrigger) and _trigger_condition_completed(
@@ -2214,6 +3642,14 @@ class AgentControlLoop:
             # observes the completed goal and lets campaign policy choose the
             # next objective.
             self._invalidate_plan("automatic trigger condition completed")
+            return None
+
+        # A map-load callback can temporarily provide no overworld model at
+        # all.  Navigation validation has no location or world signature to
+        # inspect in that frame; let the interaction-state selector emit its
+        # bounded wait while preserving the cached route for the next coherent
+        # destination observation.
+        if observation.overworld is None:
             return None
 
         count("cached_plan_validations")
@@ -2231,68 +3667,135 @@ class AgentControlLoop:
                 "REPLAN: reason='cached route destination blocked' "
                 f"source={blocked_action.source!r} destination={blocked_action.destination!r}"
             )
+            self._reject_first_action(blocked_action, "cached route destination blocked", observation)
+            local_detour = self._local_detour_around_blocked_action(observation, blocked_action)
+            if local_detour is not None:
+                previous_plan = self._cached_evaluation.plan
+                repaired_plan = NavigationPlan(
+                    local_detour,
+                    previous_plan.destination if previous_plan is not None else local_detour[-1].destination,
+                    previous_plan.metrics if previous_plan is not None else None,
+                    previous_plan.candidate_metrics if previous_plan is not None else (),
+                    previous_plan.forced_trainer_exposure if previous_plan is not None else False,
+                )
+                self._cached_evaluation = replace(self._cached_evaluation, plan=repaired_plan)
+                self._cached_actions = local_detour
+                self._cached_action_index = 0
+                self._route_plan = RoutePlan.from_navigation_plan(repaired_plan, target=self._goal)
+                self._cached_world_signature = self._world_signature(observation)
+                self._movement_batch = None
+                self._in_flight_move = None
+                self._in_flight_move_initial_facing = None
+                count("navigation_local_detours")
+                return ActionDecision(
+                    AgentAction(
+                        AgentActionType.NAVIGATE_TOWARD_GOAL,
+                        direction=local_detour[0].direction,
+                        navigation=local_detour[0],
+                        reason="local detour around current route obstacle",
+                    ),
+                    self._cached_evaluation,
+                )
             self._invalidate_plan("cached_route_destination_blocked")
             return None
         current_world_signature = self._world_signature(observation)
         world_signature_changed = self._cached_world_signature != current_world_signature
-        if world_signature_changed and not (
-            cached_action is not None
-            and cached_action.action_type is NavigationActionType.WARP
-            and location == cached_action.source
-        ):
-            affects_route, signature_detail = self._signature_change_affects_remaining_route(
+        route_complete_at_destination = (
+            self._cached_action_index >= len(self._cached_actions)
+            and self._cached_evaluation.plan is not None
+            and location == self._cached_evaluation.plan.destination
+        )
+        if world_signature_changed and self._cached_world_signature is not None and route_complete_at_destination:
+            # The route has already reached its terminal location. Runtime
+            # objects, triggers, and dynamic blockers can legitimately change
+            # while the ROM starts the destination interaction. There is no
+            # remaining movement edge for those changes to invalidate; keep
+            # the terminal evaluation alive and let the goal-specific
+            # completion/interaction branch below inspect the fresh world.
+            self._cached_world_signature = current_world_signature
+            self._report(
+                "ROUTE_SIGNATURE_UPDATED "
+                f"reason='completed route at destination' location={location!r}"
+            )
+            world_signature_changed = False
+        if world_signature_changed and cached_action is not None:
+            # A newly loaded trainer can make a later edge unsafe before it
+            # becomes the current action.  Compare changed trigger/object
+            # geometry with the remaining route and discard the cached plan
+            # when the change can affect that route.  The explicit
+            # ``_blocked_action`` check above remains the final occupancy and
+            # trainer-hazard gate before every input.
+            affects_route, detail = self._signature_change_affects_remaining_route(
                 self._cached_world_signature,
                 current_world_signature,
                 self._cached_actions[self._cached_action_index :],
             )
-            trace = getattr(context, "stutter_trace", None)
-            if trace is not None:
-                trace.mark(
-                    "route_invalidation_detail",
-                    f"world_signature_changed current={location!r} "
-                    f"cached_source={cached_action.source if cached_action else None!r} "
-                    f"cached_destination={cached_action.destination if cached_action else None!r} "
-                    f"{signature_detail} affects_route={affects_route}",
-                )
-            if cached_action is not None and not affects_route:
-                self._cached_world_signature = current_world_signature
-                return ActionDecision(
-                    AgentAction(
-                        AgentActionType.NAVIGATE_TOWARD_GOAL,
-                        direction=cached_action.direction,
-                        navigation=cached_action,
-                        reason="continue cached route; irrelevant world change",
-                    ),
-                    self._cached_evaluation,
-                )
-            invalidation("world_signature_changed")
-            return None
+            if affects_route:
+                self._invalidate_plan("cached_route_world_changed", observation=observation, detail=detail)
+                return None
+            self._cached_world_signature = current_world_signature
+            self._report(
+                "ROUTE_SIGNATURE_UPDATED "
+                "reason='next-action-only validation' "
+                f"location={location!r} next_destination={cached_action.destination!r}"
+            )
 
         if self._cached_action_index >= len(self._cached_actions):
             if self._cached_evaluation.plan is not None and location == self._cached_evaluation.plan.destination:
-                if isinstance(_goal_target(self._goal), (ActivateTrigger, ReachInteractionPosition)):
+                cached_target = _goal_target(self._goal)
+                cached_engagement = self._cached_evaluation.engagement_plan
+                if isinstance(cached_target, EngageTrainer) and cached_engagement is not None:
+                    if cached_engagement.mode is TrainerEngagementMode.UNKNOWN:
+                        # A cross-map trainer route may be planned before the
+                        # destination map's object table or hazard geometry is
+                        # visible.  Its destination is then only a map-entry
+                        # checkpoint, not an executable engagement boundary.
+                        # Reusing the empty geometry forever strands the loop
+                        # at that boundary, so let fresh perception resolve
+                        # the trainer before deciding whether to wait or move.
+                        self._invalidate_plan("trainer_engagement_geometry_requires_reobserve")
+                        return None
+                    if (
+                        cached_engagement.mode is TrainerEngagementMode.SIGHTLINE
+                        and location not in cached_engagement.engagement_locations
+                    ):
+                        # The cached route can reach a map boundary while the
+                        # sight line was resolved from an earlier map scope.
+                        # Do not treat that boundary as an engagement point.
+                        self._invalidate_plan("cached_trainer_sightline_not_reached")
+                        return None
+                    if cached_engagement.mode is TrainerEngagementMode.SIGHTLINE:
+                        return ActionDecision(
+                            AgentAction(
+                                AgentActionType.WAIT_REOBSERVE,
+                                reason="waiting for trainer sight-line activation",
+                            ),
+                            self._cached_evaluation,
+                        )
+                    cached_target = cached_engagement.interaction_target
+                if isinstance(cached_target, (ActivateTrigger, ReachInteractionPosition)):
                     world = NavigationWorld.from_overworld(observation.overworld)
                     if not GoalAwareNavigator(world).satisfies(
-                        location, observation.overworld.facing, _goal_target(self._goal)
+                        location, observation.overworld.facing, cached_target
                     ):
                         # A plan may have reached the source tile without the
                         # final turn being accepted by the emulator. Never
                         # issue A on geometric adjacency alone.
                         self._invalidate_plan("interaction_precondition_not_ready")
                         return None
-                    if isinstance(_goal_target(self._goal), ReachInteractionPosition) and _trigger_requires_input(
-                        observation, _goal_target(self._goal).trigger_id
+                    if isinstance(cached_target, ReachInteractionPosition) and _trigger_requires_input(
+                        observation, cached_target.trigger_id
                     ):
                         return ActionDecision(
                             AgentAction(
                                 AgentActionType.INTERACT,
-                                option=_goal_target(self._goal).trigger_id,
+                                option=cached_target.trigger_id,
                                 reason="cached interaction source state reached",
                             ),
                             self._cached_evaluation,
                         )
-                    if isinstance(_goal_target(self._goal), ReachInteractionPosition):
-                        if not _trigger_requires_input(observation, _goal_target(self._goal).trigger_id):
+                    if isinstance(cached_target, ReachInteractionPosition):
+                        if not _trigger_requires_input(observation, cached_target.trigger_id):
                             self._interaction_position_ready = True
                         return ActionDecision(
                             AgentAction(
@@ -2301,7 +3804,7 @@ class AgentControlLoop:
                             ),
                             self._cached_evaluation,
                         )
-                    if not _trigger_requires_input(observation, _goal_target(self._goal).trigger_id):
+                    if not _trigger_requires_input(observation, cached_target.trigger_id):
                         self._interaction_position_ready = True
                         return ActionDecision(
                             AgentAction(
@@ -2313,7 +3816,7 @@ class AgentControlLoop:
                     return ActionDecision(
                         AgentAction(
                             AgentActionType.INTERACT,
-                            option=_goal_target(self._goal).trigger_id,
+                            option=cached_target.trigger_id,
                             reason="cached goal activation position reached",
                         ),
                         self._cached_evaluation,
@@ -2394,6 +3897,7 @@ class AgentControlLoop:
 
         interaction_type = observation.interaction_type
         observation = self._resolve_stale_post_battle_movement(observation)
+        observation = self._resolve_stale_interaction_movement(observation)
         emulator_frame = (
             getattr(emulator, "get_frame_count", None) if (emulator := getattr(context, "emulator", None)) else None
         )
@@ -2455,10 +3959,10 @@ class AgentControlLoop:
         if (
             interaction_type is not InteractionType.OVERWORLD
             and observation.interaction.script_active
-            and isinstance(_goal_target(self._goal), (ActivateTrigger, ReachInteractionPosition))
             and self._cached_evaluation is not None
             and self._cached_evaluation.plan is not None
             and self._cached_action_index >= len(self._cached_actions)
+            and _interaction_trigger_id(self._goal, self._cached_evaluation) is not None
         ):
             # A cached movement batch can arrive on an automatic trigger tile
             # on the same emulator frame that the ROM installs its script.
@@ -2532,7 +4036,18 @@ class AgentControlLoop:
                 wait_result = self._executor.execute(wait_action, observation)
                 return observation, wait_decision, wait_result
         if interaction_type is not InteractionType.OVERWORLD:
-            self._invalidate_plan("non_overworld_interaction")
+            if self.navigation_transition_active:
+                # A warp can hand control to the ROM on the source tile before
+                # the destination map is observable.  This is a transition
+                # boundary, not evidence that the exhausted route failed.
+                # Keep the pending transition/route owner alive until its
+                # destination checkpoint has been observed.
+                self._report(
+                    "TRANSITION: preserving route during non-overworld boundary "
+                    f"interaction={interaction_type.name!r}"
+                )
+            else:
+                self._invalidate_plan("non_overworld_interaction")
         if interaction_type is not self._last_interaction_type:
             self._report(f"STATE: {interaction_type.name}")
             if self._battle_was_active and interaction_type is InteractionType.OVERWORLD:
@@ -2545,8 +4060,7 @@ class AgentControlLoop:
         # not run the reached-position decision again and emit another input.
         if (
             self._started_interaction_id is not None
-            and isinstance(_goal_target(self._goal), (ActivateTrigger, ReachInteractionPosition))
-            and _goal_target(self._goal).trigger_id == self._started_interaction_id
+            and _interaction_trigger_id(self._goal, self._cached_evaluation) == self._started_interaction_id
             and observation.interaction.interaction_phase is InteractionPhase.FIELD_MESSAGE_INPUT_WAIT
         ):
             # A newly-started interaction may expose its first field message
@@ -2557,8 +4071,7 @@ class AgentControlLoop:
             self._interaction_start_waits = 0
         if (
             self._started_interaction_id is not None
-            and isinstance(_goal_target(self._goal), (ActivateTrigger, ReachInteractionPosition))
-            and _goal_target(self._goal).trigger_id == self._started_interaction_id
+            and _interaction_trigger_id(self._goal, self._cached_evaluation) == self._started_interaction_id
             and observation.interaction.script_active
         ):
             wait_action = AgentAction(
@@ -2576,8 +4089,7 @@ class AgentControlLoop:
             )
         if (
             self._started_interaction_id is not None
-            and isinstance(_goal_target(self._goal), (ActivateTrigger, ReachInteractionPosition))
-            and _goal_target(self._goal).trigger_id == self._started_interaction_id
+            and _interaction_trigger_id(self._goal, self._cached_evaluation) == self._started_interaction_id
             and not observation.interaction.script_active
         ):
             # Interaction dispatch is asynchronous. Re-emitting A every frame
@@ -2652,6 +4164,26 @@ class AgentControlLoop:
                     record_runtime_transition_observation(
                         pending.source, pending.transition_kind, pending.destination, observed
                     )
+                    # Map connections can land at a valid destination tile
+                    # chosen by the ROM rather than the first predicted
+                    # boundary pair. The map change is still explicit proof
+                    # that the candidate edge opened; retain the old route
+                    # mismatch diagnostic for controller recovery.
+                    if pending.transition_kind == "map_connection":
+                        _gate_observer_call(
+                            "record_navigation_outcome",
+                            pending.action,
+                            "open",
+                            observation_frame=_gate_observation_frame(),
+                            source_kind="transition",
+                        )
+                    else:
+                        _gate_observer_call(
+                            "discard_navigation",
+                            pending.action,
+                            source_kind="transition",
+                            reason="transition destination coordinate mismatch",
+                        )
                     self._report(
                         f"TRANSITION_PREDICTION_MISMATCH source={pending.source!r} "
                         f"kind={pending.transition_kind!r} predicted={pending.destination!r} observed={observed!r}"
@@ -2673,6 +4205,13 @@ class AgentControlLoop:
                         ActionResult(ActionResultType.UNREACHABLE, None, "transition destination mismatch"),
                     )
                 self._report("TRANSITION: destination_observed")
+                _gate_observer_call(
+                    "record_navigation_outcome",
+                    pending.action,
+                    "open",
+                    observation_frame=_gate_observation_frame(),
+                    source_kind="transition",
+                )
                 self._release_transition_input(pending)
                 self._expected_world_transition = None
                 self._pending_transition = None
@@ -2707,6 +4246,12 @@ class AgentControlLoop:
                 record_runtime_transition_observation(
                     pending.source, pending.transition_kind, pending.destination, observed
                 )
+                _gate_observer_call(
+                    "discard_navigation",
+                    pending.action,
+                    source_kind="transition",
+                    reason="transition destination mismatch",
+                )
                 self._report(
                     f"TRANSITION_PREDICTION_MISMATCH source={pending.source!r} "
                     f"kind={pending.transition_kind!r} predicted={pending.destination!r} observed={observed!r}"
@@ -2719,7 +4264,39 @@ class AgentControlLoop:
                 self._pending_transition = None
                 self._expected_world_transition = None
                 self._invalidate_plan("warp_destination_mismatch")
+            elif interaction_type is not InteractionType.OVERWORLD:
+                # The ROM owns the field between warp activation and the
+                # destination-map observation.  Returning a waiting action
+                # keeps AgentControlLoop mounted, which lets CampaignController
+                # preserve ownership and prevents the campaign capability from
+                # treating this boundary as a completed or failed route.
+                wait_action = AgentAction(
+                    AgentActionType.WAIT_REOBSERVE,
+                    reason="transition script owns field; waiting for destination",
+                )
+                wait_decision = ActionDecision(wait_action)
+                wait_result = self._executor.execute(wait_action, observation)
+                return observation, wait_decision, wait_result
             elif interaction_type is InteractionType.OVERWORLD:
+                if not observation.overworld.controllable:
+                    # The ROM owns the avatar while a door/warp task is
+                    # finishing. Releasing the transition direction here is
+                    # essential: the next observation may still expose the
+                    # source map, and holding the old input can drive the
+                    # player back and forth at the Center exit.
+                    pending.observations = 0
+                    self._release_transition_input(pending)
+                    self._report(
+                        "TRANSITION: input_released_for_rom_control "
+                        f"source={pending.source!r} destination={pending.destination!r}"
+                    )
+                    wait_action = AgentAction(
+                        AgentActionType.WAIT_REOBSERVE,
+                        reason="transition script owns avatar; waiting for control",
+                    )
+                    wait_decision = ActionDecision(wait_action)
+                    wait_result = self._executor.execute(wait_action, observation)
+                    return observation, wait_decision, wait_result
                 if pending.last_position is not None and observed != pending.last_position:
                     pending.moved = True
                     pending.observations = 0
@@ -2730,8 +4307,24 @@ class AgentControlLoop:
                     # progress, not a failed input.  Count the watchdog only
                     # during stable observations with no transition signal;
                     # otherwise a legitimate long map load expires just
-                    # before the destination becomes observable.
+                    # before the destination becomes observable. Once the
+                    # ROM has installed that task, it owns the transition;
+                    # continuing to hold the activation direction can race
+                    # the map-load boundary and leaves the bot appearing to
+                    # issue no useful commands while the task is pending.
                     pending.observations = 0
+                    self._release_transition_input(pending)
+                    self._report(
+                        "TRANSITION: input_released_for_rom_transition_task "
+                        f"signals={observation.overworld.transition_signals!r}"
+                    )
+                    wait_action = AgentAction(
+                        AgentActionType.WAIT_REOBSERVE,
+                        reason="ROM transition task owns field; waiting for destination",
+                    )
+                    wait_decision = ActionDecision(wait_action)
+                    wait_result = self._executor.execute(wait_action, observation)
+                    return observation, wait_decision, wait_result
                 else:
                     pending.observations += 1
                 pending.last_position = observed
@@ -2742,6 +4335,12 @@ class AgentControlLoop:
                         f"source={pending.source!r} destination={pending.destination!r}"
                     )
                     state_cache.invalidate_runtime_observations()
+                    _gate_observer_call(
+                        "discard_navigation",
+                        pending.action,
+                        source_kind="transition",
+                        reason=reason,
+                    )
                     self._release_transition_input(pending)
                     self._pending_transition = None
                     self._expected_world_transition = None
@@ -2774,7 +4373,15 @@ class AgentControlLoop:
                 wait_decision = ActionDecision(wait_action)
                 return observation, wait_decision, self._executor.execute(wait_action, observation)
 
-        if self._warp_settling and interaction_type is InteractionType.OVERWORLD and observation.overworld is not None:
+        if self._warp_settling and observation.overworld is not None:
+            if interaction_type is not InteractionType.OVERWORLD:
+                wait_action = AgentAction(
+                    AgentActionType.WAIT_REOBSERVE,
+                    reason="waiting for post-warp script to release field",
+                )
+                wait_decision = ActionDecision(wait_action)
+                wait_result = self._executor.execute(wait_action, observation)
+                return observation, wait_decision, wait_result
             observed_location = (observation.overworld.map_id, observation.overworld.player_coordinates)
             # A map connection can expose the avatar on the destination map
             # before its coordinates belong to that map's static navigation
@@ -2863,6 +4470,13 @@ class AgentControlLoop:
                         self._in_flight_move_initial_facing = None
                     else:
                         self._movement_failure_count += 1
+                        _gate_observer_call(
+                            "record_navigation_outcome",
+                            self._in_flight_move,
+                            "blocked",
+                            observation_frame=_gate_observation_frame(),
+                            source_kind="movement",
+                        )
                         self._remember_blocked_destination(self._in_flight_move, "movement made no progress")
                         # The observation was augmented before this in-flight
                         # movement was judged blocked.  Add the newly learned
@@ -2905,9 +4519,17 @@ class AgentControlLoop:
                     wait_result = self._executor.execute(wait_action, observation)
                     return observation, wait_decision, wait_result
                 self._locally_blocked_destinations.discard(self._in_flight_move.destination)
+                _gate_observer_call(
+                    "record_navigation_outcome",
+                    self._in_flight_move,
+                    "open",
+                    observation_frame=_gate_observation_frame(),
+                    source_kind="movement",
+                )
                 self._cached_action_index += 1
                 self._movement_blocked_retries = 0
                 self._movement_failure_count = 0
+                self._clear_rejected_first_action()
                 self._in_flight_move = None
                 self._in_flight_move_initial_facing = None
             elif self._in_flight_move is not None and _is_intermediate_move_location(location, self._in_flight_move):
@@ -2973,7 +4595,36 @@ class AgentControlLoop:
         self._seed_navigation_plan(observation)
         decision = self._cached_decision(observation)
         if decision is None:
-            decision = select_action(observation)
+            # A completed staging route is an ownership boundary.  Once the
+            # avatar is on the exact staging tile, the trainer exposure loop
+            # must immediately continue with lead handoff; starting another
+            # background search for the already-satisfied ReachLocation can
+            # occupy the single-flight worker and delay that handoff.
+            local_completion_reason = (
+                _map_goal_completion_reason(observation)
+                if interaction_type is InteractionType.OVERWORLD
+                else None
+            )
+            if local_completion_reason is not None:
+                self._report(
+                    "NAVIGATION_PLAN_SUPPRESSED "
+                    f"reason='goal already reached' target={_goal_target(self._goal)!r}"
+                )
+                # Keep the normal goal evaluator responsible for the terminal
+                # result and supply it an already-complete empty plan.  This
+                # preserves its diagnostics and interaction semantics while
+                # avoiding a redundant background search.
+                current_location = (
+                    observation.overworld.map_id,
+                    observation.overworld.player_coordinates,
+                )
+                decision = select_action(
+                    observation,
+                    navigation_result=(NavigationPlan((), current_location), None, None),
+                )
+            else:
+                navigation_result = self._poll_background_navigation(observation)
+                decision = select_action(observation, navigation_result=navigation_result)
             if (
                 decision.goal_evaluation is not None
                 and decision.goal_evaluation.status is GoalStatus.REACHABLE
@@ -3026,6 +4677,10 @@ class AgentControlLoop:
                     f"action_index={self._cached_action_index}"
                 )
             self._report("PLAN: continuing_cached")
+        trainer_wait_result = self._apply_automatic_trainer_wait_watchdog(observation, decision)
+        if trainer_wait_result is not None:
+            wait_decision, wait_result = trainer_wait_result
+            return observation, wait_decision, wait_result
         blocked_action = self._blocked_action(observation, decision.action.navigation)
         if blocked_action is not None:
             # This is the last boundary before an input reaches the emulator.
@@ -3036,6 +4691,7 @@ class AgentControlLoop:
                 "REPLAN: reason='selected route destination blocked' "
                 f"source={blocked_action.source!r} destination={blocked_action.destination!r}"
             )
+            self._reject_first_action(blocked_action, "selected route destination blocked", observation)
             self._invalidate_plan("selected_route_destination_blocked")
             wait_action = AgentAction(
                 AgentActionType.WAIT_REOBSERVE,
@@ -3119,6 +4775,10 @@ class AgentControlLoop:
             )
         if decision.goal_evaluation is not None:
             if decision.goal_evaluation.status is GoalStatus.COMPLETE:
+                self._cached_evaluation = decision.goal_evaluation
+                self._cached_goal = self._goal
+                self._cached_actions = ()
+                self._cached_action_index = 0
                 return (
                     observation,
                     decision,
@@ -3150,6 +4810,20 @@ class AgentControlLoop:
         if decision.action.navigation is not None:
             prewarm_warp_destination(observation, decision.action.navigation)
         result = self._executor.execute(decision.action, observation)
+        if result.result_type is ActionResultType.EXECUTED and not self._recovery_first_action_reported:
+            controller = getattr(getattr(context, "bot_mode_instance", None), "controller", None)
+            if getattr(controller, "_execution_phase", None) == "RECOVERY":
+                navigation = decision.action.navigation
+                print_recovery_handoff(
+                    phase="first_action_emitted",
+                    objective_id=getattr(controller, "current_objective_id", None),
+                    execution_phase=getattr(controller, "_execution_phase", None),
+                    action=decision.action.action_type.name,
+                    action_source=getattr(navigation, "source", None),
+                    action_destination=getattr(navigation, "destination", None),
+                    detail=result.message or decision.action.reason or "first recovery action executed",
+                )
+                self._recovery_first_action_reported = True
         if result.result_type is ActionResultType.EXECUTED and decision.action.action_type is AgentActionType.INTERACT:
             self._started_interaction_id = decision.action.option
             self._interaction_start_waits = 0
@@ -3183,6 +4857,16 @@ class AgentControlLoop:
             )
         if decision.action.navigation is not None:
             if result.result_type is ActionResultType.EXECUTED:
+                _gate_observer_call(
+                    "record_navigation_issued",
+                    decision.action.navigation,
+                    action_frame=_gate_observation_frame(),
+                    source_kind=(
+                        "movement"
+                        if decision.action.navigation.action_type is NavigationActionType.MOVE
+                        else "transition"
+                    ),
+                )
                 if decision.action.navigation.action_type is NavigationActionType.MOVE:
                     self._in_flight_move = decision.action.navigation
                     self._in_flight_move_initial_facing = observation.overworld.facing
@@ -3228,6 +4912,17 @@ class AgentControlLoop:
                 input_issued=True,
                 last_position=(observation.overworld.map_id, observation.overworld.player_coordinates),
             )
+            # Keep the transition recorder tied to the controller's
+            # transition ownership boundary as well as the generic action
+            # dispatch boundary. The duplicate is idempotent in the recorder
+            # and covers adapters that hand off the directional input through
+            # a transition-specific path.
+            _gate_observer_call(
+                "record_navigation_issued",
+                decision.action.navigation,
+                action_frame=_gate_observation_frame(),
+                source_kind="transition",
+            )
             self._warp_wait_observations = 0
             trace = getattr(context, "stutter_trace", None)
             if trace is not None:
@@ -3248,6 +4943,8 @@ class AgentControlLoop:
         return observation, decision, result
 
     def run(self) -> Generator:
+        previous_active_loop = getattr(context, "active_agent_control_loop", None)
+        context.active_agent_control_loop = self
         try:
             while True:
                 try:
@@ -3279,4 +4976,6 @@ class AgentControlLoop:
                     raise NavigationError(reason)
                 yield
         finally:
+            if getattr(context, "active_agent_control_loop", None) is self:
+                context.active_agent_control_loop = previous_active_loop
             self.dispose()

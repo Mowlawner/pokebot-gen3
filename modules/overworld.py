@@ -3,14 +3,19 @@
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from modules.context import context
-from modules.map import observe_live_map_identity, get_map_metadata, get_map_objects
+from modules.map import observe_live_map_identity, get_map_metadata, get_map_objects, get_player_map_object
 from modules.game import get_event_var_name
 from modules.memory import get_event_flag, get_event_flag_by_number, get_event_var_by_number, get_game_state_symbol
 from modules.tasks import task_is_active
 from modules.map_path import Direction, _get_map_metadata
 from modules.player import get_player_avatar, player_avatar_is_controllable
-from modules.trigger_bindings import BindingResolution, TRIGGER_BINDINGS, resolve_trigger_binding
-from modules.console import profile_print
+from modules.trigger_bindings import (
+    BindingResolution,
+    TRIGGER_BINDINGS,
+    read_binding_guard_values,
+    resolve_trigger_binding,
+)
+from modules.console import diagnostic_print, profile_print
 from modules.profiler import count, enabled, format_snapshot, now, timing
 from modules.stutter_trace import traced
 from modules.state_cache import state_cache
@@ -39,6 +44,7 @@ _shared_overworld_observation_context = None
 _shared_overworld_observation_emulator = None
 _shared_overworld_observation_avatar_reader = None
 _shared_overworld_observation = None
+_last_transition_state_diagnostic = None
 
 
 def _current_emulator_frame():
@@ -233,6 +239,15 @@ class TriggerObservation:
     # constructor order used by navigation fixtures.
     elevation: int | None = None
     requires_input: bool = True
+    # A trainer's broad hazard geometry is used for avoidance. This separate
+    # set contains the sight-line positions executable by the trainer's
+    # currently observed facing direction and is used by EngageTrainer goals.
+    engagement_locations: frozenset[Location] = frozenset()
+    # Preserve the live/template battle flag when an object is represented as
+    # a trigger. Without this, a defeated trainer whose sight-line geometry is
+    # naturally empty is indistinguishable from an undefeated trainer whose
+    # geometry has not been observed yet.
+    trainer_defeated: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -254,6 +269,14 @@ class ObjectObservation:
     trainer_defeated: bool | None = None
     interactable: bool = True
     elevation: int | None = None
+    # ROM object templates use this pair as the movement envelope around the
+    # object's map coordinate. Keep it optional for runtime/test observations
+    # that do not carry template metadata.
+    movement_range: tuple[int, int] | None = None
+    # Runtime object coordinates move as the trainer walks. The ROM movement
+    # range is anchored to the template's initial coordinate, so preserve that
+    # coordinate separately when it is available.
+    movement_origin: Location | None = None
 
     @property
     def trainer_id(self) -> str | None:
@@ -302,10 +325,210 @@ def resolve_object_activation_positions(
     return tuple(result)
 
 
+def _trainer_possible_positions(
+    trainer: ObjectObservation,
+    tile_by_location: dict[Location, "TileObservation"],
+    occupied: set[Location],
+) -> tuple[tuple[Location, Direction | None], ...]:
+    """Return conservative centers and facings for a moving trainer template."""
+
+    movement_range = getattr(trainer, "movement_range", None)
+    if not isinstance(movement_range, tuple) or len(movement_range) != 2:
+        return ((trainer.location, None),)
+    try:
+        range_x = max(0, int(movement_range[0]))
+        range_y = max(0, int(movement_range[1]))
+    except (TypeError, ValueError):
+        return ((trainer.location, None),)
+    movement_type = str(getattr(trainer, "movement_type", "") or "")
+    if movement_type in {
+        "NONE",
+        "LOOK_AROUND",
+        "FACE_UP",
+        "FACE_DOWN",
+        "FACE_LEFT",
+        "FACE_RIGHT",
+    } or movement_type.startswith("FACE_"):
+        range_x = range_y = 0
+    elif movement_type in {
+        "WANDER_UP_AND_DOWN",
+        "WANDER_DOWN_AND_UP",
+        "WALK_UP_AND_DOWN",
+        "WALK_DOWN_AND_UP",
+    }:
+        range_x = 0
+    elif movement_type in {
+        "WANDER_LEFT_AND_RIGHT",
+        "WANDER_RIGHT_AND_LEFT",
+        "WALK_LEFT_AND_RIGHT",
+        "WALK_RIGHT_AND_LEFT",
+    }:
+        range_y = 0
+
+    origin = getattr(trainer, "movement_origin", None) or trainer.location
+    origin_map, (origin_x, origin_y) = origin
+
+    # Emerald's sequence movement types walk the perimeter described by the
+    # ROM object template. Billy on Route 104 uses
+    # ``DOWN, RIGHT, UP, LEFT``; filling the rectangle would mark the grass
+    # inside his loop as unsafe even though he can never stand there.
+    sequence_prefix = "WALK_SEQUENCE_"
+    if movement_type.startswith(sequence_prefix):
+        direction_by_name = {
+            "UP": Direction.North,
+            "RIGHT": Direction.East,
+            "DOWN": Direction.South,
+            "LEFT": Direction.West,
+        }
+        vectors = {
+            Direction.North: (0, -1),
+            Direction.East: (1, 0),
+            Direction.South: (0, 1),
+            Direction.West: (-1, 0),
+        }
+        # Sequence movement follows the perimeter one segment at a time.
+        # Preserve the direction of that segment with each possible center;
+        # applying every cardinal sight line at every center turns a loop
+        # into a filled rectangle and closes the grass inside the loop.
+        possible = []
+        current_x, current_y = origin_x, origin_y
+        for direction_name in movement_type.removeprefix(sequence_prefix).split("_"):
+            direction = direction_by_name.get(direction_name)
+            vector = vectors.get(direction)
+            if direction is None or vector is None:
+                continue
+            dx, dy = vector
+            distance = range_y if dx == 0 else range_x
+            possible.append(((origin_map, (current_x, current_y)), direction))
+            for _ in range(distance):
+                current_x += dx
+                current_y += dy
+                possible.append(((origin_map, (current_x, current_y)), direction))
+    else:
+        possible = []
+        for offset_y in range(-range_y, range_y + 1):
+            for offset_x in range(-range_x, range_x + 1):
+                location = (origin_map, (origin_x + offset_x, origin_y + offset_y))
+                tile = tile_by_location.get(location)
+                if tile is None or tile.blocked or location in occupied:
+                    continue
+                possible.append((location, None))
+
+    filtered = []
+    for location, direction in possible:
+        tile = tile_by_location.get(location)
+        if tile is None or tile.blocked or location in occupied:
+            continue
+        filtered.append((location, direction))
+    return tuple(dict.fromkeys(filtered)) or ((trainer.location, None),)
+
+
+def _trainer_possible_locations(
+    trainer: ObjectObservation,
+    tile_by_location: dict[Location, "TileObservation"],
+    occupied: set[Location],
+) -> tuple[Location, ...]:
+    """Return conservative centers reachable by a moving trainer template."""
+
+    return tuple(
+        location
+        for location, _direction in _trainer_possible_positions(trainer, tile_by_location, occupied)
+    )
+
+
+def _movement_type_facing_directions(movement_type: str) -> tuple[Direction, ...]:
+    """Return the ROM-listed facing options for a ``FACE_*`` template."""
+
+    if not movement_type.startswith("FACE_"):
+        return ()
+    direction_by_name = {
+        "UP": Direction.North,
+        "RIGHT": Direction.East,
+        "DOWN": Direction.South,
+        "LEFT": Direction.West,
+    }
+    return tuple(
+        dict.fromkeys(
+            direction_by_name[token]
+            for token in movement_type.removeprefix("FACE_").split("_")
+            if token in direction_by_name
+        )
+    )
+
+
+def _trainer_hazard_locations_for_centers(
+    trainer: ObjectObservation,
+    tiles: tuple["TileObservation", ...] | list["TileObservation"],
+    objects: tuple[ObjectObservation, ...] | list[ObjectObservation],
+    *,
+    directions: tuple[Direction, ...] | None,
+    centers: tuple[Location, ...],
+    center_directions: tuple[Direction | None, ...] | None = None,
+) -> frozenset[Location]:
+    tile_by_location = {tile.location: tile for tile in tiles}
+    occupied = {obj.location for obj in objects if obj.location != trainer.location}
+    movement_type = str(getattr(trainer, "movement_type", "") or "")
+    movement_changes_position_or_facing = movement_type.startswith(("WALK_", "WANDER_")) or movement_type in {
+        "ROTATE_CLOCKWISE",
+        "ROTATE_COUNTERCLOCKWISE",
+    }
+    if directions is None and center_directions is None:
+        if trainer.trainer_type == "See All Directions":
+            directions = tuple(Direction)
+        elif movement_changes_position_or_facing and trainer.trainer_type == "Normal":
+            directions = tuple(Direction)
+        elif trainer.trainer_type == "Normal":
+            # FACE_* movement templates are ROM-owned facing envelopes, not
+            # a single direction with an arbitrary runtime fallback.  This
+            # matters while an object event is camera-scoped or its live
+            # facing byte is unavailable: Cindy's Route 104 template is
+            # FACE_UP_AND_RIGHT, so treating an unknown byte as all four
+            # directions incorrectly closes the trainer-free grass route.
+            template_directions = _movement_type_facing_directions(movement_type)
+            if template_directions:
+                directions = template_directions
+            else:
+                try:
+                    facing = trainer.facing if isinstance(trainer.facing, Direction) else Direction.from_string(trainer.facing)
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    directions = tuple(Direction)
+                else:
+                    directions = (facing,)
+        else:
+            directions = ()
+    elif trainer.trainer_type not in {"Normal", "See All Directions"}:
+        directions = ()
+    vectors = {Direction.North: (0, -1), Direction.East: (1, 0), Direction.South: (0, 1), Direction.West: (-1, 0)}
+    result: set[Location] = set()
+    for center_index, center in enumerate(centers):
+        x, y = center[1]
+        center_directions_for_position = directions
+        if directions is None and center_directions is not None:
+            position_direction = (
+                center_directions[center_index]
+                if center_index < len(center_directions)
+                else None
+            )
+            center_directions_for_position = (
+                (position_direction,) if position_direction is not None else tuple(Direction)
+            )
+        for direction in center_directions_for_position or ():
+            dx, dy = vectors[direction]
+            for distance in range(1, (trainer.trainer_range or 0) + 1):
+                location = (center[0], (x + dx * distance, y + dy * distance))
+                tile = tile_by_location.get(location)
+                if tile is None or tile.blocked or location in occupied:
+                    break
+                result.add(location)
+    return frozenset(result)
+
+
 def trainer_hazard_locations(
     trainer: ObjectObservation,
     tiles: tuple["TileObservation", ...] | list["TileObservation"],
     objects: tuple[ObjectObservation, ...] | list[ObjectObservation] = (),
+    *,
+    directions: tuple[Direction, ...] | None = None,
 ) -> frozenset[Location]:
     """Return player locations visible to an undefeated trainer.
 
@@ -313,32 +536,74 @@ def trainer_hazard_locations(
     independent of emulator state, and conservative when collision data is
     incomplete.
     """
-    if trainer.trainer_type in (None, "None") or trainer.trainer_defeated is not False:
+    if trainer.trainer_type in (None, "None") or trainer.trainer_defeated is True:
         return frozenset()
     tile_by_location = {tile.location: tile for tile in tiles}
     occupied = {obj.location for obj in objects if obj.location != trainer.location}
-    # ``Normal`` trainer facing is not a stable predictor at a planning
-    # boundary.  Emerald updates an object event's facing while its movement
-    # script is running, and a trainer can turn as part of the approach/battle
-    # handoff.  In particular, a live object may be facing east in the frame
-    # where the player is actually exposed from the north.  Recovery uses
-    # these locations as a safety boundary, so model every cardinal sightline
-    # for a normal trainer and let collision/object occupancy stop each line.
-    # ``See All Directions`` is already equivalent, but retaining the explicit
-    # branch documents the ROM distinction.
-    directions = tuple(Direction) if trainer.trainer_type in {"Normal", "See All Directions"} else ()
-    vectors = {Direction.North: (0, -1), Direction.East: (1, 0), Direction.South: (0, 1), Direction.West: (-1, 0)}
-    x, y = trainer.location[1]
-    result: set[Location] = set()
-    for direction in directions:
-        dx, dy = vectors[direction]
-        for distance in range(1, (trainer.trainer_range or 0) + 1):
-            location = (trainer.location[0], (x + dx * distance, y + dy * distance))
-            tile = tile_by_location.get(location)
-            if tile is None or tile.blocked or location in occupied:
-                break
-            result.add(location)
-    return frozenset(result)
+    # A Normal trainer activates from the line in front of its current facing
+    # direction. Runtime object observations provide that direction, and
+    # static trainer observations provide the ROM's initial facing. Using the
+    # live line matters on routes where the other cardinal directions are the
+    # only available grass corridor. If the live facing is unavailable, use
+    # the ROM FACE_* envelope first; retain the all-directions fallback only
+    # when neither the template nor the runtime provides a direction.
+    positions = _trainer_possible_positions(trainer, tile_by_location, occupied)
+    centers = tuple(location for location, _direction in positions)
+    center_directions = tuple(direction for _location, direction in positions)
+    movement_type = str(getattr(trainer, "movement_type", "") or "")
+    return _trainer_hazard_locations_for_centers(
+        trainer,
+        tiles,
+        objects,
+        directions=directions,
+        centers=centers,
+        center_directions=(
+            center_directions
+            if (
+                directions is None
+                and trainer.trainer_type == "Normal"
+                and movement_type.startswith("WALK_SEQUENCE_")
+            )
+            else None
+        ),
+    )
+
+
+def trainer_engagement_locations(
+    trainer: ObjectObservation,
+    tiles: tuple["TileObservation", ...] | list["TileObservation"],
+    objects: tuple[ObjectObservation, ...] | list[ObjectObservation] = (),
+) -> frozenset[Location]:
+    """Return sight-line positions executable by a trainer in this frame.
+
+    Normal trainers only activate when the player enters the line in front of
+    their current facing direction. If that direction is unavailable, retain
+    the conservative broad hazard geometry rather than inventing a direction.
+    Trainers that see all directions keep all cardinal lines.
+    """
+    # Engagement must use the trainer's current executable sight line. The
+    # broader movement envelope belongs to AVOID routing only.
+    if trainer.trainer_type == "See All Directions":
+        directions = tuple(Direction)
+    else:
+        try:
+            facing = trainer.facing if isinstance(trainer.facing, Direction) else Direction.from_string(trainer.facing)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            directions = None
+        else:
+            directions = (facing,)
+    try:
+        if directions is not None:
+            return _trainer_hazard_locations_for_centers(
+                trainer,
+                tiles,
+                objects,
+                directions=directions,
+                centers=(trainer.location,),
+            )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+    return trainer_hazard_locations(trainer, tiles, objects)
 
 
 def static_trainer_observations(
@@ -378,7 +643,11 @@ def static_trainer_observations(
                         continue
                 except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
                     pass
-            defeated = template.is_trainer_defeated
+            try:
+                defeated = template.is_trainer_defeated
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+                # Unknown defeat state must retain the ROM hazard envelope.
+                defeated = None
             movement_type = str(getattr(template, "movement_type", ""))
             facing = None
             if trainer_type != "See All Directions":
@@ -396,6 +665,8 @@ def static_trainer_observations(
                     previous_location=(map_id, template.local_coordinates),
                     facing=facing,
                     movement_type=movement_type,
+                    movement_range=getattr(template, "movement_range", None),
+                    movement_origin=(map_id, template.local_coordinates),
                     trainer_type=trainer_type,
                     trainer_range=template.trainer_range,
                     trainer_defeated=defeated,
@@ -471,8 +742,10 @@ def static_pokemart_clerk_observations(
                     location=(map_id, template.local_coordinates),
                     script=script,
                     previous_location=(map_id, template.local_coordinates),
-                    movement_type=str(getattr(template, "movement_type", "")),
-                    visibility_flag_id=flag_id or None,
+                movement_type=str(getattr(template, "movement_type", "")),
+                movement_range=getattr(template, "movement_range", None),
+                movement_origin=(map_id, template.local_coordinates),
+                visibility_flag_id=flag_id or None,
                     interactable=True,
                     elevation=getattr(template, "elevation", None),
                 )
@@ -534,6 +807,11 @@ class OverworldObservation:
     player_previous_coordinates: Coordinate | None = None
     movement_state: MovementState | None = None
     dynamic_blocked_coordinates: frozenset[Coordinate] = frozenset()
+    # ROM-backed objects such as Cut trees are not guaranteed to be present
+    # in the camera-scoped runtime object table.  Keep their effective
+    # collision separate from moving object occupancy so navigation can model
+    # persistent field obstacles without treating every static NPC as a wall.
+    static_blocked_coordinates: frozenset[Coordinate] = frozenset()
     transitions: tuple[WorldTransition, ...] = ()
     transition_in_progress: bool = False
     transition_signals: frozenset[str] = frozenset()
@@ -548,7 +826,11 @@ class OverworldObservation:
 
     def tile_at(self, coordinates: Coordinate) -> TileObservation | None:
         tile = next((tile for tile in self.tiles if tile.location[1] == coordinates), None)
-        if tile is not None and coordinates in self.dynamic_blocked_coordinates and not tile.blocked:
+        if (
+            tile is not None
+            and coordinates in (self.dynamic_blocked_coordinates | self.static_blocked_coordinates)
+            and not tile.blocked
+        ):
             return replace(tile, blocked=True)
         return tile
 
@@ -582,6 +864,44 @@ def _connection_endpoint_is_executable(map_metadata, path_tiles, coordinate: Coo
     return not any(
         object_template.local_coordinates == coordinate for object_template in getattr(map_metadata, "objects", ())
     )
+
+
+def static_blocked_object_coordinates(map_id: MapId, map_metadata) -> frozenset[Coordinate]:
+    """Return currently present ROM objects that block field navigation.
+
+    Runtime object events are camera-scoped, so a route planner can otherwise
+    miss a Cut tree several tiles outside the active object window.  Cut trees
+    are persistent collision objects until their map flag is set.  Their
+    script identity is stable across Emerald maps, while ordinary NPCs and
+    trainers deliberately remain runtime occupancy/hazard data.
+
+    If the flag cannot be read, fail closed and retain the obstacle.  A false
+    negative here can make a trainer appear reachable and leave the controller
+    retrying an input against a tree indefinitely.
+    """
+    blocked: set[Coordinate] = set()
+    for template in getattr(map_metadata, "objects", ()):
+        try:
+            if getattr(template, "kind", "normal") != "normal":
+                continue
+            script = getattr(template, "script_symbol", "")
+            if script not in {"EventScript_CutTree", "CuttableTree_EventScript_CutTree"} and not (
+                isinstance(script, str) and script.endswith("_EventScript_CutTree")
+            ):
+                continue
+            flag_id = getattr(template, "flag_id", 0) or 0
+            if flag_id:
+                try:
+                    if get_event_flag_by_number(flag_id):
+                        continue
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+                    pass
+            blocked.add(template.local_coordinates)
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+            # A partially decoded object must not make the complete map
+            # observation unavailable.  Only a confirmed Cut tree is added.
+            continue
+    return frozenset(blocked)
 
 
 @traced("static_tile_preparation")
@@ -1002,6 +1322,7 @@ def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservatio
     timing("perception_static_map_observation", static_start)
     static = _static_map_observations[map_id]
     warps = static.warps
+    static_blocked_coordinates = static_blocked_object_coordinates(map_id, map_data)
 
     # These are deliberately independent ROM-side signals.  A map can be
     # loading before its map id changes, and an ordinary warp can lock input
@@ -1051,8 +1372,46 @@ def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservatio
             pass
     if not controls_available:
         transition_signals.add("player_controls_locked")
-    if getattr(getattr(avatar, "tile_transition_state", None), "name", "NOT_MOVING") != "NOT_MOVING":
+    # A map-entry avatar can retain its tile-transition state for a frame (and
+    # in Emerald, occasionally longer) after the map is coherent and field
+    # controls have already been restored.  That state alone must not strand
+    # campaign readiness; the control lock is the actionable signal.
+    if (
+        getattr(getattr(avatar, "tile_transition_state", None), "name", "NOT_MOVING") != "NOT_MOVING"
+        and not controls_available
+    ):
         transition_signals.add("avatar_tile_transition")
+
+    # A campaign readiness wait must be attributable to a concrete ROM-side
+    # transition signal.  Keep one compact, deduplicated record per state so
+    # debug logs explain a stuck boundary without adding per-frame output.
+    global _last_transition_state_diagnostic
+    try:
+        player_object_flags = tuple(get_player_map_object().flags or ())
+    except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+        player_object_flags = ()
+    transition_probe = (
+        map_id,
+        player_coordinates,
+        controls_available,
+        tuple(sorted(transition_signals)),
+        tuple(sorted(player_object_flags)),
+        repr(getattr(avatar, "flags", None)),
+    )
+    if transition_probe != _last_transition_state_diagnostic:
+        _last_transition_state_diagnostic = transition_probe
+        diagnostic_print(
+            lambda: (
+                "OVERWORLD_TRANSITION_STATE: "
+                f"map={map_id!r} coordinates={player_coordinates!r} "
+                f"controls_available={controls_available!r} "
+                f"transition_signals={tuple(sorted(transition_signals))!r} "
+                f"player_object_flags={tuple(sorted(player_object_flags))!r} "
+                f"avatar_flags={getattr(avatar, 'flags', None)!r}"
+            ),
+            trace=True,
+            prefix="OVERWORLD_TRANSITION_STATE",
+        )
 
     triggers: list[TriggerObservation] = list(static.triggers)
     runtime_start = now()
@@ -1072,17 +1431,42 @@ def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservatio
                 facing=object_event.facing_direction,
                 movement_type=getattr(object_event.object_event_template, "movement_type", None),
                 movement_action=object_event.movement_action,
+                movement_range=getattr(object_event.object_event_template, "movement_range", None),
+                movement_origin=(
+                    object_event.map_group_and_number,
+                    getattr(object_event.object_event_template, "local_coordinates", object_event.current_coords),
+                ),
                 script_controlled=any(
                     flag in object_event.flags for flag in ("heldMovementActive", "singleMovementActive", "frozen")
                 ),
                 visibility_flag_id=getattr(object_event.object_event_template, "flag_id", 0) or None,
-                trainer_type=object_event.trainer_type,
+                # Some emulator builds expose the runtime trainer byte as
+                # ``None`` while the ROM template already has the
+                # authoritative trainer classification. Preserve the runtime
+                # value when it is usable, and fall back to the template so
+                # ordinary trainers still receive a stable affordance ID and
+                # ROM-party lookup.
+                trainer_type=(
+                    object_event.trainer_type
+                    if object_event.trainer_type not in (None, "None", "???")
+                    else getattr(object_event.object_event_template, "trainer_type", object_event.trainer_type)
+                ),
                 trainer_range=(
-                    object_event.object_event_template.trainer_range if object_event.trainer_type != "None" else None
+                    object_event.object_event_template.trainer_range
+                    if (
+                        object_event.trainer_type not in (None, "None", "???")
+                        or getattr(object_event.object_event_template, "trainer_type", None)
+                        not in (None, "None", "???")
+                    )
+                    else None
                 ),
                 trainer_defeated=(
                     object_event.object_event_template.is_trainer_defeated
-                    if object_event.trainer_type != "None"
+                    if (
+                        object_event.trainer_type not in (None, "None", "???")
+                        or getattr(object_event.object_event_template, "trainer_type", None)
+                        not in (None, "None", "???")
+                    )
                     else None
                 ),
                 elevation=getattr(object_event.object_event_template, "elevation", None),
@@ -1139,6 +1523,7 @@ def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservatio
             object_observation, objects, tiles, (map_width, map_height)
         )
         trainer_hazards = trainer_hazard_locations(object_observation, tiles, objects)
+        trainer_engagement = trainer_engagement_locations(object_observation, tiles, objects)
         activation_locations = frozenset(location for location, _ in activation_requirements)
         triggers.append(
             TriggerObservation(
@@ -1152,6 +1537,8 @@ def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservatio
                 or f"object:{object_observation.local_id}",
                 hazard_locations=trainer_hazards,
                 hazard_kind="trainer" if trainer_hazards else None,
+                engagement_locations=trainer_engagement,
+                trainer_defeated=object_observation.trainer_defeated,
             )
         )
 
@@ -1178,6 +1565,12 @@ def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservatio
                     tuple(runtime_objects) + static_trainers,
                 ),
                 hazard_kind="trainer",
+                engagement_locations=trainer_engagement_locations(
+                    trainer,
+                    tiles,
+                    tuple(runtime_objects) + static_trainers,
+                ),
+                trainer_defeated=trainer.trainer_defeated,
                 # A template fallback is not a live interaction affordance.
                 # It exists solely to constrain route selection.
                 requires_input=False,
@@ -1218,12 +1611,14 @@ def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservatio
     trace_binding_start = trace.now() if trace is not None else 0
 
     def resolve_bindings():
+        guard_values = read_binding_guard_values()
         return tuple(
             resolve_trigger_binding(
                 binding,
                 runtime_objects,
                 (map_width, map_height),
                 static_objects=getattr(map_data, "objects", ()) if map_id == binding.map_id else (),
+                guard_values=guard_values,
             )
             for binding in TRIGGER_BINDINGS
         )
@@ -1236,9 +1631,28 @@ def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservatio
     if trace is not None:
         trace.duration("overworld_trigger_binding_duration_ms", trace_binding_start)
     for resolution in bindings:
+        if resolution.binding.guard_variable is not None and resolution.guard_active is not True:
+            # A guarded story object is not an actionable affordance until
+            # its save-backed scene state is known and matches the source
+            # predicate. Keep unknown state conservative.
+            continue
+        # A static semantic object whose hide flag is set is a confirmed
+        # completed/disabled scene. Do not publish it as an unresolved
+        # affordance: trainer-aware routing would otherwise fail closed on a
+        # stale empty hazard envelope forever after the story battle ended.
+        if not resolution.static_match and not resolution.runtime_match:
+            # Bindings are global registry entries, but their observations
+            # are map-local. Publishing an absent binding on every map makes
+            # a scripted trainer look like an unknown cross-map hazard.
+            continue
+        if resolution.static_match and not resolution.static_available and not resolution.runtime_match:
+            continue
         binding = resolution.binding
         activation_requirements = []
-        for object_x, object_y in resolution.runtime_locations:
+        object_coordinates = resolution.runtime_locations
+        if not object_coordinates:
+            object_coordinates = tuple(location[1] for location in resolution.static_locations)
+        for object_x, object_y in object_coordinates:
             adjacent_requirements = {
                 (object_x, object_y - 1): Direction.South,
                 (object_x + 1, object_y): Direction.West,
@@ -1254,6 +1668,24 @@ def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservatio
                 # overworld observation with a KeyError.
                 activation_requirements.append(((map_id, candidate), adjacent_requirements[candidate]))
         activation_requirements = tuple(activation_requirements)
+        semantic_trainer_defeated = None
+        if binding.hazard_kind == "trainer":
+            matching_trainer_states = tuple(
+                object_observation.trainer_defeated
+                for object_observation in (*runtime_objects, *static_trainers)
+                if object_observation.location[0] == binding.map_id
+                and binding.matches_object(object_observation.local_id, object_observation.script)
+                and object_observation.trainer_defeated is not None
+            )
+            if matching_trainer_states:
+                semantic_trainer_defeated = (
+                    False if any(state is False for state in matching_trainer_states) else True
+                )
+        semantic_hazard_locations = (
+            frozenset((map_id, coordinates) for coordinates in resolution.interaction_positions)
+            if binding.hazard_kind == "trainer" and semantic_trainer_defeated is not True
+            else frozenset()
+        )
         triggers.append(
             TriggerObservation(
                 trigger_id=binding.trigger_id,
@@ -1263,11 +1695,20 @@ def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservatio
                 ),
                 kind=f"semantic_{binding.event_type}",
                 target_map=binding.map_id,
-                navigation_locations=frozenset(
-                    {resolution.static_location} if resolution.static_location is not None else set()
-                ),
+                navigation_locations=frozenset(resolution.static_locations),
                 activation_requirements=activation_requirements,
-                affordance_id=binding.script_symbol,
+                script_symbol=binding.script_symbol,
+                affordance_id=binding.affordance_id or binding.script_symbol,
+                hazard_locations=semantic_hazard_locations,
+                hazard_kind=binding.hazard_kind,
+                # A semantic binding describes an adjacent interaction
+                # affordance. Its trainer hazard envelope is useful to route
+                # avoidance, but it is not evidence of a live sight line.
+                # Keep sight-line geometry exclusively on runtime/static
+                # trainer observations so EngageTrainer can select the right
+                # activation mode.
+                engagement_locations=frozenset(),
+                trainer_defeated=semantic_trainer_defeated,
             )
         )
 
@@ -1312,6 +1753,7 @@ def _perceive_overworld_uncached() -> OverworldObservation | OverworldObservatio
         player_previous_coordinates=getattr(avatar, "previous_coordinates", None),
         movement_state=movement_state,
         dynamic_blocked_coordinates=dynamic_blocked_coordinates,
+        static_blocked_coordinates=static_blocked_coordinates,
         transition_in_progress=bool(transition_signals),
         transition_signals=frozenset(transition_signals),
         running_shoes=_running_shoes_received(),

@@ -34,6 +34,24 @@ class TestIsWaitingForInput(unittest.TestCase):
                 )
             )
 
+    def test_emerald_dialogue_predicate_accepts_generic_hidden_box_input(self):
+        from modules.tasks import is_emerald_field_dialogue_advanceable
+
+        with (
+            patch("modules.tasks.is_field_message_waiting_for_input", return_value=False),
+            patch("modules.tasks.task_is_active", return_value=False),
+        ):
+            self.assertTrue(
+                is_emerald_field_dialogue_advanceable(
+                    task_active=False,
+                    script_active=True,
+                    native_function_name="IsFieldMessageBoxHidden",
+                    script_function_name="Std_MsgboxDefault",
+                    input_waiting=True,
+                    field_message_lifecycle_active=True,
+                )
+            )
+
     def test_emerald_dialogue_predicate_accepts_birch_speech_printer_pause(self):
         from modules.tasks import is_emerald_field_dialogue_advanceable
 
@@ -322,4 +340,30 @@ class TestIsWaitingForInput(unittest.TestCase):
         self.assertFalse(observation.dialogue_waiting)
         self.assertTrue(observation.field_message_lifecycle_active)
         self.assertFalse(observation.field_message_advance_ready)
+        interaction_state._field_message_lifecycle_active = False
+
+    def test_generic_hidden_box_input_is_actionable_after_draw_task_ends(self):
+        import modules.interaction_state as interaction_state
+
+        interaction_state._field_message_lifecycle_active = True
+        interaction_state._field_message_advance_ready = False
+        script = types.SimpleNamespace(
+            is_active=True,
+            native_function_name="IsFieldMessageBoxHidden",
+            script_function_name="Std_MsgboxDefault",
+        )
+        with (
+            patch("modules.interaction_state.get_game_state", return_value=GameState.OVERWORLD),
+            patch("modules.interaction_state.player_avatar_is_controllable", return_value=True),
+            patch("modules.interaction_state.task_is_active", return_value=False),
+            patch("modules.interaction_state.is_field_message_waiting_for_input", return_value=True),
+            patch("modules.interaction_state.is_field_message_task_waiting_for_input", return_value=False),
+            patch("modules.interaction_state.get_global_script_context", return_value=script),
+            patch("modules.interaction_state.get_tasks", return_value=[]),
+            patch("modules.nuzlocke.emerald_confirmation.observe_emerald_confirmation", return_value=None),
+        ):
+            observation = observe_interaction()
+
+        self.assertTrue(observation.dialogue_waiting)
+        self.assertEqual(observation.interaction_phase.name, "FIELD_MESSAGE_INPUT_WAIT")
         interaction_state._field_message_lifecycle_active = False

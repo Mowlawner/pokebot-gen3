@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 from modules.nuzlocke.readiness_diagnostics import (
@@ -11,6 +12,7 @@ from modules.nuzlocke.readiness_diagnostics import (
 from modules.nuzlocke.resource_policy import PartyResource, ResourceObservationStatus, ResourceSnapshot, RouteRecovery
 from modules.navigation import IntermediateRouteAnalysis, RouteAnalysis
 from modules.goals import ReachLocation
+from modules.map_data import MapRSE
 
 
 def snapshot(party, available=True):
@@ -37,7 +39,7 @@ def mon(index, hp, maximum, *, fainted=False, status="none"):
 def test_party_health_and_usable_state_are_reported_without_policy():
     diagnostic = build_progression_readiness_diagnostic(
         snapshot((mon(0, 20, 20), mon(1, 2, 25, status="poison"))),
-        objective_id="reach_petalburg",
+        objective_id="complete_petalburg_wally",
         objective_status="ready",
         navigation_goal="goal",
     )
@@ -144,7 +146,16 @@ def test_availability_and_aggregates_are_policy_neutral_and_serializable():
     assert encoded["readiness"] == "NOT_EVALUATED"
 
 
-def readiness(hp, *, trainer=None, recovery=Availability.KNOWN, party_available=True):
+def readiness(
+    hp,
+    *,
+    trainer=None,
+    recovery=Availability.KNOWN,
+    party_available=True,
+    objective_id=None,
+    status="none",
+    route_analysis_value=None,
+):
     objects = (
         ()
         if trainer is None
@@ -160,10 +171,12 @@ def readiness(hp, *, trainer=None, recovery=Availability.KNOWN, party_available=
     )
     world = SimpleNamespace(map_id=(1, 2), player_coordinates=(3, 4), objects=objects)
     return build_progression_readiness_diagnostic(
-        snapshot((mon(0, hp, 20),), available=party_available),
+        snapshot((mon(0, hp, 20, status=status),), available=party_available),
+        objective_id=objective_id,
         overworld=world,
         overworld_availability=Availability.KNOWN,
         recovery_availability=recovery,
+        route_analysis=route_analysis_value,
     )
 
 
@@ -186,6 +199,29 @@ def test_policy_recovers_a_poisoned_party_before_overworld_steps_drain_hp():
     assert result == type(result)(ReadinessDecision.RECOVER, ReadinessReason.POISONED_PARTY)
 
 
+def test_policy_allows_healthy_non_poison_status_to_continue():
+    result = CampaignReadinessPolicy().evaluate(readiness(20, status="paralysed"))
+    assert result == type(result)(ReadinessDecision.CONTINUE, ReadinessReason.PARTY_HEALTHY)
+
+
+def test_policy_recovers_non_poison_status_below_status_hp_floor():
+    result = CampaignReadinessPolicy().evaluate(readiness(8, status="paralysed"))
+    assert result == type(result)(ReadinessDecision.RECOVER, ReadinessReason.STATUS_CONDITION)
+
+
+def test_boss_preparation_uses_a_higher_critical_hp_threshold():
+    policy = CampaignReadinessPolicy()
+    safe_route = route_analysis(51)
+
+    preparation = policy.evaluate(
+        readiness(9, objective_id="prepare_roxanne", route_analysis_value=safe_route)
+    )
+    ordinary = policy.evaluate(readiness(9, route_analysis_value=safe_route))
+
+    assert preparation == type(preparation)(ReadinessDecision.RECOVER, ReadinessReason.CRITICAL_PARTY_HP)
+    assert ordinary == type(ordinary)(ReadinessDecision.CONTINUE, ReadinessReason.PARTY_HEALTHY)
+
+
 def test_policy_critical_hp_at_or_below_threshold_before_trainer_recovers():
     policy = CampaignReadinessPolicy()
     trainer = ((4, 4), 4, False)  # distance 1, within range
@@ -194,6 +230,18 @@ def test_policy_critical_hp_at_or_below_threshold_before_trainer_recovers():
     # Opportunistic recovery must not be bypassed merely because a trainer is
     # imminent.  With no route analysis, the safe result is to re-observe.
     assert policy.evaluate(readiness(5, trainer=trainer)).decision is ReadinessDecision.UNKNOWN
+
+
+def test_petalburg_woods_uses_a_higher_recovery_threshold():
+    value = replace(
+        readiness(10),
+        current_map=MapRSE.PETALBURG_WOODS.value,
+        recovery=RouteRecovery(center_available=True, safe_to_reach_center=True, route=object()),
+    )
+
+    result = CampaignReadinessPolicy().evaluate(value)
+
+    assert result == type(result)(ReadinessDecision.RECOVER, ReadinessReason.CRITICAL_PARTY_HP)
 
 
 def test_policy_trainer_provenance_and_recovery_provenance_are_explicit():
@@ -247,6 +295,22 @@ def test_policy_opportunistically_recovers_meaningfully_damaged_party_at_nearby_
     assert result.reason is ReadinessReason.OPPORTUNISTIC_RECOVERY
 
 
+def test_policy_completes_restock_before_opportunistic_recovery():
+    policy = CampaignReadinessPolicy()
+    for objective_id in ("restock_recovery_items", "restock_pokeballs"):
+        value = replace(
+            readiness(12, objective_id=objective_id, route_analysis_value=route_analysis(8)),
+            recovery=RouteRecovery(
+                center_available=True,
+                distance_to_center=8,
+                safe_to_reach_center=True,
+                route=object(),
+            ),
+        )
+        result = policy.evaluate(value)
+        assert result == type(result)(ReadinessDecision.CONTINUE, ReadinessReason.PARTY_HEALTHY)
+
+
 def test_policy_rechecks_before_imminent_trainer_for_opportunistic_recovery():
     value = readiness(
         9,
@@ -256,6 +320,74 @@ def test_policy_rechecks_before_imminent_trainer_for_opportunistic_recovery():
     result = CampaignReadinessPolicy().evaluate(value)
     assert result.decision is ReadinessDecision.UNKNOWN
     assert result.reason is ReadinessReason.OPPORTUNISTIC_ROUTE_UNAVAILABLE
+
+
+def test_known_trainer_uses_modeled_health_floor_before_generic_critical_threshold():
+    value = build_progression_readiness_diagnostic(
+        snapshot((mon(0, 8, 24),)),
+        overworld=SimpleNamespace(map_id=(1, 2), player_coordinates=(3, 4), objects=()),
+        recovery=RouteRecovery(
+            center_available=True,
+            distance_to_center=8,
+            safe_to_reach_center=True,
+            route=object(),
+        ),
+        recovery_availability=Availability.KNOWN,
+        overworld_availability=Availability.KNOWN,
+        route_analysis=route_analysis(8),
+        trainer_checkpoint=SimpleNamespace(checkpoint_id="route102:first_poochyena"),
+        trainer_readiness=SimpleNamespace(required_hp_ratio=0.5, status=SimpleNamespace(value="ready")),
+        trainer_engagement_required=True,
+    )
+
+    result = CampaignReadinessPolicy().evaluate(value)
+
+    assert result == type(result)(ReadinessDecision.RECOVER, ReadinessReason.OPPORTUNISTIC_RECOVERY)
+
+
+def test_known_trainer_health_floor_blocks_until_recovery_capability_is_known():
+    value = build_progression_readiness_diagnostic(
+        snapshot((mon(0, 9, 20),)),
+        overworld=SimpleNamespace(map_id=(1, 2), player_coordinates=(3, 4), objects=()),
+        recovery_availability=Availability.UNKNOWN,
+        overworld_availability=Availability.KNOWN,
+        trainer_checkpoint=SimpleNamespace(checkpoint_id="route103:intro_rival"),
+        trainer_readiness=SimpleNamespace(required_hp_ratio=0.5, status=SimpleNamespace(value="ready")),
+        trainer_engagement_required=True,
+    )
+
+    result = CampaignReadinessPolicy().evaluate(value)
+
+    assert result == type(result)(ReadinessDecision.UNKNOWN, ReadinessReason.RECOVERY_CAPABILITY_UNKNOWN)
+
+
+def test_targeted_trainer_with_missing_facts_cannot_continue_as_healthy():
+    value = replace(
+        readiness(20, route_analysis_value=route_analysis(8)),
+        trainer_checkpoint=None,
+        trainer_readiness=None,
+        trainer_engagement_required=True,
+    )
+
+    result = CampaignReadinessPolicy().evaluate(value)
+
+    assert result == type(result)(ReadinessDecision.UNKNOWN, ReadinessReason.TRAINER_BATTLE_UNKNOWN)
+
+
+def test_unknown_exposed_trainer_hazard_defers_without_treating_route_as_safe():
+    value = replace(
+        readiness(20, route_analysis_value=route_analysis(8)),
+        trainer_risks=(
+            SimpleNamespace(
+                confidence="unknown",
+                exposed_on_normal_route=True,
+            ),
+        ),
+    )
+
+    result = CampaignReadinessPolicy().evaluate(value)
+
+    assert result == type(result)(ReadinessDecision.UNKNOWN, ReadinessReason.TRAINER_HAZARD_UNKNOWN)
 
 
 def test_policy_does_not_opportunistically_recover_for_minor_damage_or_long_detour():
@@ -277,7 +409,9 @@ def test_policy_does_not_opportunistically_recover_for_minor_damage_or_long_deto
         overworld_availability=Availability.KNOWN,
     )
     assert CampaignReadinessPolicy().evaluate(minor).decision is ReadinessDecision.CONTINUE
-    assert CampaignReadinessPolicy().evaluate(distant).decision is ReadinessDecision.UNKNOWN
+    # An optional recovery detour is advisory while the tactical owner keeps
+    # moving, even when the selected Center is outside the short-detour budget.
+    assert CampaignReadinessPolicy().evaluate(distant).decision is ReadinessDecision.CONTINUE
 
 
 def test_policy_recovers_capability_boundary_without_normal_route_goal():
@@ -371,6 +505,7 @@ def test_policy_uses_completed_nearby_recovery_route_when_detour_analysis_is_una
         ),
         recovery_availability=Availability.KNOWN,
         overworld_availability=Availability.KNOWN,
+        targetless=True,
     )
 
     result = CampaignReadinessPolicy().evaluate(value)
@@ -391,6 +526,7 @@ def test_policy_uses_recovery_route_when_route_composition_has_no_reachable_cand
         ),
         recovery_availability=Availability.KNOWN,
         overworld_availability=Availability.KNOWN,
+        targetless=True,
         route_analysis=RouteAnalysis(ReachLocation(((1, 2), (8, 8))), object(), 100, ()),
     )
 
@@ -398,6 +534,27 @@ def test_policy_uses_recovery_route_when_route_composition_has_no_reachable_cand
 
     assert result.decision is ReadinessDecision.RECOVER
     assert result.reason is ReadinessReason.OPPORTUNISTIC_RECOVERY
+
+
+def test_targetful_opportunistic_recovery_requires_continuation_analysis():
+    value = build_progression_readiness_diagnostic(
+        snapshot((mon(0, 12, 20),)),
+        overworld=SimpleNamespace(map_id=(1, 2), player_coordinates=(3, 4), objects=()),
+        recovery=RouteRecovery(
+            center_available=True,
+            distance_to_center=8,
+            safe_to_reach_center=True,
+            route=object(),
+        ),
+        recovery_availability=Availability.KNOWN,
+        overworld_availability=Availability.KNOWN,
+        route_analysis=RouteAnalysis(ReachLocation(((1, 2), (8, 8))), object(), 100, ()),
+        targetless=False,
+    )
+
+    result = CampaignReadinessPolicy().evaluate(value)
+
+    assert result == type(result)(ReadinessDecision.CONTINUE, ReadinessReason.PARTY_HEALTHY)
 
 
 def test_policy_keeps_moving_or_recovers_when_route_analysis_times_out():
@@ -409,6 +566,7 @@ def test_policy_keeps_moving_or_recovers_when_route_analysis_times_out():
         recovery_availability=Availability.KNOWN,
         overworld_availability=Availability.KNOWN,
         route_analysis_timed_out=True,
+        targetless=True,
     )
     result = CampaignReadinessPolicy().evaluate(near)
     assert result.decision is ReadinessDecision.RECOVER
@@ -425,3 +583,25 @@ def test_policy_keeps_moving_or_recovers_when_route_analysis_times_out():
     result = CampaignReadinessPolicy().evaluate(far)
     assert result.decision is ReadinessDecision.CONTINUE
     assert result.reason is ReadinessReason.OPPORTUNISTIC_ROUTE_UNAVAILABLE
+
+
+def test_policy_uses_completed_nearby_recovery_route_after_recovery_timeout():
+    value = build_progression_readiness_diagnostic(
+        snapshot((mon(0, 12, 20),)),
+        overworld=SimpleNamespace(map_id=(1, 2), player_coordinates=(3, 4), objects=()),
+        recovery=RouteRecovery(
+            center_available=True,
+            distance_to_center=12,
+            safe_to_reach_center=True,
+            route=object(),
+            calculation_timed_out=True,
+        ),
+        recovery_availability=Availability.KNOWN,
+        overworld_availability=Availability.KNOWN,
+        targetless=True,
+    )
+
+    result = CampaignReadinessPolicy().evaluate(value)
+
+    assert result.decision is ReadinessDecision.RECOVER
+    assert result.reason is ReadinessReason.OPPORTUNISTIC_RECOVERY

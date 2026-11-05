@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 from uuid import uuid4
 from typing import TYPE_CHECKING
 
-from .events import BattleStarted, Event, NuzlockeEventObserver, NuzlockeStarted
+from .events import BattleEnded, BattleStarted, Event, NuzlockeEventObserver, NuzlockeStarted, RunFailed
 from .policy import EventSink, EventStatistics, PersistenceClass, classify_event
 from .snapshots import NuzlockeSnapshot, get_nuzlocke_snapshot
 from .campaign_state import Fact, derive_campaign_facts
@@ -43,6 +43,7 @@ class CaptureEligibility:
     location: tuple[int, int] | None = None
     species: tuple[str, ...] = ()
     encounter_status: str | None = None
+    duplicate: bool = False
 
 
 class NuzlockeRuntime:
@@ -84,6 +85,7 @@ class NuzlockeRuntime:
         self._event_store = event_store
         self._defer_event_persistence = defer_event_persistence
         self._pending_durable_events: list[tuple[Event, str]] = []
+        self._run_failure_emitted = False
         self._campaign_history_checked = event_store is None
         self._campaign_history_compatible = True
         # Do not replay durable history until a complete ROM-backed campaign
@@ -99,10 +101,15 @@ class NuzlockeRuntime:
         """Replay durable history into the projections before live updates."""
         if event_store is None:
             return
+        persisted_events = event_store.iter_events()
         for record in event_store.iter_records():
             self._campaign_projection.apply_record(record)
             self._rules_projection.apply_record(record)
         self._event_sequence = event_store.last_sequence()
+        # An archived/reused event store may already contain a terminal run.
+        # Do not manufacture another RunFailed event when that history is
+        # replayed into a fresh runtime instance.
+        self._run_failure_emitted = any(isinstance(event, RunFailed) for event in persisted_events)
         self._campaign_history_hydrated = True
 
     @property
@@ -159,7 +166,6 @@ class NuzlockeRuntime:
         for pokemon in sorted(snapshot.party, key=lambda item: item.party_index):
             if pokemon.identity is not None:
                 identity = [
-                    pokemon.identity.personality_value,
                     pokemon.identity.original_trainer_id,
                     pokemon.identity.original_trainer_secret_id,
                 ]
@@ -268,6 +274,7 @@ class NuzlockeRuntime:
         )
         self._events.clear()
         self._event_sequence = 0
+        self._run_failure_emitted = False
         diagnostic_print(
             lambda: (
                 "NUZLOCKE_HISTORY_QUARANTINED: "
@@ -304,8 +311,14 @@ class NuzlockeRuntime:
             )
         species = tuple(species or ())
 
-        def result(eligible: bool, reason: str, status: str | None = None) -> CaptureEligibility:
-            decision = CaptureEligibility(eligible, reason, location, species, status)
+        def result(
+            eligible: bool,
+            reason: str,
+            status: str | None = None,
+            *,
+            duplicate: bool = False,
+        ) -> CaptureEligibility:
+            decision = CaptureEligibility(eligible, reason, location, species, status, duplicate)
             diagnostic_print(
                 lambda: (
                     "NUZLOCKE_CAPTURE_ELIGIBILITY: "
@@ -345,7 +358,7 @@ class NuzlockeRuntime:
         if projection.rule_config.is_enabled(CampaignRuleId.SPECIES_CLAUSE) and species:
             conflict = species_clause_conflict_reason(projection.state, species)
             if conflict is not None:
-                return result(False, conflict)
+                return result(False, conflict, duplicate=True)
 
         encounters = tuple(item for item in projection.state.encounters if item.location == location)
         encounter = next((item for item in encounters if item.eligible), None)
@@ -414,6 +427,7 @@ class NuzlockeRuntime:
             self._pending_durable_events.clear()
             self._latest_snapshot = None
             self._latest_campaign_facts = None
+            self._run_failure_emitted = False
 
         self._last_frame = current.frame
         inventory_fact = Fact.known(current.inventory) if current.inventory_available else Fact.unavailable()
@@ -425,7 +439,11 @@ class NuzlockeRuntime:
             require_set_battle_style=self._rule_config.is_enabled(CampaignRuleId.SET_BATTLE_STYLE),
         )
         self._latest_campaign_facts = campaign_facts
-        if not self._check_campaign_history(current, campaign_facts):
+        history_started = trace.now() if trace is not None else 0
+        history_ready = self._check_campaign_history(current, campaign_facts)
+        if trace is not None:
+            trace.duration("nuzlocke_history_duration_ms", history_started)
+        if not history_ready:
             diagnostic_print(
                 lambda: (
                     "NUZLOCKE_HISTORY_WAITING: "
@@ -443,7 +461,7 @@ class NuzlockeRuntime:
             and campaign_facts.pokedex_received.value is True
         )
         observer_started = trace.now() if trace is not None else 0
-        events = self._observer.observe(current)
+        events = list(self._observer.observe(current))
         if trace is not None:
             trace.duration("nuzlocke_observer_duration_ms", observer_started)
         for event in events:
@@ -478,12 +496,31 @@ class NuzlockeRuntime:
             else:
                 encounter_eligible_for_event = encounter_eligible
             self._event_sequence += 1
+            previous_encounter = None
+            if isinstance(event, BattleEnded) and event.location is not None:
+                previous_encounter = self._rules_projection.state.encounter_for(event.location)
             self._campaign_projection.apply(event, session_id=self._session_id, sequence=self._event_sequence)
             self._rules_projection.apply(
                 event,
                 sequence=self._event_sequence,
                 encounter_eligible=encounter_eligible_for_event,
             )
+            if isinstance(event, BattleEnded) and event.is_wild and not event.is_trainer and event.location is not None:
+                resolved_encounter = self._rules_projection.state.encounter_for(event.location)
+                if (
+                    previous_encounter is not None
+                    and previous_encounter.status != resolved_encounter.status
+                ):
+                    diagnostic_print(
+                        lambda event=event, previous_encounter=previous_encounter, resolved_encounter=resolved_encounter: (
+                            "NUZLOCKE_ENCOUNTER_TRANSITION: "
+                            f"location={event.location!r} "
+                            f"status={previous_encounter.status!r}->{resolved_encounter.status!r} "
+                            f"species={resolved_encounter.species!r} outcome={event.outcome!r} "
+                            f"identity={resolved_encounter.pokemon_identity!r}"
+                        ),
+                        trace=False,
+                    )
             if isinstance(event, BattleStarted):
                 encounter = next(
                     (item for item in self._rules_projection.state.encounters if item.location == event.location),
@@ -525,8 +562,35 @@ class NuzlockeRuntime:
                 self._diagnostic_sink(event, self._session_id)
             for subscriber in tuple(self._subscribers):
                 subscriber(event)
+        if self._rules_projection.state.run_lost and not self._run_failure_emitted:
+            whiteout_observed = self._rules_projection.state.whiteout_occurred
+            reason = "whiteout" if whiteout_observed else "all_caught_pokemon_fainted"
+            failure = RunFailed(current.frame, reason)
+            self._run_failure_emitted = True
+            self._event_sequence += 1
+            self._campaign_projection.apply(failure, session_id=self._session_id, sequence=self._event_sequence)
+            self._rules_projection.apply(
+                failure,
+                sequence=self._event_sequence,
+                encounter_eligible=encounter_eligible,
+            )
+            persistence_class = classify_event(failure)
+            self._event_statistics.record(failure, persistence_class)
+            if persistence_class is PersistenceClass.DURABLE and self._event_sink is not None:
+                self._persist_or_defer(failure)
+            for subscriber in tuple(self._subscribers):
+                subscriber(failure)
+            diagnostic_print(
+                lambda: (
+                    "NUZLOCKE_RUN_FAILED: "
+                    f"runtime_id={id(self)!r} session_id={self._session_id!r} "
+                    f"frame={failure.frame!r} reason={failure.reason!r}"
+                ),
+                trace=True,
+            )
+            events.append(failure)
         self._events.extend(events)
-        return events
+        return tuple(events)
 
     def event_statistics(self) -> dict[str, dict[str, int]]:
         """Return generated-event counts grouped by persistence class/type."""

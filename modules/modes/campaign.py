@@ -9,24 +9,38 @@ from typing import Generator
 import traceback
 
 from modules.context import context
-from modules.agent_control import notify_battle_ended
-from modules.console import diagnostic_print
+from modules.agent_control import navigation_background_search_active, notify_battle_ended
+from modules.map_formatting import format_location
+from modules.console import (
+    diagnostic_print,
+    print_navigation_cancellation,
+    print_recovery_destinations,
+    print_recovery_handoff,
+    print_recovery_request,
+)
 from modules.nuzlocke.campaign_controller import CampaignController, runtime_campaign_state
 from modules.nuzlocke.campaign_objectives import campaign_planning_signature, plan_campaign
+from modules.nuzlocke.campaign_state import FactStatus
 from modules.nuzlocke.campaign_status import CampaignStatus
 
 from ._interface import BattleAction, BotMode
 from modules.nuzlocke.resource_policy import (
+    DuplicateEncounterPolicy,
     PartyResource,
     ResourceObservationStatus,
     ResourceDecision,
     ResourceSnapshot,
     RouteRecovery,
+    WildBattleIntent,
+    WildBattlePolicyInput,
     assess_wild_encounter,
+    choose_wild_battle_intent,
 )
 from modules.nuzlocke.resource_runtime import (
     execute_campaign_recovery,
     execute_planned_recovery,
+    execute_whiteout_continuation,
+    RunLostError,
     observe_resource_snapshot,
     observe_route_recovery,
     plan_route_recovery,
@@ -42,18 +56,44 @@ from modules.nuzlocke.readiness_diagnostics import (
     ReadinessObservationScheduler,
     build_progression_readiness_diagnostic,
 )
+from modules.battle_readiness import (
+    BattleReadiness,
+    BattleReadinessStatus,
+    established_search_probability,
+)
 from modules.nuzlocke.snapshots import get_nuzlocke_snapshot
+from modules.nuzlocke.identity import PokemonIdentity
 from modules.overworld import (
     perceive_overworld,
     OverworldObservationResult,
     publish_shared_overworld_observation,
+    prewarm_static_map_observation,
+    static_trainer_observations,
+    trainer_hazard_locations,
 )
 from modules.interaction_state import InteractionPhase, observe_interaction
 from modules.player import get_player_avatar, player_avatar_is_controllable
 from modules.memory import GameState, get_game_state
 from modules.pokemon_party import get_party
-from modules.goals import EncounterMode, GoalConstraints, NavigationGoal, ReachLocation, SemanticTarget, TrainerMode
-from modules.navigation import NavigationWorld, RouteCostAnalyzer
+from modules.pokemon import get_species_by_index
+from modules.goals import (
+    ActivateTrigger,
+    EncounterMode,
+    EngageTrainer,
+    GoalConstraints,
+    NavigationGoal,
+    ReachLocation,
+    ReachWarp,
+    SemanticTarget,
+    TrainerMode,
+)
+from modules.navigation import (
+    NavigationWorld,
+    RouteCostAnalyzer,
+    RouteAnalysis,
+    TrainerAvoidability,
+    TrainerRouteRisk,
+)
 from modules.stutter_trace import suppress_background_instrumentation
 from modules.world_navigation import get_world_map_graph
 from modules.modes.util.map import pokemon_center_candidates
@@ -61,50 +101,937 @@ from modules.battle_strategies.nuzlocke_level_balancing import (
     EmeraldIntroRivalBattleStrategy,
     NuzlockeCaptureStrategy,
     NuzlockeLevelBalancingBattleStrategy,
+    NuzlockeRunAwayStrategy,
     RoxanneBattleStrategy,
 )
+from modules.battle_strategies._interface import BattleStrategy
+from modules.battle_state import BattleOutcome, BattleType, get_battle_state, get_battle_type
 from modules.modes.util.lead_rotation import ensure_campaign_field_lead
 from modules.nuzlocke.field_lead import build_campaign_field_lead_context
+from modules.trainer_checkpoints import (
+    KNOWN_TRAINER_CHECKPOINTS,
+    merge_trainer_checkpoints,
+    trainer_checkpoint_identity,
+    trainer_checkpoint_for_battle,
+    trainer_checkpoint_for_source,
+    trainer_checkpoint_for_id,
+    trainer_checkpoints_for_map,
+    trainer_checkpoints_for_overworld,
+)
+from modules.nuzlocke.trainer_preparation import build_exp_budget, projected_trainer_experience
+from modules.trainer_readiness import assess_live_trainer_checkpoint, live_storage_readiness_members
 
 
 _RECOVERY_ROUTE_ANALYSIS_MAX_EXPANSIONS = 4000
+# Recovery is a safety action.  It may spend longer composing a known Center
+# route than speculative route analysis, but it still remains cancellable and
+# bounded by the background planner.
+_RECOVERY_ROUTE_SEARCH_TIMEOUT_SECONDS = 15.0
+# Advisory route comparisons are preference work. After a timeout or worker
+# cancellation, wait briefly before retrying the same envelope so the frame
+# loop cannot submit the same expensive search repeatedly.
+_ADVISORY_ROUTE_RETRY_COOLDOWN_SECONDS = 1.0
+
+
+def _campaign_goal_owns_trainer_exposure(goal) -> bool:
+    """Return whether the tactical loop stages a concrete trainer battle."""
+
+    return isinstance(goal, EngageTrainer) or (
+        isinstance(goal, NavigationGoal)
+        and isinstance(getattr(goal, "target", None), EngageTrainer)
+    )
+
+
+def _campaign_trainer_id(goal) -> str | None:
+    target = goal.target if isinstance(goal, NavigationGoal) else goal
+    return target.trainer_id if isinstance(target, EngageTrainer) else None
+
+
+def _encounter_stage_readiness_key():
+    """Return the semantic encounter-stage facts that invalidate readiness."""
+
+    evidence = getattr(context, "campaign_encounter_stage", None)
+    if evidence is None:
+        return None
+    return (
+        getattr(evidence, "current_map", None),
+        getattr(evidence, "next_map", None),
+        getattr(evidence, "world_signature", None),
+        getattr(evidence, "readiness", None),
+        bool(getattr(evidence, "blocked", False)),
+        tuple(getattr(evidence, "known_hazard_ids", ()) or ()),
+        tuple(getattr(evidence, "unresolved_hazard_ids", ()) or ()),
+        tuple(
+            getattr(checkpoint, "checkpoint_id", None)
+            for checkpoint in tuple(getattr(evidence, "known_hazard_checkpoints", ()) or ())
+        ),
+    )
+
+
+def _runtime_campaign_facts_or_none():
+    """Return live campaign facts when the runtime is observable.
+
+    Route hazard analysis also runs during unit and transition boundaries where
+    the emulator may not be attached yet.  Missing live facts mean that no
+    checkpoint has been authoritatively cleared; they must not make route
+    analysis fail before it can publish the registered hazard envelope.
+    """
+
+    try:
+        return getattr(runtime_campaign_state(), "campaign_facts", None)
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+        return None
+
+
+def _checkpoint_is_cleared(campaign_facts, checkpoint) -> bool:
+    """Return whether a checkpoint has an authoritative clearance fact."""
+
+    clearance_fact = getattr(checkpoint, "clearance_fact", None)
+    if campaign_facts is None or not isinstance(clearance_fact, str):
+        return False
+    clearance = getattr(campaign_facts, clearance_fact, None)
+    return clearance is not None and clearance.status is FactStatus.KNOWN and clearance.value is True
+
+
+def _pc_trainer_readiness_candidates():
+    """Return normalized PC candidates without making storage mandatory."""
+
+    try:
+        from modules.pokemon_storage import get_pokemon_storage
+
+        storage = get_pokemon_storage()
+        return live_storage_readiness_members(storage) if storage is not None else ()
+    except (AttributeError, ImportError, RuntimeError, TypeError, ValueError, IndexError):
+        return ()
+
+
+def _known_trainer_checkpoint_on_route(overworld, readiness_goal, route_analysis):
+    """Return the first known undefeated trainer exposed by the selected route.
+
+    A map traversal is often represented by a ``SemanticTarget`` rather than
+    an ``EngageTrainer`` goal.  In that case the navigation plan is the
+    authoritative indication that the selected route exposes a trainer. Keep
+    the lookup limited to route locations and registered checkpoints so an
+    unrelated trainer on the same map cannot trigger preparation.
+    """
+
+    if overworld is None or route_analysis is None:
+        return None
+    campaign_facts = _runtime_campaign_facts_or_none()
+    route = getattr(route_analysis, "normal_route", None)
+    if route is None:
+        return None
+    map_id = getattr(getattr(overworld, "map_id", None), "value", getattr(overworld, "map_id", None))
+    route_locations = set()
+    for action in getattr(route, "actions", ()):
+        for location in (getattr(action, "source", None), getattr(action, "destination", None)):
+            if not isinstance(location, tuple) or len(location) != 2:
+                continue
+            location_map = getattr(location[0], "value", location[0])
+            if location_map == map_id:
+                route_locations.add((location_map, location[1]))
+    if not route_locations and not getattr(route, "forced_trainer_exposure", False):
+        return None
+    objects_by_id = {
+        getattr(obj, "trainer_id", None): obj
+        for obj in getattr(overworld, "objects", ())
+        if getattr(obj, "trainer_id", None) is not None
+    }
+    constraints = getattr(readiness_goal, "constraints", None)
+    trainer_mode = getattr(getattr(constraints, "trainer_mode", None), "name", None)
+    triggers = tuple(getattr(overworld, "triggers", ()))
+    for trigger in triggers:
+        trainer_id = getattr(trigger, "affordance_id", None)
+        if not trainer_id:
+            continue
+        hazard_locations = tuple(
+            location
+            for location in (
+                *getattr(trigger, "hazard_locations", ()),
+                *getattr(trigger, "activation_locations", ()),
+                *getattr(trigger, "engagement_locations", ()),
+            )
+            if isinstance(location, tuple) and len(location) == 2
+        )
+        route_hazards = {
+            (getattr(location[0], "value", location[0]), location[1])
+            for location in hazard_locations
+        }
+        hazard_intersection = route_hazards.intersection(route_locations)
+        if not hazard_intersection:
+            # IGNORE explicitly permits the route to approach the trainer.
+            # If sight-line geometry is incomplete, the trigger's concrete
+            # locations still have to intersect the selected path before it
+            # can be considered a route trainer.
+            trigger_locations = {
+                (getattr(location[0], "value", location[0]), location[1])
+                for location in getattr(trigger, "locations", ())
+                if isinstance(location, tuple) and len(location) == 2
+            }
+            if trainer_mode != "IGNORE" or not trigger_locations.intersection(route_locations):
+                continue
+
+        # Static trainer triggers are deliberately published before their
+        # runtime object event exists.  A trigger with non-empty hazard
+        # geometry is evidence that the ROM template is currently active;
+        # requiring a matching runtime object drops precisely the trainer
+        # that a camera-scoped object table has not spawned yet.  A runtime
+        # object still wins when its defeated state is authoritative.
+        trainer = objects_by_id.get(trainer_id)
+        if trainer is not None:
+            active = getattr(trainer, "trainer_defeated", None) is False
+        else:
+            active = bool(route_hazards)
+        if not active:
+            continue
+
+        # A route that intersects a live trainer hazard is an exposure even
+        # when the navigator did not set its fallback marker. The marker is
+        # still useful telemetry, but action/hazard intersection is the
+        # stronger fact for campaign preparation.
+        checkpoint = trainer_checkpoint_for_source(
+            trainer_id,
+            script_symbol=_trainer_script_for_id(overworld, trainer_id),
+        )
+        if checkpoint is not None and not _checkpoint_is_cleared(campaign_facts, checkpoint):
+            return trainer_id
+
+    # ``GoalAwareNavigator`` marks a route as forced only after it has
+    # exhausted every trainer-avoiding path and rerun the search with trainer
+    # hazards ignored.  In that case the selected route can legitimately end
+    # beside the trainer rather than on one of the exact sight-line tiles
+    # captured above (for example when a map connection or an object load
+    # boundary compresses the route actions). Resolve the registered
+    # mandatory checkpoint by map and stable affordance identity as a final
+    # sight-line-aware fallback.
+    if getattr(route, "forced_trainer_exposure", False):
+        for checkpoint in KNOWN_TRAINER_CHECKPOINTS:
+            if (
+                not getattr(checkpoint, "mandatory", False)
+                or checkpoint.map_id != map_id
+            ):
+                continue
+            if _checkpoint_is_cleared(campaign_facts, checkpoint):
+                continue
+            trainer_id = checkpoint.trainer_affordance_id
+            trainer = objects_by_id.get(trainer_id)
+            if trainer is not None and getattr(trainer, "trainer_defeated", None) is not False:
+                continue
+            matching_triggers = tuple(
+                trigger
+                for trigger in triggers
+                if getattr(trigger, "affordance_id", None) == trainer_id
+            )
+            if trainer is None and not matching_triggers:
+                continue
+            if trainer_checkpoint_for_source(
+                trainer_id,
+                script_symbol=_trainer_script_for_id(overworld, trainer_id),
+            ) is not None:
+                return trainer_id
+    return None
+
+
+def _static_route_trainer_facts(overworld, route_analysis) -> tuple:
+    """Resolve future-map trainer facts whose static sight lines meet a route."""
+
+    route = getattr(route_analysis, "normal_route", None)
+    if route is None:
+        return ()
+    current_map = getattr(getattr(overworld, "map_id", None), "value", getattr(overworld, "map_id", None))
+    route_locations = set()
+    route_maps = set()
+    for action in getattr(route, "actions", ()):
+        for location in (getattr(action, "source", None), getattr(action, "destination", None)):
+            if not isinstance(location, tuple) or len(location) != 2:
+                continue
+            map_id = getattr(location[0], "value", location[0])
+            route_maps.add(map_id)
+            route_locations.add((map_id, location[1]))
+    for map_id in getattr(route, "maps", ()) or ():
+        route_maps.add(getattr(map_id, "value", map_id))
+    route_maps.discard(current_map)
+    if not route_maps or not route_locations:
+        return ()
+
+    facts = []
+    for map_id in sorted(route_maps, key=repr):
+        try:
+            # Resolve the checkpoint facts from the same static object table
+            # used by perception. This also keeps the ROM trainer catalog and
+            # the route hazard identity on one stable map/local-object ID.
+            map_facts = {
+                fact.trainer_affordance_id: fact
+                for fact in trainer_checkpoints_for_map(map_id)
+            }
+            from modules.map import get_map_metadata
+
+            metadata = get_map_metadata(map_id)
+            tiles = prewarm_static_map_observation(map_id)
+            trainers = static_trainer_observations(map_id, metadata, ())
+            for trainer in trainers:
+                trainer_id = getattr(trainer, "trainer_id", None)
+                checkpoint = map_facts.get(trainer_id)
+                if checkpoint is None:
+                    continue
+                hazards = trainer_hazard_locations(trainer, tiles, trainers)
+                if hazards.intersection(route_locations):
+                    facts.append(checkpoint)
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+            continue
+    return tuple(
+        sorted(
+            {trainer_checkpoint_identity(fact): fact for fact in facts}.values(),
+            key=lambda fact: (getattr(fact, "map_id", ()), getattr(fact, "checkpoint_id", "")),
+        )
+    )
+
+
+def _trainer_checkpoint_keys(checkpoint) -> set[tuple]:
+    """Return aliases that identify one logical trainer across data sources."""
+
+    if checkpoint is None:
+        return set()
+    map_id = getattr(getattr(checkpoint, "map_id", None), "value", getattr(checkpoint, "map_id", None))
+    keys = set()
+    for field in ("checkpoint_id", "trainer_affordance_id"):
+        value = getattr(checkpoint, field, None)
+        if value:
+            keys.add((field, value))
+    rom_id = getattr(checkpoint, "rom_trainer_id", None)
+    if rom_id is not None:
+        keys.add(("rom_trainer_id", int(rom_id)))
+    display_name = str(getattr(checkpoint, "display_name", "") or "").strip().casefold()
+    if map_id is not None and display_name:
+        keys.add(("display_name", map_id, display_name))
+    return keys
+
+
+def _trainer_checkpoint_is_defeated(checkpoint) -> bool:
+    defeated = set(getattr(context, "campaign_defeated_trainer_ids", ()) or ())
+    return bool(defeated and _trainer_checkpoint_keys(checkpoint).intersection(defeated))
+
+
+def _trainer_checkpoints_match(left, right) -> bool:
+    """Return whether two checkpoint records identify the same trainer.
+
+    The campaign route and the active battle use different identifiers.  The
+    route fact is keyed by map/local object, while the battle record is keyed
+    by the ROM trainer ID.  Preserve the records separately so defeating one
+    logical trainer prunes every frontier alias, but only merge records when
+    their map, ROM ID, or display identity proves that relationship.
+    """
+
+    if left is None or right is None:
+        return False
+    if left is right:
+        return True
+    left_checkpoint_id = getattr(left, "checkpoint_id", None)
+    right_checkpoint_id = getattr(right, "checkpoint_id", None)
+    if left_checkpoint_id is not None and left_checkpoint_id == right_checkpoint_id:
+        return True
+    left_rom_id = getattr(left, "rom_trainer_id", None)
+    right_rom_id = getattr(right, "rom_trainer_id", None)
+    if left_rom_id is not None and right_rom_id is not None:
+        try:
+            if int(left_rom_id) == int(right_rom_id):
+                return True
+        except (TypeError, ValueError):
+            pass
+    left_map = getattr(getattr(left, "map_id", None), "value", getattr(left, "map_id", None))
+    right_map = getattr(getattr(right, "map_id", None), "value", getattr(right, "map_id", None))
+    left_name = str(getattr(left, "display_name", "") or "").strip().casefold()
+    right_name = str(getattr(right, "display_name", "") or "").strip().casefold()
+    return left_map is not None and left_map == right_map and bool(left_name) and left_name == right_name
+
+
+def _deduplicate_trainer_checkpoints(checkpoints) -> tuple:
+    """Retain distinct identity records in stable order."""
+
+    result = []
+    seen = set()
+    for checkpoint in checkpoints:
+        if checkpoint is None:
+            continue
+        identity = (
+            getattr(checkpoint, "checkpoint_id", None),
+            getattr(checkpoint, "trainer_affordance_id", None),
+            getattr(checkpoint, "rom_trainer_id", None),
+            getattr(getattr(checkpoint, "map_id", None), "value", getattr(checkpoint, "map_id", None)),
+            str(getattr(checkpoint, "display_name", "") or "").casefold(),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(checkpoint)
+    return tuple(result)
+
+
+def _trainer_checkpoints_for_battle_start() -> tuple:
+    """Resolve the route and live-ROM identities for the active trainer."""
+
+    planned = getattr(context, "campaign_trainer_checkpoint", None)
+    live = None
+    try:
+        battle_state = get_battle_state()
+        if getattr(battle_state, "is_trainer_battle", False):
+            live = trainer_checkpoint_for_battle(
+                battle_state,
+                getattr(getattr(battle_state, "opponent", None), "active_battler", None),
+            )
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+        live = None
+
+    active = [checkpoint for checkpoint in (planned, live) if checkpoint is not None]
+    if not active:
+        return ()
+
+    # The readiness frontier can contain a richer static/ROM record than the
+    # singular planned checkpoint. Retain those records when they match either
+    # active identity, so a later battle teardown can clear every alias.
+    for fact in tuple(getattr(context, "campaign_trainer_facts", ()) or ()):
+        if any(_trainer_checkpoints_match(fact, checkpoint) for checkpoint in active):
+            active.append(fact)
+    return _deduplicate_trainer_checkpoints(active)
+
+
+def _remember_defeated_trainer(checkpoint) -> None:
+    """Record a won trainer battle and immediately prune its frontier facts."""
+
+    if checkpoint is None:
+        return
+    defeated = getattr(context, "campaign_defeated_trainer_ids", None)
+    if not isinstance(defeated, set):
+        defeated = set(defeated or ())
+        context.campaign_defeated_trainer_ids = defeated
+    defeated.update(_trainer_checkpoint_keys(checkpoint))
+    context.campaign_trainer_facts = tuple(
+        fact
+        for fact in tuple(getattr(context, "campaign_trainer_facts", ()) or ())
+        if not _trainer_checkpoint_is_defeated(fact)
+    )
+    if _trainer_checkpoint_is_defeated(getattr(context, "campaign_trainer_checkpoint", None)):
+        context.campaign_trainer_checkpoint = None
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_TRAINER_DEFEATED: "
+            f"checkpoint={getattr(checkpoint, 'checkpoint_id', None)!r} "
+            f"trainer={getattr(checkpoint, 'trainer_affordance_id', None)!r} "
+            "action='pruned_frontier_fact'"
+        ),
+        trace=True,
+        prefix="CAMPAIGN_TRAINER_DEFEATED",
+    )
+
+
+def _mandatory_trainer_on_outbound_map(overworld, readiness_goal, route_analysis):
+    """Return a live mandatory checkpoint when route evidence is incomplete.
+
+    Route analysis is the preferred source because it knows whether the
+    selected path actually crosses a trainer's sight line.  A background
+    analysis can still be pending, however, and static trainer geometry can
+    be absent for one observation while the ROM map and registered checkpoint
+    already prove that an outbound map contains a mandatory trainer.  Keep
+    this fallback narrow: it applies only to a map traversal, only to
+    registered mandatory checkpoints on the current or destination map, and
+    only while the checkpoint is still undefeated.
+    """
+
+    if overworld is None:
+        return None
+    if not _is_map_traversal_readiness_goal(readiness_goal):
+        return None
+    target = getattr(readiness_goal, "target", readiness_goal)
+    target_map = getattr(target, "target_map", None)
+    if target_map is None:
+        target_map = getattr(target, "map_id", None)
+    if target_map is None:
+        target_location = getattr(target, "location", None)
+        if isinstance(target_location, tuple) and len(target_location) == 2:
+            target_map = target_location[0]
+    if target_map is None:
+        target_map = getattr(target, "destination_map", None)
+    if target_map is None:
+        destination = getattr(target, "destination", None)
+        if isinstance(destination, tuple) and len(destination) == 2:
+            target_map = destination[0]
+    current_map = getattr(overworld, "map_id", None)
+    current_map = getattr(current_map, "value", current_map)
+    target_map = getattr(target_map, "value", target_map)
+    if target_map is None:
+        return None
+
+    objects_by_id = {
+        getattr(obj, "trainer_id", None): obj
+        for obj in getattr(overworld, "objects", ())
+        if getattr(obj, "trainer_id", None) is not None
+    }
+    campaign_facts = _runtime_campaign_facts_or_none()
+    # A trainer can live on an intermediate map between the current map and
+    # an interaction destination.  The old fallback only compared the
+    # checkpoint with the two endpoints, so Route 102/Calvin was invisible
+    # while the selected destination was Petalburg Gym.  Use the ROM-backed
+    # world corridor when the detailed route analysis is unavailable or has
+    # no executable AVOID route.  This is a map reachability fact, not an
+    # inference from the observed numeric state of the save.
+    corridor_maps = {current_map, target_map}
+    normal_route = getattr(route_analysis, "normal_route", None)
+    for map_id in getattr(normal_route, "maps", ()) or ():
+        corridor_maps.add(getattr(map_id, "value", map_id))
+    if len(corridor_maps) <= 2 and current_map != target_map:
+        try:
+            corridor_maps.update(
+                getattr(map_id, "value", map_id)
+                for map_id in get_world_map_graph().route(current_map, target_map).maps
+            )
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            # An unavailable static graph is unknown evidence. Do not turn it
+            # into an open route or invent a trainer owner from map names.
+            pass
+    diagnostic_print(
+        lambda: (
+            "CAMPAIGN_TRAINER_CORRIDOR: "
+            f"current_map={current_map!r} target_map={target_map!r} "
+            f"maps={tuple(sorted(corridor_maps, key=repr))!r} "
+            f"route_analysis_present={route_analysis is not None!r} "
+            f"normal_route_present={normal_route is not None!r}"
+        ),
+        trace=True,
+        prefix="CAMPAIGN_TRAINER_CORRIDOR",
+    )
+    for checkpoint in KNOWN_TRAINER_CHECKPOINTS:
+        if (
+            not getattr(checkpoint, "mandatory", False)
+            or getattr(getattr(checkpoint, "map_id", None), "value", getattr(checkpoint, "map_id", None))
+            not in corridor_maps
+        ):
+            continue
+        if _checkpoint_is_cleared(campaign_facts, checkpoint):
+            continue
+        trainer_id = checkpoint.trainer_affordance_id
+        trainer = objects_by_id.get(trainer_id)
+        if trainer is not None and getattr(trainer, "trainer_defeated", None) is True:
+            continue
+        matching_triggers = tuple(
+            trigger
+            for trigger in getattr(overworld, "triggers", ())
+            if getattr(trigger, "affordance_id", None) == trainer_id
+        )
+        if any(getattr(trigger, "trainer_defeated", None) is True for trigger in matching_triggers):
+            # Static trainer observations remain available after the runtime
+            # object leaves the camera. Preserve their authoritative battle
+            # flag so a completed checkpoint is not promoted again merely
+            # because its clearance milestone (for example Petalburg) is
+            # still ahead of the current encounter objective.
+            continue
+        # The registered checkpoint is the authoritative static fact for a
+        # mandatory trainer. Object and trigger observations are
+        # camera/runtime data and can both be absent while the player is
+        # crossing the map. Treating that absence as proof that Calvin is not
+        # present is exactly how the campaign entered Route 102 with
+        # ``Trainer facts none (unknown)``.
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_MANDATORY_TRAINER_CORRIDOR: "
+                f"trainer={trainer_id!r} checkpoint={getattr(checkpoint, 'checkpoint_id', None)!r} "
+                f"map={getattr(checkpoint, 'map_id', None)!r} "
+                "reason='verified mandatory checkpoint lies on ROM corridor'"
+            ),
+            trace=True,
+            prefix="CAMPAIGN_MANDATORY_TRAINER_CORRIDOR",
+        )
+        return trainer_id
+    return None
+
+
+def _trainer_risk_selected_for_engagement(route_analysis, readiness_policy):
+    """Choose the strongest route risk promoted by campaign policy."""
+
+    if route_analysis is None:
+        return None
+    risks = tuple(getattr(route_analysis, "trainer_risks", ()) or ())
+    candidates = tuple(
+        risk
+        for risk in risks
+        if getattr(risk, "confidence", "known") == "known"
+        and getattr(readiness_policy, "trainer_risk_requires_engagement", lambda _: False)(risk)
+    )
+    if not candidates:
+        return None
+    order = {
+        "avoidable": 0,
+        "costly": 1,
+        "practically_unavoidable": 2,
+        "unavoidable": 3,
+        "imminent": 4,
+    }
+    selected = max(
+        candidates,
+        key=lambda risk: (
+            order.get(getattr(getattr(risk, "avoidability", None), "value", None), -1),
+            -(getattr(risk, "detour", None) or 0),
+            str(getattr(risk, "trainer_id", "")),
+        ),
+    )
+    return getattr(selected, "trainer_id", None)
+
+
+def _encounter_stage_route_risks(overworld, objective=None) -> tuple[TrainerRouteRisk, ...]:
+    """Translate a blocked encounter stage into route-risk evidence.
+
+    The encounter capability is often the first owner to test a map
+    connection. Its AVOID/IGNORE comparison can therefore be newer and more
+    precise than the readiness worker's route envelope. Known hazards are
+    promotable; unresolved hazards remain an explicit unknown safety fact.
+    """
+
+    if not getattr(objective, "objective_id", "").startswith("obtain_encounter:"):
+        return ()
+    evidence = getattr(context, "campaign_encounter_stage", None)
+    if evidence is None:
+        return ()
+    evidence_reason = str(getattr(evidence, "reason", ""))
+    if not getattr(evidence, "blocked", False) and not evidence_reason.startswith(
+        "forced_trainer_exposure:"
+    ):
+        return ()
+    current_map = getattr(getattr(overworld, "map_id", None), "value", getattr(overworld, "map_id", None))
+    evidence_map = getattr(getattr(evidence, "current_map", None), "value", getattr(evidence, "current_map", None))
+    if current_map != evidence_map:
+        return ()
+    # A blocked safe probe is not, by itself, proof that the known trainers
+    # form a permanent route cut. Moving trainers can temporarily close the
+    # grass corridor, and the next stable observation may expose a safe exit.
+    # Only the affirmative forced-exposure result is strong enough to claim a
+    # known unavoidable checkpoint. Keep transient failures diagnostic so the
+    # encounter capability can retry under a changed trainer position.
+    forced_exposure = evidence_reason.startswith("forced_trainer_exposure:")
+    risks = []
+    for trainer_id in tuple(getattr(evidence, "known_hazard_ids", ()) or ()):
+        risks.append(
+            TrainerRouteRisk(
+                trainer_id=trainer_id,
+                avoidability=(
+                    TrainerAvoidability.UNAVOIDABLE
+                    if forced_exposure
+                    else TrainerAvoidability.UNKNOWN
+                ),
+                exposed_on_normal_route=True,
+                confidence="known" if forced_exposure else "unknown",
+                reason=(
+                    "encounter-stage proved forced exposure across the selected exits"
+                    if forced_exposure
+                    else "encounter-stage safe search is temporarily unavailable; trainer movement may change the corridor"
+                ),
+            )
+        )
+    for trainer_id in tuple(getattr(evidence, "unresolved_hazard_ids", ()) or ()):
+        risks.append(
+            TrainerRouteRisk(
+                trainer_id=trainer_id,
+                avoidability=TrainerAvoidability.UNKNOWN,
+                exposed_on_normal_route=True,
+                confidence="unknown",
+                reason="encounter-stage route is trainer constrained but the ROM roster is unresolved",
+            )
+        )
+    return tuple(risks)
+
+
+def _encounter_stage_checkpoint_for_id(overworld, trainer_id, evidence=None):
+    """Reuse the checkpoint resolved by the encounter-stage probe.
+
+    Encounter staging can resolve a runtime/static script just before the
+    capability returns to the campaign controller. The next readiness pass
+    may observe a camera-scoped world without that script, so resolving the
+    same stable affordance again can incorrectly turn a known trainer into an
+    unknown one. Stage evidence is the authoritative handoff for this
+    boundary; source resolution remains the fallback for older evidence and
+    ordinary route analysis.
+    """
+
+    evidence = evidence if evidence is not None else getattr(context, "campaign_encounter_stage", None)
+    for checkpoint in tuple(getattr(evidence, "known_hazard_checkpoints", ()) or ()):
+        if getattr(checkpoint, "trainer_affordance_id", None) == trainer_id:
+            return checkpoint
+    return trainer_checkpoint_for_source(
+        trainer_id,
+        script_symbol=_trainer_script_for_id(overworld, trainer_id),
+    )
+
+
+def _trainer_script_for_id(overworld, trainer_id: str | None) -> str | None:
+    """Return the ROM script symbol paired with one stable trainer affordance."""
+
+    if not trainer_id or overworld is None:
+        return None
+    for obj in getattr(overworld, "objects", ()):
+        if getattr(obj, "trainer_id", None) == trainer_id:
+            return getattr(obj, "script", None)
+    for trigger in getattr(overworld, "triggers", ()):
+        if getattr(trigger, "affordance_id", None) != trainer_id:
+            continue
+        script = getattr(trigger, "script_symbol", None)
+        if script:
+            return script
+        trigger_id = getattr(trigger, "trigger_id", "")
+        if isinstance(trigger_id, str) and trigger_id.startswith("static_object:"):
+            parts = trigger_id.split(":", 2)
+            return parts[2] if len(parts) == 3 else None
+    return None
+
+
+def _merge_route_trainer_facts(overworld, visible_facts, route_analysis, additional_facts=()):
+    """Publish ROM-backed facts for trainer hazards found by route analysis.
+
+    Perception only exposes runtime objects and static triggers in the current
+    camera scope. The route analyzer can still identify a trainer hazard at
+    the same readiness boundary, so its stable affordance IDs are an
+    additional source of facts. Unresolved IDs remain absent; the snapshot
+    must not invent a roster merely to look complete.
+    """
+
+    route = getattr(route_analysis, "normal_route", None)
+    current_map = getattr(getattr(overworld, "map_id", None), "value", getattr(overworld, "map_id", None))
+
+    def normalized_location(location):
+        if not isinstance(location, tuple) or len(location) != 2:
+            return None
+        return getattr(location[0], "value", location[0]), location[1]
+
+    route_locations = set()
+    route_maps = set()
+    if route is not None:
+        for action in getattr(route, "actions", ()):
+            for location in (getattr(action, "source", None), getattr(action, "destination", None)):
+                normalized = normalized_location(location)
+                if normalized is not None:
+                    route_locations.add(normalized)
+                    route_maps.add(normalized[0])
+        route_maps.update(getattr(map_id, "value", map_id) for map_id in getattr(route, "maps", ()) or ())
+
+    # A route analysis is the authority for future trainer facts. A visible
+    # trainer is useful to the frontier only when its geometry intersects the
+    # selected route; otherwise a whole gym or branch can look executable.
+    route_trainer_ids = {
+        getattr(risk, "trainer_id", None)
+        for risk in tuple(getattr(route_analysis, "trainer_risks", ()) or ())
+        if getattr(risk, "trainer_id", None)
+    }
+    route_trainer_ids.update(
+        getattr(fact, "trainer_affordance_id", None)
+        for fact in tuple(additional_facts or ())
+        if getattr(fact, "trainer_affordance_id", None)
+    )
+    if route is not None and route_locations:
+        for trigger in getattr(overworld, "triggers", ()):
+            trainer_id = getattr(trigger, "affordance_id", None)
+            if not trainer_id:
+                continue
+            geometry = {
+                normalized_location(location)
+                for location in (
+                    *getattr(trigger, "hazard_locations", ()),
+                    *getattr(trigger, "engagement_locations", ()),
+                    *getattr(trigger, "activation_locations", ()),
+                    *getattr(trigger, "locations", ()),
+                )
+            }
+            if geometry.intersection(route_locations):
+                route_trainer_ids.add(trainer_id)
+
+    def route_relevant(checkpoint) -> bool:
+        if _trainer_checkpoint_is_defeated(checkpoint):
+            return False
+        if route is None:
+            # No complete route exists during a map/script boundary. Keep the
+            # display empty until the next route envelope is available; an
+            # explicit trainer owner is republished by
+            # _remember_campaign_trainer_fact().
+            return current_map is None
+        return getattr(checkpoint, "trainer_affordance_id", None) in route_trainer_ids
+
+    facts_by_identity = {}
+    for fact in tuple(visible_facts or ()):
+        if getattr(fact, "checkpoint_id", None) is None or not route_relevant(fact):
+            continue
+        facts_by_identity[trainer_checkpoint_identity(fact)] = fact
+    for risk in tuple(getattr(route_analysis, "trainer_risks", ()) or ()):
+        trainer_id = getattr(risk, "trainer_id", None)
+        if not trainer_id:
+            continue
+        checkpoint = trainer_checkpoint_for_source(
+            trainer_id,
+            script_symbol=_trainer_script_for_id(overworld, trainer_id),
+        )
+        if checkpoint is not None:
+            if _trainer_checkpoint_is_defeated(checkpoint):
+                continue
+            identity = trainer_checkpoint_identity(checkpoint)
+            facts_by_identity[identity] = merge_trainer_checkpoints(
+                facts_by_identity.get(identity), checkpoint
+            )
+    for checkpoint in tuple(additional_facts or ()):
+        if _trainer_checkpoint_is_defeated(checkpoint):
+            continue
+        identity = trainer_checkpoint_identity(checkpoint)
+        facts_by_identity[identity] = merge_trainer_checkpoints(
+            facts_by_identity.get(identity), checkpoint
+        )
+    return tuple(
+        sorted(
+            facts_by_identity.values(),
+            key=lambda fact: (
+                getattr(fact, "map_id", ()),
+                getattr(fact, "checkpoint_id", ""),
+            ),
+        )
+    )
+
+
+def _remember_campaign_trainer_fact(checkpoint) -> tuple:
+    """Publish one resolved trainer fact across camera/readiness boundaries."""
+
+    if checkpoint is None:
+        return tuple(getattr(context, "campaign_trainer_facts", ()) or ())
+    existing = tuple(getattr(context, "campaign_trainer_facts", ()) or ())
+    merged = {
+        trainer_checkpoint_identity(fact): fact
+        for fact in existing
+        if getattr(fact, "checkpoint_id", None) is not None
+        and not _trainer_checkpoint_is_defeated(fact)
+    }
+    if getattr(checkpoint, "checkpoint_id", None) is not None and not _trainer_checkpoint_is_defeated(checkpoint):
+        identity = trainer_checkpoint_identity(checkpoint)
+        merged[identity] = merge_trainer_checkpoints(merged.get(identity), checkpoint)
+    result = tuple(
+        sorted(
+            merged.values(),
+            key=lambda fact: (
+                getattr(fact, "map_id", ()),
+                getattr(fact, "checkpoint_id", ""),
+            ),
+        )
+    )
+    context.campaign_trainer_facts = result
+    return result
+
+
+def _is_map_traversal_readiness_goal(goal) -> bool:
+    """Return whether readiness should inspect the route for trainer hazards."""
+
+    target = getattr(goal, "target", goal)
+    return (
+        getattr(getattr(target, "kind", None), "name", None) in {"MAP", "LOCATION", "INTERACTION"}
+        or isinstance(target, (ReachLocation, ReachWarp))
+    )
+
+
+def _objective_owns_scripted_trainer_battle(objective) -> bool:
+    """Return whether the objective's capability owns a story battle scene."""
+
+    return bool(
+        getattr(getattr(objective, "resource_policy", None), "mandatory_battle", False)
+    )
 
 
 class _RoutePlanningBudget:
     """Cooperative wall-clock budget shared by a background route job."""
 
     def __init__(self, timeout_seconds: float):
+        self.timeout_seconds = timeout_seconds
         self.deadline = time.monotonic() + timeout_seconds
         self.cancelled = False
+        self.cancel_reason: str | None = None
 
-    def cancel(self) -> None:
+    def cancel(self, reason: str = "background route search was superseded") -> None:
         self.cancelled = True
+        self.cancel_reason = reason
 
     def check(self) -> None:
         if self.cancelled:
-            raise TimeoutError("background route search was superseded")
+            raise TimeoutError(self.cancel_reason or "background route search was superseded")
         if time.monotonic() >= self.deadline:
-            self.cancelled = True
-            raise TimeoutError("background route search exceeded 10 second budget")
+            reason = f"background route search exceeded {self.timeout_seconds:g} second budget"
+            self.cancel(reason)
+            raise TimeoutError(reason)
 
 
 class _SingleFlightBackgroundPlanner:
-    """Run prioritized, cancellable route jobs without blocking frames.
+    """Run one prioritized, cancellable route job without blocking frames.
 
-    The name is retained for compatibility with existing tests/callers. The
-    planner now permits one critical and one speculative job to overlap, which
-    means a stale analysis cannot prevent urgent recovery from starting.
+    Route searches are Python object-graph walks.  Running two of them at once
+    does not provide useful parallelism under the GIL, but it does make both
+    searches compete with the emulator and frame loop.  A critical request
+    still supersedes speculative work; the existing worker observes the
+    cancellation token and the executor then runs the critical request.
     """
 
-    DEFAULT_TIMEOUT_SECONDS = 10.0
+    # Route calculation runs off the frame thread. Give semantic map-by-map
+    # composition enough time to finish while retaining a hard cooperative
+    # deadline so a stale request cannot occupy the single worker forever.
+    DEFAULT_TIMEOUT_SECONDS = 8.0
 
     def __init__(self):
-        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nuzbot-route")
+        # Keep route analysis single-flight at the process level.  This is a
+        # scheduling decision, not a correctness limit: ``poll`` cancels a
+        # lower-priority job before submitting a higher-priority one.  One
+        # worker prevents speculative recovery/trainer analysis from
+        # monopolizing the GIL alongside the emulator callback thread.
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nuzbot-route")
         self._jobs = {}
         self._completed = {}
+        # A replacement request is retained only until the canceled worker
+        # releases the executor slot.  Submitting it immediately would put it
+        # behind that worker in ThreadPoolExecutor's queue, which is how a
+        # frame-bound analysis could accumulate stale searches behind one
+        # recovery calculation.
+        self._deferred = {}
 
-    @staticmethod
-    def _run(operation, budget):
+    @classmethod
+    def _job_label(cls, key) -> str:
+        domain = cls._key_domain(key)
+        digest = cls._key_digest(key)
+        if domain == "recovery" and isinstance(key, tuple) and len(key) > 1:
+            request_key = key[1]
+            if isinstance(request_key, tuple) and request_key:
+                return f"{domain} {format_location(request_key[0])} key={digest}"
+        return f"{domain} key={digest}"
+
+    def _emit_cancellation(
+        self,
+        *,
+        key,
+        phase: str,
+        reason: str,
+        replacement_key=None,
+        changed=(),
+        duration_ms: float | None = None,
+    ) -> None:
+        print_navigation_cancellation(
+            phase=phase,
+            reason=reason,
+            changed=changed,
+            duration_ms=duration_ms,
+            request_label=self._job_label(key),
+            replacement_label=(self._job_label(replacement_key) if replacement_key is not None else None),
+            worker="campaign_route",
+        )
+
+    def _cancel_job(self, key, job, *, reason: str, replacement_key=None, phase: str = "requested") -> None:
+        job["budget"].cancel(reason)
+        if not job.get("cancellation_reported", False):
+            self._emit_cancellation(
+                key=key,
+                phase=phase,
+                reason=reason,
+                replacement_key=replacement_key,
+                changed=("priority",) if replacement_key is not None else (),
+                duration_ms=(time.monotonic() - job["started_at"]) * 1000.0,
+            )
+            job["cancellation_reported"] = True
+
+    def _run(self, operation, budget, key):
         # Navigation's trace/profiler hooks refer to the mutable frame trace
         # and process-wide timing state. Suppress those hooks only on this
         # worker; the route calculation itself remains unchanged.
@@ -114,7 +1041,21 @@ class _SingleFlightBackgroundPlanner:
                 accepts_budget = bool(inspect.signature(operation).parameters)
             except (TypeError, ValueError):
                 accepts_budget = False
-            return operation(budget) if accepts_budget else operation()
+            try:
+                return operation(budget) if accepts_budget else operation()
+            except TimeoutError as error:
+                if budget.cancelled and not self._job_was_reported(key):
+                    self._emit_cancellation(
+                        key=key,
+                        phase="terminal",
+                        reason=str(error),
+                        duration_ms=None,
+                    )
+                raise
+
+    def _job_was_reported(self, key) -> bool:
+        job = self._jobs.get(key)
+        return bool(job and job.get("cancellation_reported", False))
 
     @staticmethod
     def _key_digest(key) -> str:
@@ -140,8 +1081,45 @@ class _SingleFlightBackgroundPlanner:
             if job["future"].done():
                 return self._harvest(key, job)
             if time.monotonic() >= job["budget"].deadline:
-                job["budget"].cancel()
-                error = TimeoutError("background route search exceeded 10 second budget")
+                reason = f"background route search exceeded {job['budget'].timeout_seconds:g} second budget"
+                if self._key_domain(key) == "recovery":
+                    # Recovery planning can already have a valid incumbent
+                    # when a later Center candidate exceeds the wall-clock
+                    # budget. Let the worker observe cancellation and return
+                    # that partial RouteRecovery instead of discarding the
+                    # whole candidate batch here.
+                    if not job.get("timeout_requested", False):
+                        self._cancel_job(key, job, reason=reason, phase="requested")
+                        job["timeout_requested"] = True
+                        diagnostic_print(
+                            lambda: (
+                                "BACKGROUND_ROUTE_JOB: "
+                                "event='timeout' "
+                                f"domain={self._key_domain(key)!r} key_digest={self._key_digest(key)!r} "
+                                f"elapsed_ms={(time.monotonic() - job['started_at']) * 1000.0:.1f} "
+                                "action='harvest_partial_recovery'"
+                            ),
+                            trace=True,
+                            prefix="BACKGROUND_ROUTE_JOB",
+                        )
+                    if job["future"].cancel():
+                        # A queued job has no incumbent to preserve. Retain
+                        # the historical terminal error behavior for this
+                        # case rather than resubmitting the canceled work.
+                        error = TimeoutError(reason)
+                        self._jobs.pop(key, None)
+                        self._completed[key] = (None, error)
+                        self._emit_cancellation(
+                            key=key,
+                            phase="terminal",
+                            reason=str(error),
+                            duration_ms=(time.monotonic() - job["started_at"]) * 1000.0,
+                        )
+                        return "error", None, error
+                    return "pending", None, None
+
+                self._cancel_job(key, job, reason=reason, phase="terminal")
+                error = TimeoutError(reason)
                 # A running thread cannot be force-killed safely. Retain it
                 # until it observes cancellation, but make the timeout a
                 # terminal result for this request immediately.
@@ -162,29 +1140,77 @@ class _SingleFlightBackgroundPlanner:
                 return "error", None, error
             return "pending", None, None
 
-        # Urgent recovery supersedes queued/speculative route work. Search
-        # functions receive this cancellation token at every expansion, so a
-        # lower-priority worker yields promptly instead of monopolizing CPU.
+        # Keep one logical worker owner at a time. A completed future that has
+        # not been harvested still owns the result boundary: letting another
+        # domain consume the slot would make the owner lose its completion
+        # event. A higher-priority request may harvest that completed result,
+        # or cancel a running lower-priority request, but it never queues work
+        # behind the canceled future.
         for other_key, other in tuple(self._jobs.items()):
-            if other["priority"] > priority:
-                other["budget"].cancel()
+            if other["future"].done():
+                current_domain = self._key_domain(key)
+                other_domain = self._key_domain(other_key)
+                domain_owner_must_harvest = (
+                    other_domain is not None
+                    and current_domain != other_domain
+                    and priority >= other["priority"]
+                )
+                if not domain_owner_must_harvest:
+                    self._harvest(other_key, other)
+                else:
+                    return "pending", None, None
+
+        active_jobs = tuple(self._jobs.items())
+        if active_jobs:
+            higher_priority_job = False
+            for other_key, other in active_jobs:
+                if other["priority"] <= priority:
+                    # Equal or higher-priority work owns the single route
+                    # worker. Do not enqueue a second request behind it.
+                    return "pending", None, None
+                reason = "higher-priority campaign route request superseded the active request"
+                self._cancel_job(
+                    other_key,
+                    other,
+                    reason=reason,
+                    replacement_key=key,
+                )
+                higher_priority_job = True
                 if other["future"].cancel():
                     self._jobs.pop(other_key, None)
+            if higher_priority_job and self._jobs:
+                self._deferred[key] = (operation, priority, timeout_seconds)
+                diagnostic_print(
+                    lambda: (
+                        "BACKGROUND_ROUTE_JOB: "
+                        "event='deferred' reason='waiting_for_superseded_worker' "
+                        f"domain={self._key_domain(key)!r} key_digest={self._key_digest(key)!r} "
+                        f"priority={priority!r} active_jobs={len(self._jobs)!r}"
+                    ),
+                    trace=True,
+                    prefix="BACKGROUND_ROUTE_JOB",
+                )
+                return "pending", None, None
 
-        budget = _RoutePlanningBudget(timeout_seconds or self.DEFAULT_TIMEOUT_SECONDS)
-        future = self._executor.submit(self._run, operation, budget)
+        deferred = self._deferred.pop(key, None)
+        if deferred is not None:
+            operation, priority, timeout_seconds = deferred
+        effective_timeout = self.DEFAULT_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+        budget = _RoutePlanningBudget(effective_timeout)
+        future = self._executor.submit(self._run, operation, budget, key)
         self._jobs[key] = {
             "future": future,
             "budget": budget,
             "priority": priority,
             "started_at": time.monotonic(),
+            "cancellation_reported": False,
         }
         diagnostic_print(
             lambda: (
                 "BACKGROUND_ROUTE_JOB: "
                 "event='submitted' "
                 f"domain={self._key_domain(key)!r} key_digest={self._key_digest(key)!r} "
-                f"priority={priority!r} timeout_seconds={timeout_seconds or self.DEFAULT_TIMEOUT_SECONDS!r} "
+                f"priority={priority!r} timeout_seconds={effective_timeout!r} "
                 f"active_jobs={len(self._jobs)!r} completed_jobs={len(self._completed)!r}"
             ),
             trace=True,
@@ -201,13 +1227,29 @@ class _SingleFlightBackgroundPlanner:
             value = None
             error = caught
         self._jobs.pop(key, None)
-        self._completed[key] = (value, error)
+        if error is not None and job.get("timeout_requested", False) and not job.get(
+            "terminal_timeout_reported", False
+        ):
+            self._emit_cancellation(
+                key=key,
+                phase="terminal",
+                reason=str(error),
+                duration_ms=elapsed_ms,
+            )
+            job["terminal_timeout_reported"] = True
+        # A discarded running job may finish after its request has been
+        # superseded. Do not make that stale result look like a valid cache
+        # hit if a caller happens to poll the old key during cleanup.
+        if not job.get("discarded", False):
+            self._completed[key] = (value, error)
         diagnostic_print(
             lambda: (
                 "BACKGROUND_ROUTE_JOB: "
                 f"event={'error' if error is not None else 'complete'!r} "
                 f"domain={self._key_domain(key)!r} key_digest={self._key_digest(key)!r} "
                 f"elapsed_ms={elapsed_ms:.1f} exception_type={type(error).__name__ if error else None!r} "
+                f"exception={error!r} traceback={traceback.format_exc() if error is not None else None!r} "
+                f"partial_result={bool(getattr(value, 'calculation_timed_out', False))!r} "
                 f"active_jobs={len(self._jobs)!r} completed_jobs={len(self._completed)!r}"
             ),
             trace=True,
@@ -219,14 +1261,50 @@ class _SingleFlightBackgroundPlanner:
         """Forget a completed/retired request before an explicit retry."""
 
         self._completed.pop(key, None)
+        self._deferred.pop(key, None)
         job = self._jobs.get(key)
         if job is not None:
-            job["budget"].cancel()
-            job["future"].cancel()
-            # Remove the logical slot immediately. The old worker is already
-            # cancellation-marked and will exit cooperatively; a retry must
-            # not inherit its expired deadline.
-            self._jobs.pop(key, None)
+            self._cancel_job(
+                key,
+                job,
+                reason="campaign route request discarded by caller",
+            )
+            if job["future"].done():
+                self._jobs.pop(key, None)
+            elif job["future"].cancel():
+                # A queued job has not started and can be removed from the
+                # executor immediately. Leaving it queued lets stale route
+                # analyses run one after another behind the current request.
+                self._jobs.pop(key, None)
+            else:
+                # A running thread cannot be force-killed safely. Keep its
+                # logical slot until it observes cancellation so a timeout
+                # retry cannot submit a duplicate search while the stale
+                # worker is still consuming CPU. Remove it as soon as the
+                # future finishes; otherwise repeated frame-boundary
+                # invalidations accumulate completed stale jobs forever.
+                job["discarded"] = True
+
+                def cleanup(future, *, key=key):
+                    current = self._jobs.get(key)
+                    if current is not None and current.get("future") is future and current.get("discarded"):
+                        self._jobs.pop(key, None)
+
+                job["future"].add_done_callback(cleanup)
+
+    def is_pending(self, key) -> bool:
+        """Return whether a request still has a running worker."""
+
+        job = self._jobs.get(key)
+        return job is not None and not job["future"].done()
+
+    def elapsed_seconds(self, key) -> float | None:
+        """Return elapsed worker time for a pending diagnostic, if present."""
+
+        job = self._jobs.get(key)
+        if job is None:
+            return None
+        return max(0.0, time.monotonic() - job["started_at"])
 
     @staticmethod
     def _job_domain(key):
@@ -277,13 +1355,93 @@ class CampaignProgressionMode(BotMode):
 
         return context.rom is not None and context.rom.is_emerald
 
+    def owns_evolution_policy(self) -> bool:
+        """Let campaign strategy decide evolution independently of the profile."""
+
+        return True
+
+    def on_pokemon_evolving_after_battle(self, pokemon, party_index: int) -> bool:
+        """Allow useful evolutions while preserving pre-evolution-only moves.
+
+        The ROM presents this callback after the level-up move window. If the
+        pre-evolution has a later level-up move that the target species never
+        learns, the campaign delays the evolution and gets another chance at
+        the next level. Otherwise the stronger species is preferred.
+        """
+
+        species = getattr(pokemon, "species", None)
+        level = getattr(pokemon, "level", None)
+        evolutions = tuple(
+            evolution
+            for evolution in getattr(species, "evolutions", ())
+            if str(getattr(evolution, "method", "")).startswith("level")
+        )
+        if not evolutions or not isinstance(level, int):
+            return True
+
+        try:
+            target_species = tuple(get_species_by_index(evolution.target_species_index) for evolution in evolutions)
+        except (KeyError, IndexError, TypeError, ValueError):
+            return True
+
+        target_moves = {
+            entry.move.name
+            for target in target_species
+            for entry in getattr(getattr(target, "learnset", None), "level_up", ())
+        }
+        banned_moves = set(getattr(getattr(getattr(context, "config", None), "battle", None), "banned_moves", ()))
+        protected_move = next(
+            (
+                entry.move
+                for entry in getattr(getattr(species, "learnset", None), "level_up", ())
+                if entry.level > level
+                and entry.move.name not in target_moves
+                and entry.move.name not in banned_moves
+            ),
+            None,
+        )
+        if protected_move is not None:
+            context.message = (
+                f"Delaying {pokemon.name}'s evolution to preserve {protected_move.name}, "
+                "which its evolved form does not learn."
+            )
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_EVOLUTION_DECISION: "
+                    f"allowed=False party_index={party_index} pokemon={pokemon.name!r} "
+                    f"species={species.name!r} move={protected_move.name!r} "
+                    f"targets={[target.name for target in target_species]!r}"
+                ),
+                trace=True,
+            )
+            return False
+
+        diagnostic_print(
+            lambda: (
+                "CAMPAIGN_EVOLUTION_DECISION: "
+                f"allowed=True party_index={party_index} pokemon={pokemon.name!r} "
+                f"species={species.name!r} targets={[target.name for target in target_species]!r}"
+            ),
+            trace=True,
+        )
+        return True
+
+    def on_whiteout(self) -> bool:
+        """Resume from a recoverable whiteout using a living PC Pokémon."""
+
+        self._whiteout_continuation_pending = True
+        context.message = "Whiteout recovered; replacing the fainted party from the PC."
+        return True
+
     def __init__(self):
         """Create the campaign controller and readiness scheduler."""
 
+        self._readiness_policy = CampaignReadinessPolicy()
         self._readiness_scheduler = ReadinessObservationScheduler(
             self._readiness_input,
             self._cheap_readiness_context,
             max_age_ticks=15,
+            transient_context=self._readiness_transient_context,
         )
         self.controller = CampaignController(
             runtime_campaign_state,
@@ -293,6 +1451,7 @@ class CampaignProgressionMode(BotMode):
             # fallback here that can reopen the healing catalog or select a
             # different Center after the plan has been composed.
             recovery_factory=execute_campaign_recovery,
+            readiness_policy=self._readiness_policy,
         )
         self._readiness_evaluated = False
         self._campaign_selection_key = None
@@ -300,21 +1459,71 @@ class CampaignProgressionMode(BotMode):
         self._campaign_boundary_context_seen = False
         self._last_campaign_boundary_context = None
         self._active_battle_wild: bool | None = None
+        # Battle teardown clears the transient opponent projection before this
+        # mode receives the outcome. Keep every route/ROM alias latched at the
+        # battle-start boundary so a confirmed win can prune the frontier.
+        self._active_trainer_checkpoints: tuple = ()
+        # Whiteout is not necessarily a failed run. When the runtime observes
+        # a living PC roster, the listener leaves the player at the Center and
+        # this mode replaces the fainted party before campaign planning resumes.
+        self._whiteout_continuation_pending = False
+        # The battle listener can hand control back before the snapshot
+        # observer publishes its faint event. Retain stable identities across
+        # that narrow boundary so Center recovery can place them in the death
+        # record box after healing.
+        self._pending_fainted_identities: set[PokemonIdentity] = set()
         self._lead_handoff_pending = False
         # Recovery and opportunistic route analysis share one worker so a
         # stale search cannot queue behind a newer one indefinitely.
         self._background_route_planner = _SingleFlightBackgroundPlanner()
+        # A player coordinate changes on every walking frame. Keep one
+        # in-flight analysis for the same map/objective/hazard envelope. The
+        # tactical controller validates the exact start before executing the
+        # resulting movement, so walking does not require rebuilding this
+        # advisory comparison every frame.
+        self._pending_route_analysis = None
+        # Route safety analysis is an envelope observation.  The tactical
+        # navigator still validates every movement plan against the live
+        # position, but the expensive campaign analysis should not be
+        # discarded and rebuilt just because the avatar walked one tile.
+        self._route_analysis_anchor = None
         self._prepared_recovery_request = None
         self._prepared_recovery_anchor = None
+        self._last_recovery_request_panel_key = None
+        self._last_recovery_destination_panel_key = None
+        self._last_recovery_calculation_panel_key = None
+        self._advisory_route_retry_deadlines = {}
+        self._advisory_route_retry_notices = set()
 
     def _clear_background_route_state(self) -> None:
         """Discard frame-bound recovery inputs after a semantic boundary."""
 
+        prepared = getattr(self, "_prepared_recovery_request", None)
+        planner = getattr(self, "_background_route_planner", None)
+        if planner is not None and hasattr(prepared, "key"):
+            planner.discard(("recovery", prepared.key))
+        pending_analysis = getattr(self, "_pending_route_analysis", None)
+        if planner is not None and pending_analysis is not None:
+            planner.discard(pending_analysis["key"])
+        self._pending_route_analysis = None
+        self._route_analysis_anchor = None
         self._prepared_recovery_request = None
         self._prepared_recovery_anchor = None
+        self._last_recovery_calculation_panel_key = None
+        getattr(self, "_advisory_route_retry_deadlines", {}).clear()
+        getattr(self, "_advisory_route_retry_notices", set()).clear()
 
     @staticmethod
     def _recovery_anchor():
+        """Return the live location boundary for one recovery calculation.
+
+        The prepared request contains the exact starting coordinate.  A
+        running worker is allowed to finish when a transient snapshot moves
+        within the same map, but a completed request is retired before a new
+        coordinate is planned.  This preserves route correctness without
+        turning each pending frame into a new search.
+        """
+
         runtime = getattr(context, "nuzlocke_runtime", None)
         snapshot = getattr(runtime, "latest_snapshot", None)
         player = getattr(snapshot, "player", None)
@@ -329,9 +1538,50 @@ class CampaignProgressionMode(BotMode):
     def _select_campaign(self, state):
         """Reuse map-level planning until a relevant campaign fact changes."""
 
-        key = campaign_planning_signature(state)
+        planning_key = campaign_planning_signature(state)
+        restock_deferral = getattr(context, "campaign_restock_deferral", None)
+        # Restock deferral is a transient execution fact. It intentionally
+        # lives outside CampaignState, but it must still invalidate a cached
+        # restock selection or the controller will remount the same objective
+        # on the next frame.
+        key = (
+            planning_key
+            if restock_deferral is None
+            else (planning_key, ("campaign_restock_deferral", restock_deferral))
+        )
         if key == self._campaign_selection_key and self._campaign_selection is not None:
-            return self._campaign_selection
+            cached_objective = getattr(self._campaign_selection, "objective", None)
+            if cached_objective is None:
+                return self._campaign_selection
+            try:
+                completion = cached_objective.completion.evaluate(state)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                # A partially observed state or a test seam may not expose a
+                # usable completion predicate. Preserve the existing cache in
+                # that case; the normal planning call remains the authority
+                # when the signature changes.
+                return self._campaign_selection
+            if completion.status is not FactStatus.KNOWN or completion.value is not True:
+                return self._campaign_selection
+
+            # A capability can publish an authoritative completion fact and
+            # request a frontier refresh before the next planning signature is
+            # rebuilt. Never remount the just-completed objective from that
+            # stale selection. Replan immediately even when the signature is
+            # unchanged because the completion predicate is the execution
+            # boundary's source of truth.
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_SELECTION_CACHE_INVALIDATE: "
+                    f"objective={cached_objective.objective_id!r} "
+                    f"completion_status={completion.status.value!r} "
+                    f"completion_value={completion.value!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_SELECTION_CACHE_INVALIDATE",
+            )
+            self._campaign_selection_key = None
+            self._campaign_selection = None
         selection = plan_campaign(state)
         self._campaign_selection_key = key
         self._campaign_selection = selection
@@ -350,11 +1600,21 @@ class CampaignProgressionMode(BotMode):
             return observe_route_recovery(candidate_limit=candidate_limit)
         anchor = self._recovery_anchor()
         prepared = self._prepared_recovery_request
+        prepared_key = ("recovery", prepared.key) if hasattr(prepared, "key") else None
+        same_map = (
+            prepared is not None
+            and self._prepared_recovery_anchor is not None
+            and anchor is not None
+            and self._prepared_recovery_anchor[:2] == anchor[:2]
+        )
+        pending_same_map_request = same_map and planner.is_pending(prepared_key)
         if (
             prepared is None
             or self._prepared_recovery_anchor != anchor
             or getattr(prepared, "critical", False) is not critical
-        ):
+        ) and not pending_same_map_request:
+            if prepared_key is not None:
+                planner.discard(prepared_key)
             try:
                 prepared = prepare_route_recovery(candidate_limit=candidate_limit, critical=critical)
             except Exception as error:
@@ -369,6 +1629,34 @@ class CampaignProgressionMode(BotMode):
                 return RouteRecovery(observation_available=False, observation_error=str(error))
             self._prepared_recovery_request = prepared if hasattr(prepared, "key") else None
             self._prepared_recovery_anchor = anchor
+            if hasattr(prepared, "ordered_sources"):
+                request_panel_key = (
+                    anchor,
+                    critical,
+                    tuple(
+                        (
+                            getattr(source, "source_id", None),
+                            getattr(source, "outdoor_location", None),
+                        )
+                        for _, source in prepared.ordered_sources
+                    ),
+                )
+                if request_panel_key != self._last_recovery_request_panel_key:
+                    self._last_recovery_request_panel_key = request_panel_key
+                    print_recovery_request(
+                        location=getattr(prepared, "location", anchor),
+                        critical=critical,
+                        reason=(
+                            "party HP/status reached the critical recovery threshold"
+                            if critical
+                            else "party reached the opportunistic recovery threshold"
+                        ),
+                        candidate_count=len(prepared.ordered_sources),
+                        destinations=(
+                            getattr(source, "source_id", None) or repr(getattr(source, "outdoor_location", None))
+                            for _, source in prepared.ordered_sources
+                        ),
+                    )
         if isinstance(prepared, RouteRecovery):
             return prepared
 
@@ -376,16 +1664,27 @@ class CampaignProgressionMode(BotMode):
             ("recovery", prepared.key),
             lambda budget, prepared=prepared: plan_route_recovery(prepared, cancel_check=budget.check),
             priority=0 if critical else 1,
+            timeout_seconds=_RECOVERY_ROUTE_SEARCH_TIMEOUT_SECONDS,
         )
         if status == "pending":
-            diagnostic_print(
-                lambda: (
-                    "CAMPAIGN_RECOVERY_CALCULATION: "
-                    f"state='pending' request_key={prepared.key!r}"
-                ),
-                trace=True,
-                prefix="CAMPAIGN_RECOVERY_CALCULATION",
+            elapsed_getter = getattr(planner, "elapsed_seconds", None)
+            elapsed_seconds = (
+                elapsed_getter(("recovery", prepared.key))
+                if callable(elapsed_getter)
+                else None
             )
+            calculation_panel_key = ("pending", prepared.key)
+            if calculation_panel_key != getattr(self, "_last_recovery_calculation_panel_key", None):
+                self._last_recovery_calculation_panel_key = calculation_panel_key
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_RECOVERY_CALCULATION: "
+                        f"state='pending' request_key={prepared.key!r} "
+                        f"elapsed_ms={elapsed_seconds * 1000.0 if elapsed_seconds is not None else None!r}"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_RECOVERY_CALCULATION",
+                )
             return RouteRecovery(
                 observation_available=False,
                 observation_error="route_calculation_pending",
@@ -400,8 +1699,17 @@ class CampaignProgressionMode(BotMode):
                 trace=True,
                 prefix="CAMPAIGN_RECOVERY_CALCULATION",
             )
+            destination_diagnostics = tuple(getattr(error, "candidate_diagnostics", ()) or ())
+            destination_panel_key = (prepared.key, repr(destination_diagnostics), "error")
+            if destination_diagnostics and destination_panel_key != self._last_recovery_destination_panel_key:
+                self._last_recovery_destination_panel_key = destination_panel_key
+                print_recovery_destinations(destination_diagnostics)
             timed_out = isinstance(error, TimeoutError)
-            if timed_out:
+            candidate_search_incomplete = any(
+                getattr(item, "outcome", None) in {"pruned", "pending", "timed_out"}
+                for item in destination_diagnostics
+            )
+            if timed_out or candidate_search_incomplete:
                 planner.discard(("recovery", prepared.key))
                 self._clear_background_route_state()
             return RouteRecovery(
@@ -413,39 +1721,163 @@ class CampaignProgressionMode(BotMode):
                 # same request can be retried after a transient boundary.
                 observation_available=timed_out,
                 observation_error=str(error),
-                calculation_timed_out=timed_out,
+                calculation_timed_out=timed_out or candidate_search_incomplete,
+                candidate_diagnostics=destination_diagnostics,
             )
-        diagnostic_print(
-            lambda: (
-                "CAMPAIGN_RECOVERY_CALCULATION: "
-                f"state='complete' center={getattr(result, 'center_location', None)!r} "
-                f"distance={getattr(result, 'distance_to_center', None)!r}"
-            ),
-            trace=True,
-            prefix="CAMPAIGN_RECOVERY_CALCULATION",
+        calculation_panel_key = (
+            "complete",
+            prepared.key,
+            getattr(result, "center_location", None),
+            getattr(result, "distance_to_center", None),
         )
+        if calculation_panel_key != getattr(self, "_last_recovery_calculation_panel_key", None):
+            self._last_recovery_calculation_panel_key = calculation_panel_key
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_RECOVERY_CALCULATION: "
+                    f"state='complete' center={getattr(result, 'center_location', None)!r} "
+                    f"distance={getattr(result, 'distance_to_center', None)!r} "
+                    f"calculation_timed_out={getattr(result, 'calculation_timed_out', False)!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_RECOVERY_CALCULATION",
+            )
+            selected_route = getattr(result, "route", None)
+            selected_metrics = getattr(selected_route, "metrics", None)
+            print_recovery_handoff(
+                phase="calculation_complete",
+                start=getattr(prepared, "location", None),
+                destination=getattr(result, "center_location", None),
+                source_id=getattr(getattr(result, "healing_source", None), "source_id", None),
+                route_actions=(
+                    len(getattr(selected_route, "actions", ()))
+                    if selected_route is not None
+                    else None
+                ),
+                route_cost=getattr(selected_metrics, "total_route_cost", None),
+                detail=(
+                    "partial recovery route calculated after candidate timeout; "
+                    "awaiting campaign controller mount"
+                    if getattr(result, "calculation_timed_out", False)
+                    else "recovery route calculated; awaiting campaign controller mount"
+                ),
+            )
+        destination_diagnostics = tuple(getattr(result, "candidate_diagnostics", ()) or ())
+        destination_panel_key = (prepared.key, repr(destination_diagnostics))
+        if destination_panel_key != self._last_recovery_destination_panel_key:
+            self._last_recovery_destination_panel_key = destination_panel_key
+            print_recovery_destinations(destination_diagnostics)
         return result
 
     @staticmethod
-    def _route_analysis_key(world, start, goal, candidates) -> str:
-        """Build a stable key from analysis inputs without loading new maps."""
-        blocked, transitions = world.revision_key()
-        return repr(
-            (
-                start,
-                repr(goal),
-                tuple(repr(candidate) for candidate in candidates),
-                getattr(world, "facing", None),
-                getattr(world, "running_shoes", None),
-                getattr(world, "player_elevation", None),
-                getattr(world, "surfing", None),
-                transitions,
-                blocked,
+    def _route_analysis_envelope_key(world, goal, candidates) -> tuple:
+        """Return inputs that remain stable while walking one route envelope."""
+        _blocked, transitions = world.revision_key()
+        # ``NavigationWorld`` overlays live NPC occupancy on top of the ROM
+        # tile catalog.  That occupancy changes as a wandering NPC moves, but
+        # it is already revalidated by the tactical planner before each input.
+        # Including it here turns a stable campaign analysis into a new search
+        # every frame. Keep static collision topology in the envelope and let
+        # the live tactical plan own transient occupancy.
+        tiles = getattr(world, "tiles", {})
+        static_tiles = getattr(tiles, "_static_tiles", tiles)
+        static_blocked = tuple(
+            sorted(
+                (location[1] for location, tile in static_tiles.items() if getattr(tile, "blocked", False)),
+                key=repr,
             )
         )
+        # Trainer state is live perception.  It can change while the player
+        # remains on the same map and without changing tile occupancy or warp
+        # revisions: an object can spawn, turn, become defeated, or expose a
+        # newly decoded sight line.  Reusing an analysis across that boundary
+        # can route through a trainer using stale safety evidence.
+        trigger_revision = tuple(
+            sorted(
+                [
+                    (
+                        getattr(trigger, "trigger_id", None),
+                        getattr(trigger, "affordance_id", None),
+                        getattr(trigger, "hazard_kind", None),
+                        getattr(trigger, "condition_active", None),
+                        getattr(trigger, "trainer_defeated", None),
+                        tuple(sorted(getattr(trigger, "hazard_locations", ()) or (), key=repr)),
+                    )
+                    for trigger in getattr(world, "triggers", ())
+                ],
+                key=repr,
+            )
+        )
+        return (
+            repr(goal),
+            tuple(repr(candidate) for candidate in candidates),
+            getattr(world, "running_shoes", None),
+            getattr(world, "player_elevation", None),
+            getattr(world, "surfing", None),
+            transitions,
+            static_blocked,
+            trigger_revision,
+        )
 
-    def _analyze_route_async(self, world, graph, start, goal, candidates):
-        """Run opportunistic route composition without blocking a frame."""
+    @classmethod
+    def _route_analysis_key(cls, world, start, goal, candidates) -> str:
+        """Build an envelope key for one immutable route/hazard observation."""
+
+        # The route result is used to publish trainer hazards and compare
+        # campaign-level alternatives.  Movement execution remains exact
+        # start-position work owned by AgentControlLoop.  Keeping the
+        # background key independent of the current tile prevents a walking
+        # campaign from superseding its own analysis every frame.
+        return repr(cls._route_analysis_envelope_key(world, goal, candidates))
+
+    def _analyze_route_async(
+        self,
+        world,
+        graph,
+        start,
+        goal,
+        candidates,
+        *,
+        tactical_goal=None,
+        allow_without_tactical_owner=False,
+    ):
+        """Run opportunistic route composition without blocking a frame.
+
+        A completed recovery route is itself the executable owner while the
+        controller is waiting for the parent-route comparison.  In that
+        boundary there is intentionally no mounted tactical loop to guard,
+        so continuation analysis must be allowed to start from the campaign
+        readiness worker.
+        """
+
+        active_loop = getattr(context, "active_agent_control_loop", None)
+        active_loop_goal = getattr(active_loop, "_goal", None)
+        tactical_owner_goal = (
+            active_loop_goal
+            if _campaign_goal_owns_trainer_exposure(active_loop_goal)
+            else tactical_goal
+        )
+        trainer_owner_id = _campaign_trainer_id(tactical_owner_goal)
+        trainer_checkpoint = trainer_checkpoint_for_id(trainer_owner_id)
+        if trainer_owner_id is not None and trainer_checkpoint is not None:
+            campaign_facts = _runtime_campaign_facts_or_none()
+            if not _checkpoint_is_cleared(campaign_facts, trainer_checkpoint):
+                pending = getattr(self, "_pending_route_analysis", None)
+                planner = getattr(self, "_background_route_planner", None)
+                if pending is not None and planner is not None:
+                    planner.discard(pending["key"])
+                self._pending_route_analysis = None
+                self._route_analysis_anchor = None
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_ROUTE_ANALYSIS: "
+                        f"state='deferred' owner='trainer' trainer={trainer_owner_id!r} "
+                        "reason='unresolved trainer choke point owns tactical route'"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_ROUTE_ANALYSIS",
+                )
+                return None, False, False
 
         planner = getattr(self, "_background_route_planner", None)
         if planner is None:
@@ -455,19 +1887,109 @@ class CampaignProgressionMode(BotMode):
                 max_expansions=_RECOVERY_ROUTE_ANALYSIS_MAX_EXPANSIONS,
             ).analyze(start, goal, candidates), False, False
 
+        # Tactical navigation has priority over campaign diagnostics. On the
+        # first readiness pass the tactical generator has not been mounted
+        # yet, so there is no active worker for the guard below to observe.
+        # Let the controller mount that executable owner first; a later
+        # readiness boundary can start this advisory analysis while the
+        # tactical route is cached or after its search has completed.
+        tactical_owner_mounted = active_loop is not None and (
+            tactical_goal is None or active_loop_goal == tactical_goal
+        )
+        if (
+            tactical_goal is not None
+            and not tactical_owner_mounted
+            and not allow_without_tactical_owner
+        ):
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_RECOVERY_ROUTE_ANALYSIS: "
+                    "state='deferred' reason='tactical_loop_mount_pending'"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_RECOVERY_ROUTE_ANALYSIS",
+            )
+            return None, False, False
+
+        # Tactical navigation has priority over campaign diagnostics. Check
+        # this before constructing any route key so a transition boundary or
+        # lightweight test double cannot be dereferenced while an active
+        # tactical search already owns the frame.
+        if navigation_background_search_active():
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_RECOVERY_ROUTE_ANALYSIS: "
+                    "state='deferred' reason='tactical_navigation_search_active'"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_RECOVERY_ROUTE_ANALYSIS",
+            )
+            return None, True, False
+
+        # Tactical navigation has priority over campaign diagnostics. Both
+        # analyzers can ask the same global navigator for a multi-map route;
+        # allowing them to run concurrently competes for CPU and can leave
+        # the tactical controller waiting on a second search. Route analysis
+        # is advisory and is safe to poll again after the executable route is
+        # no longer being composed.
         key = ("analysis", self._route_analysis_key(world, start, goal, candidates))
-        status, result, error = planner.poll(
-            key,
-            lambda budget: RouteCostAnalyzer(
+        envelope_key = self._route_analysis_envelope_key(world, goal, candidates)
+        retry_deadlines = getattr(self, "_advisory_route_retry_deadlines", None)
+        if retry_deadlines is None:
+            retry_deadlines = self._advisory_route_retry_deadlines = {}
+        retry_notices = getattr(self, "_advisory_route_retry_notices", None)
+        if retry_notices is None:
+            retry_notices = self._advisory_route_retry_notices = set()
+        retry_deadline = retry_deadlines.get(key)
+        if retry_deadline is not None:
+            if time.monotonic() < retry_deadline:
+                if key not in retry_notices:
+                    retry_notices.add(key)
+                    diagnostic_print(
+                        lambda: (
+                            "CAMPAIGN_RECOVERY_ROUTE_ANALYSIS: "
+                            f"state='cooldown' request_key={key[1]!r} "
+                            f"remaining_seconds={max(0.0, retry_deadline - time.monotonic()):.3f}"
+                        ),
+                        trace=True,
+                        prefix="CAMPAIGN_RECOVERY_ROUTE_ANALYSIS",
+                    )
+                return None, True, False
+            retry_deadlines.pop(key, None)
+            retry_notices.discard(key)
+        owner_checkpoint = getattr(trainer_checkpoint, "checkpoint_id", None)
+        diagnostic_edge = (start, getattr(getattr(goal, "target", goal), "target_map", None), len(candidates))
+        operation = lambda budget: RouteCostAnalyzer(
                 world,
                 graph=graph,
                 max_expansions=_RECOVERY_ROUTE_ANALYSIS_MAX_EXPANSIONS,
-            ).analyze(start, goal, candidates, cancel_check=budget.check),
-            priority=2,
-        )
+            ).analyze(start, goal, candidates, cancel_check=budget.check)
+        pending = getattr(self, "_pending_route_analysis", None)
+        if pending is not None and pending["key"] != key:
+            # A changed map, objective, or trainer hazard envelope invalidates
+            # the old search.  A changed player tile does not, because the
+            # key intentionally represents the stable envelope rather than a
+            # frame-by-frame tactical start position.
+            planner.discard(pending["key"])
+            self._pending_route_analysis = None
+
+        status, result, error = planner.poll(key, operation, priority=2)
+        if status == "pending":
+            self._pending_route_analysis = {
+                "key": key,
+                "envelope_key": envelope_key,
+                "anchor": start,
+                "operation": operation,
+            }
+        elif getattr(self, "_pending_route_analysis", None) is not None and self._pending_route_analysis["key"] == key:
+            self._pending_route_analysis = None
         if status == "pending":
             diagnostic_print(
-                lambda: f"CAMPAIGN_RECOVERY_ROUTE_ANALYSIS: state='pending' request_key={key[1]!r}",
+                lambda: (
+                    "CAMPAIGN_RECOVERY_ROUTE_ANALYSIS: "
+                    f"state='pending' request_key={key[1]!r} owner={trainer_owner_id!r} "
+                    f"checkpoint={owner_checkpoint!r} candidate_edge={diagnostic_edge!r} priority=2"
+                ),
                 trace=True,
                 prefix="CAMPAIGN_RECOVERY_ROUTE_ANALYSIS",
             )
@@ -476,7 +1998,9 @@ class CampaignProgressionMode(BotMode):
             diagnostic_print(
                 lambda: (
                     "CAMPAIGN_RECOVERY_ROUTE_ANALYSIS: "
-                    f"state='error' exception_type={type(error).__name__!r} exception={error!r}"
+                    f"state='error' exception_type={type(error).__name__!r} exception={error!r} "
+                    f"owner={trainer_owner_id!r} checkpoint={owner_checkpoint!r} "
+                    f"candidate_edge={diagnostic_edge!r} priority=2"
                 ),
                 trace=True,
                 prefix="CAMPAIGN_RECOVERY_ROUTE_ANALYSIS",
@@ -487,12 +2011,20 @@ class CampaignProgressionMode(BotMode):
                 # result and allow the readiness scheduler's cooldown to
                 # submit a fresh bounded request later.
                 planner.discard(key)
+                retry_deadlines[key] = time.monotonic() + _ADVISORY_ROUTE_RETRY_COOLDOWN_SECONDS
+                retry_notices.discard(key)
             return None, False, timed_out
         diagnostic_print(
-            lambda: f"CAMPAIGN_RECOVERY_ROUTE_ANALYSIS: state='complete' request_key={key[1]!r}",
+            lambda: (
+                "CAMPAIGN_RECOVERY_ROUTE_ANALYSIS: "
+                f"state='complete' request_key={key[1]!r} owner={trainer_owner_id!r} "
+                f"checkpoint={owner_checkpoint!r} candidate_edge={diagnostic_edge!r} priority=2"
+            ),
             trace=True,
             prefix="CAMPAIGN_RECOVERY_ROUTE_ANALYSIS",
         )
+        retry_deadlines.pop(key, None)
+        retry_notices.discard(key)
         return result, False, False
 
     def _campaign_controller(self):
@@ -508,11 +2040,14 @@ class CampaignProgressionMode(BotMode):
         them every frame, but does not change the party's readiness facts or the
         set of map-level recovery affordances.  Battle completion explicitly
         invalidates the scheduler, while the map identity below naturally
-        invalidates it across a map transition.
+        invalidates it across a map transition. Encounter-stage evidence is
+        also included because a tactical encounter probe can discover a route
+        trainer after the ordinary readiness observation was cached.
         """
 
         runtime = getattr(context, "nuzlocke_runtime", None)
         snapshot = getattr(runtime, "latest_snapshot", None)
+        encounter_stage_key = _encounter_stage_readiness_key()
         if snapshot is not None:
             player = getattr(snapshot, "player", None)
             map_id = (
@@ -521,11 +2056,24 @@ class CampaignProgressionMode(BotMode):
             )
             state = getattr(getattr(snapshot, "game_state", None), "name", None)
             controllable = getattr(player, "controllable", None)
+            # The runtime snapshot is intentionally immutable and can lag one
+            # frame behind gMapHeader while a door/map transition settles.
+            # Read the live avatar boundary for map ownership so readiness is
+            # guaranteed to run once on the destination map.
+            try:
+                avatar = get_player_avatar()
+                live_map_id = getattr(avatar, "map_group_and_number", None)
+                if live_map_id is not None:
+                    map_id = getattr(live_map_id, "value", live_map_id)
+                controllable = player_avatar_is_controllable()
+            except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+                pass
             return (
                 state,
                 map_id,
                 controllable,
                 getattr(snapshot, "readiness_revision", None),
+                encounter_stage_key,
             )
         try:
             avatar = get_player_avatar()
@@ -559,7 +2107,7 @@ class CampaignProgressionMode(BotMode):
         if snapshot is None:
             # Lightweight embedders may not mount the Nuzlocke runtime. Keep
             # their historical coarse key shape and behavior.
-            return (state, map_id, controllable, ball_count)
+            return (state, map_id, controllable, ball_count, encounter_stage_key)
 
         try:
             party_signature = tuple(
@@ -600,7 +2148,33 @@ class CampaignProgressionMode(BotMode):
             )
         except (AttributeError, TypeError, ValueError):
             campaign_signature = None
-        return (state, map_id, controllable, ball_count, party_signature, inventory_signature, campaign_signature)
+        return (
+            state,
+            map_id,
+            controllable,
+            ball_count,
+            party_signature,
+            inventory_signature,
+            campaign_signature,
+            encounter_stage_key,
+        )
+
+    @staticmethod
+    def _readiness_transient_context():
+        """Return the live avatar boundary used for transient readiness.
+
+        The stable readiness cache intentionally ignores walking coordinates.
+        A transient ``OVERWORLD_UNAVAILABLE`` result is different: it can be
+        produced while the avatar still has a warp-time coordinate such as
+        ``(10, -1)`` and must be refreshed when the live avatar reaches its
+        actual destination tile.
+        """
+
+        try:
+            avatar = get_player_avatar()
+            return avatar.map_group_and_number, avatar.local_coordinates
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            return None
 
     @staticmethod
     def _recovery_candidate_goals(current_location, recovery, *, is_rse):
@@ -634,7 +2208,24 @@ class CampaignProgressionMode(BotMode):
     def _readiness_input(self, objective, goal):
         """Build the current readiness diagnostic from shared ROM observations."""
 
+        readiness_policy = getattr(self, "_readiness_policy", None) or CampaignReadinessPolicy()
         self._readiness_evaluated = True
+        runtime = getattr(context, "nuzlocke_runtime", None)
+        session_id = getattr(runtime, "session_id", None)
+        if session_id is not None and getattr(context, "campaign_defeated_trainer_session_id", None) != session_id:
+            context.campaign_defeated_trainer_ids = set()
+            context.campaign_defeated_trainer_session_id = session_id
+            context.campaign_trainer_facts = ()
+            context.campaign_encounter_stage = None
+            context.campaign_capability_completion_latch = None
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_TRAINER_FRONTIER_RESET: "
+                    f"session_id={session_id!r} reason='observed campaign session changed'"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_TRAINER_FRONTIER_RESET",
+            )
         # Perceive the overworld first.  The callback-based game-state reader
         # can briefly report UNKNOWN at a battle/script boundary even when
         # the authoritative overworld observation has already become stable.
@@ -645,7 +2236,13 @@ class CampaignProgressionMode(BotMode):
         # Without this projection a damaged party is classified as
         # opportunistically unknown and the campaign waits in place.
         readiness_goal = goal
-        if readiness_goal is None:
+        # Interaction capabilities can own a destination without exposing a
+        # navigation goal of their own.  Readiness still needs to inspect the
+        # outbound route: this is how a mandatory story battle is claimed by
+        # the trainer checkpoint envelope before the interaction capability
+        # starts walking.  Preserve the original interaction goal for
+        # execution; this projection is only for safety analysis.
+        if isinstance(readiness_goal, ActivateTrigger) or readiness_goal is None:
             destination = getattr(objective, "destination", None)
             if isinstance(destination, tuple) and len(destination) == 2:
                 target_map = (
@@ -661,9 +2258,84 @@ class CampaignProgressionMode(BotMode):
                     encounter_mode=EncounterMode.AVOID,
                 )
 
+        trainer_checkpoint = None
+        trainer_readiness = None
+        trainer_engagement_required = False
         overworld = perceive_overworld()
         publish_shared_overworld_observation(overworld)
-        runtime = getattr(context, "nuzlocke_runtime", None)
+        try:
+            visible_trainer_facts = trainer_checkpoints_for_overworld(overworld)
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            visible_trainer_facts = ()
+        previous_trainer_facts = tuple(getattr(context, "campaign_trainer_facts", ()) or ())
+        if visible_trainer_facts:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_TRAINER_FACTS: "
+                    f"facts={tuple((fact.trainer_affordance_id, fact.display_name, fact.checkpoint_id, fact.source) for fact in visible_trainer_facts)!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_TRAINER_FACTS",
+            )
+        trainer_target = (
+            getattr(readiness_goal, "target", None)
+            if not isinstance(readiness_goal, EngageTrainer)
+            else readiness_goal
+        )
+        if isinstance(trainer_target, EngageTrainer):
+            trainer_engagement_required = True
+            trainer_checkpoint = trainer_checkpoint_for_source(
+                trainer_target.trainer_id,
+                script_symbol=_trainer_script_for_id(overworld, trainer_target.trainer_id),
+            )
+            if trainer_checkpoint is not None:
+                try:
+                    trainer_readiness = assess_live_trainer_checkpoint(
+                        trainer_checkpoint,
+                        get_party(),
+                        expected_exp=projected_trainer_experience(trainer_checkpoint),
+                        pc_candidates=_pc_trainer_readiness_candidates(),
+                    )
+                    context.campaign_trainer_checkpoint = trainer_checkpoint
+                    _remember_campaign_trainer_fact(trainer_checkpoint)
+                    context.campaign_trainer_readiness = trainer_readiness
+                    diagnostic_print(
+                        lambda: (
+                            "CAMPAIGN_TRAINER_READINESS: "
+                            f"checkpoint={trainer_checkpoint.checkpoint_id!r} "
+                            f"trainer={trainer_target.trainer_id!r} "
+                            f"status={trainer_readiness.status.value!r} "
+                            f"win_probability={established_search_probability(trainer_readiness.search, 'win_probability')!r} "
+                            f"catastrophic_probability={established_search_probability(trainer_readiness.search, 'catastrophic_probability')!r} "
+                            f"recommended_action={trainer_readiness.recommended_action!r} "
+                            f"lead={trainer_readiness.lead_name!r} "
+                            f"lead_source={trainer_readiness.lead_source!r} "
+                            f"roster_action={trainer_readiness.roster_action!r} "
+                            f"reason={trainer_readiness.reason!r}"
+                        ),
+                        trace=True,
+                        prefix="CAMPAIGN_TRAINER_READINESS",
+                    )
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                    trainer_readiness = BattleReadiness(
+                        trainer_checkpoint.checkpoint_id,
+                        BattleReadinessStatus.UNKNOWN,
+                        reason="known trainer checkpoint could not be evaluated from current party facts",
+                    )
+                    context.campaign_trainer_checkpoint = trainer_checkpoint
+                    context.campaign_trainer_readiness = trainer_readiness
+            else:
+                context.campaign_trainer_checkpoint = None
+                trainer_readiness = BattleReadiness(
+                    None,
+                    BattleReadinessStatus.UNKNOWN,
+                    reason="trainer checkpoint is not registered for conservative pre-battle planning",
+                )
+                context.campaign_trainer_readiness = trainer_readiness
+        else:
+            context.campaign_trainer_checkpoint = None
+            context.campaign_trainer_readiness = None
+
         snapshot = getattr(runtime, "latest_snapshot", None) if runtime is not None else None
         if snapshot is None:
             snapshot = get_nuzlocke_snapshot()
@@ -750,6 +2422,26 @@ class CampaignProgressionMode(BotMode):
                 pass
             stable_overworld = overworld_availability is Availability.KNOWN
 
+        overworld_availability_key = (
+            overworld_availability.value,
+            overworld_reason,
+            getattr(overworld, "map_id", None),
+            getattr(overworld, "player_coordinates", None),
+        )
+        if getattr(self, "_last_overworld_availability_key", None) != overworld_availability_key:
+            self._last_overworld_availability_key = overworld_availability_key
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_OVERWORLD_AVAILABILITY: "
+                    f"availability={overworld_availability.value!r} "
+                    f"reason={overworld_reason!r} "
+                    f"map={getattr(overworld, 'map_id', None)!r} "
+                    f"coordinates={getattr(overworld, 'player_coordinates', None)!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_OVERWORLD_AVAILABILITY",
+            )
+
         # ``get_nuzlocke_snapshot`` and ``perceive_overworld`` read different
         # emulator signals.  When only the callback classifier is unknown,
         # use the validated stable-overworld boundary instead of deferring
@@ -788,11 +2480,14 @@ class CampaignProgressionMode(BotMode):
         # the map synchronously, which stalls the active tactical controller
         # even when the party is healthy and already navigating normally.
         objective_id = getattr(objective, "objective_id", None)
+        critical_hp_threshold = readiness_policy.critical_hp_ratio_for(objective_id)
+        status_hp_threshold = readiness_policy.status_hp_ratio_for(objective_id)
         critical_recovery_needed = resource_observation_valid and (
             not resources.usable_party
             or any(member.fainted for member in resources.party)
             or resources.has_poisoned_party
-            or resources.worst_hp_ratio < CampaignReadinessPolicy().critical_hp_ratio
+            or resources.needs_status_recovery_at(status_hp_threshold)
+            or resources.worst_hp_ratio < critical_hp_threshold
         )
         # The main readiness policy owns opportunistic recovery for every
         # stable-overworld objective. Objective resource metadata still
@@ -800,7 +2495,7 @@ class CampaignProgressionMode(BotMode):
         # check is eligible.
         opportunistic_recovery_needed = (
             resource_observation_valid
-            and resources.worst_hp_ratio <= CampaignReadinessPolicy().opportunistic_hp_ratio
+            and resources.worst_hp_ratio <= readiness_policy.opportunistic_hp_ratio
         )
         recovery_needed = critical_recovery_needed or opportunistic_recovery_needed
         # Critical recovery is a safety decision, not a detour optimization.
@@ -890,14 +2585,63 @@ class CampaignProgressionMode(BotMode):
         # its bounded distance; composing a normal route plus recovery
         # outbound/continuation routes here launches redundant synchronous
         # searches in one application frame.
-        direct_targetless_recovery = (
-            objective is not None and goal is None
+        targetless_route_owner = (
+            objective is not None
+            and goal is None
+            and (
+                getattr(objective, "objective_id", "").startswith("reach_")
+                or getattr(objective, "objective_id", "").startswith("obtain_encounter:")
+            )
         )
+        direct_targetless_recovery = objective is not None and goal is None and not targetless_route_owner
         if direct_targetless_recovery and recovery_needed and not critical_recovery_needed:
             diagnostic_print(
                 lambda: (
                     "READINESS_ROUTE_ANALYSIS_SKIPPED: "
                     "reason='targetless capability uses selected recovery route directly' "
+                    f"distance_to_center={getattr(recovery, 'distance_to_center', None)!r}"
+                ),
+                trace=True,
+                prefix="READINESS_ROUTE_ANALYSIS_SKIPPED",
+            )
+        recovery_distance_for_policy = getattr(recovery, "distance_to_center", None)
+        nearby_recovery_route_ready = (
+            recovery_needed
+            and not critical_recovery_needed
+            and getattr(recovery, "center_available", False) is True
+            and getattr(recovery, "safe_to_reach_center", False) is True
+            and getattr(recovery, "route", None) is not None
+            and isinstance(recovery_distance_for_policy, (int, float))
+            and not isinstance(recovery_distance_for_policy, bool)
+            and recovery_distance_for_policy <= readiness_policy.opportunistic_detour_threshold
+        )
+        # A short route to the Center is only sufficient when this capability
+        # has no parent destination. A targetful objective must compare the
+        # complete ``start -> Center -> parent goal`` route with the direct
+        # route; the Center leg alone says nothing about the outbound
+        # continuation.
+        if nearby_recovery_route_ready and direct_targetless_recovery:
+            diagnostic_print(
+                lambda: (
+                    "READINESS_ROUTE_ANALYSIS_SKIPPED: "
+                    "reason='targetless capability uses selected recovery route directly' "
+                    f"distance_to_center={recovery_distance_for_policy!r}"
+                ),
+                trace=True,
+                prefix="READINESS_ROUTE_ANALYSIS_SKIPPED",
+            )
+        completed_recovery_route = (
+            recovery_needed
+            and getattr(recovery, "center_available", False) is True
+            and getattr(recovery, "safe_to_reach_center", False) is True
+            and getattr(recovery, "route", None) is not None
+        )
+        if completed_recovery_route and not critical_recovery_needed and direct_targetless_recovery:
+            diagnostic_print(
+                lambda: (
+                    "READINESS_ROUTE_ANALYSIS_SKIPPED: "
+                    "reason='completed_recovery_route_is_authoritative' "
+                    f"destination={getattr(recovery, 'center_location', None)!r} "
                     f"distance_to_center={getattr(recovery, 'distance_to_center', None)!r}"
                 ),
                 trace=True,
@@ -924,6 +2668,7 @@ class CampaignProgressionMode(BotMode):
             and not critical_recovery_needed
             and not direct_targetless_recovery
             and not getattr(recovery, "calculation_pending", False)
+            and not getattr(recovery, "calculation_timed_out", False)
             and overworld is not None
             and overworld_availability is Availability.KNOWN
             and readiness_goal is not None
@@ -961,12 +2706,23 @@ class CampaignProgressionMode(BotMode):
                     current_location,
                     readiness_goal,
                     candidates,
+                    tactical_goal=goal,
+                    allow_without_tactical_owner=completed_recovery_route,
                 )
                 if route_analysis_pending:
                     diagnostic_print(
                         lambda: (
                             "READINESS_ROUTE_ANALYSIS: "
                             f"state='pending' start={current_location!r} goal={readiness_goal!r}"
+                        ),
+                        trace=True,
+                        prefix="READINESS_ROUTE_ANALYSIS",
+                    )
+                elif route_analysis is None:
+                    diagnostic_print(
+                        lambda: (
+                            "READINESS_ROUTE_ANALYSIS: "
+                            f"state='deferred' start={current_location!r} goal={readiness_goal!r}"
                         ),
                         trace=True,
                         prefix="READINESS_ROUTE_ANALYSIS",
@@ -1024,6 +2780,271 @@ class CampaignProgressionMode(BotMode):
                 trace=True,
                 prefix="READINESS_ROUTE_ANALYSIS_SKIPPED",
             )
+        # Trainer exposure is a campaign safety fact even when no recovery
+        # detour is being considered.  The older implementation only had a
+        # RouteAnalysis on the opportunistic-recovery path, so a healthy party
+        # could traverse directly to Petalburg without ever inspecting its
+        # normal route for Calvin's sight line. Reuse the bounded background
+        # analyzer with no intermediate destinations to obtain that route.
+        trainer_route_goal = readiness_goal or getattr(recovery, "navigation_goal", None)
+        if (
+            recovery_needed
+            and getattr(recovery, "calculation_pending", False)
+            and route_analysis is None
+        ):
+            # Recovery owns the shared route worker until its selected healing
+            # route is known. Trainer-risk analysis is advisory at this
+            # boundary; launching it here only queues stale work behind the
+            # recovery calculation and makes the readiness loop appear stuck.
+            diagnostic_print(
+                lambda: (
+                    "READINESS_ROUTE_ANALYSIS_SKIPPED: "
+                    "reason='recovery_calculation_pending' "
+                    f"recovery_error={getattr(recovery, 'observation_error', None)!r}"
+                ),
+                trace=True,
+                prefix="READINESS_ROUTE_ANALYSIS_SKIPPED",
+            )
+        if (
+            route_analysis is None
+            and not route_analysis_pending
+            and not route_analysis_timed_out
+            and not getattr(recovery, "calculation_pending", False)
+            and overworld_availability is Availability.KNOWN
+            and _is_map_traversal_readiness_goal(trainer_route_goal)
+            and (
+                goal is not None
+                or getattr(objective, "objective_id", "").startswith("reach_")
+                    or getattr(objective, "objective_id", "").startswith("obtain_encounter:")
+                    or (
+                        getattr(objective, "destination", None) is not None
+                        and getattr(objective, "objective_id", None) != "receive_pokedex"
+                    )
+                    or (
+                    direct_targetless_recovery
+                    and getattr(objective, "objective_id", "").startswith("restock_")
+                )
+            )
+        ):
+            try:
+                current_location = (overworld.map_id, overworld.player_coordinates)
+                world = NavigationWorld.from_overworld(overworld)
+                graph = get_world_map_graph()
+                route_analysis, route_analysis_pending, route_analysis_timed_out = self._analyze_route_async(
+                    world,
+                    graph,
+                    current_location,
+                    trainer_route_goal,
+                    (),
+                    tactical_goal=goal,
+                )
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_TRAINER_ROUTE_ANALYSIS: "
+                        f"state={'pending' if route_analysis_pending else 'timed_out' if route_analysis_timed_out else 'complete'} "
+                        f"normal_destination={getattr(getattr(route_analysis, 'normal_route', None), 'destination', None)!r} "
+                        f"forced_trainer_exposure={getattr(getattr(route_analysis, 'normal_route', None), 'forced_trainer_exposure', None)!r} "
+                        f"trainer_risks={[(getattr(risk, 'trainer_id', None), getattr(getattr(risk, 'avoidability', None), 'value', None), getattr(risk, 'detour', None)) for risk in getattr(route_analysis, 'trainer_risks', ())]!r}"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_TRAINER_ROUTE_ANALYSIS",
+                )
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                route_analysis = None
+
+        encounter_stage_risks = _encounter_stage_route_risks(overworld, objective)
+        if encounter_stage_risks:
+            if route_analysis is None:
+                route_analysis = RouteAnalysis(
+                    readiness_goal,
+                    None,
+                    None,
+                    (),
+                    encounter_stage_risks,
+                )
+            else:
+                route_analysis = replace(
+                    route_analysis,
+                    trainer_risks=tuple(getattr(route_analysis, "trainer_risks", ()) or ())
+                    + encounter_stage_risks,
+                )
+            for risk in encounter_stage_risks:
+                if getattr(risk, "confidence", "known") != "known":
+                    continue
+                checkpoint = _encounter_stage_checkpoint_for_id(
+                    overworld,
+                    risk.trainer_id,
+                    getattr(context, "campaign_encounter_stage", None),
+                )
+                if checkpoint is not None:
+                    _remember_campaign_trainer_fact(checkpoint)
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_ENCOUNTER_STAGE_ROUTE_RISK: "
+                    f"risks={[(risk.trainer_id, risk.avoidability.value, risk.confidence) for risk in encounter_stage_risks]!r} "
+                    f"reason={getattr(getattr(context, 'campaign_encounter_stage', None), 'reason', None)!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_ENCOUNTER_STAGE_ROUTE_RISK",
+            )
+
+        static_route_trainer_facts = _static_route_trainer_facts(overworld, route_analysis)
+        route_trainer_facts = _merge_route_trainer_facts(
+            overworld,
+            (*previous_trainer_facts, *visible_trainer_facts),
+            route_analysis,
+            static_route_trainer_facts,
+        )
+        if route_trainer_facts != previous_trainer_facts:
+            context.campaign_trainer_facts = route_trainer_facts
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_TRAINER_FACTS: "
+                    f"source='route_analysis' facts={tuple((fact.trainer_affordance_id, fact.display_name, fact.checkpoint_id, fact.source) for fact in route_trainer_facts)!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_TRAINER_FACTS",
+            )
+
+        # Route analysis supplies two separate facts: a trainer actually
+        # intersects the selected path, and a trainer-free alternative exists
+        # but costs enough to be strategically unattractive.  Promote either
+        # case to an explicit EngageTrainer goal only when the checkpoint is
+        # known and the policy says the exposure deserves preparation. Cheap
+        # avoidance therefore remains the default, while Calvin-like
+        # forced/near-forced routes become deliberate, prepared battles.
+        route_trainer_id = _known_trainer_checkpoint_on_route(
+            overworld,
+            readiness_goal,
+            route_analysis,
+        )
+        if route_trainer_id is None and static_route_trainer_facts:
+            route_trainer_id = static_route_trainer_facts[0].trainer_affordance_id
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_STATIC_ROUTE_TRAINER: "
+                    f"trainer={route_trainer_id!r} "
+                    f"checkpoint={static_route_trainer_facts[0].checkpoint_id!r} "
+                    "reason='future-map static sight line intersects normal route'"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_STATIC_ROUTE_TRAINER",
+            )
+        if route_trainer_id is None:
+            route_trainer_id = _mandatory_trainer_on_outbound_map(
+                overworld,
+                readiness_goal,
+                route_analysis,
+            )
+            if route_trainer_id is not None:
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_MANDATORY_TRAINER_FALLBACK: "
+                        f"trainer={route_trainer_id!r} "
+                        f"current_map={getattr(overworld, 'map_id', None)!r} "
+                        f"target={getattr(getattr(readiness_goal, 'target', readiness_goal), 'target_map', None)!r} "
+                        "reason='registered mandatory trainer on outbound map'"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_MANDATORY_TRAINER_FALLBACK",
+                )
+        encounter_objective = getattr(objective, "objective_id", "").startswith("obtain_encounter:")
+        promoted_risk_trainer_id = _trainer_risk_selected_for_engagement(
+            route_analysis,
+            readiness_policy,
+        )
+        # An encounter route owns movement only while it can avoid the
+        # trainer. A route risk that reaches the preparation threshold changes
+        # ownership: the campaign must prepare for that ROM-backed trainer
+        # before mounting the encounter capability. Cheaply avoidable Cindy
+        # style sight lines remain encounter-owned and are routed around.
+        selected_route_trainer_id = (
+            promoted_risk_trainer_id
+            if encounter_objective
+            else route_trainer_id or promoted_risk_trainer_id
+        )
+        if (
+            selected_route_trainer_id is not None
+            and not isinstance(readiness_goal, EngageTrainer)
+            and not _objective_owns_scripted_trainer_battle(objective)
+        ):
+            readiness_goal = NavigationGoal(
+                EngageTrainer(selected_route_trainer_id),
+                constraints=GoalConstraints(trainer_mode=TrainerMode.ENGAGE),
+                encounter_mode=EncounterMode.AVOID,
+            )
+            trainer_engagement_required = True
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_TRAINER_RISK_PROMOTED: "
+                    f"trainer={selected_route_trainer_id!r} "
+                    f"route_exposure={route_trainer_id!r} "
+                    f"policy_threshold={getattr(readiness_policy, 'trainer_risk_prepare_at', None)!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_TRAINER_RISK_PROMOTED",
+            )
+
+        if trainer_readiness is None:
+            route_trainer_id = selected_route_trainer_id
+            if route_trainer_id is not None:
+                # Route promotion is already a campaign safety decision. Keep
+                # the preparation owner set even if live party/PC facts are
+                # transiently unavailable while resolving the checkpoint;
+                # the readiness policy must wait for that evidence instead
+                # of allowing a scripted capability to walk into the battle.
+                trainer_engagement_required = True
+                trainer_checkpoint = next(
+                    (
+                        fact
+                        for fact in tuple(getattr(context, "campaign_trainer_facts", ()) or ())
+                        if getattr(fact, "trainer_affordance_id", None) == route_trainer_id
+                    ),
+                    None,
+                )
+                if trainer_checkpoint is None:
+                    trainer_checkpoint = _encounter_stage_checkpoint_for_id(
+                        overworld,
+                        route_trainer_id,
+                        getattr(context, "campaign_encounter_stage", None),
+                    )
+                if trainer_checkpoint is not None:
+                    try:
+                        trainer_readiness = assess_live_trainer_checkpoint(
+                            trainer_checkpoint,
+                            get_party(),
+                            expected_exp=projected_trainer_experience(trainer_checkpoint),
+                            pc_candidates=_pc_trainer_readiness_candidates(),
+                        )
+                        context.campaign_trainer_checkpoint = trainer_checkpoint
+                        _remember_campaign_trainer_fact(trainer_checkpoint)
+                        context.campaign_trainer_readiness = trainer_readiness
+                        diagnostic_print(
+                            lambda: (
+                                "CAMPAIGN_TRAINER_ROUTE_READINESS: "
+                                f"checkpoint={trainer_checkpoint.checkpoint_id!r} "
+                                f"trainer={route_trainer_id!r} "
+                                f"status={trainer_readiness.status.value!r} "
+                                f"win_probability={established_search_probability(trainer_readiness.search, 'win_probability')!r} "
+                                f"catastrophic_probability={established_search_probability(trainer_readiness.search, 'catastrophic_probability')!r} "
+                                f"recommended_action={trainer_readiness.recommended_action!r} "
+                                f"lead={trainer_readiness.lead_name!r} "
+                                f"lead_source={trainer_readiness.lead_source!r} "
+                                f"roster_action={trainer_readiness.roster_action!r} "
+                                f"reason={trainer_readiness.reason!r}"
+                            ),
+                            trace=True,
+                            prefix="CAMPAIGN_TRAINER_ROUTE_READINESS",
+                        )
+                    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                        trainer_readiness = BattleReadiness(
+                            trainer_checkpoint.checkpoint_id,
+                            BattleReadinessStatus.UNKNOWN,
+                            reason="known route trainer checkpoint could not be evaluated from current party facts",
+                        )
+                        context.campaign_trainer_checkpoint = trainer_checkpoint
+                        context.campaign_trainer_readiness = trainer_readiness
+
         return build_progression_readiness_diagnostic(
             snapshot,
             objective_id=objective.objective_id if objective is not None else None,
@@ -1043,11 +3064,69 @@ class CampaignProgressionMode(BotMode):
             targetless=goal is None,
             route_analysis_pending=route_analysis_pending,
             route_analysis_timed_out=route_analysis_timed_out,
+            trainer_checkpoint=trainer_checkpoint,
+            trainer_readiness=trainer_readiness,
+            trainer_engagement_required=trainer_engagement_required,
+            trainer_risks=tuple(getattr(route_analysis, "trainer_risks", ()) or ()),
+            encounter_stage=getattr(context, "campaign_encounter_stage", None),
         )
 
-    def on_battle_started(self, encounter) -> BattleAction:
+    def requires_explicit_battle_policy(self) -> bool:
+        """Keep Campaign Progression away from the global battle fallback."""
+
+        return True
+
+    def _campaign_battle_strategy_for_objective(self, objective):
+        """Return the strict strategy used when a battle is already active."""
+
+        objective_id = getattr(objective, "objective_id", None)
+        if objective_id == "defeat_roxanne":
+            return RoxanneBattleStrategy()
+        if objective_id == "complete_intro_rival":
+            return EmeraldIntroRivalBattleStrategy()
+        return NuzlockeLevelBalancingBattleStrategy()
+
+    def battle_strategy_for_restored_battle(self) -> BattleStrategy:
+        """Resume a save-state battle without constructing the legacy strategy."""
+
+        controller = getattr(self, "controller", None)
+        selection = getattr(controller, "last_selection", None)
+        objective = getattr(selection, "objective", None)
+        return self._campaign_battle_strategy_for_objective(objective)
+
+    def battle_strategy_for_run_away(self) -> BattleStrategy:
+        """Use the strict escape policy for Campaign wild-battle exits."""
+
+        return NuzlockeRunAwayStrategy()
+
+    def on_battle_started(self, encounter) -> BattleAction | BattleStrategy:
         """Choose campaign battle policy, leaving execution to the listener."""
         self._active_battle_wild = encounter is not None
+        self._active_trainer_checkpoints = ()
+        context.campaign_wild_battle_intent = None
+        try:
+            first_battle = BattleType.FirstBattle in get_battle_type()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            first_battle = False
+        if first_battle:
+            # Emerald's introductory wild battle is mandatory: it is neither
+            # a legal encounter nor an escapable transit battle.
+            context.campaign_wild_battle_intent = WildBattleIntent.DEFEAT.value
+            diagnostic_print(
+                lambda: "CAMPAIGN_WILD_BATTLE_INTENT: intent='defeat' reason='mandatory FirstBattle'",
+                trace=True,
+                prefix="CAMPAIGN_WILD_BATTLE_INTENT",
+            )
+        if encounter is None:
+            self._active_trainer_checkpoints = _trainer_checkpoints_for_battle_start()
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_TRAINER_BATTLE_HANDOFF: "
+                    f"latched={tuple(getattr(checkpoint, 'checkpoint_id', None) for checkpoint in self._active_trainer_checkpoints)!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_TRAINER_BATTLE_HANDOFF",
+            )
         scheduler = getattr(self, "_readiness_scheduler", None)
         if scheduler is not None:
             scheduler.invalidate("battle_started")
@@ -1077,6 +3156,34 @@ class CampaignProgressionMode(BotMode):
             if not legality.allowed:
                 raise BotModeError(f"Campaign battle entry rejected: {legality.reason}")
 
+            # A known unavoidable trainer must have a legal EXP recipient plan
+            # before the battle can begin.  This is separate from the current
+            # level check: a level-cap-legal party can still be close enough
+            # to the next level that the trainer reward would make the run
+            # illegal after the battle.
+            checkpoint = getattr(context, "campaign_trainer_checkpoint", None)
+            if encounter is None and checkpoint is not None and legality.assessment.level_cap is not None:
+                budget = build_exp_budget(
+                    get_party(),
+                    target_level=None,
+                    level_cap=legality.assessment.level_cap,
+                    unavoidable_checkpoints=(checkpoint,),
+                )
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_TRAINER_EXP_ENTRY: "
+                        f"trainer={getattr(checkpoint, 'checkpoint_id', None)!r} "
+                        f"projected_exp={budget.unavoidable_exp!r} cap_headroom={budget.cap_headroom!r} "
+                        f"legal={budget.mandatory_exp_is_legal!r}"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_TRAINER_EXP_ENTRY",
+                )
+                if budget.mandatory_exp_is_legal is not True:
+                    raise BotModeError(
+                        "Campaign trainer battle entry rejected: projected trainer EXP cannot be absorbed below the active cap"
+                    )
+
             # A preparation area still owns the first legal wild encounter.
             # Resolve that ownership before selecting the training strategy;
             # otherwise the strategy would defeat a catchable encounter.
@@ -1089,7 +3196,7 @@ class CampaignProgressionMode(BotMode):
                     )
                 except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
                     legal_capture_target = False
-                if legal_capture_target:
+                if legal_capture_target and not first_battle:
                     diagnostic_print(
                         lambda: (
                             "CAMPAIGN_WILD_CAPTURE_HANDOFF: "
@@ -1099,6 +3206,28 @@ class CampaignProgressionMode(BotMode):
                         trace=False,
                     )
                     return BattleAction.Catch
+            if encounter is not None:
+                # Objective-specific preparation enters this branch before
+                # the ordinary wild-boundary handler below. Assign the
+                # training intent here so the battle planner receives
+                # ``training`` even for registered preparation objectives.
+                resource_policy = getattr(objective, "resource_policy", None)
+                if not first_battle:
+                    context.campaign_wild_battle_intent = choose_wild_battle_intent(
+                        WildBattlePolicyInput(
+                            preparation_requested=bool(getattr(context, "campaign_preparation_target", None)),
+                            policy_intent=getattr(
+                                resource_policy,
+                                "wild_battle_intent",
+                                WildBattleIntent.AUTO,
+                            ),
+                            duplicate_policy=getattr(
+                                resource_policy,
+                                "duplicate_encounter_policy",
+                                DuplicateEncounterPolicy.RUN,
+                            ),
+                        )
+                    ).value
             if objective.objective_id == "prepare_roxanne":
                 return NuzlockeLevelBalancingBattleStrategy()
             if objective.objective_id == "defeat_roxanne":
@@ -1109,7 +3238,7 @@ class CampaignProgressionMode(BotMode):
             # The Nuzlocke rules projection is authoritative about whether
             # this wild battle owns the area's first legal encounter.  Make
             # that decision at the listener boundary so Campaign Progression
-            # can use the existing CatchStrategy; relying only on the later
+            # can use the campaign capture strategy; relying only on the later
             # battle-state property lets the opening turn fall through to a
             # defeating move when the projection has just crossed the battle
             # start boundary.
@@ -1121,7 +3250,8 @@ class CampaignProgressionMode(BotMode):
                 )
             except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
                 legal_capture_target = False
-            if legal_capture_target:
+            if legal_capture_target and not first_battle:
+                context.campaign_wild_battle_intent = WildBattleIntent.CAPTURE.value
                 diagnostic_print(
                     lambda: (
                         "CAMPAIGN_WILD_CAPTURE_HANDOFF: "
@@ -1133,8 +3263,79 @@ class CampaignProgressionMode(BotMode):
                 return BattleAction.Catch
             objective = controller.last_selection.objective
             resource_policy = getattr(objective, "resource_policy", None)
+            duplicate_encounter = False
+            try:
+                encounter_species = (
+                    getattr(getattr(encounter, "pokemon", None), "species_name_for_stats", None)
+                    or getattr(getattr(getattr(encounter, "pokemon", None), "species", None), "name", None)
+                )
+                if runtime is not None and encounter_species:
+                    eligibility = runtime.capture_eligibility_for(
+                        location,
+                        is_wild=True,
+                        is_trainer=False,
+                        species=(encounter_species,),
+                    )
+                    duplicate_encounter = bool(getattr(eligibility, "duplicate", False))
+            except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+                duplicate_encounter = False
+            policy_intent = getattr(
+                resource_policy,
+                "wild_battle_intent",
+                WildBattleIntent.AUTO,
+            )
+            duplicate_policy = getattr(
+                resource_policy,
+                "duplicate_encounter_policy",
+                DuplicateEncounterPolicy.RUN,
+            )
+            intent = (
+                WildBattleIntent.DEFEAT
+                if first_battle
+                else choose_wild_battle_intent(
+                    WildBattlePolicyInput(
+                        preparation_requested=bool(getattr(context, "campaign_preparation_target", None)),
+                        transit_requested=resource_policy is None,
+                        duplicate_encounter=duplicate_encounter,
+                        policy_intent=policy_intent,
+                        duplicate_policy=duplicate_policy,
+                    )
+                )
+            )
+            context.campaign_wild_battle_intent = intent.value
+            preparation_requested = bool(getattr(context, "campaign_preparation_target", None))
+            party = None
+            snapshot = None
+            decision = None
+            low_health_for_preparation = False
+            if preparation_requested:
+                try:
+                    party = tuple(get_party())
+                    ratios = tuple(
+                        pokemon.current_hp / pokemon.total_hp
+                        for pokemon in party
+                        if getattr(pokemon, "total_hp", 0) > 0 and getattr(pokemon, "current_hp", 0) > 0
+                    )
+                    low_health_for_preparation = bool(
+                        ratios
+                        and min(ratios)
+                        <= (getattr(getattr(self, "_readiness_policy", None), "opportunistic_hp_ratio", 0.75))
+                    )
+                except (AttributeError, RuntimeError, TypeError, ValueError, ZeroDivisionError):
+                    low_health_for_preparation = False
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_WILD_BATTLE_INTENT: "
+                    f"intent={intent.value!r} objective={getattr(objective, 'objective_id', None)!r} "
+                    f"preparation={preparation_requested!r} "
+                    f"duplicate={duplicate_encounter!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_WILD_BATTLE_INTENT",
+            )
             if resource_policy is not None:
-                party = get_party()
+                if party is None:
+                    party = tuple(get_party())
                 snapshot = ResourceSnapshot(
                     tuple(
                         PartyResource(
@@ -1159,15 +3360,41 @@ class CampaignProgressionMode(BotMode):
                     trace=True,
                 )
                 if decision is ResourceDecision.PREFER_RUN:
-                    return BattleAction.RunAway
+                    diagnostic_print(
+                        lambda: (
+                            "CAMPAIGN_RESOURCE: wild intent retains planner ownership "
+                            f"intent={intent.value!r} preparation={preparation_requested!r}"
+                        ),
+                        trace=True,
+                    )
+            request_recovery = getattr(controller, "request_recovery_after_wild_battle", None)
+            resource_boundary_requires_recovery = (
+                low_health_for_preparation
+                or (
+                    decision is ResourceDecision.PREFER_RUN
+                    and snapshot is not None
+                    and snapshot.worst_hp_ratio <= getattr(
+                        getattr(self, "_readiness_policy", None), "opportunistic_hp_ratio", 0.75
+                    )
+                )
+            )
+            if encounter is not None and resource_boundary_requires_recovery and callable(request_recovery):
+                request_recovery("wild_battle_resource_boundary")
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_RESOURCE: wild battle completed its battle-boundary handoff "
+                        f"intent={intent.value!r} preparation={preparation_requested!r} "
+                        f"low_health_for_preparation={low_health_for_preparation!r}"
+                    ),
+                    trace=True,
+                    prefix="CAMPAIGN_WILD_BATTLE_RECOVERY_HANDOFF",
+                )
         # Ordinary campaign-owned battles should rotate the lowest-level
         # living party member into the lead.  The explicit handlers above
         # retain their specialized policies, and legal wild captures were
-        # handed to CatchStrategy before reaching this point.  This applies
+        # handed to the campaign capture strategy before reaching this point. This applies
         # to trainer battles too, where ``encounter`` is None.
-        if objective is not None:
-            return NuzlockeLevelBalancingBattleStrategy()
-        return BattleAction.Fight
+        return self._campaign_battle_strategy_for_objective(objective)
 
     def capture_battle_strategy(self):
         """Return the campaign capture policy for the battle listener."""
@@ -1185,6 +3412,41 @@ class CampaignProgressionMode(BotMode):
     def on_battle_ended(self, outcome) -> None:
         """Invalidate readiness after a battle changes party or route state."""
 
+        if outcome is BattleOutcome.Won and getattr(self, "_active_battle_wild", None) is not True:
+            checkpoints = tuple(getattr(self, "_active_trainer_checkpoints", ()) or ())
+            if not checkpoints:
+                # This is only a compatibility fallback for a battle that was
+                # entered before the latch existed. Do not use the readiness
+                # checkpoint here: it may already describe the next trainer.
+                checkpoint = getattr(context, "campaign_active_trainer_checkpoint", None)
+                checkpoints = (checkpoint,) if checkpoint is not None else ()
+            for checkpoint in checkpoints:
+                _remember_defeated_trainer(checkpoint)
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_TRAINER_BATTLE_HANDOFF: "
+                    f"outcome='Won' cleared={tuple(getattr(checkpoint, 'checkpoint_id', None) for checkpoint in checkpoints)!r}"
+                ),
+                trace=True,
+                prefix="CAMPAIGN_TRAINER_BATTLE_HANDOFF",
+            )
+        self._active_trainer_checkpoints = ()
+        context.campaign_active_trainer_checkpoint = None
+
+        pending_fainted = getattr(self, "_pending_fainted_identities", None)
+        if pending_fainted is None:
+            pending_fainted = self._pending_fainted_identities = set()
+        try:
+            party = get_party()
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            party = ()
+        pending_fainted.update(
+            identity
+            for pokemon in party
+            if getattr(pokemon, "current_hp", 0) <= 0
+            and (identity := PokemonIdentity.from_pokemon(pokemon)) is not None
+        )
+
         # Campaign tactical loops are suspended while BattleListener owns the
         # battle. Trainer battles can move/defeat an overworld object, so the
         # cached route must be discarded. Wild battles do not alter route
@@ -1193,7 +3455,9 @@ class CampaignProgressionMode(BotMode):
         # cases so HP, party, and Poké Ball changes are observed.
         wild_battle = getattr(self, "_active_battle_wild", None)
         self._active_battle_wild = None
-        self._clear_background_route_state()
+        context.campaign_wild_battle_intent = None
+        if wild_battle is not True:
+            self._clear_background_route_state()
         controller = getattr(self, "controller", None)
         selection = getattr(controller, "last_selection", None)
         objective = getattr(selection, "objective", None)
@@ -1238,7 +3502,9 @@ class CampaignProgressionMode(BotMode):
 
         reason = "campaign_boundary_changed"
         if isinstance(previous, tuple) and isinstance(current, tuple):
-            if len(previous) > 1 and len(current) > 1 and previous[1] != current[1]:
+            if len(previous) >= 5 and len(current) >= 5 and previous[-1] != current[-1]:
+                reason = "encounter_stage_changed"
+            elif len(previous) > 1 and len(current) > 1 and previous[1] != current[1]:
                 reason = "map_changed"
             elif len(previous) > 0 and len(current) > 0 and previous[0] != current[0]:
                 reason = "game_state_changed"
@@ -1268,11 +3534,61 @@ class CampaignProgressionMode(BotMode):
         previous = None
         previous_phase = None
         while True:
+            if getattr(self, "_whiteout_continuation_pending", False):
+                self._whiteout_continuation_pending = False
+                diagnostic_print(
+                    "CAMPAIGN_WHITEOUT_CONTINUATION: starting PC roster replacement",
+                    trace=True,
+                    prefix="CAMPAIGN_WHITEOUT_CONTINUATION",
+                )
+                try:
+                    yield from execute_whiteout_continuation()
+                except Exception as error:
+                    diagnostic_print(
+                        lambda: (
+                            "CAMPAIGN_WHITEOUT_CONTINUATION_FAILED: "
+                            f"exception_type={type(error).__name__!r} error={error!r}"
+                        ),
+                        trace=True,
+                        prefix="CAMPAIGN_WHITEOUT_CONTINUATION_FAILED",
+                    )
+                    if isinstance(error, RunLostError):
+                        # A run with no living PC continuation is a normal
+                        # autonomous terminal outcome. Reset the emulator and
+                        # let the opening/campaign capability start the next
+                        # fresh run; manual mode must never be the loss path.
+                        diagnostic_print(
+                            lambda: (
+                                "CAMPAIGN_RUN_LOST_RESTART: "
+                                f"reason={error!r} action='emulator_reset_and_restart'"
+                            ),
+                            trace=True,
+                            prefix="CAMPAIGN_RUN_LOST_RESTART",
+                        )
+                        context.message = "Run lost; restarting the campaign autonomously."
+                        context.emulator.reset_held_buttons()
+                        context.emulator.reset()
+                        return
+                    context.message = f"Whiteout continuation failed: {error}. Switched back to manual mode."
+                    context.set_manual_mode()
+                    return
+                self.controller.request_refresh("whiteout_continuation_completed")
+                self._lead_handoff_pending = True
             controller = self._campaign_controller()
             self._observe_campaign_boundary(controller)
             state = controller.step()
             marker = (state.status, state.objective_id, state.reason)
             lead_handoff_pending = getattr(self, "_lead_handoff_pending", False)
+            if (
+                getattr(state, "execution_phase", "CAMPAIGN") == "RECOVERY"
+                and previous_phase != "RECOVERY"
+            ):
+                # A readiness pass may have started speculative trainer-route
+                # analysis while the recovery route was still being resolved.
+                # Once the controller owns the recovery stop, that analysis
+                # cannot affect the mounted plan and only competes with the
+                # emulator while the recovery generator is executing.
+                self._clear_background_route_state()
             if (
                 getattr(state, "execution_phase", "CAMPAIGN") == "CAMPAIGN"
                 and state.status.value == "ready"
@@ -1288,6 +3604,8 @@ class CampaignProgressionMode(BotMode):
                     )
                 )
             ):
+                if previous_phase == "RECOVERY":
+                    self._clear_background_route_state()
                 reason = (
                     "battle_or_capture_completed"
                     if lead_handoff_pending
@@ -1296,6 +3614,24 @@ class CampaignProgressionMode(BotMode):
                     else "campaign_objective_handoff"
                 )
                 self._lead_handoff_pending = False
+                # Trainer exposure has its own final staging boundary. The
+                # general field-lead policy must not rotate the party here,
+                # between trainer readiness and the engagement route.
+                trainer_exposure_owner = _campaign_goal_owns_trainer_exposure(
+                    getattr(state, "tactical_goal", None)
+                )
+                if trainer_exposure_owner:
+                    diagnostic_print(
+                        lambda: (
+                            "CAMPAIGN_FIELD_LEAD_HANDOFF: "
+                            f"rotated=False reason={reason!r} "
+                            "deferred_to='trainer_exposure_staging'"
+                        ),
+                        trace=True,
+                    )
+                    previous = marker
+                    previous_phase = getattr(state, "execution_phase", "CAMPAIGN")
+                    continue
                 try:
                     leveling_strategy = NuzlockeLevelBalancingBattleStrategy()
                 except (AttributeError, RuntimeError, TypeError, ValueError, IndexError) as error:

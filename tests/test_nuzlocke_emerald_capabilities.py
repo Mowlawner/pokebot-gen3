@@ -36,7 +36,7 @@ from modules.overworld import (
     TriggerObservation,
     WarpObservation,
 )
-from modules.navigation import TransitionRelevance, classify_transition_relevance
+from modules.navigation import NavigationError, TransitionRelevance, classify_transition_relevance
 from modules.world_navigation import WorldEdge, WorldMapGraph
 from modules.nuzlocke.emerald_confirmation import (
     EmeraldConfirmationChoice,
@@ -318,7 +318,10 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
                 ("petalburg_wally_scene_complete", True),
             ),
         )
-        with patch.object(capabilities, "_emerald_observation", return_value=observation):
+        with (
+            patch.object(capabilities, "_emerald_observation", return_value=observation),
+            patch.object(capabilities.context, "campaign_capability_completion_latch", None),
+        ):
             campaign = capabilities.observation_driven_emerald_campaign("complete_petalburg_wally")
             with self.assertRaises(StopIteration):
                 next(campaign)
@@ -342,16 +345,79 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             with self.assertRaises(StopIteration):
                 next(progression)
 
+    def test_missing_current_map_affordance_discards_cached_tactical_loop(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        map_id = MapRSE.ROUTE103.value
+        semantic_trigger = TriggerObservation(
+            "introductory_rival",
+            frozenset({(map_id, (10, 3))}),
+            frozenset({(map_id, (10, 2))}),
+            kind="semantic_object",
+            affordance_id="Route103_EventScript_Rival",
+        )
+        observed = OverworldObservation(
+            map_id,
+            (10, 2),
+            Direction.South,
+            True,
+            (),
+            (),
+            (),
+            (semantic_trigger,),
+        )
+        binding_gap = replace(observed, triggers=())
+        created = []
+
+        class FakeLoop:
+            def __init__(self):
+                self.closed = False
+
+            def run(self):
+                try:
+                    while True:
+                        yield None
+                finally:
+                    self.closed = True
+
+            def close(self):
+                self.closed = True
+
+        def fake_constructor(*_args, **_kwargs):
+            loop = FakeLoop()
+            created.append(loop)
+            return loop
+
+        with (
+            patch.object(capabilities, "perceive_overworld", side_effect=(observed, binding_gap)),
+            patch.object(capabilities, "AgentControlLoop", side_effect=fake_constructor),
+        ):
+            cache = {}
+            progression = capabilities.observation_driven_overworld_progression(
+                semantic_target=SemanticTarget.interaction(map_id, "Route103_EventScript_Rival"),
+                execution_cache=cache,
+            )
+            next(progression)
+            with self.assertRaises(StopIteration):
+                next(progression)
+
+        self.assertEqual(len(created), 1)
+        self.assertTrue(created[0].closed)
+        self.assertNotIn("overworld", cache)
+
     def test_pokeball_restock_buys_to_the_upper_target(self):
         from modules.nuzlocke import emerald_capabilities as capabilities
 
         ball = SimpleNamespace(name="Poké Ball", price=200)
-        bag = SimpleNamespace(quantity_of=Mock(return_value=1))
+        antidote = SimpleNamespace(name="Antidote", price=100)
+        potion = SimpleNamespace(name="Potion", price=300)
+        items = {item.name: item for item in (ball, antidote, potion)}
+        bag = SimpleNamespace(quantity_of=lambda item: 1 if item is ball else 2)
         player = SimpleNamespace(money=2000)
         buy = Mock(return_value=iter((None,)))
         with (
             patch.object(capabilities, "task_is_active", side_effect=(True, False)),
-            patch("modules.items.get_item_by_name", return_value=ball),
+            patch("modules.items.get_item_by_name", side_effect=lambda name: items[name]),
             patch("modules.items.get_item_bag", return_value=bag),
             patch("modules.player.get_player", return_value=player),
             patch("modules.mart.get_mart_buyable_items", return_value=[ball]),
@@ -364,6 +430,154 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
                 next(restock)
 
         buy.assert_called_once_with([(ball, 9)])
+
+    def test_restock_travel_avoids_undefeated_trainers(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        source = SimpleNamespace(source_id="pokemart:petalburg")
+        overworld = SimpleNamespace(map_id=MapRSE.ROUTE104.value)
+        captured = {}
+
+        def fake_progression(**kwargs):
+            captured.update(kwargs)
+            yield
+
+        with (
+            patch.object(capabilities, "_shop_main_menu_is_active", return_value=False),
+            patch.object(capabilities, "_shop_task_is_active", return_value=False),
+            patch.object(capabilities, "_scripted_interruption_is_actionable", return_value=False),
+            patch.object(capabilities, "_rom_script_is_active", return_value=False),
+            patch.object(capabilities, "_baseline_shopping_plan", return_value=([("Potion", 1)], True, False)),
+            patch.object(capabilities, "_emerald_observation", return_value=SimpleNamespace(overworld=overworld)),
+            patch.object(capabilities, "_nearest_pokeball_source", return_value=source),
+            patch.object(
+                capabilities,
+                "_pokeball_source_target",
+                return_value=SemanticTarget.map(MapRSE.PETALBURG_CITY.value),
+            ),
+            patch.object(capabilities, "emerald_pokeball_source_entrances", return_value=()),
+            patch.object(capabilities, "_publish_navigation_intent"),
+            patch.object(
+                capabilities,
+                "observation_driven_overworld_progression",
+                side_effect=fake_progression,
+            ),
+        ):
+            restock = capabilities.execute_pokeball_restock(objective_id="restock_recovery_items")
+            next(restock)
+
+        policy = captured["navigation_policy"]
+        self.assertIsInstance(policy, NavigationGoal)
+        self.assertIs(policy.constraints.trainer_mode, TrainerMode.AVOID)
+        self.assertIs(policy.encounter_mode, capabilities.EncounterMode.AVOID)
+
+    def test_baseline_restock_combines_recovery_items_and_pokeballs(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        antidote = SimpleNamespace(name="Antidote", price=100)
+        potion = SimpleNamespace(name="Potion", price=300)
+        ball = SimpleNamespace(name="Poké Ball", price=200)
+        items = {item.name: item for item in (antidote, potion, ball)}
+        bag = SimpleNamespace(quantity_of=lambda item: 0 if item is not ball else 1)
+        player = SimpleNamespace(money=3000)
+        buy = Mock(return_value=iter((None,)))
+
+        with (
+            patch.object(capabilities, "task_is_active", side_effect=(True, False)),
+            patch("modules.items.get_item_by_name", side_effect=lambda name: items[name]),
+            patch("modules.items.get_item_bag", return_value=bag),
+            patch("modules.player.get_player", return_value=player),
+            patch("modules.mart.get_mart_buyable_items", return_value=[antidote, potion, ball]),
+            patch("modules.modes.util.higher_level_actions.buy_in_shop", buy),
+            patch.object(capabilities, "_finish_shop_exit_dialogue", return_value=iter(())),
+        ):
+            restock = capabilities.execute_pokeball_restock()
+            next(restock)
+            with self.assertRaises(StopIteration):
+                next(restock)
+
+        buy.assert_called_once_with([(antidote, 4), (potion, 5), (ball, 4)])
+
+    def test_combined_baseline_restock_preserves_recovery_cash_floor(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        antidote = SimpleNamespace(name="Antidote", price=100)
+        potion = SimpleNamespace(name="Potion", price=300)
+        ball = SimpleNamespace(name="Poké Ball", price=200)
+        items = {item.name: item for item in (antidote, potion, ball)}
+        bag = SimpleNamespace(quantity_of=lambda item: 0 if item is not ball else 1)
+        player = SimpleNamespace(money=2000)
+
+        with (
+            patch("modules.items.get_item_by_name", side_effect=lambda name: items[name]),
+            patch("modules.items.get_item_bag", return_value=bag),
+            patch("modules.player.get_player", return_value=player),
+            patch("modules.mart.get_mart_buyable_items", return_value=[antidote, potion, ball]),
+        ):
+            shopping, recovery_required, pokeball_required = capabilities._baseline_shopping_plan()
+
+        self.assertTrue(recovery_required)
+        self.assertTrue(pokeball_required)
+        self.assertEqual(shopping, [(antidote, 4), (potion, 4), (ball, 1)])
+
+    def test_combined_baseline_restock_reports_required_but_unaffordable_at_cash_floor(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        antidote = SimpleNamespace(name="Antidote", price=100)
+        potion = SimpleNamespace(name="Potion", price=300)
+        ball = SimpleNamespace(name="Poké Ball", price=200)
+        items = {item.name: item for item in (antidote, potion, ball)}
+        bag = SimpleNamespace(quantity_of=lambda _item: 0)
+        player = SimpleNamespace(money=200)
+
+        with (
+            patch("modules.items.get_item_by_name", side_effect=lambda name: items[name]),
+            patch("modules.items.get_item_bag", return_value=bag),
+            patch("modules.player.get_player", return_value=player),
+            patch("modules.mart.get_mart_buyable_items", return_value=[antidote, potion, ball]),
+        ):
+            shopping, recovery_required, pokeball_required = capabilities._baseline_shopping_plan()
+
+        self.assertEqual(shopping, [])
+        self.assertTrue(recovery_required)
+        self.assertTrue(pokeball_required)
+
+    def test_restock_route_planning_does_not_read_shop_catalog_in_overworld(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        antidote = SimpleNamespace(name="Antidote", price=100)
+        potion = SimpleNamespace(name="Potion", price=300)
+        ball = SimpleNamespace(name="Poké Ball", price=200)
+        items = {item.name: item for item in (antidote, potion, ball)}
+        bag = SimpleNamespace(quantity_of=lambda _item: 0)
+        player = SimpleNamespace(money=2000)
+        overworld = SimpleNamespace(map_id=MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value)
+        navigation = iter((None,))
+
+        with (
+            patch("modules.items.get_item_by_name", side_effect=lambda name: items[name]),
+            patch("modules.items.get_item_bag", return_value=bag),
+            patch("modules.player.get_player", return_value=player),
+            patch("modules.mart.get_mart_buyable_items", side_effect=AssertionError("shop catalog read in overworld")),
+            patch.object(capabilities, "_shop_main_menu_is_active", return_value=False),
+            patch.object(capabilities, "_shop_task_is_active", return_value=False),
+            patch.object(capabilities, "_scripted_interruption_is_actionable", return_value=False),
+            patch.object(capabilities, "_emerald_observation", return_value=SimpleNamespace(overworld=overworld)),
+            patch.object(
+                capabilities,
+                "_nearest_pokeball_source",
+                return_value=SimpleNamespace(source_id="oldale_mart"),
+            ),
+            patch.object(capabilities, "_pokeball_source_target", return_value=SemanticTarget.map((1, 0))),
+            patch.object(capabilities, "emerald_pokeball_source_entrances", return_value=()),
+            patch.object(capabilities, "_publish_navigation_intent") as publish_intent,
+            patch.object(capabilities, "observation_driven_overworld_progression", return_value=navigation) as navigate,
+        ):
+            restock = capabilities.execute_pokeball_restock(objective_id="restock_recovery_items")
+            next(restock)
+
+        navigate.assert_called_once()
+        publish_intent.assert_called_once_with(SemanticTarget.map((1, 0)), "Navigate to Poké Mart")
 
     def test_money_trainer_joins_trigger_to_live_object_defeat_state(self):
         from modules.nuzlocke import emerald_capabilities as capabilities
@@ -401,6 +615,46 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             available_id,
         )
 
+    def test_money_funding_excludes_scripted_tutorial_trainer_objects(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        trainer_id = "trainer:(0, 17):4"
+        tutorial_script = "PetalburgCity_EventScript_WallyTutorial"
+        overworld = SimpleNamespace(
+            map_id=(0, 17),
+            player_coordinates=(5, 5),
+            objects=(
+                SimpleNamespace(
+                    trainer_id=trainer_id,
+                    trainer_defeated=False,
+                    script=tutorial_script,
+                ),
+            ),
+            triggers=(
+                TriggerObservation(
+                    "wally_tutorial",
+                    frozenset(),
+                    activation_locations={((0, 17), (5, 4))},
+                    affordance_id=trainer_id,
+                    script_symbol=tutorial_script,
+                    hazard_locations={((0, 17), (5, 4))},
+                ),
+            ),
+        )
+
+        with patch.object(
+            capabilities,
+            "trainer_checkpoint_for_source",
+            return_value=SimpleNamespace(
+                checkpoint_kind="hazard",
+                party=(SimpleNamespace(level=5),),
+            ),
+        ):
+            self.assertEqual(
+                capabilities._observed_money_trainer_candidates(SimpleNamespace(overworld=overworld)),
+                (),
+            )
+
     def test_money_funding_waits_for_observed_trainer_payout(self):
         from modules.nuzlocke import emerald_capabilities as capabilities
 
@@ -430,7 +684,96 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             patch("modules.player.get_player", return_value=player),
             patch.object(capabilities, "observation_driven_overworld_progression", return_value=navigation()),
         ):
-            self.assertEqual(list(capabilities._earn_money_from_safe_trainer()), [None])
+            emitted = list(capabilities._earn_money_from_safe_trainer())
+            self.assertTrue(emitted)
+            self.assertTrue(all(item is None for item in emitted))
+
+    def test_money_funding_tries_next_candidate_after_route_failure(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        player = SimpleNamespace(money=100)
+        first = SimpleNamespace(map_id=(1, 2), trainer_id="trainer:(1, 2):1", estimated_route_cost=1, source="observed")
+        second = SimpleNamespace(map_id=(1, 2), trainer_id="trainer:(1, 2):2", estimated_route_cost=2, source="observed")
+        overworld = SimpleNamespace(map_id=(1, 2), player_coordinates=(1, 1))
+
+        def failed_navigation():
+            raise RuntimeError("first interaction is inaccessible")
+            yield
+
+        def successful_navigation():
+            player.money = 500
+            yield
+
+        with (
+            patch.object(capabilities, "_emerald_observation", return_value=SimpleNamespace(overworld=overworld)),
+            patch("modules.player.get_player", return_value=player),
+            patch.object(capabilities, "_money_trainer_candidates", return_value=(first, second)),
+            patch.object(
+                capabilities,
+                "observation_driven_overworld_progression",
+                side_effect=[failed_navigation(), successful_navigation()],
+            ) as navigate,
+        ):
+            emitted = list(capabilities._earn_money_from_safe_trainer())
+            self.assertTrue(emitted)
+            self.assertTrue(all(item is None for item in emitted))
+
+        assert navigate.call_count == 2
+        assert navigate.call_args_list[1].kwargs["semantic_target"] == SemanticTarget.interaction(
+            second.map_id, second.trainer_id
+        )
+
+    def test_money_funding_can_target_a_reachable_trainer_on_another_map(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        current_map = (0, 99)
+        target_map = MapRSE.ROUTE104.value
+        trainer_id = f"trainer:{target_map}:7"
+        player = SimpleNamespace(money=100)
+        overworld = SimpleNamespace(
+            map_id=current_map,
+            player_coordinates=(3, 4),
+            objects=(),
+            triggers=(),
+        )
+        trainer = SimpleNamespace(
+            trainer_id=trainer_id,
+            trainer_defeated=False,
+            location=(target_map, (8, 6)),
+        )
+        graph = Mock()
+        graph.map_costs.return_value = ((current_map, 0), (target_map, 3))
+        graph.estimate_location_cost.return_value = 12
+
+        def navigation():
+            player.money = 500
+            yield
+
+        with (
+            patch.object(capabilities, "_emerald_observation", return_value=SimpleNamespace(overworld=overworld)),
+            patch("modules.player.get_player", return_value=player),
+            patch("modules.world_navigation.get_world_map_graph", return_value=graph),
+            patch.object(
+                capabilities,
+                "get_map_metadata",
+                return_value=SimpleNamespace(),
+            ),
+            patch.object(
+                capabilities,
+                "static_trainer_observations",
+                side_effect=lambda map_id, _metadata: (trainer,) if map_id == target_map else (),
+            ),
+            patch.object(capabilities, "observation_driven_overworld_progression", return_value=navigation()) as navigate,
+        ):
+            emitted = list(capabilities._earn_money_from_safe_trainer())
+            self.assertTrue(emitted)
+            self.assertTrue(all(item is None for item in emitted))
+
+        self.assertEqual(
+            navigate.call_args.kwargs["semantic_target"],
+            SemanticTarget.interaction(target_map, trainer_id),
+        )
+        self.assertEqual(navigate.call_args.kwargs["navigation_policy"].target, capabilities.EngageTrainer(trainer_id))
 
     def test_recovery_shop_purchase_respects_cash_floor(self):
         from modules.nuzlocke import emerald_capabilities as capabilities
@@ -453,6 +796,37 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
 
         buy.assert_called_once_with([(antidote, 4), (potion, 1)])
 
+    def test_shopping_plan_message_lists_items_cost_and_cash_floor(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        antidote = SimpleNamespace(name="Antidote", price=100)
+        ball = SimpleNamespace(name="Poké Ball", price=200)
+        player = SimpleNamespace(money=1000)
+        ui_context = SimpleNamespace(message="")
+
+        with (
+            patch.object(capabilities, "context", ui_context),
+            patch("modules.player.get_player", return_value=player),
+            patch("modules.modes.util.higher_level_actions.buy_in_shop", return_value=iter(())),
+            patch.object(capabilities, "diagnostic_print") as diagnostic,
+        ):
+            list(
+                capabilities._purchase_shopping_plan(
+                    ([(antidote, 4), (ball, 2)], True, True),
+                    objective_id="restock_recovery_items",
+                )
+            )
+
+        self.assertIn("4x Antidote", ui_context.message)
+        self.assertIn("2x Poké Ball", ui_context.message)
+        self.assertIn("Total: $800", ui_context.message)
+        self.assertIn("wallet: $1,000", ui_context.message)
+        self.assertIn("cash floor: $200", ui_context.message)
+        diagnostic.assert_called_once()
+        diagnostic_message = diagnostic.call_args.args[0]
+        self.assertIn("4x Antidote", diagnostic_message())
+        self.assertIn("2x Poké Ball", diagnostic_message())
+
     def test_pokeball_restock_recognizes_shop_transition_tasks(self):
         from modules.nuzlocke import emerald_capabilities as capabilities
 
@@ -462,6 +836,167 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             side_effect=lambda task_name: task_name == "Task_GoToBuyOrSellMenu",
         ):
             self.assertTrue(capabilities._shop_task_is_active())
+
+    def test_pokeball_restock_recognizes_taskless_shop_script_handoff(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        script_context = SimpleNamespace(
+            is_active=True,
+            script_function_name="OldaleTown_Mart_ExpandedItems",
+            stack=("OldaleTown_Mart_ExpandedItems",),
+        )
+        with (
+            patch.object(capabilities, "task_is_active", return_value=False),
+            patch.object(capabilities, "get_global_script_context", return_value=script_context),
+        ):
+            self.assertTrue(capabilities._shop_task_is_active())
+
+    def test_empty_restock_plan_closes_the_open_mart_menu(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        emulator = SimpleNamespace(press_button_fresh=Mock())
+        with (
+            patch.object(capabilities, "context", SimpleNamespace(emulator=emulator)),
+            patch.object(capabilities, "_shop_main_menu_is_active", side_effect=(True, True, False, False)),
+            patch("modules.mart.get_mart_buyable_items", return_value=[]),
+            patch.object(capabilities, "_baseline_shopping_plan", return_value=([], False, True)),
+            patch.object(capabilities, "_finish_shop_exit_dialogue", return_value=iter(())),
+            patch.object(capabilities, "_scripted_interruption_is_actionable", return_value=False),
+            patch.object(capabilities, "_restock_wallet", return_value=100),
+            patch.object(capabilities, "_earn_money_from_safe_trainer", return_value=iter(())),
+        ):
+            restock = capabilities.execute_pokeball_restock()
+            next(restock)
+            next(restock)
+
+        self.assertEqual(emulator.press_button_fresh.call_count, 1)
+
+    def test_empty_restock_plan_skips_mart_navigation(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        ui_context = SimpleNamespace(message="")
+        with (
+            patch.object(capabilities, "context", ui_context),
+            patch.object(capabilities, "_shop_main_menu_is_active", return_value=False),
+            patch.object(capabilities, "_shop_task_is_active", return_value=False),
+            patch.object(capabilities, "_scripted_interruption_is_actionable", return_value=False),
+            patch.object(capabilities, "_baseline_shopping_plan", return_value=([], False, False)),
+            patch.object(capabilities, "_emerald_observation") as observe,
+        ):
+            restock = capabilities.execute_pokeball_restock()
+            with self.assertRaises(StopIteration):
+                next(restock)
+
+        observe.assert_not_called()
+        self.assertIn("No item restock is required", ui_context.message)
+
+    def test_unaffordable_restock_plan_does_not_reopen_the_mart(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        earn_money = Mock(return_value=iter(()))
+        with (
+            patch.object(capabilities, "_shop_main_menu_is_active", return_value=False),
+            patch.object(capabilities, "_shop_task_is_active", return_value=False),
+            patch.object(capabilities, "_scripted_interruption_is_actionable", return_value=False),
+            patch.object(capabilities, "_baseline_shopping_plan", return_value=([], False, True)),
+            patch.object(capabilities, "_restock_wallet", return_value=100),
+            patch.object(capabilities, "_earn_money_from_safe_trainer", earn_money),
+            patch.object(capabilities, "_emerald_observation") as observe,
+            patch.object(capabilities, "observation_driven_overworld_progression") as navigate,
+        ):
+            restock = capabilities.execute_pokeball_restock()
+            next(restock)
+            next(restock)
+
+        observe.assert_not_called()
+        navigate.assert_not_called()
+        earn_money.assert_called_once_with()
+
+    def test_unaffordable_restock_releases_when_no_trainer_can_fund_it(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        ui_context = SimpleNamespace(message="")
+        player = SimpleNamespace(money=100, map_group_and_number=(1, 2))
+        with (
+            patch.object(capabilities, "context", ui_context),
+            patch.object(capabilities, "_shop_main_menu_is_active", return_value=False),
+            patch.object(capabilities, "_shop_task_is_active", return_value=False),
+            patch.object(capabilities, "_scripted_interruption_is_actionable", return_value=False),
+            patch.object(capabilities, "_baseline_shopping_plan", return_value=([], True, False)),
+            patch.object(capabilities, "_restock_wallet", return_value=100),
+            patch.object(capabilities, "get_player", return_value=player),
+            patch.object(
+                capabilities,
+                "_earn_money_from_safe_trainer",
+                side_effect=RuntimeError("No observed safe undefeated trainer is available to fund recovery supplies"),
+            ),
+        ):
+            restock = capabilities.execute_pokeball_restock("restock_recovery_items")
+            with self.assertRaises(StopIteration):
+                next(restock)
+
+        self.assertEqual(
+            ui_context.campaign_restock_deferral,
+            ("restock_recovery_items", (1, 2)),
+        )
+        self.assertIn("resuming campaign travel", ui_context.message)
+
+    def test_restock_releases_while_a_rom_script_owns_the_frame(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        player = SimpleNamespace(money=100, map_group_and_number=(1, 2))
+        with (
+            patch.object(capabilities.context, "campaign_restock_deferral", None),
+            patch.object(capabilities.context, "campaign_restock_phase", None),
+            patch.object(capabilities.context, "campaign_restock_owner", None),
+            patch.object(capabilities, "_shop_main_menu_is_active", return_value=False),
+            patch.object(capabilities, "_shop_task_is_active", return_value=False),
+            patch.object(capabilities, "_scripted_interruption_is_actionable", return_value=False),
+            patch.object(capabilities, "_rom_script_is_active", return_value=True),
+            patch.object(capabilities, "get_player", return_value=player),
+            patch.object(capabilities, "_baseline_shopping_plan") as plan,
+        ):
+            restock = capabilities.execute_pokeball_restock("restock_recovery_items")
+            with self.assertRaises(StopIteration):
+                next(restock)
+            plan.assert_not_called()
+            self.assertEqual(
+                capabilities.context.campaign_restock_deferral,
+                ("restock_recovery_items", (1, 2)),
+            )
+
+    def test_unaffordable_restock_retries_after_wallet_increases(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        purchase = SimpleNamespace(name="Poké Ball", price=200)
+        observation = SimpleNamespace(overworld=SimpleNamespace(map_id=(0, 0)))
+        navigation = iter((None,))
+        with (
+            patch.object(capabilities, "_shop_main_menu_is_active", return_value=False),
+            patch.object(capabilities, "_shop_task_is_active", return_value=False),
+            patch.object(capabilities, "_scripted_interruption_is_actionable", return_value=False),
+            patch.object(
+                capabilities,
+                "_baseline_shopping_plan",
+                side_effect=(([], False, True), ([(purchase, 1)], False, True)),
+            ),
+            patch.object(capabilities, "_restock_wallet", return_value=100),
+            patch.object(capabilities, "_earn_money_from_safe_trainer", return_value=iter(())) as earn_money,
+            patch.object(capabilities, "_emerald_observation", return_value=observation),
+            patch.object(capabilities, "_nearest_pokeball_source", return_value=SimpleNamespace(source_id="mart")),
+            patch.object(capabilities, "_pokeball_source_target", return_value=object()),
+            patch.object(capabilities, "emerald_pokeball_source_entrances", return_value=()),
+            patch.object(capabilities, "observation_driven_overworld_progression", return_value=navigation) as navigate,
+        ):
+            restock = capabilities.execute_pokeball_restock()
+            next(restock)
+            # The wallet read is deliberately changed after the deferred
+            # frame; the second observed plan is now affordable.
+            capabilities._restock_wallet.return_value = 400
+            next(restock)
+
+        earn_money.assert_called_once_with()
+        navigate.assert_called_once()
 
     def test_pokeball_restock_waits_for_shop_transition_before_observing_overworld(self):
         from modules.nuzlocke import emerald_capabilities as capabilities
@@ -589,6 +1124,12 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
 
         with (
             patch.object(capabilities, "_shop_main_menu_is_active", return_value=False),
+            patch.object(capabilities, "_scripted_interruption_is_actionable", return_value=False),
+            patch.object(
+                capabilities,
+                "_baseline_shopping_plan",
+                return_value=([(SimpleNamespace(name="Poké Ball", price=200), 1)], False, True),
+            ),
             patch.object(
                 capabilities,
                 "_emerald_observation",
@@ -605,6 +1146,89 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
 
         self.assertEqual(navigation.steps, 2)
         observe.assert_called_once_with(False, "restock_pokeballs")
+
+    def test_pokeball_restock_finishes_story_dialogue_before_resuming_navigation(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        class CountingNavigation:
+            def __init__(self):
+                self.steps = 0
+
+            def __next__(self):
+                self.steps += 1
+                return None
+
+        navigation = CountingNavigation()
+        source = SimpleNamespace(source_id="petalburg_mart", interior_map=MapRSE.PETALBURG_CITY)
+        overworld = SimpleNamespace(map_id=MapRSE.PETALBURG_CITY.value)
+        observation = SimpleNamespace(overworld=overworld)
+        finish_interruption = Mock(return_value=iter((None,)))
+
+        with (
+            patch.object(capabilities, "_shop_main_menu_is_active", return_value=False),
+            patch.object(capabilities, "_shop_task_is_active", return_value=False),
+            patch.object(capabilities, "_scripted_interruption_is_actionable", side_effect=(False, True)),
+            patch.object(
+                capabilities,
+                "_baseline_shopping_plan",
+                return_value=([(SimpleNamespace(name="Poké Ball", price=200), 1)], False, True),
+            ),
+            patch.object(capabilities, "_finish_scripted_interruption", finish_interruption),
+            patch.object(capabilities, "_emerald_observation", return_value=observation),
+            patch.object(capabilities, "_nearest_pokeball_source", return_value=source),
+            patch.object(capabilities, "_pokeball_source_target", return_value=SemanticTarget.map((1, 0))),
+            patch.object(capabilities, "emerald_pokeball_source_entrances", return_value=()),
+            patch.object(capabilities, "observation_driven_overworld_progression", return_value=navigation),
+        ):
+            restock = capabilities.execute_pokeball_restock()
+            next(restock)
+            next(restock)
+
+        self.assertEqual(navigation.steps, 1)
+        finish_interruption.assert_called_once_with()
+
+    def test_scripted_interruption_yields_shop_menu_to_restock_capability(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        with (
+            patch.object(capabilities, "_shop_main_menu_is_active", return_value=True),
+            patch.object(capabilities, "observe_agent") as observe,
+        ):
+            interruption = capabilities._finish_scripted_interruption()
+            with self.assertRaises(StopIteration):
+                next(interruption)
+
+        observe.assert_not_called()
+
+    def test_scripted_interruption_timeout_defers_without_throwing(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        interaction = SimpleNamespace(
+            script_active=True,
+            script_function="LittlerootTown_EventScript_GiveRunningShoes",
+            native_function="WaitForMovementFinish",
+            interaction_phase=InteractionPhase.SCRIPT_NATIVE_WAIT,
+            dialogue_waiting=False,
+            controllable=False,
+        )
+        observation = SimpleNamespace(
+            interaction=interaction,
+            interaction_type=InteractionType.UNKNOWN,
+        )
+        action = SimpleNamespace(action_type=None)
+
+        with (
+            patch.object(capabilities, "_shop_main_menu_is_active", return_value=False),
+            patch.object(capabilities, "observe_agent", return_value=observation),
+            patch.object(capabilities, "select_action", return_value=SimpleNamespace(action=action)),
+            patch.object(capabilities.AgentActionExecutor, "execute"),
+        ):
+            interruption = capabilities._finish_scripted_interruption()
+            for _ in range(120):
+                next(interruption)
+
+            with self.assertRaises(StopIteration):
+                next(interruption)
 
     def test_post_gender_name_prompt_is_a_single_transition_input(self):
         action = choose_emerald_campaign_action(
@@ -662,6 +1286,122 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
         self.assertIsNotNone(goal)
         self.assertIs(goal.warp, first)
         self.assertEqual(goal.destination, destination)
+
+    def test_observed_exit_groups_same_destination_warps_and_keeps_cheapest_route(self):
+        """A cheaper ordinary exit must survive anti-reversal filtering."""
+
+        source_map = (25, 40)
+        destination = ((0, 0), (14, 8))
+        short = WarpObservation((source_map, (2, 8)), destination, required_facing=Direction.South)
+        long = WarpObservation((source_map, (1, 8)), destination, required_facing=Direction.South)
+        world = SimpleNamespace(
+            map_id=source_map,
+            player_coordinates=(2, 3),
+            controllable=True,
+            transitions=(short, long),
+            warps=(),
+        )
+        navigator = Mock()
+
+        def plan(_start, goal, algorithm):
+            self.assertEqual(algorithm, "dijkstra")
+            self.assertEqual(goal.warps, (short, long))
+            chosen = short
+            return SimpleNamespace(
+                actions=(
+                    SimpleNamespace(
+                        action_type=SimpleNamespace(name="WARP"),
+                        source=chosen.entry,
+                        destination=chosen.destination,
+                    ),
+                ),
+                metrics=SimpleNamespace(encounter_opportunities=0, total_route_cost=6, movement_actions=5),
+            )
+
+        navigator.plan.side_effect = plan
+
+        selected = _observed_exit_goal(world, navigator)
+
+        self.assertIs(selected.warp, short)
+        self.assertEqual(navigator.plan.call_count, 1)
+
+    def test_observed_exit_groups_rows_from_one_map_connection(self):
+        source_map = (25, 40)
+        destination = ((0, 0), (14, 8))
+        first = MapConnectionObservation(
+            (source_map, (2, 8)),
+            destination,
+            required_facing=Direction.South,
+        )
+        second = MapConnectionObservation(
+            (source_map, (3, 8)),
+            destination,
+            required_facing=Direction.South,
+        )
+        world = SimpleNamespace(
+            map_id=source_map,
+            player_coordinates=(2, 3),
+            controllable=True,
+            transitions=(first, second),
+            warps=(),
+        )
+        navigator = Mock()
+        navigator.plan.return_value = SimpleNamespace(
+            actions=(
+                SimpleNamespace(
+                    action_type=SimpleNamespace(name="WARP"),
+                    source=first.entry,
+                    destination=first.destination,
+                ),
+            ),
+            metrics=SimpleNamespace(encounter_opportunities=0, total_route_cost=6, movement_actions=5),
+        )
+
+        selected = _observed_exit_goal(world, navigator)
+
+        self.assertIs(selected.warp, first)
+        navigator.plan.assert_called_once()
+        self.assertEqual(navigator.plan.call_args.args[1].warps, (first, second))
+
+    def test_observed_exit_suppresses_identical_failed_search_until_world_changes(self):
+        source_map = (25, 40)
+        destination = ((0, 0), (14, 8))
+        exit_transition = MapConnectionObservation(
+            (source_map, (0, 8)), destination, required_facing=Direction.West
+        )
+        world = SimpleNamespace(
+            map_id=source_map,
+            player_coordinates=(2, 3),
+            controllable=True,
+            transitions=(exit_transition,),
+            warps=(),
+            dynamic_blocked_coordinates=frozenset(),
+            static_blocked_coordinates=frozenset(),
+            triggers=(),
+            objects=(),
+        )
+        navigator = Mock()
+        navigator.plan.side_effect = NavigationError("blocked by trainer sight line")
+        progress = {}
+        target = SemanticTarget.map(destination[0])
+
+        with patch(
+            "modules.nuzlocke.emerald_capabilities.transition_world_route",
+            return_value=SimpleNamespace(estimated_cost=1),
+        ):
+            self.assertIsNone(_observed_exit_goal(world, navigator, target, progress))
+            self.assertIsNone(_observed_exit_goal(world, navigator, target, progress))
+        self.assertEqual(navigator.plan.call_count, 1)
+
+        changed_values = vars(world).copy()
+        changed_values["dynamic_blocked_coordinates"] = frozenset({(3, 3)})
+        changed = SimpleNamespace(**changed_values)
+        with patch(
+            "modules.nuzlocke.emerald_capabilities.transition_world_route",
+            return_value=SimpleNamespace(estimated_cost=1),
+        ):
+            self.assertIsNone(_observed_exit_goal(changed, navigator, target, progress))
+        self.assertEqual(navigator.plan.call_count, 2)
 
     def test_observed_exit_requires_controllability(self):
         from modules.overworld import OverworldObservation
@@ -1591,6 +2331,146 @@ class EmeraldCampaignCapabilityTests(unittest.TestCase):
             )
         )
         self.assertIs(action, EmeraldCampaignAction.WAIT)
+
+    def test_native_script_wait_owns_controllable_lab_frame(self):
+        action = choose_emerald_observation_action(
+            EmeraldObservation(
+                game_state=GameState.OVERWORLD,
+                ui_mode="OVERWORLD",
+                title_actionable=False,
+                startup_tasks=(),
+                native_task_state=("WaitForMovementFinish", "GiveStarterEvent", True),
+                script_stack=("GiveStarterEvent",),
+                map_id=MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value,
+                coordinates=(6, 5),
+                controllable=True,
+                dialogue_actionable=False,
+                dialogue_lifecycle_active=False,
+                menu=None,
+                naming=None,
+                confirmation=None,
+                starter_selection=None,
+                gender_task=None,
+                rom_owned_movement=False,
+                clock_interaction=None,
+                clock_target=None,
+                campaign_facts=(),
+                overworld=SimpleNamespace(controllable=True),
+                objective_id="receive_pokedex",
+                semantic_target=_semantic_target_for_objective("receive_pokedex"),
+            )
+        )
+        self.assertIs(action, EmeraldCampaignAction.WAIT)
+
+    def test_native_clock_task_remains_actionable_during_script_wait(self):
+        action = choose_emerald_observation_action(
+            EmeraldObservation(
+                game_state=GameState.OVERWORLD,
+                ui_mode="OVERWORLD",
+                title_actionable=False,
+                startup_tasks=("Task_SetClock_HandleInput",),
+                native_task_state=("SetClock", "PlayersHouse_2F_EventScript_SetWallClock", True),
+                script_stack=("PlayersHouse_2F_EventScript_SetWallClock",),
+                map_id=MapRSE.LITTLEROOT_TOWN_MAYS_HOUSE_2F.value,
+                coordinates=(3, 2),
+                controllable=True,
+                dialogue_actionable=False,
+                dialogue_lifecycle_active=False,
+                menu=None,
+                naming=None,
+                confirmation=None,
+                starter_selection=None,
+                gender_task=None,
+                rom_owned_movement=False,
+                clock_interaction=("Task_SetClock_HandleInput", 0, 12, 0, 0),
+                clock_target=None,
+                campaign_facts=(("wall_clock_set", False),),
+                overworld=SimpleNamespace(controllable=True),
+                objective_id="set_wall_clock",
+                semantic_target=_semantic_target_for_objective("set_wall_clock"),
+            )
+        )
+        self.assertIs(action, EmeraldCampaignAction.ADVANCE_CLOCK)
+
+    def test_navigation_does_not_plan_while_native_script_owns_frame(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        cached_loop = Mock()
+        cache = {"overworld": ((None, (6, 5)), cached_loop)}
+        with (
+            patch.object(capabilities, "_rom_script_is_active", return_value=True),
+            patch.object(capabilities, "perceive_overworld") as perceive_overworld,
+            patch.object(capabilities, "_observed_exit_goal") as observed_exit_goal,
+        ):
+            progression = capabilities.observation_driven_overworld_progression(execution_cache=cache)
+            next(progression)
+
+        perceive_overworld.assert_not_called()
+        observed_exit_goal.assert_not_called()
+        cached_loop.close.assert_called_once_with()
+        self.assertNotIn("overworld", cache)
+
+    def test_navigation_resumes_after_native_script_releases_frame(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        current = OverworldObservation(
+            MapRSE.LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB.value,
+            (6, 5),
+            Direction.North,
+            True,
+            (),
+            (),
+            (),
+            (),
+        )
+        with (
+            patch.object(capabilities, "_rom_script_is_active", side_effect=(True, False)),
+            patch.object(capabilities, "perceive_overworld", return_value=current),
+            patch.object(capabilities, "_observed_exit_goal", return_value=None) as observed_exit_goal,
+        ):
+            progression = capabilities.observation_driven_overworld_progression()
+            next(progression)
+            next(progression)
+
+        observed_exit_goal.assert_called_once()
+
+    def test_pokedex_completion_waits_for_native_script_to_settle(self):
+        from modules.nuzlocke import emerald_capabilities as capabilities
+
+        def observation(native_active):
+            return SimpleNamespace(
+                map_id=None,
+                dialogue_lifecycle_active=False,
+                native_task_state=("WaitForMovementFinish", "GiveStarterEvent", native_active),
+                campaign_facts=(
+                    ("pokedex_received", True),
+                    ("pokeballs_received", True),
+                    ("pokeballs_ready", True),
+                ),
+                overworld=None,
+                controllable=False,
+                dialogue_actionable=False,
+                game_state=GameState.UNKNOWN,
+                starter_selection=None,
+                confirmation=None,
+                naming=None,
+                menu=None,
+                ui_mode="UNKNOWN",
+                title_actionable=False,
+                gender_task=None,
+                semantic_target=None,
+                clock_interaction=None,
+                clock_target=None,
+            )
+
+        with (
+            patch.object(capabilities, "_emerald_observation", side_effect=(observation(True), observation(False))),
+            patch.object(capabilities, "choose_emerald_observation_action", return_value=EmeraldCampaignAction.WAIT),
+        ):
+            campaign = capabilities.observation_driven_emerald_campaign("receive_pokedex")
+            next(campaign)
+            with self.assertRaises(StopIteration):
+                next(campaign)
 
     def test_lab_target_prevents_oldale_return_to_route103(self):
         from modules.world_navigation import WorldEdge, WorldMapGraph
@@ -2526,6 +3406,157 @@ class EmeraldCampaignLifecycleTests(unittest.TestCase):
             self.observation(OpeningSequenceState.SCRIPTED_INTRO, gender_task=None, dialogue=False)
         )
         self.assertIs(action, EmeraldCampaignAction.WAIT)
+
+    def test_campaign_checks_for_pc_medicine_at_each_new_pokemon_center_map(self):
+        map_id = MapRSE.OLDALE_TOWN_POKEMON_CENTER_1F.value
+        observation = SimpleNamespace(
+            map_id=map_id,
+            campaign_facts=(),
+            controllable=True,
+            overworld=SimpleNamespace(map_id=map_id, player_coordinates=(5, 5), controllable=True, triggers=()),
+            game_state=GameState.OVERWORLD,
+            dialogue_actionable=False,
+            dialogue_lifecycle_active=False,
+        )
+        with (
+            patch(
+                "modules.nuzlocke.emerald_capabilities._emerald_observation",
+                side_effect=(observation, observation),
+            ),
+            patch(
+                "modules.nuzlocke.resource_runtime._withdraw_pc_healing_item_at_current_location",
+                return_value=iter(("withdraw",)),
+            ) as withdraw,
+            patch(
+                "modules.nuzlocke.emerald_capabilities.choose_emerald_observation_action",
+                return_value=EmeraldCampaignAction.WAIT,
+            ),
+        ):
+            campaign = observation_driven_emerald_campaign()
+            self.assertEqual(next(campaign), "withdraw")
+
+        withdraw.assert_called_once_with()
+
+    def test_campaign_does_not_check_pc_medicine_during_truck_transition(self):
+        map_id = MapRSE.INSIDE_OF_TRUCK.value
+        observation = EmeraldObservation(
+            game_state=GameState.OVERWORLD,
+            ui_mode="overworld",
+            map_id=map_id,
+            coordinates=(2, 2),
+            controllable=False,
+            dialogue_actionable=False,
+            dialogue_lifecycle_active=False,
+            menu=None,
+            naming=None,
+            confirmation=None,
+            gender_task=None,
+            rom_owned_movement=False,
+            campaign_facts=(),
+            overworld=SimpleNamespace(
+                map_id=map_id,
+                player_coordinates=(2, 2),
+                controllable=False,
+                triggers=(),
+            ),
+        )
+        with (
+            patch(
+                "modules.nuzlocke.emerald_capabilities._emerald_observation",
+                return_value=observation,
+            ),
+            patch(
+                "modules.nuzlocke.resource_runtime._withdraw_pc_healing_item_at_current_location",
+                side_effect=AssertionError("truck transition must not enter PC withdrawal"),
+            ) as withdraw,
+            patch(
+                "modules.nuzlocke.emerald_capabilities.choose_emerald_observation_action",
+                return_value=EmeraldCampaignAction.WAIT,
+            ),
+        ):
+            campaign = observation_driven_emerald_campaign("complete_new_game_setup")
+            next(campaign)
+
+        withdraw.assert_not_called()
+
+    def test_ordinary_campaign_navigation_avoids_trainers_without_forced_route_opt_in(self):
+        semantic_target = SemanticTarget.map(MapRSE.PETALBURG_CITY.value)
+        observation = EmeraldObservation(
+            GameState.UNKNOWN,
+            "overworld",
+            None,
+            None,
+            True,
+            False,
+            False,
+            None,
+            None,
+            None,
+            None,
+            False,
+            semantic_target=semantic_target,
+        )
+        with (
+            patch(
+                "modules.nuzlocke.emerald_capabilities._emerald_observation",
+                return_value=observation,
+            ),
+            patch(
+                "modules.nuzlocke.emerald_capabilities.choose_emerald_observation_action",
+                return_value=EmeraldCampaignAction.ADVANCE_OBSERVED_OVERWORLD,
+            ),
+            patch(
+                "modules.nuzlocke.emerald_capabilities.observation_driven_overworld_progression",
+                return_value=iter(("advanced",)),
+            ) as progression,
+        ):
+            campaign = observation_driven_emerald_campaign("complete_petalburg_wally")
+            next(campaign)
+
+        policy = progression.call_args.args[4]
+        self.assertIs(policy.constraints.trainer_mode, TrainerMode.AVOID)
+        self.assertFalse(policy.constraints.allow_forced_trainer_exposure)
+
+    def test_introductory_rival_allows_forced_exposure_after_readiness_boundary(self):
+        semantic_target = SemanticTarget.interaction(
+            MapRSE.ROUTE103.value,
+            interaction_id="Route103_EventScript_Rival",
+        )
+        observation = EmeraldObservation(
+            GameState.UNKNOWN,
+            "overworld",
+            None,
+            None,
+            True,
+            False,
+            False,
+            None,
+            None,
+            None,
+            None,
+            False,
+            semantic_target=semantic_target,
+        )
+        with (
+            patch(
+                "modules.nuzlocke.emerald_capabilities._emerald_observation",
+                return_value=observation,
+            ),
+            patch(
+                "modules.nuzlocke.emerald_capabilities.choose_emerald_observation_action",
+                return_value=EmeraldCampaignAction.ADVANCE_OBSERVED_OVERWORLD,
+            ),
+            patch(
+                "modules.nuzlocke.emerald_capabilities.observation_driven_overworld_progression",
+                return_value=iter(("advanced",)),
+            ) as progression,
+        ):
+            campaign = observation_driven_emerald_campaign("complete_intro_rival")
+            next(campaign)
+
+        policy = progression.call_args.args[4]
+        self.assertIs(policy.constraints.trainer_mode, TrainerMode.AVOID)
+        self.assertTrue(policy.constraints.allow_forced_trainer_exposure)
 
 
 if __name__ == "__main__":

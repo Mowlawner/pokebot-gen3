@@ -31,6 +31,11 @@ class TestTriggerBindings(unittest.TestCase):
         self.assertEqual(binding.map_id, MapRSE.ROUTE103.value)
         self.assertEqual(binding.script_symbol, "Route103_EventScript_Rival")
         self.assertEqual(binding.event_type, "object")
+        self.assertEqual(binding.affordance_id, f"trainer:{MapRSE.ROUTE103.value}:2")
+        self.assertEqual(binding.hazard_kind, "trainer")
+        self.assertEqual(binding.guard_variable, "BIRCH_LAB_STATE")
+        self.assertEqual(binding.guard_operator, "eq")
+        self.assertEqual(binding.guard_value, 3)
 
     def test_first_badge_bindings_use_rom_script_identities(self):
         devon = get_trigger_binding("devon_goods_researcher")
@@ -39,6 +44,9 @@ class TestTriggerBindings(unittest.TestCase):
         self.assertEqual(devon.map_id, MapRSE.PETALBURG_WOODS.value)
         self.assertEqual(devon.script_symbol, "PetalburgWoods_EventScript_DevonResearcherLeft")
         self.assertIn("PetalburgWoods_EventScript_DevonResearcherRight", devon.alternate_script_symbols)
+        self.assertIn("PetalburgWoods_EventScript_DevonResearcherIntro", devon.alternate_script_symbols)
+        self.assertEqual(devon.local_ids, (4, 3))
+        self.assertTrue(devon.allow_scriptless_local_match)
         self.assertEqual(roxanne.map_id, MapRSE.RUSTBORO_CITY_GYM.value)
         self.assertEqual(roxanne.script_symbol, "RustboroCity_Gym_EventScript_Roxanne")
 
@@ -63,6 +71,26 @@ class TestTriggerBindings(unittest.TestCase):
             self.assertIsNotNone(binding, trigger_id)
             self.assertEqual(binding.map_id, map_id)
             self.assertEqual(binding.script_symbol, script_symbol)
+
+    def test_script_owned_trainer_binding_exposes_static_hazard_geometry(self):
+        binding = get_trigger_binding("devon_goods_researcher")
+        template = SimpleNamespace(
+            local_id=4,
+            script_symbol=binding.script_symbol,
+            flag_id=0,
+            local_coordinates=(12, 8),
+        )
+
+        resolution = resolve_trigger_binding(
+            binding,
+            (),
+            map_size=(30, 20),
+            static_objects=(template,),
+        )
+
+        self.assertTrue(resolution.static_available)
+        self.assertEqual(resolution.static_location, (binding.map_id, (12, 8)))
+        self.assertIn((12, 7), resolution.interaction_positions)
 
     def test_real_object_event_template_script_matches_binding(self):
         object_event = _route103_object_event()
@@ -122,6 +150,56 @@ class TestTriggerBindings(unittest.TestCase):
             {(10, 2), (11, 3), (10, 4), (9, 3)},
         )
 
+    def test_route103_rival_requires_birch_lab_state_three(self):
+        binding = get_trigger_binding("introductory_rival")
+        static_template = SimpleNamespace(
+            local_id=2,
+            local_coordinates=(10, 3),
+            script_symbol="Route103_EventScript_Rival",
+            flag_id=0,
+        )
+
+        active = resolve_trigger_binding(
+            binding,
+            (),
+            map_size=(30, 30),
+            static_objects=(static_template,),
+            guard_values={"BIRCH_LAB_STATE": 3},
+        )
+        self.assertTrue(active.guard_active)
+        self.assertEqual(active.guard_current_value, 3)
+        self.assertIn((10, 4), active.interaction_positions)
+
+        before_starter = resolve_trigger_binding(
+            binding,
+            (),
+            map_size=(30, 30),
+            static_objects=(static_template,),
+            guard_values={"BIRCH_LAB_STATE": 2},
+        )
+        self.assertFalse(before_starter.guard_active)
+        self.assertEqual(before_starter.interaction_positions, ())
+
+        after_rival = resolve_trigger_binding(
+            binding,
+            (),
+            map_size=(30, 30),
+            static_objects=(static_template,),
+            guard_values={"BIRCH_LAB_STATE": 4},
+        )
+        self.assertFalse(after_rival.guard_active)
+        self.assertEqual(after_rival.interaction_positions, ())
+
+        unavailable = resolve_trigger_binding(
+            binding,
+            (),
+            map_size=(30, 30),
+            static_objects=(static_template,),
+            guard_values={},
+        )
+        self.assertIsNone(unavailable.guard_active)
+        self.assertEqual(unavailable.interaction_positions, ())
+
     def test_runtime_position_overrides_static_position(self):
         binding = get_trigger_binding("introductory_rival")
         static_template = SimpleNamespace(
@@ -174,6 +252,95 @@ class TestTriggerBindings(unittest.TestCase):
         self.assertIsNone(resolution.static_location)
         self.assertFalse(resolution.runtime_match)
 
+    def test_unreadable_static_hide_flag_remains_unknown_and_unavailable(self):
+        binding = get_trigger_binding("introductory_rival")
+        static_template = SimpleNamespace(
+            local_id=2,
+            local_coordinates=(10, 3),
+            script_symbol="Route103_EventScript_Rival",
+            flag_id=723,
+        )
+
+        with patch("modules.trigger_bindings.get_event_flag_by_number", side_effect=RuntimeError("save block settling")):
+            resolution = resolve_trigger_binding(
+                binding,
+                (),
+                map_size=(30, 30),
+                static_objects=(static_template,),
+            )
+
+        self.assertTrue(resolution.static_match)
+        self.assertFalse(resolution.static_available)
+        self.assertIsNone(resolution.static_availability)
+        self.assertIsNone(resolution.static_location)
+        self.assertEqual(resolution.interaction_positions, ())
+
+    def test_hidden_static_semantic_object_is_not_published(self):
+        avatar = SimpleNamespace(
+            map_group_and_number=MapRSE.ROUTE103.value,
+            local_coordinates=(5, 5),
+            facing_direction="North",
+        )
+        map_data = SimpleNamespace(
+            map_size=(30, 20),
+            warps=[],
+            coord_events=[],
+            bg_events=[],
+            objects=[
+                SimpleNamespace(
+                    local_id=2,
+                    local_coordinates=(10, 3),
+                    script_symbol="Route103_EventScript_Rival",
+                    flag_id=123,
+                )
+            ],
+        )
+        path_tile = SimpleNamespace(
+            local_coordinates=(5, 5),
+            accessible_from_direction=[True, True, True, True],
+            warps_to=None,
+        )
+        with (
+            patch("modules.overworld.get_player_avatar", return_value=avatar),
+            patch("modules.overworld._get_map_metadata", return_value=SimpleNamespace(tiles=[path_tile])),
+            patch("modules.overworld.get_map_metadata", return_value=map_data),
+            patch("modules.overworld.get_map_objects", return_value=[]),
+            patch("modules.overworld.player_avatar_is_controllable", return_value=True),
+            patch("modules.trigger_bindings.get_event_flag_by_number", return_value=True),
+        ):
+            observation = perceive_overworld()
+
+        assert all(trigger.trigger_id != "introductory_rival" for trigger in observation.triggers)
+
+    def test_semantic_binding_is_not_published_on_an_unrelated_map(self):
+        avatar = SimpleNamespace(
+            map_group_and_number=MapRSE.ROUTE102.value,
+            local_coordinates=(39, 6),
+            facing_direction="North",
+        )
+        map_data = SimpleNamespace(
+            map_size=(50, 20),
+            warps=[],
+            coord_events=[],
+            bg_events=[],
+            objects=[],
+        )
+        path_tile = SimpleNamespace(
+            local_coordinates=(39, 6),
+            accessible_from_direction=[True, True, True, True],
+            warps_to=None,
+        )
+        with (
+            patch("modules.overworld.get_player_avatar", return_value=avatar),
+            patch("modules.overworld._get_map_metadata", return_value=SimpleNamespace(tiles=[path_tile])),
+            patch("modules.overworld.get_map_metadata", return_value=map_data),
+            patch("modules.overworld.get_map_objects", return_value=[]),
+            patch("modules.overworld.player_avatar_is_controllable", return_value=True),
+        ):
+            observation = perceive_overworld()
+
+        assert all(trigger.trigger_id != "introductory_rival" for trigger in observation.triggers)
+
     def test_local_id_disambiguates_static_templates(self):
         binding = get_trigger_binding("introductory_rival")
         templates = (
@@ -200,7 +367,109 @@ class TestTriggerBindings(unittest.TestCase):
 
         self.assertTrue(resolution.static_match)
         self.assertTrue(resolution.static_ambiguous)
+        self.assertTrue(resolution.static_available)
         self.assertIsNone(resolution.static_location)
+        self.assertEqual(
+            resolution.static_locations,
+            (
+                (MapRSE.ROUTE103.value, (10, 3)),
+                (MapRSE.ROUTE103.value, (11, 3)),
+            ),
+        )
+        self.assertEqual(
+            set(resolution.interaction_positions),
+            {(10, 2), (10, 3), (10, 4), (9, 3), (11, 2), (11, 3), (11, 4), (12, 3)},
+        )
+
+    def test_multiple_static_templates_resolve_visibility_individually(self):
+        binding = TriggerBinding(
+            "researcher",
+            MapRSE.PETALBURG_WOODS.value,
+            "ResearcherLeft",
+            alternate_script_symbols=("ResearcherRight",),
+        )
+        templates = (
+            SimpleNamespace(local_id=7, local_coordinates=(10, 3), script_symbol="ResearcherLeft", flag_id=101),
+            SimpleNamespace(local_id=8, local_coordinates=(20, 3), script_symbol="ResearcherRight", flag_id=102),
+        )
+
+        with patch(
+            "modules.trigger_bindings.get_event_flag_by_number",
+            side_effect=(True, False),
+        ):
+            resolution = resolve_trigger_binding(
+                binding,
+                (),
+                map_size=(30, 30),
+                static_objects=templates,
+                # Include the right-side variant explicitly for this fixture.
+            )
+
+        self.assertTrue(resolution.static_match)
+        self.assertTrue(resolution.static_available)
+        self.assertEqual(
+            resolution.static_locations,
+            ((MapRSE.PETALBURG_WOODS.value, (20, 3)),),
+        )
+
+    def test_woods_binding_publishes_all_static_variants_without_runtime_object(self):
+        binding = get_trigger_binding("devon_goods_researcher")
+        avatar = SimpleNamespace(
+            map_group_and_number=MapRSE.PETALBURG_WOODS.value,
+            local_coordinates=(5, 5),
+            facing_direction="North",
+        )
+        map_data = SimpleNamespace(
+            map_size=(30, 20),
+            warps=[],
+            coord_events=[],
+            bg_events=[],
+            objects=[
+                SimpleNamespace(
+                    local_id=4,
+                    local_coordinates=(12, 8),
+                    script_symbol="",
+                    flag_id=724,
+                ),
+                SimpleNamespace(
+                    local_id=3,
+                    local_coordinates=(20, 8),
+                    script_symbol="",
+                    flag_id=725,
+                ),
+            ],
+        )
+        path_tile = SimpleNamespace(
+            local_coordinates=(5, 5),
+            accessible_from_direction=[True, True, True, True],
+            warps_to=None,
+        )
+
+        with (
+            patch("modules.overworld.get_player_avatar", return_value=avatar),
+            patch("modules.overworld._get_map_metadata", return_value=SimpleNamespace(tiles=[path_tile])),
+            patch("modules.overworld.get_map_metadata", return_value=map_data),
+            patch("modules.overworld.get_map_objects", return_value=[]),
+            patch("modules.overworld.player_avatar_is_controllable", return_value=True),
+            patch("modules.overworld.get_event_flag_by_number", side_effect=(False, False)),
+            patch("modules.trigger_bindings.get_event_flag_by_number", side_effect=(False, False)),
+        ):
+            observation = perceive_overworld()
+
+        semantic_trigger = next(
+            trigger for trigger in observation.triggers if trigger.trigger_id == "devon_goods_researcher"
+        )
+        self.assertEqual(
+            semantic_trigger.navigation_locations,
+            frozenset(
+                {
+                    (MapRSE.PETALBURG_WOODS.value, (12, 8)),
+                    (MapRSE.PETALBURG_WOODS.value, (20, 8)),
+                }
+            ),
+        )
+        self.assertTrue(semantic_trigger.hazard_locations)
+        self.assertEqual(semantic_trigger.trainer_defeated, None)
 
     def test_perception_emits_semantic_trigger_for_runtime_object(self):
         object_event = _route103_object_event()
@@ -242,6 +511,7 @@ class TestTriggerBindings(unittest.TestCase):
             patch("modules.overworld.get_map_metadata", return_value=map_data),
             patch("modules.overworld.get_map_objects", return_value=[object_event]),
             patch("modules.overworld.player_avatar_is_controllable", return_value=True),
+            patch("modules.overworld.read_binding_guard_values", return_value={"BIRCH_LAB_STATE": 3}),
             patch(
                 "modules.map.get_map_metadata",
                 return_value=SimpleNamespace(
@@ -272,6 +542,10 @@ class TestTriggerBindings(unittest.TestCase):
             semantic_trigger.navigation_locations,
             frozenset({(MapRSE.ROUTE103.value, (10, 3))}),
         )
+        self.assertEqual(semantic_trigger.script_symbol, "Route103_EventScript_Rival")
+        self.assertEqual(semantic_trigger.affordance_id, f"trainer:{MapRSE.ROUTE103.value}:2")
+        self.assertEqual(semantic_trigger.hazard_kind, "trainer")
+        self.assertEqual(semantic_trigger.hazard_locations, semantic_trigger.activation_locations)
 
     def test_unrelated_object_does_not_match(self):
         binding = get_trigger_binding("introductory_rival")

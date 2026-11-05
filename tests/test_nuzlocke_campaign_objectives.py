@@ -29,6 +29,7 @@ from modules.nuzlocke.campaign_objectives import (
     EncounterEvaluationPolicy,
     EncounterClassification,
     EncounterRecommendation,
+    EncounterEvaluation,
     evaluate_encounter_opportunity,
 )
 from modules.nuzlocke.campaign_state import CampaignFacts, CampaignState, Fact, FactStatus, RunStatus
@@ -36,6 +37,12 @@ from modules.nuzlocke.identity import PokemonIdentity
 from modules.nuzlocke.rules import LocationEncounter
 from modules.nuzlocke.encounter_catalog import encounter_opportunities
 from modules.nuzlocke.capture_policy import EncounterCandidate, EncounterMethod
+from modules.nuzlocke.campaign_reachability import (
+    CampaignReachabilityStatus,
+    assess_campaign_reachability,
+)
+from modules.nuzlocke.campaign_access import CampaignAccessRequirement
+from modules.nuzlocke.emerald_campaign_registry import emerald_map_access_requirements
 from modules.nuzlocke.campaign_simulation import CampaignCheckpoint, simulate_checkpoint
 from modules.world_navigation import WorldEdge, WorldMapGraph
 from modules.nuzlocke.snapshots import (
@@ -195,16 +202,16 @@ class CampaignObjectiveTests(unittest.TestCase):
             (
                 WorldEdge(
                     MapRSE.OLDALE_TOWN.value,
-                    MapRSE.PETALBURG_CITY.value,
+                    MapRSE.PETALBURG_CITY_GYM.value,
                     "connection",
                     (),
                     (),
                     estimated_cost=10,
                 ),
                 WorldEdge(MapRSE.OLDALE_TOWN.value, near, "connection", (), (), estimated_cost=4),
-                WorldEdge(near, MapRSE.PETALBURG_CITY.value, "connection", (), (), estimated_cost=6),
+                WorldEdge(near, MapRSE.PETALBURG_CITY_GYM.value, "connection", (), (), estimated_cost=6),
                 WorldEdge(MapRSE.OLDALE_TOWN.value, far, "connection", (), (), estimated_cost=30),
-                WorldEdge(far, MapRSE.PETALBURG_CITY.value, "connection", (), (), estimated_cost=30),
+                WorldEdge(far, MapRSE.PETALBURG_CITY_GYM.value, "connection", (), (), estimated_cost=30),
             )
         )
         opportunities = (
@@ -243,6 +250,7 @@ class CampaignObjectiveTests(unittest.TestCase):
             WorldEdge(MapRSE.ROUTE103.value, progression, "connection", (), (), estimated_cost=10),
         )
         state = replace(self.state(), raw_map=Fact.known(current))
+        state = replace(state, campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True))
         before = state
         on_route = evaluate_encounter_opportunity(
             state,
@@ -262,6 +270,34 @@ class CampaignObjectiveTests(unittest.TestCase):
         self.assertEqual(detour.classification, EncounterClassification.LARGE_DETOUR)
         self.assertEqual(detour.recommendation, EncounterRecommendation.DEFER)
         self.assertEqual(state, before)
+
+    def test_route101_is_zero_detour_from_littleroot_when_it_is_on_the_direct_corridor(self):
+        current = MapRSE.LITTLEROOT_TOWN.value
+        route101 = MapRSE.ROUTE101.value
+        oldale = MapRSE.OLDALE_TOWN.value
+        route102 = MapRSE.ROUTE102.value
+        progression = MapRSE.PETALBURG_CITY.value
+        graph = WorldMapGraph(
+            (
+                # Deliberately make each corridor edge expensive. Membership
+                # in the direct ROM route, rather than edge arithmetic, is
+                # the fact that defines a zero campaign detour.
+                WorldEdge(current, route101, "connection", (), (), estimated_cost=40),
+                WorldEdge(route101, oldale, "connection", (), (), estimated_cost=40),
+                WorldEdge(oldale, route102, "connection", (), (), estimated_cost=2),
+                WorldEdge(route102, progression, "connection", (), (), estimated_cost=2),
+            )
+        )
+        state = replace(self.state(), raw_map=Fact.known(current))
+        evaluation = evaluate_encounter_opportunity(
+            state,
+            campaign_objectives_module.EncounterOpportunity(route101, False, False, True),
+            progression,
+            graph=graph,
+        )
+
+        self.assertEqual(evaluation.classification, EncounterClassification.ON_ROUTE)
+        self.assertEqual(evaluation.detour_cost, 0)
 
     def test_unreachable_encounter_is_unavailable(self):
         state = self.state()
@@ -295,6 +331,292 @@ class CampaignObjectiveTests(unittest.TestCase):
         optional = encounter_task(MapRSE.OLDALE_TOWN.value)
         selection = select_available_campaign_task(self.state(), (optional, required))
         self.assertEqual(selection.objective.objective_id, "required")
+
+    def test_open_party_slot_prefers_nearest_legal_encounter_before_progression(self):
+        required = replace(
+            self.objective("complete_petalburg_wally", self.predicate("reached", False)),
+            destination=MapRSE.PETALBURG_CITY.value,
+        )
+
+        def evaluated(location, encounter_cost):
+            return EncounterEvaluation(
+                task_id=f"obtain_encounter:{location[0]}:{location[1]}",
+                location=location,
+                progression_destination=MapRSE.PETALBURG_CITY.value,
+                classification=EncounterClassification.ON_ROUTE,
+                recommendation=EncounterRecommendation.PREFER,
+                direct_progression_cost=10,
+                encounter_cost=encounter_cost,
+                encounter_to_progression_cost=10 - encounter_cost,
+                via_encounter_cost=10,
+                detour_cost=0,
+                detour_ratio=0.0,
+            )
+
+        route_101 = replace(
+            encounter_task(MapRSE.ROUTE101.value),
+            encounter_evaluation=evaluated(MapRSE.ROUTE101.value, 3),
+        )
+        route_102 = replace(
+            encounter_task(MapRSE.ROUTE102.value),
+            encounter_evaluation=evaluated(MapRSE.ROUTE102.value, 6),
+        )
+        state = self.state(
+            campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True),
+        )
+        candidate = EncounterCandidate(MapRSE.ROUTE101.value, EncounterMethod.LAND)
+        with patch.object(
+            campaign_objectives_module,
+            "_current_campaign_encounter_candidates",
+            return_value=(candidate,),
+        ):
+            selection = campaign_objectives_module._select_available_campaign_tasks(
+                (required, route_102, route_101), state
+            )
+
+        self.assertEqual(selection.objective.objective_id, route_101.objective_id)
+        self.assertEqual(selection.reason, "selected nearest on-route encounter while party has an open slot")
+
+    def test_current_corridor_encounter_and_next_map_share_one_portfolio(self):
+        required = replace(
+            self.objective("complete_petalburg_woods", self.predicate("reached", False)),
+            destination=MapRSE.PETALBURG_WOODS.value,
+        )
+
+        def on_route(location, route_cost):
+            return replace(
+                encounter_task(location),
+                encounter_evaluation=EncounterEvaluation(
+                    task_id=f"encounter:{location!r}",
+                    location=location,
+                    progression_destination=MapRSE.PETALBURG_WOODS.value,
+                    classification=EncounterClassification.ON_ROUTE,
+                    recommendation=EncounterRecommendation.PREFER,
+                    direct_progression_cost=20,
+                    encounter_cost=route_cost,
+                    encounter_to_progression_cost=20 - route_cost,
+                    via_encounter_cost=20,
+                    detour_cost=0,
+                    detour_ratio=0.0,
+                ),
+            )
+
+        route104 = on_route(MapRSE.ROUTE104.value, 0)
+        woods = on_route(MapRSE.PETALBURG_WOODS.value, 10)
+        state = replace(
+            self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True)),
+            raw_map=Fact.known(MapRSE.ROUTE104.value),
+        )
+        candidates = {
+            MapRSE.ROUTE104.value: (EncounterCandidate(MapRSE.ROUTE104.value, EncounterMethod.LAND, ("Taillow",)),),
+            MapRSE.PETALBURG_WOODS.value: (
+                EncounterCandidate(MapRSE.PETALBURG_WOODS.value, EncounterMethod.LAND, ("Shroomish",)),
+            ),
+        }
+        with patch.object(
+            campaign_objectives_module,
+            "_current_campaign_encounter_candidates",
+            side_effect=lambda _state, location: candidates[location],
+        ):
+            selection = campaign_objectives_module._select_available_campaign_tasks(
+                (required, route104, woods), state
+            )
+
+        self.assertEqual(selection.objective.objective_id, route104.objective_id)
+        self.assertTrue(any(row["task_id"] == woods.objective_id for row in selection.encounter_portfolio))
+
+    def test_early_petalburg_itinerary_keeps_route_101_103_and_102_encounters(self):
+        required = replace(
+            self.objective("complete_petalburg_wally", self.predicate("reached", False)),
+            destination=MapRSE.PETALBURG_CITY.value,
+        )
+
+        def deferred_encounter(location):
+            return replace(
+                encounter_task(location),
+                encounter_evaluation=EncounterEvaluation(
+                    task_id=f"obtain_encounter:{location[0]}:{location[1]}",
+                    location=location,
+                    progression_destination=MapRSE.PETALBURG_CITY.value,
+                    classification=EncounterClassification.LARGE_DETOUR,
+                    recommendation=EncounterRecommendation.DEFER,
+                    direct_progression_cost=10,
+                    encounter_cost=20,
+                    encounter_to_progression_cost=10,
+                    via_encounter_cost=30,
+                    detour_cost=20,
+                    detour_ratio=2.0,
+                ),
+            )
+
+        route_101 = deferred_encounter(MapRSE.ROUTE101.value)
+        route_103 = deferred_encounter(MapRSE.ROUTE103.value)
+        route_102 = deferred_encounter(MapRSE.ROUTE102.value)
+        state = self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True))
+        candidates = {
+            location: (EncounterCandidate(location, EncounterMethod.LAND, ("Poochyena",), ("dark",)),)
+            for location in (MapRSE.ROUTE101.value, MapRSE.ROUTE103.value, MapRSE.ROUTE102.value)
+        }
+
+        with patch.object(
+            campaign_objectives_module,
+            "_current_campaign_encounter_candidates",
+            side_effect=lambda _state, location: candidates[location],
+        ):
+            selection = campaign_objectives_module._select_available_campaign_tasks(
+                (required, route_101, route_103, route_102), state
+            )
+            self.assertEqual(selection.objective.objective_id, route_101.objective_id)
+
+            selection = campaign_objectives_module._select_available_campaign_tasks(
+                (required, route_103, route_102), state
+            )
+            self.assertEqual(selection.objective.objective_id, route_103.objective_id)
+
+            selection = campaign_objectives_module._select_available_campaign_tasks(
+                (required, route_102), state
+            )
+            self.assertEqual(selection.objective.objective_id, route_102.objective_id)
+
+    def test_large_detour_competes_with_preferred_encounter_in_one_portfolio(self):
+        required = replace(
+            self.objective("complete_petalburg_wally", self.predicate("reached", False)),
+            destination=MapRSE.PETALBURG_CITY_GYM.value,
+        )
+
+        def evaluated(location, classification, recommendation, detour_cost):
+            return replace(
+                encounter_task(location),
+                encounter_evaluation=EncounterEvaluation(
+                    task_id=f"obtain_encounter:{location[0]}:{location[1]}",
+                    location=location,
+                    progression_destination=MapRSE.PETALBURG_CITY_GYM.value,
+                    classification=classification,
+                    recommendation=recommendation,
+                    direct_progression_cost=10,
+                    encounter_cost=10 + detour_cost,
+                    encounter_to_progression_cost=10,
+                    via_encounter_cost=10 + detour_cost,
+                    detour_cost=detour_cost,
+                    detour_ratio=detour_cost / 10,
+                ),
+            )
+
+        preferred = evaluated(
+            MapRSE.ROUTE102.value,
+            EncounterClassification.ON_ROUTE,
+            EncounterRecommendation.PREFER,
+            0,
+        )
+        deferred = evaluated(
+            MapRSE.ROUTE103.value,
+            EncounterClassification.LARGE_DETOUR,
+            EncounterRecommendation.DEFER,
+            20,
+        )
+        state = self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True))
+        candidates = {
+            preferred.destination: (
+                EncounterCandidate(preferred.destination, EncounterMethod.LAND, ("Zigzagoon",)),
+            ),
+            deferred.destination: (
+                EncounterCandidate(
+                    deferred.destination,
+                    EncounterMethod.LAND,
+                    ("Lotad",),
+                    ("water",),
+                    future_value=20.0,
+                ),
+            ),
+        }
+        with patch.object(
+            campaign_objectives_module,
+            "_current_campaign_encounter_candidates",
+            side_effect=lambda _state, location: candidates[location],
+        ):
+            selection = campaign_objectives_module._select_available_campaign_tasks(
+                (required, preferred, deferred), state
+            )
+
+        self.assertEqual(selection.objective.objective_id, deferred.objective_id)
+        self.assertEqual(selection.encounter_portfolio[0]["task_id"], deferred.objective_id)
+        self.assertEqual(
+            {row["task_id"] for row in selection.encounter_portfolio},
+            {preferred.objective_id, deferred.objective_id},
+        )
+
+    def test_early_petalburg_itinerary_catches_route_102_before_calvin_when_already_there(self):
+        required = replace(
+            self.objective("complete_petalburg_wally", self.predicate("reached", False)),
+            destination=MapRSE.PETALBURG_CITY.value,
+        )
+        route_101 = replace(encounter_task(MapRSE.ROUTE101.value), encounter_evaluation=replace(
+            EncounterEvaluation(
+                task_id="route101",
+                location=MapRSE.ROUTE101.value,
+                progression_destination=MapRSE.PETALBURG_CITY.value,
+                classification=EncounterClassification.LARGE_DETOUR,
+                recommendation=EncounterRecommendation.DEFER,
+                direct_progression_cost=10,
+                encounter_cost=20,
+                encounter_to_progression_cost=10,
+                via_encounter_cost=30,
+                detour_cost=20,
+                detour_ratio=2.0,
+            )
+        ))
+        route_102 = replace(route_101, objective_id="obtain_encounter:0:17", destination=MapRSE.ROUTE102.value)
+        state = replace(
+            self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True)),
+            raw_map=Fact.known(MapRSE.ROUTE102.value),
+        )
+        with patch.object(
+            campaign_objectives_module,
+            "_current_campaign_encounter_candidates",
+            return_value=(EncounterCandidate(MapRSE.ROUTE102.value, EncounterMethod.LAND, ("Poochyena",), ("dark",)),),
+        ):
+            selection = campaign_objectives_module._select_available_campaign_tasks(
+                (required, route_101, route_102), state
+            )
+
+        self.assertEqual(selection.objective.objective_id, route_102.objective_id)
+
+    def test_trainer_preparation_can_promote_a_large_encounter_detour(self):
+        required = replace(
+            self.objective("complete_petalburg_wally", self.predicate("reached", False)),
+            destination=MapRSE.PETALBURG_CITY.value,
+        )
+        detour = replace(
+            encounter_task(MapRSE.ROUTE103.value),
+            encounter_evaluation=EncounterEvaluation(
+                task_id="obtain_encounter:0:18",
+                location=MapRSE.ROUTE103.value,
+                progression_destination=MapRSE.PETALBURG_CITY.value,
+                classification=EncounterClassification.LARGE_DETOUR,
+                recommendation=EncounterRecommendation.DEFER,
+                direct_progression_cost=10,
+                encounter_cost=20,
+                encounter_to_progression_cost=10,
+                via_encounter_cost=30,
+                detour_cost=20,
+                detour_ratio=2.0,
+                trainer_preparation_gain=1.0,
+                trainer_checkpoint_id="route102:first_poochyena",
+            ),
+        )
+        state = self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True))
+        candidate = EncounterCandidate(MapRSE.ROUTE103.value, EncounterMethod.LAND)
+        with patch.object(
+            campaign_objectives_module,
+            "_current_campaign_encounter_candidates",
+            return_value=(candidate,),
+        ):
+            selection = campaign_objectives_module._select_available_campaign_tasks(
+                (required, detour), state
+            )
+
+        self.assertEqual(selection.objective.objective_id, detour.objective_id)
+        self.assertIn("route102:first_poochyena", selection.reason)
 
     def test_level_target_completion_uses_all_living_non_egg_party_members(self):
         state = self.state()
@@ -405,8 +727,50 @@ class CampaignObjectiveTests(unittest.TestCase):
         rows = campaign_task_diagnostics(state, (task,))
         self.assertEqual(rows[0]["task_id"], task.objective_id)
         self.assertIn("route_relation", rows[0])
+        self.assertIn("selection_diagnostic", rows[0])
+        self.assertEqual(rows[0]["selection_diagnostic"]["task_id"], task.objective_id)
         self.assertEqual(state, before)
         self.assertIsNone(select_available_campaign_task(state, (task,)).objective)
+
+    def test_required_selection_explains_skipped_encounter_tradeoff(self):
+        required = replace(
+            self.objective("complete_petalburg_wally", self.predicate("reached", False)),
+            destination=MapRSE.PETALBURG_CITY.value,
+        )
+        encounter = replace(
+            encounter_task(MapRSE.ROUTE102.value),
+            encounter_evaluation=EncounterEvaluation(
+                task_id="obtain_encounter:0:17",
+                location=MapRSE.ROUTE102.value,
+                progression_destination=MapRSE.PETALBURG_CITY.value,
+                classification=EncounterClassification.LARGE_DETOUR,
+                recommendation=EncounterRecommendation.DEFER,
+                direct_progression_cost=10,
+                encounter_cost=12,
+                encounter_to_progression_cost=10,
+                via_encounter_cost=22,
+                detour_cost=12,
+                detour_ratio=1.2,
+                trainer_preparation_gain=0.25,
+                trainer_checkpoint_id="route102:first_poochyena",
+            ),
+        )
+
+        with patch.object(
+            campaign_objectives_module,
+            "_current_campaign_encounter_candidates",
+            return_value=(),
+        ):
+            selection = campaign_objectives_module._select_available_campaign_tasks(
+                (required, encounter), self.state()
+            )
+
+        self.assertEqual(selection.objective.objective_id, required.objective_id)
+        detail = selection.selection_diagnostics[0]
+        self.assertFalse(detail["selected"])
+        self.assertIn("required progression", detail["reason"])
+        self.assertEqual(detail["detour_cost"], 12)
+        self.assertEqual(detail["trainer_preparation_gain"], 0.25)
 
     def state(
         self,
@@ -606,7 +970,7 @@ class CampaignObjectiveTests(unittest.TestCase):
         self.assertTrue(state.campaign_facts.nuzlocke_started.value)
         planned = plan_campaign(state, goal=ultimate_emerald_campaign_goal())
         self.assertEqual(planned.status, ObjectiveStatus.READY)
-        self.assertEqual(planned.objective.objective_id, "reach_petalburg")
+        self.assertEqual(planned.objective.objective_id, "complete_petalburg_wally")
 
     def test_introductory_rival_accepts_a_usable_partially_damaged_party(self):
         objective = next(item for item in initial_emerald_campaign() if item.objective_id == "complete_intro_rival")
@@ -878,9 +1242,9 @@ class CampaignObjectiveTests(unittest.TestCase):
         )
         selection = select_campaign_objective(state)
         self.assertEqual(selection.status, ObjectiveStatus.READY)
-        self.assertEqual(selection.objective.objective_id, "reach_petalburg")
+        self.assertEqual(selection.objective.objective_id, "complete_petalburg_wally")
 
-    def test_low_ball_inventory_exposes_restock_before_route_progression(self):
+    def test_low_ball_inventory_without_a_planned_encounter_allows_progression(self):
         facts = self.facts(
             text_speed_fast=True,
             new_game_setup_complete=True,
@@ -903,9 +1267,9 @@ class CampaignObjectiveTests(unittest.TestCase):
         selection = select_available_campaign_task(state)
 
         self.assertEqual(selection.status, ObjectiveStatus.READY)
-        self.assertEqual(selection.objective.objective_id, "restock_pokeballs")
+        self.assertEqual(selection.objective.objective_id, "complete_petalburg_wally")
 
-    def test_dependency_aware_planner_exposes_restock_interrupt(self):
+    def test_dependency_aware_planner_allows_progression_without_a_planned_encounter(self):
         facts = replace(
             self.facts(
                 text_speed_fast=True,
@@ -926,7 +1290,7 @@ class CampaignObjectiveTests(unittest.TestCase):
         selection = plan_campaign(self.state(balls=1, campaign_facts=facts))
 
         self.assertEqual(selection.status, ObjectiveStatus.READY)
-        self.assertEqual(selection.objective.objective_id, "restock_pokeballs")
+        self.assertEqual(selection.objective.objective_id, "complete_petalburg_wally")
 
     def test_restock_uses_nonzero_live_inventory_when_receipt_fact_is_unknown(self):
         facts = replace(
@@ -947,7 +1311,11 @@ class CampaignObjectiveTests(unittest.TestCase):
 
         for balls in (1, 3, 4):
             selection = select_available_campaign_task(self.state(balls=balls, campaign_facts=facts))
-            self.assertEqual(selection.objective.objective_id, "restock_pokeballs", balls)
+            self.assertTrue(
+                selection.objective is None
+                or selection.objective.objective_id != "restock_pokeballs",
+                balls,
+            )
 
         sufficient_facts = replace(facts, pokeballs_sufficient=Fact.known(True))
         sufficient_selection = select_available_campaign_task(self.state(balls=5, campaign_facts=sufficient_facts))
@@ -956,7 +1324,7 @@ class CampaignObjectiveTests(unittest.TestCase):
             or sufficient_selection.objective.objective_id != "restock_pokeballs"
         )
 
-    def test_zero_ball_restock_requires_opening_receipt_fact(self):
+    def test_zero_ball_restock_requires_opening_receipt_and_planned_encounter(self):
         facts = self.facts(pokedex_received=True, pokeballs_ready=True)
         unknown_receipt = replace(
             facts,
@@ -969,15 +1337,27 @@ class CampaignObjectiveTests(unittest.TestCase):
         )
 
         received = replace(unknown_receipt, pokeballs_received=Fact.known(True))
-        self.assertEqual(
-            select_available_campaign_task(self.state(balls=0, campaign_facts=received)).objective.objective_id,
-            "restock_pokeballs",
+        selection = select_available_campaign_task(self.state(balls=0, campaign_facts=received))
+        self.assertTrue(
+            selection.objective is None
+            or selection.objective.objective_id != "restock_pokeballs"
         )
 
     def test_low_ball_reserve_suppresses_encounters_until_restock_is_selected(self):
         facts = replace(
-            self.facts(pokedex_received=True, pokeballs_ready=True),
-            pokeballs_received=Fact.unknown(),
+            self.facts(
+                text_speed_fast=True,
+                new_game_setup_complete=True,
+                wall_clock_set=True,
+                rival_met=True,
+                birch_rescued=True,
+                starter_obtained=True,
+                intro_rival_battle_complete=True,
+                pokedex_received=True,
+                pokeballs_available=True,
+                pokeballs_ready=True,
+            ),
+            pokeballs_received=Fact.known(True),
             pokeballs_sufficient=Fact.known(False),
         )
         state = replace(
@@ -985,11 +1365,29 @@ class CampaignObjectiveTests(unittest.TestCase):
             encounters=Fact.known((LocationEncounter(MapRSE.ROUTE102.value, "none"),)),
         )
 
-        available = available_campaign_tasks(state)
+        graph = WorldMapGraph(
+            (
+                WorldEdge(MapRSE.OLDALE_TOWN.value, MapRSE.ROUTE102.value, "connection", (), (), estimated_cost=4),
+                WorldEdge(MapRSE.ROUTE102.value, MapRSE.PETALBURG_CITY_GYM.value, "connection", (), (), estimated_cost=6),
+                WorldEdge(MapRSE.OLDALE_TOWN.value, MapRSE.PETALBURG_CITY_GYM.value, "connection", (), (), estimated_cost=10),
+            )
+        )
+        opportunity = campaign_objectives_module.EncounterOpportunity(
+            MapRSE.ROUTE102.value, True, False, True
+        )
+        with (
+            patch.object(campaign_objectives_module, "encounter_opportunities", return_value=(opportunity,)),
+            patch.object(campaign_objectives_module, "get_world_map_graph", return_value=graph),
+        ):
+            available = available_campaign_tasks(state)
+            selection = select_available_campaign_task(state)
+            planned = plan_campaign(state)
         task_ids = tuple(task.objective_id for task in available)
 
         self.assertIn("restock_pokeballs", task_ids)
         self.assertNotIn("obtain_encounter:0:17", task_ids)
+        self.assertEqual(selection.objective.objective_id, "restock_pokeballs")
+        self.assertEqual(planned.objective.objective_id, "restock_pokeballs")
 
     def test_sufficient_ball_inventory_does_not_expose_restock(self):
         facts = replace(
@@ -1048,10 +1446,8 @@ class CampaignObjectiveTests(unittest.TestCase):
                 "obtain_starter",
                 "complete_intro_rival",
                 "receive_pokedex",
-                "reach_petalburg",
                 "complete_petalburg_wally",
                 "complete_petalburg_woods",
-                "reach_rustboro",
                 "complete_rustboro_goods_stolen",
                 "report_devon_goods",
                 "recover_devon_goods",
@@ -1082,9 +1478,9 @@ class CampaignObjectiveTests(unittest.TestCase):
         )
         selection = select_available_campaign_task(state)
         self.assertEqual(selection.status, ObjectiveStatus.READY)
-        self.assertEqual(selection.objective.objective_id, "reach_petalburg")
+        self.assertEqual(selection.objective.objective_id, "complete_petalburg_wally")
         self.assertEqual(selection.objective.task_kind, "required")
-        self.assertEqual(selection.objective.destination, MapRSE.PETALBURG_CITY.value)
+        self.assertEqual(selection.objective.destination, MapRSE.PETALBURG_CITY_GYM.value)
 
     def test_post_start_objectives_remain_ordered(self):
         complete = dict(
@@ -1101,7 +1497,7 @@ class CampaignObjectiveTests(unittest.TestCase):
             nuzlocke_started=True,
         )
         state = self.state(campaign_facts=self.facts(**complete))
-        self.assertEqual(select_available_campaign_task(state).objective.objective_id, "reach_petalburg")
+        self.assertEqual(select_available_campaign_task(state).objective.objective_id, "complete_petalburg_wally")
         state = self.state(campaign_facts=self.facts(**complete, visited_petalburg=True))
         self.assertEqual(select_available_campaign_task(state).objective.objective_id, "complete_petalburg_wally")
         state = self.state(
@@ -1116,7 +1512,10 @@ class CampaignObjectiveTests(unittest.TestCase):
                 petalburg_woods_scene_complete=True,
             )
         )
-        self.assertEqual(select_available_campaign_task(state).objective.objective_id, "reach_rustboro")
+        self.assertEqual(
+            select_available_campaign_task(state).objective.objective_id,
+            "complete_rustboro_goods_stolen",
+        )
         state = self.state(
             campaign_facts=self.facts(
                 **complete,
@@ -1126,7 +1525,10 @@ class CampaignObjectiveTests(unittest.TestCase):
                 devon_goods_recovered=True,
             )
         )
-        self.assertEqual(select_available_campaign_task(state).objective.objective_id, "reach_rustboro")
+        self.assertEqual(
+            select_available_campaign_task(state).objective.objective_id,
+            "complete_rustboro_goods_stolen",
+        )
         state = self.state(
             campaign_facts=self.facts(
                 **complete,
@@ -1135,6 +1537,7 @@ class CampaignObjectiveTests(unittest.TestCase):
                 petalburg_woods_scene_complete=True,
                 devon_goods_recovered=True,
                 visited_rustboro=True,
+                devon_goods_stolen=True,
             )
         )
         self.assertEqual(select_available_campaign_task(state).objective.objective_id, "prepare_roxanne")
@@ -1175,6 +1578,120 @@ class CampaignObjectiveTests(unittest.TestCase):
         self.assertEqual(selection.reason, "selected required recovery-item restock task")
         self.assertEqual(plan_campaign(state).objective.objective_id, "restock_recovery_items")
 
+    def test_unfundable_recovery_restock_defers_on_current_map(self):
+        complete = self.facts(
+            text_speed_fast=True,
+            new_game_setup_complete=True,
+            wall_clock_set=True,
+            rival_met=True,
+            birch_rescued=True,
+            starter_obtained=True,
+            intro_rival_battle_complete=True,
+            pokedex_received=True,
+            pokeballs_available=True,
+            pokeballs_ready=True,
+            nuzlocke_started=True,
+        )
+        state = replace(
+            self.state(area="ROUTE101", balls=5, campaign_facts=complete),
+            inventory=Fact.known(
+                InventorySnapshot(
+                    (),
+                    (
+                        ItemQuantity("Poke Ball", 5),
+                        ItemQuantity("Antidote", 0),
+                        ItemQuantity("Potion", 1),
+                    ),
+                    (),
+                )
+            ),
+        )
+        campaign_objectives_module.context.campaign_restock_deferral = (
+            "restock_recovery_items",
+            MapRSE.OLDALE_TOWN.value,
+        )
+
+        selection = select_available_campaign_task(state)
+
+        self.assertEqual(selection.objective.objective_id, "complete_petalburg_wally")
+        self.assertEqual(plan_campaign(state).objective.objective_id, "complete_petalburg_wally")
+
+    def test_unfundable_restock_deferral_survives_unknown_map_observation(self):
+        complete = self.facts(
+            text_speed_fast=True,
+            new_game_setup_complete=True,
+            wall_clock_set=True,
+            rival_met=True,
+            birch_rescued=True,
+            starter_obtained=True,
+            intro_rival_battle_complete=True,
+            pokedex_received=True,
+            pokeballs_available=True,
+            pokeballs_ready=True,
+            nuzlocke_started=True,
+        )
+        state = replace(
+            self.state(area="ROUTE101", balls=5, campaign_facts=complete),
+            raw_map=Fact.unknown(),
+            inventory=Fact.known(
+                InventorySnapshot(
+                    (),
+                    (
+                        ItemQuantity("Poke Ball", 5),
+                        ItemQuantity("Antidote", 0),
+                        ItemQuantity("Potion", 1),
+                    ),
+                    (),
+                )
+            ),
+        )
+        campaign_objectives_module.context.campaign_restock_deferral = (
+            "restock_recovery_items",
+            MapRSE.OLDALE_TOWN.value,
+        )
+
+        selection = select_available_campaign_task(state)
+
+        self.assertEqual(selection.objective.objective_id, "complete_petalburg_wally")
+        self.assertEqual(
+            campaign_objectives_module.context.campaign_restock_deferral,
+            ("restock_recovery_items", MapRSE.OLDALE_TOWN.value),
+        )
+
+    def test_active_wally_scene_keeps_restock_from_preempting_story_progression(self):
+        complete = self.facts(
+            text_speed_fast=True,
+            new_game_setup_complete=True,
+            wall_clock_set=True,
+            rival_met=True,
+            birch_rescued=True,
+            starter_obtained=True,
+            intro_rival_battle_complete=True,
+            pokedex_received=True,
+            pokeballs_available=True,
+            pokeballs_ready=True,
+            nuzlocke_started=True,
+        )
+        state = replace(
+            self.state(area="PETALBURG_CITY_GYM", balls=5, campaign_facts=complete),
+            raw_map=Fact.known(MapRSE.PETALBURG_CITY_GYM.value),
+            inventory=Fact.known(
+                InventorySnapshot(
+                    (),
+                    (
+                        ItemQuantity("Poke Ball", 5),
+                        ItemQuantity("Antidote", 0),
+                        ItemQuantity("Potion", 1),
+                    ),
+                    (),
+                )
+            ),
+        )
+
+        selection = select_available_campaign_task(state)
+
+        self.assertEqual(selection.objective.objective_id, "complete_petalburg_wally")
+
     def test_first_badge_fixture_advances_from_new_run_to_authoritative_gym_flag(self):
         """Exercise the complete declarative slice through DEFEATED_RUSTBORO_GYM."""
         stages = [((), "set_text_speed")]
@@ -1193,11 +1710,11 @@ class CampaignObjectiveTests(unittest.TestCase):
             stages.append((tuple(completed), next_objective))
         completed.extend(("pokeballs_available", "pokeballs_received"))
         for fact, next_objective in (
-            ("pokeballs_ready", "reach_petalburg"),
-            ("visited_petalburg", "complete_petalburg_wally"),
+            ("pokeballs_ready", "complete_petalburg_wally"),
             ("petalburg_wally_scene_complete", "complete_petalburg_woods"),
-            ("petalburg_woods_scene_complete", "reach_rustboro"),
-            ("visited_rustboro", "prepare_roxanne"),
+            ("petalburg_woods_scene_complete", "complete_rustboro_goods_stolen"),
+            ("devon_goods_stolen", "recover_devon_goods"),
+            ("devon_goods_recovered", "prepare_roxanne"),
             ("prepare_roxanne", "defeat_roxanne"),
             ("first_badge_obtained", None),
         ):
@@ -1243,6 +1760,325 @@ class CampaignObjectiveTests(unittest.TestCase):
             current_area_is("OLDALE_TOWN").evaluate(self.state(canonical_available=False)).status,
             FactStatus.UNKNOWN,
         )
+
+    def test_reachability_keeps_current_checkpoint_map_open_but_blocks_beyond_it(self):
+        graph = WorldMapGraph(
+            (
+                WorldEdge(
+                    MapRSE.OLDALE_TOWN.value,
+                    MapRSE.ROUTE102.value,
+                    "connection",
+                    (),
+                    (),
+                    estimated_cost=1,
+                ),
+                WorldEdge(
+                    MapRSE.ROUTE102.value,
+                    MapRSE.PETALBURG_CITY.value,
+                    "connection",
+                    (),
+                    (),
+                    estimated_cost=1,
+                ),
+                WorldEdge(
+                    MapRSE.PETALBURG_CITY.value,
+                    MapRSE.ROUTE111.value,
+                    "connection",
+                    (),
+                    (),
+                    estimated_cost=1,
+                ),
+            )
+        )
+        state = self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True))
+
+        current_checkpoint = assess_campaign_reachability(state, MapRSE.ROUTE102.value, graph=graph)
+        future_route = assess_campaign_reachability(state, MapRSE.ROUTE111.value, graph=graph)
+
+        self.assertEqual(current_checkpoint.status, CampaignReachabilityStatus.REACHABLE_NOW)
+        self.assertEqual(future_route.status, CampaignReachabilityStatus.REACHABLE_AFTER_PREPARATION)
+        self.assertIn("route102:first_poochyena", future_route.blockers[0])
+        self.assertFalse(future_route.executable_now)
+
+        cleared_state = replace(
+            state,
+            campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True, visited_petalburg=True),
+            badges=Fact.known(
+                (
+                    NamedFlag("BADGE01_GET", True),
+                    NamedFlag("BADGE02_GET", True),
+                )
+            ),
+        )
+        self.assertEqual(
+            assess_campaign_reachability(cleared_state, MapRSE.ROUTE111.value, graph=graph).status,
+            CampaignReachabilityStatus.REACHABLE_NOW,
+        )
+
+    def test_oldale_west_exit_requires_the_pokedex_adventure_flag_boundary(self):
+        graph = WorldMapGraph(
+            (
+                WorldEdge(
+                    MapRSE.OLDALE_TOWN.value,
+                    MapRSE.ROUTE102.value,
+                    "connection",
+                    (),
+                    (),
+                    estimated_cost=1,
+                ),
+            )
+        )
+        requirements = emerald_map_access_requirements()
+        before_pokedex = self.state(campaign_facts=self.facts(pokedex_received=False))
+        blocked = assess_campaign_reachability(
+            before_pokedex,
+            MapRSE.ROUTE102.value,
+            graph=graph,
+            access_requirements=requirements,
+        )
+
+        self.assertEqual(blocked.status, CampaignReachabilityStatus.REACHABLE_AFTER_PREPARATION)
+        self.assertEqual(blocked.access_requirement_ids, ("route102:oldale_adventure_started",))
+        self.assertIn("route102:oldale_adventure_started: missing campaign fact pokedex_received", blocked.blockers)
+
+        after_pokedex = replace(
+            before_pokedex,
+            campaign_facts=self.facts(pokedex_received=True),
+        )
+        opened = assess_campaign_reachability(
+            after_pokedex,
+            MapRSE.ROUTE102.value,
+            graph=graph,
+            access_requirements=requirements,
+        )
+        self.assertEqual(opened.status, CampaignReachabilityStatus.REACHABLE_NOW)
+
+    def test_current_map_trainer_does_not_block_unrelated_route101_or_route103(self):
+        graph = WorldMapGraph(
+            (
+                WorldEdge(MapRSE.ROUTE102.value, MapRSE.ROUTE101.value, "connection", (), (), estimated_cost=1),
+                WorldEdge(MapRSE.ROUTE102.value, MapRSE.ROUTE103.value, "connection", (), (), estimated_cost=1),
+            )
+        )
+        state = replace(
+            self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True)),
+            raw_map=Fact.known(MapRSE.ROUTE102.value),
+        )
+
+        for destination in (MapRSE.ROUTE101.value, MapRSE.ROUTE103.value):
+            result = assess_campaign_reachability(state, destination, graph=graph)
+            self.assertEqual(result.status, CampaignReachabilityStatus.REACHABLE_NOW)
+            self.assertEqual(result.blockers, ())
+
+    def test_emerald_registry_blocks_future_encounter_corridors_before_story_opening(self):
+        graph = WorldMapGraph(
+            (
+                WorldEdge(MapRSE.OLDALE_TOWN.value, MapRSE.ROUTE110.value, "connection", (), (), estimated_cost=1),
+                WorldEdge(MapRSE.OLDALE_TOWN.value, MapRSE.ROUTE116.value, "connection", (), (), estimated_cost=1),
+            )
+        )
+        state = self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True))
+        requirements = emerald_map_access_requirements()
+
+        route110 = assess_campaign_reachability(
+            state,
+            MapRSE.ROUTE110.value,
+            graph=graph,
+            access_requirements=requirements,
+        )
+        route116 = assess_campaign_reachability(
+            state,
+            MapRSE.ROUTE116.value,
+            graph=graph,
+            access_requirements=requirements,
+        )
+
+        self.assertEqual(route110.status, CampaignReachabilityStatus.REACHABLE_AFTER_PREPARATION)
+        self.assertIn("route110:rustboro_corridor: missing campaign fact visited_rustboro", route110.blockers)
+        self.assertEqual(route116.status, CampaignReachabilityStatus.REACHABLE_AFTER_PREPARATION)
+        self.assertIn("route116:rustboro: missing campaign fact visited_rustboro", route116.blockers)
+
+        opened = replace(
+            state,
+            campaign_facts=self.facts(
+                pokedex_received=True,
+                pokeballs_ready=True,
+                petalburg_wally_scene_complete=True,
+                petalburg_woods_scene_complete=True,
+                visited_rustboro=True,
+            ),
+        )
+        self.assertEqual(
+            assess_campaign_reachability(
+                opened,
+                MapRSE.ROUTE110.value,
+                graph=graph,
+                access_requirements=requirements,
+            ).status,
+            CampaignReachabilityStatus.REACHABLE_NOW,
+        )
+
+    def test_route111_requires_both_badges_even_after_early_trainer_clearance(self):
+        graph = WorldMapGraph(
+            (
+                WorldEdge(MapRSE.OLDALE_TOWN.value, MapRSE.ROUTE102.value, "connection", (), (), estimated_cost=1),
+                WorldEdge(MapRSE.ROUTE102.value, MapRSE.PETALBURG_CITY.value, "connection", (), (), estimated_cost=1),
+                WorldEdge(MapRSE.PETALBURG_CITY.value, MapRSE.ROUTE111.value, "connection", (), (), estimated_cost=1),
+            )
+        )
+        state = replace(
+            self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True, visited_petalburg=True)),
+            badges=Fact.known(
+                (
+                    NamedFlag("BADGE01_GET", True),
+                    NamedFlag("BADGE02_GET", False),
+                )
+            ),
+        )
+
+        result = assess_campaign_reachability(state, MapRSE.ROUTE111.value, graph=graph)
+
+        self.assertEqual(result.status, CampaignReachabilityStatus.REACHABLE_AFTER_PREPARATION)
+        self.assertIn("route111:two_badges: missing badge BADGE02_GET", result.blockers)
+        self.assertEqual(result.access_requirement_ids, ("route111:two_badges",))
+
+    def test_unknown_badge_does_not_open_future_map(self):
+        graph = WorldMapGraph(
+            (
+                WorldEdge(MapRSE.OLDALE_TOWN.value, MapRSE.ROUTE111.value, "connection", (), (), estimated_cost=1),
+            )
+        )
+        state = replace(
+            self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True)),
+            badges=Fact.unknown(),
+        )
+
+        result = assess_campaign_reachability(state, MapRSE.ROUTE111.value, graph=graph)
+
+        self.assertEqual(result.status, CampaignReachabilityStatus.UNKNOWN)
+        self.assertIn("route111:two_badges: BADGE01_GET is unresolved", result.blockers)
+
+    def test_new_mauville_requires_surf_and_basement_key(self):
+        graph = WorldMapGraph(
+            (
+                WorldEdge(MapRSE.OLDALE_TOWN.value, MapRSE.NEW_MAUVILLE_ENTRANCE.value, "connection", (), (), estimated_cost=1),
+                WorldEdge(MapRSE.NEW_MAUVILLE_ENTRANCE.value, MapRSE.NEW_MAUVILLE_INSIDE.value, "warp", (), (), estimated_cost=1),
+            )
+        )
+        requirements = (
+            CampaignAccessRequirement(
+                "newmauville:surf",
+                MapRSE.NEW_MAUVILLE_ENTRANCE.value,
+                required_capabilities=("surf_available",),
+            ),
+            CampaignAccessRequirement(
+                "newmauville:basement_key",
+                MapRSE.NEW_MAUVILLE_INSIDE.value,
+                required_capabilities=("surf_available", "basement_key_obtained"),
+            ),
+        )
+        state = self.state(
+            campaign_facts=replace(
+                self.facts(pokedex_received=True, pokeballs_ready=True),
+                surf_available=Fact.known(False),
+                basement_key_obtained=Fact.known(False),
+            )
+        )
+
+        blocked = assess_campaign_reachability(
+            state,
+            MapRSE.NEW_MAUVILLE_INSIDE.value,
+            graph=graph,
+            access_requirements=requirements,
+        )
+
+        self.assertEqual(blocked.status, CampaignReachabilityStatus.REACHABLE_AFTER_PREPARATION)
+        self.assertIn("newmauville:surf: missing capability surf_available", blocked.blockers)
+        self.assertIn("newmauville:basement_key: missing capability basement_key_obtained", blocked.blockers)
+
+        ready_state = replace(
+            state,
+            campaign_facts=replace(
+                state.campaign_facts,
+                surf_available=Fact.known(True),
+                basement_key_obtained=Fact.known(True),
+            ),
+        )
+        ready = assess_campaign_reachability(
+            ready_state,
+            MapRSE.NEW_MAUVILLE_INSIDE.value,
+            graph=graph,
+            access_requirements=requirements,
+        )
+        self.assertEqual(ready.status, CampaignReachabilityStatus.REACHABLE_NOW)
+
+    def test_frontier_ids_hide_deferred_encounters_but_keep_them_in_policy_input(self):
+        required = replace(
+            self.objective("complete_petalburg_wally", self.predicate("reached", False)),
+            destination=MapRSE.PETALBURG_CITY.value,
+        )
+        future = replace(
+            encounter_task(MapRSE.NEW_MAUVILLE_INSIDE.value),
+            encounter_evaluation=EncounterEvaluation(
+                task_id="obtain_encounter:newmauville",
+                location=MapRSE.NEW_MAUVILLE_INSIDE.value,
+                progression_destination=MapRSE.PETALBURG_CITY.value,
+                classification=EncounterClassification.UNREACHABLE,
+                recommendation=EncounterRecommendation.UNAVAILABLE,
+                direct_progression_cost=10,
+                encounter_cost=20,
+                encounter_to_progression_cost=10,
+                via_encounter_cost=30,
+                detour_cost=20,
+                detour_ratio=2.0,
+                reachability_status=CampaignReachabilityStatus.REACHABLE_AFTER_PREPARATION,
+                reachability_blockers=("newmauville:basement_key: missing capability basement_key_obtained",),
+            ),
+        )
+        state = self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True))
+        with patch.object(
+            campaign_objectives_module,
+            "available_campaign_tasks",
+            return_value=(required, future),
+        ):
+            selection = select_available_campaign_task(state)
+
+        self.assertEqual(selection.objective.objective_id, required.objective_id)
+        self.assertEqual(selection.frontier_objective_ids, (required.objective_id,))
+
+    def test_inaccessible_encounter_cannot_take_ownership_from_required_progression(self):
+        required = replace(
+            self.objective("complete_petalburg_wally", self.predicate("reached", False)),
+            destination=MapRSE.PETALBURG_CITY.value,
+        )
+        future = replace(
+            encounter_task(MapRSE.ROUTE111.value),
+            encounter_evaluation=EncounterEvaluation(
+                task_id="obtain_encounter:route111",
+                location=MapRSE.ROUTE111.value,
+                progression_destination=MapRSE.PETALBURG_CITY.value,
+                classification=EncounterClassification.UNREACHABLE,
+                recommendation=EncounterRecommendation.UNAVAILABLE,
+                direct_progression_cost=10,
+                encounter_cost=20,
+                encounter_to_progression_cost=10,
+                via_encounter_cost=30,
+                detour_cost=20,
+                detour_ratio=2.0,
+                reachability_status=CampaignReachabilityStatus.REACHABLE_AFTER_PREPARATION,
+                reachability_blockers=("route102:first_poochyena: mandatory trainer preparation required",),
+            ),
+        )
+        state = self.state(campaign_facts=self.facts(pokedex_received=True, pokeballs_ready=True))
+        candidate = EncounterCandidate(MapRSE.ROUTE111.value, EncounterMethod.LAND)
+        with patch.object(
+            campaign_objectives_module,
+            "_current_campaign_encounter_candidates",
+            return_value=(candidate,),
+        ):
+            selection = campaign_objectives_module._select_available_campaign_tasks((required, future), state)
+
+        self.assertEqual(selection.objective.objective_id, required.objective_id)
 
 
 if __name__ == "__main__":

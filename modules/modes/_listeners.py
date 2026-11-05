@@ -28,6 +28,7 @@ from modules.menuing import (
     take_held_items_from_multiple_party_pokemon,
     get_items_available_for_pickup,
 )
+from modules.nuzlocke.held_item_policy import evaluate_held_item, party_held_items_needing_removal
 from modules.player import (
     TileTransitionState,
     get_player_avatar,
@@ -42,7 +43,7 @@ from modules.tasks import (
     get_task,
     get_tasks,
 )
-from ._interface import BattleAction, BotListener, BotMode, FrameInfo
+from ._interface import BattleAction, BotListener, BotMode, BotModeError, FrameInfo
 from .util import isolate_inputs, save_the_game, leave_safari_zone
 from ..battle_handler import handle_battle
 from ..battle_state import (
@@ -58,7 +59,10 @@ from ..battle_state import (
 )
 from ..battle_strategies import DefaultBattleStrategy, BattleStrategy
 from ..battle_strategies.catch import CatchStrategy
-from ..battle_strategies.nuzlocke_level_balancing import NuzlockeLevelBalancingBattleStrategy
+from ..battle_strategies.nuzlocke_level_balancing import (
+    NuzlockeCaptureStrategy,
+    NuzlockeLevelBalancingBattleStrategy,
+)
 from ..battle_strategies.run_away import RunAwayStrategy
 from ..fishing import FishingAttempt, FishingRod, FishingResult
 from ..keyboard import handle_naming_screen
@@ -258,9 +262,23 @@ class BattleListener(BotListener):
                 # encounter/battle history and could choose a new strategy;
                 # the ROM is already waiting for the next party member, so
                 # resume with the normal battle controller directly.
+                restored_strategy_factory = getattr(bot_mode, "battle_strategy_for_restored_battle", None)
+                restored_strategy = (
+                    restored_strategy_factory() if callable(restored_strategy_factory) else None
+                )
+                if restored_strategy is None:
+                    if context.bot_mode == "Campaign Progression":
+                        restored_strategy = NuzlockeLevelBalancingBattleStrategy()
+                    else:
+                        requires_explicit_policy = getattr(bot_mode, "requires_explicit_battle_policy", None)
+                        if callable(requires_explicit_policy) and requires_explicit_policy():
+                            raise BotModeError(
+                                "Campaign Progression resumed a battle without an explicit battle strategy."
+                            )
+                        restored_strategy = DefaultBattleStrategy()
                 self._reported_start_of_battle = True
                 self._current_action = BattleAction.Fight
-                context.controller_stack.append(self.fight(DefaultBattleStrategy()))
+                context.controller_stack.append(self.fight(restored_strategy))
 
         elif self._in_battle and not self._reported_start_of_battle and get_game_state() == GameState.BATTLE:
             self._reported_start_of_battle = True
@@ -276,16 +294,36 @@ class BattleListener(BotListener):
                 self._active_wild_encounter = None
 
             action = bot_mode.on_battle_started(self._active_wild_encounter)
+            requires_explicit_policy = getattr(bot_mode, "requires_explicit_battle_policy", None)
+            explicit_policy_required = callable(requires_explicit_policy) and requires_explicit_policy()
+
+            # Check this before the trainer/tutorial compatibility coercions
+            # below. Otherwise a missing Campaign callback would be converted
+            # to BattleAction.Fight and would silently construct the legacy
+            # DefaultBattleStrategy.
+            if action is None and explicit_policy_required:
+                raise BotModeError(
+                    "Campaign Progression returned no explicit battle strategy or action."
+                )
+            if action is BattleAction.Fight and explicit_policy_required:
+                raise BotModeError(
+                    "Campaign Progression returned the legacy Fight action instead of an explicit battle strategy."
+                )
 
             if encounter_type is EncounterType.Trainer and not isinstance(action, BattleStrategy):
                 action = BattleAction.Fight
             elif encounter_type is EncounterType.Tutorial:
                 # Modes that own the tutorial can still return CustomAction,
-                # but campaign mode explicitly requests Fight so the ROM's
-                # Wally battle script is advanced by the normal controller.
+                # while an explicit strategy is also valid for Campaign
+                # Progression. Both requests let the ROM's Wally battle script
+                # advance through the normal controller.
                 # Previously this branch overwrote that request and left the
                 # campaign loop waiting forever in GameState.BATTLE.
-                action = action if action is BattleAction.Fight else BattleAction.CustomAction
+                action = (
+                    action
+                    if action is BattleAction.Fight or isinstance(action, BattleStrategy)
+                    else BattleAction.CustomAction
+                )
             elif action is None:
                 action = handle_encounter(self._active_wild_encounter)
 
@@ -307,11 +345,29 @@ class BattleListener(BotListener):
                 context.controller_stack.append(self.fight(action))
                 diagnostic_print("STARTER_FLOW: BattleListener appended fight(strategy)", trace=True)
             elif action == BattleAction.Fight:
-                diagnostic_print("STARTER_FLOW: BattleListener appending fight(DefaultBattleStrategy)", trace=True)
-                context.controller_stack.append(self.fight(DefaultBattleStrategy()))
-                diagnostic_print("STARTER_FLOW: BattleListener appended fight(DefaultBattleStrategy)", trace=True)
+                if context.bot_mode == "Campaign Progression":
+                    campaign_factory = getattr(bot_mode, "battle_strategy_for_restored_battle", None)
+                    campaign_strategy = (
+                        campaign_factory()
+                        if callable(campaign_factory)
+                        else NuzlockeLevelBalancingBattleStrategy()
+                    )
+                    diagnostic_print(
+                        lambda: (
+                            "STARTER_FLOW: BattleListener appending strict campaign battle strategy "
+                            f"{type(campaign_strategy).__name__}"
+                        ),
+                        trace=True,
+                    )
+                    context.controller_stack.append(self.fight(campaign_strategy))
+                else:
+                    diagnostic_print("STARTER_FLOW: BattleListener appending fight(DefaultBattleStrategy)", trace=True)
+                    context.controller_stack.append(self.fight(DefaultBattleStrategy()))
+                    diagnostic_print("STARTER_FLOW: BattleListener appended fight(DefaultBattleStrategy)", trace=True)
             elif action == BattleAction.RunAway:
-                context.controller_stack.append(self.run_away_from_battle())
+                run_away_factory = getattr(bot_mode, "battle_strategy_for_run_away", None)
+                run_away_strategy = run_away_factory() if callable(run_away_factory) else None
+                context.controller_stack.append(self.run_away_from_battle(run_away_strategy))
             elif action == BattleAction.Catch:
                 context.controller_stack.append(self.catch())
             else:
@@ -581,21 +637,7 @@ class BattleListener(BotListener):
             trace=True,
         )
 
-        if len(result.party_indices_with_picked_up_items) > 0:
-            context.stats.log_pickup_items(
-                [get_party()[index].held_item for index in result.party_indices_with_picked_up_items]
-            )
-
-        if (
-            get_game_state() != GameState.BATTLE
-            and not get_global_script_context().is_active
-            and player_avatar_is_standing_still()
-        ):
-            if context.bot_mode_instance is not None and (
-                len(result.party_indices_with_stolen_items) > 0
-                or (should_check_for_pickup() and context.bot_mode_instance.on_pickup_threshold_reached())
-            ):
-                yield from self.retrieve_held_items(result)
+        yield from self._maintain_held_items_after_battle(result)
         if isinstance(strategy, NuzlockeLevelBalancingBattleStrategy) and context.bot_mode != "Campaign Progression":
             yield from self._post_battle_rotation(strategy, first_non_fainted_lead_before_battle)
         elif (
@@ -633,18 +675,61 @@ class BattleListener(BotListener):
                 not pokemon.is_egg
                 and pokemon.ability.name == "Pickup"
                 and (held_item := pokemon.held_item) is not None
-                and held_item.name in pickup_item_names
+                and any(
+                    held_item.name.casefold().replace("’", "'")
+                    == pickup_name.casefold().replace("’", "'")
+                    for pickup_name in pickup_item_names
+                )
             ):
                 pokemon_with_picked_up_item.append(pokemon.index)
+
+        policy_indices = party_held_items_needing_removal(get_party())
+        for party_index in policy_indices:
+            pokemon = get_party()[party_index]
+            decision = evaluate_held_item(pokemon)
+            diagnostic_print(
+                lambda pokemon=pokemon, party_index=party_index, decision=decision: (
+                    "HELD_ITEM_POLICY: "
+                    f"pokemon={getattr(pokemon, 'name', None)!r} party_index={party_index!r} "
+                    f"item={getattr(getattr(pokemon, 'held_item', None), 'name', None)!r} "
+                    f"ability={getattr(getattr(pokemon, 'ability', None), 'name', None)!r} "
+                    f"action='take' reason={decision.reason!r}"
+                ),
+                trace=True,
+                prefix="HELD_ITEM_POLICY:",
+            )
 
         retrieved_items = yield from take_held_items_from_multiple_party_pokemon(
             [
                 *result.party_indices_with_stolen_items,
                 *pokemon_with_picked_up_item,
+                *policy_indices,
             ],
             force_checking=len(result.party_indices_with_stolen_items) == 0,
         )
         yield from plugin_picked_up_items(retrieved_items)
+
+    def _maintain_held_items_after_battle(self, result: HandledBattleResult):
+        """Record and collect held items after every stable battle exit."""
+
+        if len(result.party_indices_with_picked_up_items) > 0:
+            context.stats.log_pickup_items(
+                [get_party()[index].held_item for index in result.party_indices_with_picked_up_items]
+            )
+
+        policy_indices_present = bool(party_held_items_needing_removal(get_party()))
+        if (
+            get_game_state() != GameState.BATTLE
+            and not get_global_script_context().is_active
+            and player_avatar_is_standing_still()
+            and context.bot_mode_instance is not None
+            and (
+                len(result.party_indices_with_stolen_items) > 0
+                or policy_indices_present
+                or (should_check_for_pickup() and context.bot_mode_instance.on_pickup_threshold_reached())
+            )
+        ):
+            yield from self.retrieve_held_items(result)
 
     @debug.track
     def rotate_lead_pokemon(self, new_lead_index: int, old_lead_index: int):
@@ -686,11 +771,28 @@ class BattleListener(BotListener):
             return
         self._post_battle_rotation_active = True
         try:
-            menu_controller = MenuWrapper(RotatePokemon(new_lead_index, old_lead_index)).step()
+            rotation = RotatePokemon(new_lead_index, old_lead_index)
+            menu_controller = MenuWrapper(rotation).step()
             for elapsed_frames in range(self._POST_BATTLE_ROTATION_TIMEOUT_FRAMES):
                 try:
                     next(menu_controller)
                 except StopIteration:
+                    if rotation.failure is not None or not rotation.completed:
+                        failure = rotation.failure
+                        diagnostic_print(
+                            lambda: (
+                                "BATTLE_POST_ROTATION_MENU: "
+                                f"completed=False elapsed_frames={elapsed_frames!r} "
+                                f"new_lead={new_lead_index!r} old_lead={old_lead_index!r} "
+                                f"phase={getattr(failure, 'phase', None)!r} "
+                                f"reason={getattr(failure, 'reason', 'rotation stopped without completion')!r}"
+                            ),
+                            trace=True,
+                        )
+                        if context.bot_mode != "Manual":
+                            context.message = "Post-battle party rotation stalled; switching to manual mode."
+                            context.set_manual_mode(enable_video_and_slow_down=False)
+                        return
                     diagnostic_print(
                         lambda: (
                             "BATTLE_POST_ROTATION_MENU: "
@@ -778,10 +880,9 @@ class BattleListener(BotListener):
     @isolate_inputs
     @debug.track
     def catch(self):
-        # CatchStrategy owns the turns, but a completed capture can add a new
-        # low-level party member. Keep the post-battle leveling policy the
-        # same as ordinary campaign battles, including the zero-ball fallback
-        # where CatchStrategy fights or runs instead of throwing an item.
+        # The selected capture strategy owns the turns, but a completed
+        # capture can add a new low-level party member. Keep the post-battle
+        # leveling policy the same as ordinary campaign battles.
         first_non_fainted_lead_before_battle = get_party().first_non_fainted.index
         try:
             party_size_before_battle = len(get_party())
@@ -789,8 +890,16 @@ class BattleListener(BotListener):
             party_size_before_battle = None
         yield from plugin_battle_started(self._active_wild_encounter)
         capture_factory = getattr(getattr(context, "bot_mode_instance", None), "capture_battle_strategy", None)
-        capture_strategy = capture_factory() if callable(capture_factory) else CatchStrategy()
-        yield from handle_battle(capture_strategy)
+        if callable(capture_factory):
+            capture_strategy = capture_factory()
+        elif context.bot_mode == "Campaign Progression":
+            # Campaign capture ownership must remain on the strict
+            # expectiminimax strategy even if the mode factory is temporarily
+            # unavailable during a transition.
+            capture_strategy = NuzlockeCaptureStrategy()
+        else:
+            capture_strategy = CatchStrategy()
+        result = yield from handle_battle(capture_strategy)
         yield from self._wait_until_battle_is_over()
         # The battle engine mutates both structures while returning control
         # to the field. Do not let a same-frame cache hide a newly caught
@@ -823,6 +932,7 @@ class BattleListener(BotListener):
                     )
                     break
                 yield
+        yield from self._maintain_held_items_after_battle(result)
         if context.bot_mode != "Campaign Progression":
             yield from self._post_battle_rotation(
                 NuzlockeLevelBalancingBattleStrategy(),
@@ -843,13 +953,14 @@ class BattleListener(BotListener):
 
     @isolate_inputs
     @debug.track
-    def run_away_from_battle(self):
+    def run_away_from_battle(self, strategy: BattleStrategy | None = None):
         first_non_fainted_lead_before_battle = get_party().first_non_fainted.index
         while get_game_state() != GameState.BATTLE:
             yield
         yield from plugin_battle_started(self._active_wild_encounter)
-        yield from handle_battle(RunAwayStrategy())
+        result = yield from handle_battle(strategy or RunAwayStrategy())
         yield from self._wait_until_battle_is_over()
+        yield from self._maintain_held_items_after_battle(result)
         # Running is also a normal campaign battle exit. If the encounter
         # was skipped because of resource pressure, give the weakest living
         # member the next opportunity to receive experience.

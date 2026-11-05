@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 from modules.context import context
-from modules.map import get_maps_with_wild_encounters
+from modules.map import get_map_all_tiles, get_map_data, get_maps_with_wild_encounters
 from modules.map import get_wild_encounters_for_map
 
 from .campaign_state import CampaignState
@@ -31,6 +31,18 @@ _world_encounter_locations_cache: dict[tuple[int, str], tuple[tuple[int, int], .
 # runtime only has a land-encounter executor.  The ROM catalog remains broad;
 # this boundary controls which methods may be mounted by campaign planning.
 CAMPAIGN_EXECUTABLE_ENCOUNTER_METHODS = frozenset({EncounterMethod.LAND})
+
+
+@lru_cache(maxsize=128)
+def _land_encounter_tiles_available(location: tuple[int, int]) -> bool:
+    """Return whether the ROM map exposes a tile for the land executor."""
+    try:
+        map_data = get_map_data(location, (0, 0))
+        return any(tile.has_encounters for tile in get_map_all_tiles(map_data))
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        # Offline fixtures can provide encounter tables without a tile map.
+        # Preserve their catalog behavior; live profiles have this metadata.
+        return True
 
 
 def _party_has_move(state: CampaignState, move_name: str) -> bool:
@@ -197,9 +209,30 @@ def encounter_candidates_for_location(
         )
         if not entries or not method_is_available:
             continue
+        if method is EncounterMethod.LAND and not _land_encounter_tiles_available(location):
+            continue
         species = tuple(dict.fromkeys(entry.species.name for entry in entries))
         types = tuple(dict.fromkeys(type_.name.lower() for entry in entries for type_ in entry.species.types))
-        result.append(EncounterCandidate(location, method, species, types, reachable=reachable, pending=pending))
+        species_rates_by_name: dict[str, float] = {}
+        species_types: dict[str, tuple[str, ...]] = {}
+        for entry in entries:
+            name = entry.species.name
+            species_rates_by_name[name] = species_rates_by_name.get(name, 0.0) + float(entry.encounter_rate)
+            species_types[name] = tuple(type_.name.lower() for type_ in entry.species.types)
+        result.append(
+            EncounterCandidate(
+                location,
+                method,
+                species,
+                types,
+                reachable=reachable,
+                pending=pending,
+                species_rates=tuple(species_rates_by_name.items()),
+                species_types=tuple(species_types.items()),
+                min_level=min((int(entry.min_level) for entry in entries), default=None),
+                max_level=max((int(entry.max_level) for entry in entries), default=None),
+            )
+        )
     return tuple(result)
 
 

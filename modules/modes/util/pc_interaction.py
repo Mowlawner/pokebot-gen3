@@ -35,6 +35,7 @@ class PCStorageSection(Enum):
     WithdrawPokemon = auto()
     DepositPokemon = auto()
     MovePokemon = auto()
+    SelectBox = auto()
     MoveItems = auto()
     WithdrawItem = auto()
     DepositItem = auto()
@@ -44,6 +45,7 @@ class PCStorageSection(Enum):
 class PCStorageActionType(Enum):
     Withdraw = auto()
     Deposit = auto()
+    Select = auto()
     Toss = auto()
     ReleaseFromParty = auto()
     ReleaseFromBox = auto()
@@ -77,6 +79,14 @@ class PCAction:
             PCStorageActionType.Deposit,
             pokemon,
             target_box,
+        )
+
+    @classmethod
+    def select_active_box(cls, box_index: int) -> "PCAction":
+        return cls(
+            PCStorageSection.SelectBox,
+            PCStorageActionType.Select,
+            target_box=box_index,
         )
 
     @classmethod
@@ -223,6 +233,9 @@ def _get_storage_state() -> StorageState:
         )
 
 
+_POKEMON_STORAGE_TRANSITION_TIMEOUT = 180
+
+
 def _get_storage_task_name() -> str:
     return "Task_PokemonStorageSystem" if context.rom.is_rs else "Task_PCMainMenu"
 
@@ -269,6 +282,8 @@ def _open_pc_menu(button_to_press: str = "A") -> Generator:
 
 @debug.track
 def _open_pokemon_storage_menu(menu_index: int) -> Generator:
+    storage_task_name = _get_storage_task_name()
+
     # If we're in the item menu -> close until we're back at the main menu
     if get_global_script_context().is_active and "EventScript_AccessPlayersPC" in get_global_script_context().stack:
         yield from _open_pc_menu("B")
@@ -279,13 +294,29 @@ def _open_pokemon_storage_menu(menu_index: int) -> Generator:
             context.emulator.press_button("Up")
             yield
             yield
-        yield from wait_until_task_is_active(_get_storage_task_name(), "A")
-    while get_task(_get_storage_task_name()).data_value(0) != 2:
+        yield from wait_until_task_is_active(storage_task_name, "A")
+    # The event script may have finished by the time the PC task is observed.
+    # Task_PCMainMenu is the usable boundary for the Pokémon section menu, so
+    # continue from it even when the script stack is inactive.
+    for elapsed in range(_POKEMON_STORAGE_TRANSITION_TIMEOUT):
+        storage_task = get_task(storage_task_name)
+        task_ready = storage_task is not None and storage_task.data_value(0) == 2
+        if task_ready:
+            break
         yield
+    else:
+        raise BotModeError(
+            "Pokémon storage main menu was not ready before PC actions "
+            f"(waited {_POKEMON_STORAGE_TRANSITION_TIMEOUT} frames; "
+            f"game_state={get_game_state()!r}; callback={get_game_state_symbol()!r}; "
+            f"task={storage_task_name!r})."
+        )
 
     # Select the correct section
-    while get_task(_get_storage_task_name()).data_value(1) != menu_index:
-        context.emulator.press_button("Down" if get_task(_get_storage_task_name()).data_value(1) < menu_index else "Up")
+    while get_task(storage_task_name).data_value(1) != menu_index:
+        context.emulator.press_button(
+            "Down" if get_task(storage_task_name).data_value(1) < menu_index else "Up"
+        )
         yield
     if context.rom.is_rs:
         while get_game_state_symbol() != "SUB_8096B38":
@@ -294,6 +325,31 @@ def _open_pokemon_storage_menu(menu_index: int) -> Generator:
         yield from wait_for_n_frames(15)
     else:
         yield from wait_until_task_is_active("Task_PokeStorageMain", "A")
+
+        # Task_PokeStorageMain can become active one or more frames before
+        # callback2 publishes POKE_STORAGE. Require either that callback or a
+        # decoded storage menu before performing PC actions. This check must
+        # happen after selecting the requested Pokémon section: Task_PCMainMenu
+        # is the section menu, not the storage grid itself.
+        storage_input_task_name = "Task_PokeStorageMain"
+        for elapsed in range(_POKEMON_STORAGE_TRANSITION_TIMEOUT):
+            game_state = get_game_state()
+            storage_task = get_task(storage_input_task_name)
+            task_ready = storage_task is not None
+            try:
+                storage_menu_visible = bool(_get_storage_menu())
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, IndexError):
+                storage_menu_visible = False
+            if task_ready and (game_state is GameState.POKE_STORAGE or storage_menu_visible):
+                break
+            yield
+        else:
+            raise BotModeError(
+                "Pokémon storage menu was not observed before PC actions "
+                f"(waited {_POKEMON_STORAGE_TRANSITION_TIMEOUT} frames; "
+                f"game_state={get_game_state()!r}; callback={get_game_state_symbol()!r}; "
+                f"task={storage_input_task_name!r}; storage_menu_visible={storage_menu_visible!r})."
+            )
 
 
 @debug.track
@@ -466,20 +522,24 @@ def _do_withdraw_actions(actions: list[PCAction]) -> Generator:
     yield from _back_to_pokemon_storage_menu()
 
 
+def _validate_party_deposit(party, pokemon: Pokemon) -> None:
+    """Reject party deposits that would leave no usable party member."""
+    if len(party) == 1:
+        raise BotModeError("Cannot deposit that Pokémon because it's the only one in the party.")
+    if len(party.non_eggs) == 1:
+        raise BotModeError("Cannot deposit that Pokémon because only eggs would remain in the party.")
+    living = party.non_fainted_pokemon
+    if len(living) == 1 and any(member is pokemon for member in living):
+        raise BotModeError("Cannot deposit that Pokémon because it is the only living Pokémon in the party.")
+
+
 @debug.track
 def _do_deposit_actions(actions: list[PCAction]) -> Generator:
     yield from _open_pokemon_storage_menu(1)
     for action in actions:
         if action.action is PCStorageActionType.Deposit:
             party = get_party()
-            if len(party) == 1:
-                raise BotModeError("Cannot deposit that Pokémon because it's the only one in the party.")
-            if len(party.non_eggs) == 1:
-                raise BotModeError("Cannot deposit that Pokémon because only eggs would remain in the party.")
-            if len(party.non_fainted_pokemon) == 1:
-                raise BotModeError(
-                    "Cannot deposit that Pokémon because only fainted Pokémon would remain in the party."
-                )
+            _validate_party_deposit(party, action.pokemon)
             target_box = action.target_box
             if target_box is None:
                 index = 0
@@ -597,6 +657,22 @@ def _do_move_pokemon_actions(actions: list[PCAction]) -> Generator:
             while _get_storage_state().state != 0:
                 yield
             yield
+    yield from _back_to_pokemon_storage_menu()
+
+
+@debug.track
+def _do_select_box_actions(actions: list[PCAction]) -> Generator:
+    """Set the active capture box while the PC is already open."""
+    yield from _open_pokemon_storage_menu(0)
+    for action in actions:
+        if action.action is not PCStorageActionType.Select:
+            continue
+        target_box = action.target_box
+        if target_box is None or not 0 <= target_box < 14:
+            raise BotModeError(f"Cannot select invalid PC box {target_box!r}.")
+        yield from _select_box(target_box)
+        if _get_storage_state().active_box != target_box:
+            raise BotModeError(f"Could not select PC box {target_box + 1}.")
     yield from _back_to_pokemon_storage_menu()
 
 
@@ -782,6 +858,10 @@ def interact_with_pc(actions: list[PCAction]) -> Generator:
     actions_for_move_pokemon_menu = [action for action in actions if action.section is PCStorageSection.MovePokemon]
     if len(actions_for_move_pokemon_menu) > 0:
         yield from _do_move_pokemon_actions(actions_for_move_pokemon_menu)
+
+    actions_for_select_box_menu = [action for action in actions if action.section is PCStorageSection.SelectBox]
+    if len(actions_for_select_box_menu) > 0:
+        yield from _do_select_box_actions(actions_for_select_box_menu)
 
     actions_for_withdraw_menu = [action for action in actions if action.section is PCStorageSection.WithdrawPokemon]
     if len(actions_for_withdraw_menu) > 0:

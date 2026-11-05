@@ -1,0 +1,144 @@
+"""Campaign-owned wild-battle preparation loop.
+
+The legacy ``PokecenterLoopController`` deliberately heals once when it is
+mounted.  That is useful for the standalone level-grind mode, where the
+requested run should start from a known Center, but it is the wrong contract
+for campaign preparation: campaign readiness has already decided whether
+recovery is needed.  Keep the campaign loop separate so mounting preparation
+does not create a new healing decision.
+"""
+
+from collections.abc import Callable, Iterator
+from typing import Literal, Optional
+
+from modules.battle_strategies import BattleStrategy, DefaultBattleStrategy
+from modules.context import context
+from modules.debug import debug
+from modules.encounter import EncounterInfo, handle_encounter
+from modules.map import (
+    get_effective_encounter_rates_for_current_map,
+    get_map_data_for_current_position,
+)
+from modules.map_data import MapFRLG, PokemonCenter, get_map_enum
+from modules.modes import BattleAction, BotModeError
+from modules.modes.util import (
+    apply_white_flute_if_available,
+    find_closest_pokemon_center,
+    fish,
+    heal_in_pokemon_center,
+    navigate_to,
+    spin,
+)
+from modules.player import get_player_location
+from modules.pokemon_party import get_party
+
+
+class CampaignPreparationLoopController:
+    """Run preparation encounters under campaign recovery ownership.
+
+    This intentionally mirrors the useful battle and activity lifecycle of
+    the legacy loop while leaving startup healing to the campaign readiness
+    decision.  Legacy modes continue to use ``PokecenterLoopController``.
+    """
+
+    def __init__(
+        self,
+        focus_on_lead_pokemon: bool = False,
+        recovery_handler: Callable[[PokemonCenter], Iterator[object]] | None = None,
+        center_finder: Callable[[object], PokemonCenter] | None = None,
+        activity_handler: Callable[[], None] | None = None,
+    ):
+        self.battle_strategy = DefaultBattleStrategy
+        self._focus_on_lead_pokemon = focus_on_lead_pokemon
+        self._recovery_handler = recovery_handler
+        self._center_finder = center_finder or find_closest_pokemon_center
+        self._activity_handler = activity_handler
+        self._needs_healing = False
+        self._leave_pokemon_center = False
+
+    def on_battle_started(self, encounter: "EncounterInfo | None") -> BattleAction | BattleStrategy | None:
+        if encounter is None:
+            return None
+        action = handle_encounter(encounter, enable_auto_battle=True)
+        return self.battle_strategy() if action is BattleAction.Fight else action
+
+    def on_battle_ended(self) -> None:
+        lead_pokemon = get_party().non_eggs[0]
+        if not self.battle_strategy().pokemon_can_battle(lead_pokemon):
+            lead_knows_damaging_moves = any(
+                learned_move.move.base_power
+                for learned_move in lead_pokemon.moves
+                if learned_move is not None
+            )
+            if (
+                lead_pokemon.current_hp <= 0
+                or lead_knows_damaging_moves
+                or not self.battle_strategy().party_can_battle()
+            ):
+                self._needs_healing = True
+
+    def on_whiteout(self) -> bool:
+        self._leave_pokemon_center = True
+        return True
+
+    def verify_on_start(self):
+        current_location = get_map_data_for_current_position()
+        if not current_location.has_encounters:
+            raise BotModeError("There are not encounters on this tile.")
+
+        effective_encounters = get_effective_encounter_rates_for_current_map()
+        if (not current_location.is_surfable and len(effective_encounters.land_encounters) == 0) or (
+            current_location.is_surfable and len(effective_encounters.surf_encounters) == 0
+        ):
+            raise BotModeError(
+                "Currently, no encounters can happen on this map. This might be due to active Repel, or because this map simply doesn't have any."
+            )
+
+        self._center_finder(current_location)
+
+    @debug.track
+    def run(
+        self,
+        stop_condition: Optional[Callable[[], bool]] = None,
+        activity: Literal["spin", "fish"] = "spin",
+    ):
+        encounter_spot = get_map_data_for_current_position()
+        pokemon_center = self._center_finder(encounter_spot)
+
+        # Campaign readiness owns this decision.  In particular, do not set
+        # this at mount time merely to establish a respawn point; a healthy
+        # party should remain on the selected training map.
+        while stop_condition is None or not stop_condition():
+            if self._leave_pokemon_center:
+                if context.rom.is_frlg:
+                    current_map = get_player_location()[0]
+                    door_coordinates = (4, 8) if current_map is MapFRLG.PALLET_TOWN_PLAYERS_HOUSE_1F else (7, 8)
+                    yield from navigate_to(current_map, door_coordinates)
+            elif self._needs_healing:
+                if self._recovery_handler is None:
+                    yield from heal_in_pokemon_center(pokemon_center)
+                else:
+                    yield from self._recovery_handler(pokemon_center)
+
+            self._leave_pokemon_center = False
+            self._needs_healing = False
+
+            yield from navigate_to(get_map_enum(encounter_spot), encounter_spot.local_position)
+
+            def activity_stop_condition() -> bool:
+                return (
+                    self._needs_healing
+                    or self._leave_pokemon_center
+                    or (stop_condition is not None and stop_condition())
+                )
+
+            if activity == "fish":
+                yield from fish(stop_condition=activity_stop_condition, loop=True)
+            else:
+                yield from apply_white_flute_if_available()
+                if self._activity_handler is None:
+                    yield from spin(stop_condition=activity_stop_condition)
+                else:
+                    while not activity_stop_condition():
+                        self._activity_handler()
+                        yield

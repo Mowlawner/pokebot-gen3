@@ -43,16 +43,25 @@ the long-term ownership migration described later in this document:
    rival battle handoff.
 2. Recovery candidate validation is bounded. The observer evaluates at most
    four catalog candidates by default, and each speculative world search is
-   limited to 4,000 expansions and 512 route-cost units. After a candidate is
-   found, later searches receive its lexicographic
-   `(encounter_opportunities, total_route_cost)` ceiling. A budget exhaustion is
-   recorded as a candidate failure and does not stall the controller.
+   limited to 4,000 expansions and 512 route-cost units. Critical recovery
+   keeps the lexicographic `(encounter_opportunities, total_route_cost)` ceiling;
+   opportunistic recovery uses a weighted route-cost ceiling so a nearby path
+   through a few grass tiles can beat a much longer encounter-free detour. A
+   budget exhaustion is recorded as a candidate failure and does not stall the
+   controller.
 3. Readiness is mounted from execution shape and campaign readiness, not from
    the `receive_pokedex` objective ID or objective-specific resource metadata.
    Tactical goals, destination-bearing capabilities, and targetless capabilities
    after the Pokédex boundary use the same readiness policy. Targetless
    capabilities reuse the selected recovery route directly, avoiding a second
    global route-composition search.
+
+Opportunistic recovery now uses `EncounterMode.MOSTLY_AVOID` with the existing
+default penalty of eight route-cost units per encounter opportunity. Critical
+recovery remains encounter-first and only uses the weighted mode after a strict
+search exhausts its bounded budget. Route metrics preserve the configured
+penalty through cross-map composition and execution, so candidate diagnostics
+and the mounted route use the same score.
 
 The remaining limitation is architectural rather than a freeze-safety issue:
 the controller still executes a selected recovery stop through its transient
@@ -172,6 +181,54 @@ Petalburg is the concrete example that the placeholder graph currently hides:
   scene task, then delegate movement, dialogue, interaction, and battle work
   to their respective executors until the ROM reports the resulting fact.
 
+### Trigger-first campaign planning direction
+
+The Emerald campaign should be planned as a sequence of ROM-backed progress
+triggers and completion facts. A map is usually the place where a trigger is
+located, but arriving at that map is not itself the strategic milestone. The
+planner must ask which authoritative gate is currently unmet, then resolve the
+movement and interaction prerequisites needed to activate that gate.
+
+For the early game, the progression frontier should therefore be represented
+by facts such as:
+
+1. the opening cutscene has completed and the clock is set;
+2. the rival meeting has completed;
+3. Birch's rescue, starter selection, Pokédex receipt, and initial Poké Ball
+   handoff have completed;
+4. the Wally scene in Petalburg has completed, which opens the Petalburg Woods
+   path;
+5. the Petalburg Woods Devon scene and villainous-grunt battle have completed;
+6. Rustboro has been reached through that cleared route and Roxanne's gym
+   progression has completed.
+
+Petalburg arrival is still useful as an observed location fact and route
+boundary for the Wally capability. It should not stand in for
+`complete_petalburg_wally`, because the Wally completion fact is the ROM-owned
+event that changes the next reachable frontier. The same rule applies to later
+map arrivals whose only purpose is to expose a scene or script that unlocks
+onward travel.
+
+The resolver should keep three kinds of work distinct:
+
+- **Required progression triggers:** unmet ROM flags, variables, scene
+  completions, trainer defeats, and other authoritative gates that advance the
+  campaign frontier.
+- **Safety and preparation work:** recovery, restocking, trainer preparation,
+  lead selection, and other temporary stops that may preempt a trigger but do
+  not become campaign progress facts.
+- **Optional Nuzlocke work:** a legally available encounter, species-clause
+  handling, and other resource or roster choices that can be inserted when
+  they are executable without violating the next required trigger.
+
+The resolver should select the next unmet executable trigger, recursively
+expand its ROM-backed prerequisites, and let navigation, interaction, and
+battle capabilities execute that task. Durable Nuzlocke facts such as
+encounter ownership, captures, faint history, and whiteouts remain separate
+from ROM progression facts. `visited_petalburg` may remain in the observation
+record and prerequisite graph, but it should not be treated as the strategic
+completion milestone when Wally's ROM trigger is still unset.
+
 | State or machinery | Authority and purpose | Audit result |
 | --- | --- | --- |
 | `get_event_flag()` / `get_event_var()` and `CampaignFacts` | Current ROM/save-backed story state; `first_badge_obtained` comes directly from `DEFEATED_RUSTBORO_GYM` | Keep as campaign authority; reject uninitialized reads |
@@ -196,20 +253,20 @@ inferring that policy from a profile name.
 
 The current runtime already uses the live `pokedex_received` fact to activate
 the one-encounter-per-area rule. The synthetic `start_nuzlocke` objective and
-controller boundary handoff have been removed. `reach_petalburg` remains as a
-ROM-observed traversal objective, while the actual Wally, Woods, Devon Goods,
-Rustboro, and Roxanne boundaries are represented as recursively resolved
-objectives. Legacy `NuzlockeStarted` records remain readable for migration and
-rules projection, but cannot activate the current save's campaign.
+controller boundary handoff have been removed. Petalburg arrival remains an
+observed ROM fact, while the actual Wally, Woods, Devon Goods, Rustboro, and
+Roxanne boundaries are represented as recursively resolved objectives. Legacy
+`NuzlockeStarted` records remain readable for migration and rules projection,
+but cannot activate the current save's campaign.
 
 ### Completed cleanup boundary
 
 The following items are the concrete removal/migration list from this audit:
 
-1. Remove `start_nuzlocke` from the placeholder campaign list. Retain
-   `reach_petalburg` as an observed traversal objective and add the actual
-   Norman/Wally, Woods, Devon Goods, Rustboro, and Roxanne ROM-state goals to
-   the recursive registry.
+1. Remove `start_nuzlocke` from the placeholder campaign list. Keep Petalburg
+   arrival as an observed traversal fact and make the actual Norman/Wally,
+   Woods, Devon Goods, Rustboro, and Roxanne ROM-state goals the recursive
+   registry objectives.
 2. Remove the `CampaignController.refresh()` special case that invokes
    `runtime_campaign_boundary()`, and remove that campaign-boundary write from
    the progression path.
@@ -314,9 +371,9 @@ is therefore a compatibility bridge toward the cleaner envelope rather than
 the completed dynamic planner:
 
 ```text
-CampaignPlan(parent=reach_littleroot,
+CampaignPlan(parent=complete_petalburg_wally,
              stops=[RecoveryStop(OldaleCenter),
-                    ParentObjective(reach_littleroot)])
+                    ParentObjective(complete_petalburg_wally)])
 ```
 
 This preserves the parent objective and makes recovery an explicit first stop.

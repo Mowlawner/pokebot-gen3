@@ -102,6 +102,30 @@ def can_receive_experience_without_exceeding_cap(
         return False
 
 
+def experience_remaining_in_cap(pokemon: object, level_cap: int) -> int | None:
+    """Return how much EXP this Pokémon can still receive below ``level_cap``.
+
+    The campaign rule forbids reaching level ``level_cap + 1``. The returned
+    value is therefore the largest integer award that keeps total EXP strictly
+    below that next-level threshold. ``None`` means the growth, EXP, or cap
+    facts were unavailable, or that level 100 has no finite next threshold.
+    """
+
+    if level_cap < 1:
+        return None
+    try:
+        total_exp = pokemon.total_exp
+        growth = pokemon.species.level_up_type
+        if not isinstance(total_exp, int) or level_cap >= 100:
+            return None
+        next_cap_exp = growth.get_experience_needed_for_level(level_cap + 1)
+        if not isinstance(next_cap_exp, int):
+            return None
+        return max(0, next_cap_exp - total_exp - 1)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
 class LevelCapRule:
     """Campaign-rule adapter for cap assessment."""
 

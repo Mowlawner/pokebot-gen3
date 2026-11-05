@@ -46,6 +46,7 @@ class FixtureStateAdapterTests(unittest.TestCase):
                 {
                     "SET_WALL_CLOCK",
                     "RESCUED_BIRCH",
+                    "ADVENTURE_STARTED",
                     "DEFEATED_RIVAL_ROUTE103",
                     "HIDE_ROUTE_103_RIVAL",
                     "SYS_POKEMON_GET",
@@ -66,7 +67,10 @@ class FixtureStateAdapterTests(unittest.TestCase):
                 {
                     "LITTLEROOT_INTRO_STATE",
                     "LITTLEROOT_RIVAL_STATE",
+                    "LITTLEROOT_TOWN_STATE",
+                    "ROUTE101_STATE",
                     "BIRCH_LAB_STATE",
+                    "OLDALE_RIVAL_STATE",
                     "PETALBURG_CITY_STATE",
                     "PETALBURG_GYM_STATE",
                     "PETALBURG_WOODS_STATE",

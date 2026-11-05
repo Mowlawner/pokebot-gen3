@@ -65,6 +65,7 @@ class CampaignRulesConfigTests(unittest.TestCase):
         self.assertTrue(config.is_enabled(CampaignRuleId.FAINTING))
         self.assertTrue(config.is_enabled(CampaignRuleId.SPECIES_CLAUSE))
         self.assertTrue(config.is_enabled(CampaignRuleId.LEVEL_CAP))
+        self.assertTrue(config.is_enabled(CampaignRuleId.WHITEOUT_FAILURE))
 
     def test_unrestricted_config_disables_baseline_rule_reduction(self):
         projection = NuzlockeRulesProjection(rule_config=CampaignRulesConfig.unrestricted())
@@ -81,6 +82,19 @@ class CampaignRulesConfigTests(unittest.TestCase):
         self.assertEqual(projection.state.dead_pokemon, ())
         self.assertFalse(projection.state.run_lost)
         self.assertTrue(projection.state.legal)
+
+    def test_whiteout_failure_is_independently_configurable(self):
+        projection = NuzlockeRulesProjection(
+            rule_config=CampaignRulesConfig(frozenset({CampaignRuleId.FAINTING}))
+        )
+        projection.apply(WhiteoutOccurred(3), sequence=1)
+        self.assertFalse(projection.state.run_lost)
+
+        projection = NuzlockeRulesProjection(
+            rule_config=CampaignRulesConfig(frozenset({CampaignRuleId.WHITEOUT_FAILURE}))
+        )
+        projection.apply(WhiteoutOccurred(3), sequence=1)
+        self.assertTrue(projection.state.run_lost)
 
     def test_runtime_retains_rule_configuration_when_reset(self):
         config = CampaignRulesConfig.unrestricted()

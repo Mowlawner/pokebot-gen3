@@ -260,8 +260,22 @@ def is_field_message_waiting_for_input(field_message_lifecycle_active: bool = Fa
         if task_is_active("Task_DrawFieldMessage"):
             return True
         script_context = get_global_script_context()
-        if script_context is None or script_context.native_function_name != "WaitForAorBPress":
+        if script_context is None:
             return False
+        if script_context.native_function_name != "WaitForAorBPress":
+            # Emerald's ordinary ``Std_MsgboxDefault`` helper can remain at
+            # ``IsFieldMessageBoxHidden`` after the draw task has gone away.
+            # Once a field-message lifecycle is established, the ROM input
+            # wait is actionable even though it has not switched to
+            # WaitForAorBPress. Keep this generic path tied to the ordinary
+            # message helper so yes/no wrappers and unrelated native waits do
+            # not receive an A press.
+            return bool(
+                field_message_lifecycle_active
+                and script_context.native_function_name == "IsFieldMessageBoxHidden"
+                and script_context.script_function_name == "Std_MsgboxDefault"
+                and not task_is_active("Task_DrawFieldMessage")
+            )
         return field_message_lifecycle_active or get_text_printer().active
     except (AttributeError, KeyError, RuntimeError, ValueError, TypeError, IndexError):
         # Emulator state is legitimately incomplete for a frame during a map
@@ -313,6 +327,22 @@ def is_emerald_field_dialogue_advanceable(
     legacy opening handler and observation-driven campaign capabilities.
     """
     if is_field_message_waiting_for_input(field_message_lifecycle_active or task_active):
+        return True
+    # The ordinary Emerald message helper can remain at IsFieldMessageBoxHidden
+    # after Task_DrawFieldMessage has ended.  In that boundary state the
+    # observer has already established ownership of an ordinary message
+    # lifecycle, and the sampled input flag is the authoritative signal that
+    # A/B may advance it.  Keep this explicit in the public predicate rather
+    # than relying only on the lower-level runtime probe so callers that cache
+    # or mock that probe retain the same contract.
+    if (
+        field_message_lifecycle_active
+        and not task_active
+        and script_active
+        and native_function_name == "IsFieldMessageBoxHidden"
+        and script_function_name == "Std_MsgboxDefault"
+        and input_waiting
+    ):
         return True
     # New Game Birch's opening is owned by main_menu.c rather than the field
     # script engine.  Its ``Task_NewGameBirchSpeech_*`` task drives the same

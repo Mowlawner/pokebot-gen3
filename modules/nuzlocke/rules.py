@@ -19,6 +19,7 @@ from .events import (
     StorageChanged,
     PokemonCaptured,
     PokemonFainted,
+    RunFailed,
     WhiteoutOccurred,
     NuzlockeStarted,
 )
@@ -74,6 +75,7 @@ class NuzlockeCampaignState:
     unknown_faints: tuple[PokemonFainted, ...] = ()
     violations: tuple[RuleViolation, ...] = ()
     run_lost: bool = False
+    whiteout_occurred: bool = False
     last_event_sequence: int = 0
     # Species caught under an eligible encounter.  Keep the original spelling
     # for diagnostics, while comparisons use case-folded values.
@@ -125,7 +127,7 @@ class NuzlockeCampaignState:
 
 
 class FaintingRule:
-    """Reduce permanent fainting and whiteout events when enabled."""
+    """Reduce permanent fainting and an empty living roster when enabled."""
 
     rule_id = CampaignRuleId.FAINTING
 
@@ -137,24 +139,62 @@ class FaintingRule:
         encounter_eligible: bool,
         active_wild: dict[tuple[int, int], tuple[PokemonIdentity, ...]],
     ) -> NuzlockeCampaignState:
-        """Reduce faint and whiteout events into permanent run state."""
+        """Reduce faint events into permanent run state."""
 
         if isinstance(event, PokemonFainted):
             if event.identity is None:
                 return replace(state, unknown_faints=state.unknown_faints + (event,))
             if event.identity not in state.dead_pokemon:
-                return replace(state, dead_pokemon=state.dead_pokemon + (event.identity,))
-        elif isinstance(event, WhiteoutOccurred):
-            return replace(state, run_lost=True)
+                state = replace(state, dead_pokemon=state.dead_pokemon + (event.identity,))
+            caught = state.caught_first_encounters
+            if caught and all(identity in state.dead_pokemon for identity in caught):
+                return replace(state, run_lost=True)
         return state
 
     def evaluate(self, state: NuzlockeCampaignState) -> RuleAssessment:
-        """Assess whether the reduced run has suffered a whiteout."""
+        """Assess whether every known caught Pokémon has permanently fainted."""
+
+        caught = state.caught_first_encounters
+        all_caught_fainted = bool(caught) and all(identity in state.dead_pokemon for identity in caught)
+        return RuleAssessment(self.rule_id, not all_caught_fainted, ("all caught Pokémon fainted",) if all_caught_fainted else ())
+
+    def constrain(self, state: NuzlockeCampaignState, candidate):
+        """Leave candidate selection unchanged for this observation rule."""
+
+        return candidate
+
+
+class WhiteoutFailureRule:
+    """Declare a run lost when the ROM reports a whiteout."""
+
+    rule_id = CampaignRuleId.WHITEOUT_FAILURE
+
+    def apply(
+        self,
+        state: NuzlockeCampaignState,
+        event: Event,
+        *,
+        encounter_eligible: bool,
+        active_wild: dict[tuple[int, int], tuple[PokemonIdentity, ...]],
+    ) -> NuzlockeCampaignState:
+        """Reduce the configured whiteout boundary into run state."""
+
+        del encounter_eligible, active_wild
+        if isinstance(event, WhiteoutOccurred):
+            return replace(
+                state,
+                run_lost=state.run_lost or event.run_ending is not False,
+                whiteout_occurred=True,
+            )
+        return state
+
+    def evaluate(self, state: NuzlockeCampaignState) -> RuleAssessment:
+        """Assess whether a configured whiteout has ended the run."""
 
         return RuleAssessment(
             self.rule_id,
-            not state.run_lost,
-            ("whiteout occurred",) if state.run_lost else (),
+            not state.whiteout_occurred,
+            ("whiteout occurred",) if state.whiteout_occurred else (),
         )
 
     def constrain(self, state: NuzlockeCampaignState, candidate):
@@ -182,7 +222,12 @@ class OneEncounterPerAreaRule:
             if not (encounter_eligible and event.is_wild and not event.is_trainer and event.location is not None):
                 return state
             location = event.location
-            existing = next((e for e in state.encounters if e.location == location), None)
+            # History from before the encounter rule became active is kept for
+            # auditability, but it does not own the area's first legal
+            # encounter.  Looking up any record here made a later eligible
+            # battle appear to be a repeat after an incidental pre-Pokédex
+            # wild battle had been observed on the same map.
+            existing = next((e for e in state.encounters if e.location == location and e.eligible), None)
             if existing is None:
                 identity = event.opponent_pokemon_identities[0] if len(event.opponent_pokemon_identities) == 1 else None
                 species = event.opponent_species[0] if len(event.opponent_species) == 1 else None
@@ -207,14 +252,20 @@ class OneEncounterPerAreaRule:
             locations = ((event.location, ()),) if event.location is not None else tuple(active_wild.items())
             for location, opponent_ids in locations:
                 if not opponent_ids or event.identity in opponent_ids:
-                    current = next((item for item in state.encounters if item.location == location), None)
+                    current = next(
+                        (item for item in state.encounters if item.location == location and item.eligible),
+                        None,
+                    )
                     # Capture events from an incidental repeat must not
                     # mutate the already-resolved first encounter.  Only a
                     # pending eligible battle owns a capture outcome.
                     if current is not None and current.status == PENDING:
                         return self._resolve(state, location, CAPTURED, event.identity)
         elif isinstance(event, BattleEnded) and event.is_wild and not event.is_trainer and event.location is not None:
-            current = next((e for e in state.encounters if e.location == event.location), None)
+            current = next(
+                (e for e in state.encounters if e.location == event.location and e.eligible),
+                None,
+            )
             if current is not None and current.status == PENDING:
                 outcome = event.outcome.lower()
                 status = (
@@ -462,7 +513,12 @@ class NuzlockeRulesProjection:
         self._rule_config = rule_config or CampaignRulesConfig()
         self._rules = tuple(
             rule
-            for rule in (SpeciesClauseRule(), OneEncounterPerAreaRule(), FaintingRule())
+            for rule in (
+                SpeciesClauseRule(),
+                OneEncounterPerAreaRule(),
+                FaintingRule(),
+                WhiteoutFailureRule(),
+            )
             if self._rule_config.is_enabled(rule.rule_id)
         )
 
@@ -505,6 +561,7 @@ class NuzlockeRulesProjection:
                 PokemonCaptured,
                 PokemonFainted,
                 WhiteoutOccurred,
+                RunFailed,
                 GameStateChanged,
                 MapChanged,
                 PartyChanged,
@@ -522,6 +579,8 @@ class NuzlockeRulesProjection:
             raise ValueError(f"Event sequence out of order: expected {expected}, got {actual}")
         self._seen.add(key)
         state = self._state
+        if isinstance(event, RunFailed):
+            state = replace(state, run_lost=True)
         eligible_now = self._encounters_active if encounter_eligible is None else encounter_eligible
         if isinstance(event, BattleStarted) and event.encounter_eligible is not None:
             # A persisted BattleStarted owns the eligibility decision made at

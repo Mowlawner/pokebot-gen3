@@ -245,12 +245,20 @@ def _observe_field_message_waiting(state: GameState | Any) -> bool:
         # message box is still hidden. Preserve the lifecycle for ownership,
         # but do not expose that transition as actionable dialogue.
         task_input_ready = is_field_message_task_waiting_for_input()
+        generic_hidden_input = (
+            waiting
+            and native_name == "IsFieldMessageBoxHidden"
+            and getattr(script_context, "script_function_name", None) == "Std_MsgboxDefault"
+            and _field_message_lifecycle_active
+            and not draw_task_active
+        )
         hidden_transition = (
             waiting
             and native_name == "IsFieldMessageBoxHidden"
             and _field_message_lifecycle_active
             and not draw_task_active
             and not task_input_ready
+            and not generic_hidden_input
         )
         if hidden_transition:
             waiting = False

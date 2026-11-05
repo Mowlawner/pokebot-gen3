@@ -34,6 +34,22 @@ class RecoveryStop:
     reason: str = ""
     continuation_route: Any = None
     urgency: RecoveryUrgency = RecoveryUrgency.OPPORTUNISTIC
+    # Preserve the executable goal selected by route recovery, including an
+    # exact Center door transition. The public destination remains the
+    # outdoor catalog location for status and compatibility. Keep this field
+    # last so older positional RecoveryStop construction remains compatible.
+    navigation_goal: Any = None
+    # Carry the exact healing catalog source selected by route analysis so
+    # execution does not have to reverse-map the destination.
+    healing_source: Any = None
+    # Recovery execution must be explicit.  A same-tile stop is a valid
+    # field-item action only when the planner selected it as such; it is not
+    # an implicit permission to consume a Potion after a Center search timed
+    # out or returned no route.
+    execution_kind: str = "center_route"
+    # Origin of the route carried by this stop. The controller validates it
+    # against the live readiness location before mounting recovery.
+    route_origin: Any = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +99,70 @@ def _candidate_location(candidate: Any, fallback=None) -> tuple[Any, tuple[int, 
     return None
 
 
+def _readiness_route_origin(readiness: Any) -> tuple[Any, tuple[int, int]] | None:
+    """Return a usable live origin for a planner-created recovery stop."""
+
+    current_map = getattr(readiness, "current_map", None)
+    current_coordinates = getattr(readiness, "current_coordinates", None)
+    if (
+        current_map is not None
+        and isinstance(current_coordinates, tuple)
+        and len(current_coordinates) == 2
+    ):
+        return current_map, current_coordinates
+    return None
+
+
+def _observed_recovery_stop(
+    objective: CampaignObjective,
+    readiness: Any,
+    reason: ReadinessReason | None,
+    critical: bool,
+) -> RecoveryStop | None:
+    """Build a stop from the recovery worker's verified route.
+
+    Route analysis compares the healing detour with the parent objective. It
+    is advisory, however: a completed recovery route remains executable even
+    when the parent continuation is unavailable or a route-analysis candidate
+    cannot be converted into a public destination. Keep the already-validated
+    route as the safety fallback and let the controller replan the parent
+    objective after healing.
+    """
+
+    recovery = getattr(readiness, "recovery", None)
+    destination = getattr(recovery, "center_location", None)
+    route = getattr(recovery, "route", None)
+    if not (
+        recovery is not None
+        # ``center_available`` describes the catalog classification. The
+        # executable route may instead be reported through the broader
+        # healing-source capability, so the route itself is authoritative
+        # once the observer has marked it safe.
+        and getattr(recovery, "safe_to_reach_center", True) is not False
+        and route is not None
+        and isinstance(destination, tuple)
+        and len(destination) == 2
+        and isinstance(destination[1], tuple)
+        and len(destination[1]) == 2
+    ):
+        return None
+    route_origin = getattr(recovery, "route_origin", None)
+    if route_origin is None:
+        route_origin = _readiness_route_origin(readiness)
+    return RecoveryStop(
+        source=ReachLocation(destination),
+        destination=destination,
+        parent_objective_id=objective.objective_id,
+        route=route,
+        route_origin=route_origin,
+        navigation_goal=getattr(recovery, "navigation_goal", None),
+        healing_source=getattr(recovery, "healing_source", None),
+        reason=getattr(reason, "value", "recovery required"),
+        urgency=RecoveryUrgency.CRITICAL if critical else RecoveryUrgency.OPPORTUNISTIC,
+        execution_kind="center_route",
+    )
+
+
 def build_campaign_plan(
     objective: CampaignObjective,
     readiness: Any | None = None,
@@ -128,7 +208,9 @@ def build_campaign_plan(
         ReadinessReason.NO_USABLE_POKEMON.value,
         ReadinessReason.FAINTED_PARTY_MEMBER.value,
         ReadinessReason.POISONED_PARTY.value,
+        ReadinessReason.STATUS_CONDITION.value,
     }
+    observed_recovery_stop = _observed_recovery_stop(objective, readiness, reason, critical)
     candidates = tuple(
         candidate
         for candidate in getattr(analysis, "candidates", ())
@@ -140,47 +222,53 @@ def build_campaign_plan(
         )
     )
     if not candidates:
+        recovery = getattr(readiness, "recovery", None)
+        # A completed incumbent remains executable even when a later
+        # candidate timed out.  The route worker has already validated the
+        # selected Center path; only the comparison against other Centers is
+        # incomplete. Preserve that safety route and let the campaign replan
+        # its parent objective after healing.
+        if observed_recovery_stop is not None:
+            return CampaignPlan(
+                objective.objective_id,
+                (observed_recovery_stop,),
+                readiness_decision=decision,
+                readiness_reason=reason,
+            )
+        # A bounded route calculation is an incomplete observation. Keep
+        # ownership in the campaign controller so it can retry the Center
+        # search; consuming a limited field item here would turn search
+        # uncertainty into an irreversible resource decision.
+        if getattr(recovery, "calculation_pending", False) or getattr(recovery, "calculation_timed_out", False):
+            return base
         # A targetless capability (notably the post-rival Pokédex handoff)
         # has no parent navigation goal to compose against. Critical and
         # already-approved opportunistic recovery still need an executable
         # stop in that case; the route observation has already selected the
         # concrete Center and measured its route. Do not reopen the healing
         # catalog or invent a different destination here.
-        recovery = getattr(readiness, "recovery", None)
-        destination = getattr(recovery, "center_location", None)
-        center_available = bool(recovery and recovery.center_available)
-        safe_to_reach_center = bool(recovery and recovery.safe_to_reach_center)
-        if (
-            (critical or reason is ReadinessReason.OPPORTUNISTIC_RECOVERY)
-            and center_available
-            and safe_to_reach_center
-            and isinstance(destination, tuple)
-            and len(destination) == 2
-            and isinstance(destination[1], tuple)
-            and len(destination[1]) == 2
+        # Candidate diagnostics describe alternative healing sources. A
+        # bounded or pending alternative must not invalidate a completed route
+        # already selected by the recovery worker. Only suppress the fallback
+        # when there is no executable observed route to mount.
+        if any(
+            getattr(candidate, "outcome", None) in {"pruned", "pending"}
+            for candidate in (getattr(recovery, "candidate_diagnostics", ()) or ())
         ):
-            return CampaignPlan(
-                objective.objective_id,
-                (
-                    RecoveryStop(
-                        source=ReachLocation(destination),
-                        destination=destination,
-                        parent_objective_id=objective.objective_id,
-                        route=getattr(recovery, "route", None),
-                        reason=getattr(reason, "value", "recovery required"),
-                        urgency=RecoveryUrgency.CRITICAL if critical else RecoveryUrgency.OPPORTUNISTIC,
-                    ),
-                ),
-                readiness_decision=decision,
-                readiness_reason=reason,
-            )
+            return base
         # A bag cure is an executable recovery stop even when no Center route
         # is available. Keep it at the current location so the recovery
         # factory can consume the item without inventing a navigation target.
         resources = getattr(readiness, "resource_snapshot", None)
         current_map = getattr(readiness, "current_map", None)
         current_coordinates = getattr(readiness, "current_coordinates", None)
+        requires_center_recovery = getattr(reason, "value", reason) in {
+            ReadinessReason.FAINTED_PARTY_MEMBER.value,
+            ReadinessReason.NO_USABLE_POKEMON.value,
+        }
         if (
+            not requires_center_recovery
+            and
             resources is not None
             and getattr(resources, "bag_healing_items", ())
             and isinstance(current_map, tuple)
@@ -198,6 +286,8 @@ def build_campaign_plan(
                         parent_objective_id=objective.objective_id,
                         reason=getattr(reason, "value", "item recovery required"),
                         urgency=RecoveryUrgency.CRITICAL if critical else RecoveryUrgency.OPPORTUNISTIC,
+                        execution_kind="field_item",
+                        route_origin=(current_map, current_coordinates),
                     ),
                 ),
                 readiness_decision=decision,
@@ -232,7 +322,17 @@ def build_campaign_plan(
         getattr(getattr(readiness, "recovery", None), "center_location", None),
     )
     if location is None:
+        if observed_recovery_stop is not None:
+            return CampaignPlan(
+                objective.objective_id,
+                (observed_recovery_stop,),
+                readiness_decision=decision,
+                readiness_reason=reason,
+            )
         return base
+    route_origin = getattr(getattr(readiness, "recovery", None), "route_origin", None)
+    if route_origin is None:
+        route_origin = _readiness_route_origin(readiness)
     return CampaignPlan(
         objective.objective_id,
         (
@@ -241,9 +341,13 @@ def build_campaign_plan(
                 destination=location,
                 parent_objective_id=objective.objective_id,
                 route=selected.first_route,
+                route_origin=route_origin,
+                navigation_goal=getattr(getattr(readiness, "recovery", None), "navigation_goal", None),
+                healing_source=getattr(getattr(readiness, "recovery", None), "healing_source", None),
                 reason=getattr(reason, "value", "recovery required"),
                 continuation_route=getattr(selected, "continuation_route", None),
                 urgency=RecoveryUrgency.CRITICAL if critical else RecoveryUrgency.OPPORTUNISTIC,
+                execution_kind="center_route",
             ),
         ),
         readiness_decision=decision,

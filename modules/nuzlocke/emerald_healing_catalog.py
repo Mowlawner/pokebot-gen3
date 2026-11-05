@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from modules.map_data import MapRSE, PokemonCenter
+from modules.map_path import Direction
 
 
 def _map_id_value(map_id):
@@ -161,6 +162,20 @@ class HealingSourceRSE(Enum):
         """Return the ROM script symbol for this healing interaction."""
 
         return self.value[3]
+
+    @property
+    def center_pc_approach(self):
+        """Return the verified Emerald Center PC approach geometry.
+
+        Every Pokémon Center in the supported Emerald map set uses the same
+        PC approach tile and facing.  This is intentionally exposed as a
+        fallback for a live observation that omitted the PC trigger; runtime
+        execution still verifies the map, tile, facing, and storage state.
+        """
+
+        if not self.source_id.startswith("pokemon_center:"):
+            return None
+        return (_map_id_value(self.interior_map), (10, 2)), Direction.North
 
 
 def emerald_healing_sources() -> tuple[HealingSourceRSE, ...]:

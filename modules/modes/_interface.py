@@ -86,6 +86,30 @@ class BotMode:
         """
         return None
 
+    def requires_explicit_battle_policy(self) -> bool:
+        """Return whether battle starts may use the global encounter fallback.
+
+        Most modes retain the historical ``None`` behavior. A mode with its
+        own campaign policy can require an explicit strategy or action so an
+        accidental callback omission cannot silently select legacy behavior.
+        """
+
+        return False
+
+    def battle_strategy_for_restored_battle(self):
+        """Return a strategy for a battle resumed at a save-state boundary.
+
+        ``None`` preserves the historical default strategy for modes that do
+        not persist a battle strategy across process restoration.
+        """
+
+        return None
+
+    def battle_strategy_for_run_away(self):
+        """Return a mode-specific strategy for an explicit run-away action."""
+
+        return None
+
     def on_battle_ended(self, outcome: "BattleOutcome") -> None:
         """
         This is called when a battle is over, i.e. the final result is known.
@@ -112,6 +136,15 @@ class BotMode:
         :return: True if the evolution should happen, False if it should be cancelled.
         """
         return True
+
+    def owns_evolution_policy(self) -> bool:
+        """Return whether this mode makes the final evolution decision.
+
+        Most modes retain the profile-level ``stop_evolution`` switch. A
+        campaign mode can claim this hook when evolution is part of its own
+        strategy and the profile switch should not silently cancel it.
+        """
+        return False
 
     def on_pickup_threshold_reached(self) -> bool:
         """

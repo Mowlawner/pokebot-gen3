@@ -5,7 +5,7 @@ from enum import Enum
 from pathlib import Path
 from unittest.mock import patch
 
-from modules.nuzlocke.events import MapChanged, PokemonStorageLocation, StorageChanged
+from modules.nuzlocke.events import MapChanged, PokemonStorageLocation, RunFailed, StorageChanged
 from modules.nuzlocke.identity import PokemonIdentity
 from modules.nuzlocke.persistence import (
     EventStoreCorruptionError,
@@ -69,6 +69,60 @@ def complete_campaign_observation(*, pokedex_received: bool = True) -> CampaignO
 
 
 class TestNuzlockePersistence(unittest.TestCase):
+    def test_quarantine_archives_failed_run_and_reopens_empty_active_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            store = JsonEventStore(path)
+            store.append(RunFailed(7, "whiteout"), "failed-run")
+
+            archived = store.quarantine(label="failed")
+
+            self.assertIsNotNone(archived)
+            self.assertTrue(archived.exists())
+            self.assertIn(".failed-", archived.name)
+            self.assertEqual(store.iter_events(), ())
+            self.assertEqual(JsonEventStore(archived).iter_events(), (RunFailed(7, "whiteout"),))
+
+    def test_provenance_accepts_legacy_individual_identity(self):
+        """Old manifests remain valid after provenance drops personality values."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            store = JsonEventStore(path)
+            provenance = path.with_name(path.name + ".provenance")
+            provenance.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "game_id": "test",
+                        "high_water_facts": {},
+                        "stable_identity": [101, 1234, 5678],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertTrue(
+                store.campaign_history_compatible(
+                    {"game_id": "test", "facts": {}, "stable_identity": [1234, 5678]}
+                )
+            )
+
+    def test_provenance_is_cached_until_the_store_changes_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            store = JsonEventStore(path)
+            provenance = path.with_name(path.name + ".provenance")
+            provenance.write_text(
+                json.dumps({"schema_version": 1, "high_water_facts": {}}),
+                encoding="utf-8",
+            )
+
+            first = store._read_provenance()
+            provenance.unlink()
+            second = store._read_provenance()
+
+        self.assertEqual(second, first)
+
     def test_lazy_store_does_not_create_profile_file_until_append(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.json"

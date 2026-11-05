@@ -22,7 +22,7 @@ class Battle(BaseConfig):
     hp_threshold: Annotated[float, Field(ge=0, le=100)] = 20
     lead_cannot_battle_action: Literal["stop", "flee", "rotate"] = "flee"
     faint_action: Literal["stop", "flee", "rotate"] = "flee"
-    new_move: Literal["stop", "cancel", "learn_best"] = "stop"
+    new_move: Literal["stop", "cancel", "learn_best"] = "learn_best"
     stop_evolution: bool = True
     switch_strategy: Literal["first_available", "lowest_level"] = "first_available"
     banned_moves: list[str] = [
@@ -82,12 +82,20 @@ class NuzlockeRules(BaseConfig):
 
     filename: ClassVar = "nuzlocke_rules.yml"
     enabled_rules: list[
-        Literal["one_encounter_per_area", "fainting", "species_clause", "level_cap", "set_battle_style"]
+        Literal[
+            "one_encounter_per_area",
+            "fainting",
+            "species_clause",
+            "level_cap",
+            "set_battle_style",
+            "whiteout_failure",
+        ]
     ] = [
         "one_encounter_per_area",
         "fainting",
         "species_clause",
         "level_cap",
+        "whiteout_failure",
     ]
     # Restock uses hysteresis: do not leave the current route until the bag is
     # below the lower threshold, then buy back up to the upper target.

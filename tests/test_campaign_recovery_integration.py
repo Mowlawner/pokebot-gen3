@@ -1,6 +1,7 @@
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from modules.context import context
 from modules.goals import Goal, ReachLocation, SemanticTarget
@@ -154,6 +155,55 @@ class CampaignRecoveryIntegrationTests(unittest.TestCase):
         self.assertEqual(len(tactical_starts), 1)
         self.assertEqual(controller.current_objective_id, "reach_generic")
 
+    def test_low_health_wild_boundary_stops_encounter_route_until_recovery_is_ready(self):
+        objective = CampaignObjective(
+            "reach_generic", "generic", (), SimpleNamespace(evaluate=lambda _: Fact.known(False))
+        )
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "ready")
+        execution = CampaignExecutionResult(
+            objective,
+            CampaignExecutionStatus.READY,
+            "encounter capability",
+            tactical_goal=Goal(),
+            capability=lambda: iter(()),
+        )
+        pending = replace(
+            readiness(ReadinessDecision.CONTINUE),
+            party=(SimpleNamespace(usable=True, hp_ratio=0.3, fainted=False),),
+            recovery=SimpleNamespace(calculation_pending=True),
+            recovery_availability=Availability.UNKNOWN,
+            readiness_reason=ReadinessReason.PARTY_HEALTHY,
+            route_analysis=None,
+        )
+        recovery_ready = readiness(ReadinessDecision.RECOVER)
+        recovery_starts = []
+        readiness_observations = iter((pending, recovery_ready))
+
+        controller = CampaignController(
+            lambda: object(),
+            selector=lambda _: selection,
+            adapter=lambda _: execution,
+            readiness_provider=lambda *_: next(readiness_observations),
+            recovery_factory=lambda _: iter((recovery_starts.append("recovery"),)),
+        )
+        controller.last_selection = selection
+        controller.last_execution = execution
+        controller.current_objective_id = objective.objective_id
+        controller.current_tactical_goal = execution.tactical_goal
+        controller._execution_phase = "PREPARATION"
+        controller._tactical_loop = iter((None,))
+        controller._tactical_loop_objective_id = objective.objective_id
+
+        controller.request_recovery_after_wild_battle()
+        first = controller.step()
+        self.assertEqual(first.execution_phase, "RECOVERY_WAIT")
+        self.assertEqual(recovery_starts, [])
+        self.assertIsNone(controller._tactical_loop)
+
+        second = controller.step()
+        self.assertEqual(second.execution_phase, "RECOVERY")
+        self.assertEqual(recovery_starts, ["recovery"])
+
     def test_recovery_completion_replaces_stale_healing_status(self):
         objective = CampaignObjective(
             "reach_generic",
@@ -195,7 +245,7 @@ class CampaignRecoveryIntegrationTests(unittest.TestCase):
         finally:
             context.campaign_status = previous_status
 
-    def test_recovery_keyerror_retry_keeps_campaign_autonomous(self):
+    def test_recovery_keyerror_retry_escalates_after_bounded_retries(self):
         objective = CampaignObjective("reach_generic", "generic", (), SimpleNamespace(evaluate=lambda _: None))
         selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "ready")
         execution = CampaignExecutionResult(objective, CampaignExecutionStatus.READY, "ready", tactical_goal=Goal())
@@ -220,11 +270,10 @@ class CampaignRecoveryIntegrationTests(unittest.TestCase):
 
         states = [controller.step() for _ in range(5)]
 
-        self.assertNotEqual(states[-1].status, CampaignControllerStatus.BLOCKED)
-        self.assertNotEqual(states[-1].execution_phase, "BLOCKED")
-        self.assertIn(states[-1].status, {CampaignControllerStatus.UNKNOWN, CampaignControllerStatus.READY})
-        self.assertGreaterEqual(len(attempts), 4)
-        self.assertNotEqual(controller.step().status, CampaignControllerStatus.BLOCKED)
+        self.assertEqual(states[-1].status, CampaignControllerStatus.BLOCKED)
+        self.assertEqual(states[-1].execution_phase, "BLOCKED")
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(controller.step().status, CampaignControllerStatus.BLOCKED)
 
     def test_run_lost_recovery_is_terminal_and_keeps_control_in_campaign_mode(self):
         objective = CampaignObjective("reach_generic", "generic", (), SimpleNamespace(evaluate=lambda _: None))
@@ -275,6 +324,44 @@ class CampaignRecoveryIntegrationTests(unittest.TestCase):
         controller._readiness_provider = lambda *_: readiness(ReadinessDecision.CONTINUE)
         controller.step()
         self.assertEqual(starts, ["campaign"])
+
+    def test_unknown_readiness_preserves_active_campaign_lead_rotation(self):
+        """The party menu owns the loop while a trainer lead is rotating."""
+
+        objective = CampaignObjective("reach_generic", "generic", (), SimpleNamespace(evaluate=lambda _: None))
+        selection = ObjectiveSelection(objective, ObjectiveStatus.READY, "ready")
+        execution = CampaignExecutionResult(objective, CampaignExecutionStatus.READY, "ready", tactical_goal=Goal())
+        advanced = []
+
+        def tactical_loop():
+            advanced.append("campaign")
+            yield
+
+        controller = CampaignController(
+            lambda: SimpleNamespace(
+                raw_map=SimpleNamespace(is_known=False),
+                coordinates=SimpleNamespace(is_known=False),
+            ),
+            selector=lambda _: selection,
+            adapter=lambda _: execution,
+            tactical_loop_factory=lambda _: tactical_loop(),
+            readiness_provider=lambda *_: readiness(ReadinessDecision.UNKNOWN),
+        )
+        controller.current_objective_id = objective.objective_id
+        controller.current_tactical_goal = execution.tactical_goal
+        controller.last_selection = selection
+        controller.last_execution = execution
+        controller._tactical_loop = tactical_loop()
+        controller._tactical_loop_objective_id = objective.objective_id
+        controller.status = CampaignControllerStatus.READY
+
+        with patch.object(context, "campaign_trainer_lead_rotation", {"trainer_id": "calvin"}):
+            result = controller.step()
+
+        self.assertEqual(result.status, CampaignControllerStatus.READY, repr(result))
+        self.assertEqual(result.reason, "trainer lead rotation owns party menu")
+        self.assertEqual(advanced, ["campaign"])
+        self.assertIsNotNone(controller._tactical_loop)
 
     def test_stable_recovery_unavailable_does_not_force_recheck_loop(self):
         objective = CampaignObjective("reach_generic", "generic", (), SimpleNamespace(evaluate=lambda _: None))

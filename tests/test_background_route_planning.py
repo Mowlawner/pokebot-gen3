@@ -115,6 +115,51 @@ def test_single_flight_preserves_completed_result_for_its_domain():
             planner.close()
 
 
+def test_single_flight_does_not_queue_advisory_work_behind_recovery():
+    planner = _SingleFlightBackgroundPlanner()
+    started = threading.Event()
+    release = threading.Event()
+    advisory_calls = []
+
+    def recovery(budget):
+        started.set()
+        release.wait(1)
+        budget.check()
+        return "recovery"
+
+    def advisory():
+        advisory_calls.append(1)
+        return "analysis"
+
+    try:
+        recovery_key = ("recovery", "active")
+        analysis_key = ("analysis", "queued")
+        assert planner.poll(recovery_key, recovery, priority=1)[0] == "pending"
+        assert started.wait(1)
+
+        assert planner.poll(analysis_key, advisory, priority=1)[0] == "pending"
+        assert advisory_calls == []
+
+        release.set()
+        for _ in range(100):
+            result = planner.poll(recovery_key, recovery, priority=1)
+            if result[0] == "complete":
+                break
+            time.sleep(0.001)
+        assert result == ("complete", "recovery", None)
+
+        for _ in range(100):
+            result = planner.poll(analysis_key, advisory, priority=1)
+            if result[0] == "complete":
+                break
+            time.sleep(0.001)
+        assert result == ("complete", "analysis", None)
+        assert advisory_calls == [1]
+    finally:
+        release.set()
+        planner.close()
+
+
 def test_recovery_preparation_does_not_run_candidate_path_search():
     location = (MapRSE.ROUTE101, (3, 4))
     with (
@@ -153,6 +198,155 @@ def test_background_planner_enforces_a_configurable_wall_clock_budget():
         assert result[0] == "error"
         assert isinstance(result[2], TimeoutError)
     finally:
+        planner.close()
+
+
+def test_background_planner_reports_priority_cancellation_in_rich_console():
+    planner = _SingleFlightBackgroundPlanner()
+    started = threading.Event()
+
+    def speculative(budget):
+        started.set()
+        while True:
+            budget.check()
+
+    try:
+        with patch("modules.modes.campaign.print_navigation_cancellation") as cancellation_log:
+            assert planner.poll(("analysis", "speculative"), speculative, priority=2, timeout_seconds=1)[0] == "pending"
+            assert started.wait(1)
+            assert planner.poll(("recovery", "critical"), lambda: "safe", priority=0)[0] == "pending"
+            requested = [
+                call.kwargs
+                for call in cancellation_log.call_args_list
+                if call.kwargs.get("phase") == "requested"
+            ]
+            assert requested
+            assert requested[0]["worker"] == "campaign_route"
+            assert "higher-priority campaign route request superseded" in requested[0]["reason"]
+            assert requested[0]["replacement_label"].startswith("recovery")
+    finally:
+        planner.close()
+
+
+def test_background_planner_reports_timeout_in_rich_console():
+    planner = _SingleFlightBackgroundPlanner()
+
+    def never_finishes(budget):
+        while True:
+            budget.check()
+
+    try:
+        with patch("modules.modes.campaign.print_navigation_cancellation") as cancellation_log:
+            assert planner.poll(("recovery", "budget"), never_finishes, timeout_seconds=0.01)[0] == "pending"
+            result = None
+            for _ in range(100):
+                result = planner.poll(("recovery", "budget"), never_finishes, timeout_seconds=0.01)
+                if result[0] == "error":
+                    break
+                time.sleep(0.001)
+            assert result[0] == "error"
+            terminal = [
+                call.kwargs
+                for call in cancellation_log.call_args_list
+                if call.kwargs.get("phase") == "terminal"
+            ]
+            assert terminal
+            assert "second budget" in terminal[0]["reason"]
+    finally:
+        planner.close()
+
+
+def test_recovery_timeout_harvests_a_partial_incumbent():
+    planner = _SingleFlightBackgroundPlanner()
+    started = threading.Event()
+
+    def partial_recovery(budget):
+        started.set()
+        try:
+            while True:
+                budget.check()
+        except TimeoutError:
+            return SimpleNamespace(calculation_timed_out=True, route="petalburg")
+
+    try:
+        key = ("recovery", "partial")
+        assert planner.poll(key, partial_recovery, timeout_seconds=0.01)[0] == "pending"
+        assert started.wait(1)
+        time.sleep(0.02)
+        result = None
+        for _ in range(100):
+            result = planner.poll(key, partial_recovery, timeout_seconds=0.01)
+            if result[0] == "complete":
+                break
+            time.sleep(0.001)
+        assert result[0] == "complete"
+        assert result[2] is None
+        assert result[1].calculation_timed_out is True
+        assert result[1].route == "petalburg"
+    finally:
+        planner.close()
+
+
+def test_discard_does_not_submit_duplicate_work_while_timed_out_worker_runs():
+    planner = _SingleFlightBackgroundPlanner()
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def work(budget):
+        calls.append(1)
+        started.set()
+        release.wait(1)
+        budget.check()
+
+    try:
+        assert planner.poll("timed-out", work, timeout_seconds=0.01)[0] == "pending"
+        assert started.wait(1)
+        time.sleep(0.02)
+        assert planner.poll("timed-out", work, timeout_seconds=0.01)[0] == "error"
+        planner.discard("timed-out")
+        # The stale thread is still alive and owns the logical key. A retry
+        # must wait for it to observe cancellation instead of starting a
+        # second CPU-bound route search.
+        assert planner.poll("timed-out", work, timeout_seconds=0.01)[0] == "error"
+        assert calls == [1]
+    finally:
+        release.set()
+        planner.close()
+
+
+def test_discard_cancels_queued_work_before_it_can_run():
+    planner = _SingleFlightBackgroundPlanner()
+    started = threading.Event()
+    release = threading.Event()
+    queued_calls = []
+
+    def running(budget):
+        started.set()
+        release.wait(1)
+        budget.check()
+
+    def queued(budget):
+        queued_calls.append(1)
+        budget.check()
+
+    try:
+        assert planner.poll("running", running)[0] == "pending"
+        assert started.wait(1)
+        assert planner.poll("queued", queued)[0] == "pending"
+        planner.discard("queued")
+        assert not planner.is_pending("queued")
+
+        release.set()
+        for _ in range(100):
+            result = planner.poll("running", running)
+            if result[0] != "pending":
+                break
+            time.sleep(0.001)
+        assert result[0] == "complete"
+        assert queued_calls == []
+    finally:
+        release.set()
         planner.close()
 
 

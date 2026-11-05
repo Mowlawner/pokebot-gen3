@@ -20,7 +20,7 @@ from .snapshots import (
     get_nuzlocke_snapshot,
 )
 from .identity import PokemonIdentity
-from .events import NuzlockeStarted, PokemonCaptured, PokemonStorageLocation, StorageChanged
+from .events import NuzlockeStarted, PokemonCaptured, PokemonStorageLocation, RunFailed, StorageChanged
 from .runtime import CaptureEligibility, NuzlockeRuntime
 from .policy import EventStatistics, PersistenceClass, classify_event
 from .diagnostics import BoundedEventTrace
@@ -46,6 +46,7 @@ from .rules import (
     FaintingRule,
     LocationEncounter,
     OneEncounterPerAreaRule,
+    WhiteoutFailureRule,
     RuleAssessment,
     RuleViolation,
     load_rules,
@@ -89,12 +90,22 @@ from .capture_policy import (
     CapturePolicyContext,
     CapturePolicyWeights,
     CaptureRecommendation,
+    EncounterPortfolioContext,
+    EncounterPortfolioPlan,
     EncounterCandidate,
     EncounterMethod,
     choose_encounter,
+    choose_encounter_portfolio,
     score_encounter,
+    score_portfolio_candidate,
+    conditioned_pool_certainty,
 )
-from .trainer_policy import TrainerPolicyInput, choose_trainer_mode
+from .trainer_policy import (
+    TrainerCheckpointKind,
+    TrainerExposureKind,
+    TrainerPolicyInput,
+    choose_trainer_mode,
+)
 from .emerald_healing_catalog import (
     HealingSourceRSE,
     emerald_healing_sources,
@@ -144,7 +155,9 @@ from .campaign_execution import (
     adapt_campaign_execution,
 )
 from .resource_policy import (
+    DuplicateEncounterPolicy,
     EncounterPolicy,
+    RecoveryEffect,
     HealingResource,
     PokeballRestockPolicy,
     RecoveryKind,
@@ -155,8 +168,11 @@ from .resource_policy import (
     ResourceObjective,
     ResourceSnapshot,
     RouteRecovery,
+    WildBattleIntent,
+    WildBattlePolicyInput,
     assess_campaign_resources,
     assess_wild_encounter,
+    choose_wild_battle_intent,
 )
 
 
@@ -237,6 +253,8 @@ __all__ = [
     "CampaignRulesConfig",
     "FaintingRule",
     "OneEncounterPerAreaRule",
+    "WhiteoutFailureRule",
+    "RunFailed",
     "RuleAssessment",
     "LocationEncounter",
     "RuleViolation",
@@ -269,6 +287,12 @@ __all__ = [
     "derive_campaign_facts",
     "EncounterOpportunity",
     "encounter_opportunities",
+    "EncounterCandidate",
+    "EncounterPortfolioContext",
+    "EncounterPortfolioPlan",
+    "choose_encounter",
+    "choose_encounter_portfolio",
+    "score_portfolio_candidate",
     "HealingSourceRSE",
     "emerald_healing_sources",
     "emerald_healing_sources_for_map",
@@ -302,8 +326,15 @@ __all__ = [
     "CampaignExecutionStatus",
     "adapt_campaign_execution",
     "PokeballRestockPolicy",
+    "DuplicateEncounterPolicy",
+    "RecoveryEffect",
     "RecoveryKind",
     "RecoverySupplyPolicy",
+    "WildBattleIntent",
+    "WildBattlePolicyInput",
+    "choose_wild_battle_intent",
+    "TrainerCheckpointKind",
+    "TrainerExposureKind",
     "CampaignController",
     "CampaignControllerState",
     "CampaignControllerStatus",

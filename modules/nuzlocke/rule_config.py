@@ -25,6 +25,7 @@ class CampaignRuleId(str, Enum):
     SPECIES_CLAUSE = "species_clause"
     LEVEL_CAP = "level_cap"
     SET_BATTLE_STYLE = "set_battle_style"
+    WHITEOUT_FAILURE = "whiteout_failure"
 
 
 DEFAULT_NUZLOCKE_RULES = frozenset(
@@ -33,6 +34,7 @@ DEFAULT_NUZLOCKE_RULES = frozenset(
         CampaignRuleId.FAINTING,
         CampaignRuleId.SPECIES_CLAUSE,
         CampaignRuleId.LEVEL_CAP,
+        CampaignRuleId.WHITEOUT_FAILURE,
     }
 )
 

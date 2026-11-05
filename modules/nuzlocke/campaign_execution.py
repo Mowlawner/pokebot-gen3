@@ -11,8 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Iterator
 
-from modules.goals import ActivateTrigger, EngageTrainer, Goal, NavigationGoal, ReachWarp, EARLY_POKEBALL_TRIGGER_ID
-from modules.map_data import MapRSE
+from modules.goals import ActivateTrigger, EngageTrainer, Goal, NavigationGoal, EARLY_POKEBALL_TRIGGER_ID
 
 from .campaign_objectives import CampaignObjective, ObjectiveSelection, ObjectiveStatus
 from .emerald_campaign_registry import emerald_capability_definition
@@ -100,23 +99,6 @@ class CampaignExecutionAdapter:
                 "mounted observation-driven party healing capability",
                 objective.execution_id,
                 capability=execute_heal_party,
-            )
-
-        if objective.objective_id == "reach_oldale":
-            goal = objective.tactical_target
-            if not isinstance(goal, ReachWarp) or goal.destination_map != MapRSE.OLDALE_TOWN.value:
-                return CampaignExecutionResult(
-                    objective,
-                    CampaignExecutionStatus.UNSUPPORTED,
-                    "reach_oldale has no valid Oldale navigation goal",
-                    objective.execution_id,
-                )
-            return CampaignExecutionResult(
-                objective,
-                CampaignExecutionStatus.READY,
-                "translated to the existing Oldale navigation goal",
-                objective.execution_id,
-                goal,
             )
 
         if objective.objective_id == "complete_intro_rival":

@@ -22,6 +22,7 @@ def get_bot_modes() -> list[Type[BotMode]]:
         from .agent_pilot import AgentRivalBattlePilot
         from .campaign import CampaignProgressionMode
         from .trainer_navigation_validation import TrainerNavigationValidationMode
+        from .gate_edge_validation import GateEdgeValidationMode
         from .bunny_hop import BunnyHopMode
         from .daycare import DaycareMode
         from .ev_train import EVTrainMode
@@ -50,6 +51,7 @@ def get_bot_modes() -> list[Type[BotMode]]:
             AgentRivalBattlePilot,
             CampaignProgressionMode,
             TrainerNavigationValidationMode,
+            GateEdgeValidationMode,
             BerryBlendMode,
             BunnyHopMode,
             DaycareMode,

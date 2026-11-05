@@ -9,6 +9,8 @@ from modules.map_path import Direction
 from modules.overworld import (
     ObjectObservation,
     TileObservation,
+    _trainer_possible_locations,
+    trainer_engagement_locations,
     trainer_hazard_locations,
     TriggerObservation,
     evaluate_trigger_condition,
@@ -19,6 +21,7 @@ from modules.overworld import (
     OverworldObservationStatus,
     static_trainer_observations,
     static_pokemart_clerk_observations,
+    static_blocked_object_coordinates,
 )
 
 
@@ -47,7 +50,7 @@ class TestOverworldPerception(unittest.TestCase):
         ):
             self.assertEqual(map_module.get_live_map_id(), (2, 2))
 
-    def test_normal_trainer_hazards_cover_all_cardinal_lines(self):
+    def test_normal_trainer_hazards_follow_current_facing_line(self):
         map_id = (1, 2)
         tiles = tuple(
             TileObservation((map_id, (x, y)), False, frozenset(Direction), elevation=0)
@@ -58,10 +61,155 @@ class TestOverworldPerception(unittest.TestCase):
             1, (map_id, (1, 0)), facing="East", trainer_type="Normal", trainer_range=3, trainer_defeated=False
         )
         hazards = trainer_hazard_locations(trainer, tiles)
+        self.assertEqual(
+            hazards,
+            frozenset({(map_id, (2, 0)), (map_id, (3, 0)), (map_id, (4, 0))}),
+        )
+        self.assertNotIn((map_id, (1, 1)), hazards)
+        self.assertNotIn((map_id, (0, 0)), hazards)
+
+    def test_normal_trainer_without_facing_keeps_conservative_hazards(self):
+        map_id = (1, 2)
+        tiles = tuple(
+            TileObservation((map_id, (x, y)), False, frozenset(Direction), elevation=0)
+            for x in range(5)
+            for y in range(5)
+        )
+        trainer = ObjectObservation(
+            1, (map_id, (1, 0)), facing=None, trainer_type="Normal", trainer_range=3, trainer_defeated=False
+        )
+        hazards = trainer_hazard_locations(trainer, tiles)
         self.assertIn((map_id, (1, 1)), hazards)
         self.assertIn((map_id, (0, 0)), hazards)
-        self.assertIn((map_id, (4, 0)), hazards)
         self.assertEqual(len(hazards), 7)
+
+    def test_unknown_runtime_facing_uses_rom_face_template_directions(self):
+        map_id = (1, 2)
+        tiles = tuple(
+            TileObservation((map_id, (x, y)), False, frozenset(Direction), elevation=0)
+            for x in range(5)
+            for y in range(5)
+        )
+        trainer = ObjectObservation(
+            1,
+            (map_id, (2, 2)),
+            facing="???",
+            movement_type="FACE_UP_AND_RIGHT",
+            trainer_type="Normal",
+            trainer_range=2,
+            trainer_defeated=False,
+        )
+
+        hazards = trainer_hazard_locations(trainer, tiles)
+
+        self.assertEqual(
+            hazards,
+            frozenset(
+                {
+                    (map_id, (2, 1)),
+                    (map_id, (2, 0)),
+                    (map_id, (3, 2)),
+                    (map_id, (4, 2)),
+                }
+            ),
+        )
+        self.assertNotIn((map_id, (2, 3)), hazards)
+        self.assertNotIn((map_id, (1, 2)), hazards)
+
+    def test_moving_trainer_hazard_covers_rom_movement_rectangle(self):
+        map_id = (1, 2)
+        tiles = tuple(
+            TileObservation((map_id, (x, y)), False, frozenset(Direction), elevation=0)
+            for x in range(7)
+            for y in range(7)
+        )
+        trainer = ObjectObservation(
+            1,
+            (map_id, (3, 3)),
+            trainer_type="See All Directions",
+            trainer_range=1,
+            trainer_defeated=False,
+            movement_type="WANDER_AROUND",
+            movement_range=(1, 1),
+        )
+
+        hazards = trainer_hazard_locations(trainer, tiles)
+
+        # The current center is (3, 3), but a rectangular movement route can
+        # put the trainer at (2, 2), making (1, 2) a live sight-line tile.
+        self.assertIn((map_id, (1, 2)), hazards)
+        # The same speculative envelope must not change the executable
+        # interaction line used by an EngageTrainer goal.
+        engagement = trainer_engagement_locations(trainer, tiles)
+        self.assertNotIn((map_id, (1, 2)), engagement)
+
+    def test_route_104_billy_sequence_uses_rom_perimeter_from_template_origin(self):
+        map_id = (0, 19)
+        tiles = tuple(
+            TileObservation((map_id, (x, y)), False, frozenset(Direction), elevation=3)
+            for x in range(15, 27)
+            for y in range(60, 76)
+        )
+        billy = ObjectObservation(
+            28,
+            (map_id, (20, 70)),
+            trainer_type="Normal",
+            trainer_range=2,
+            trainer_defeated=False,
+            movement_type="WALK_SEQUENCE_DOWN_RIGHT_UP_LEFT",
+            movement_range=(6, 5),
+            movement_origin=(map_id, (18, 67)),
+        )
+
+        centers = _trainer_possible_locations(
+            billy,
+            {tile.location: tile for tile in tiles},
+            set(),
+        )
+
+        self.assertIn((map_id, (18, 72)), centers)
+        self.assertIn((map_id, (24, 72)), centers)
+        self.assertIn((map_id, (24, 67)), centers)
+        self.assertNotIn((map_id, (20, 70)), centers)
+        self.assertNotIn((map_id, (20, 68)), centers)
+
+    def test_moving_normal_trainer_avoidance_follows_each_rom_perimeter_segment(self):
+        map_id = (0, 19)
+        tiles = tuple(
+            TileObservation((map_id, (x, y)), False, frozenset(Direction), elevation=3)
+            for x in range(15, 27)
+            for y in range(60, 76)
+        )
+        billy = ObjectObservation(
+            28,
+            (map_id, (18, 68)),
+            facing="Down",
+            trainer_type="Normal",
+            trainer_range=2,
+            trainer_defeated=False,
+            movement_type="WALK_SEQUENCE_DOWN_RIGHT_UP_LEFT",
+            movement_range=(6, 5),
+            movement_origin=(map_id, (18, 67)),
+        )
+
+        hazards = trainer_hazard_locations(billy, tiles)
+
+        # The west side of Billy's loop is unsafe while he walks south, and
+        # the east side is unsafe while he walks north. AVOID must cover the
+        # segment directions even though the current frame only faces south.
+        self.assertIn((map_id, (17, 67)), hazards)
+        self.assertIn((map_id, (24, 69)), hazards)
+        self.assertIn((map_id, (20, 72)), hazards)
+        # Billy cannot stand in the loop's interior, so his sight lines do
+        # not turn that grass into a filled hazard rectangle.
+        self.assertEqual(len(hazards), 30)
+        self.assertFalse(
+            any(
+                (map_id, (x, y)) in hazards
+                for x in range(19, 24)
+                for y in range(68, 72)
+            )
+        )
 
     def test_defeated_trainer_has_no_hazards_and_objects_block_sight(self):
         map_id = (1, 2)
@@ -74,9 +222,27 @@ class TestOverworldPerception(unittest.TestCase):
         blocker = ObjectObservation(2, (map_id, (3, 0)))
         hazards = trainer_hazard_locations(trainer, tiles, (blocker,))
         self.assertNotIn((map_id, (3, 0)), hazards)
-        self.assertIn((map_id, (1, 1)), hazards)
-        self.assertIn((map_id, (0, 0)), hazards)
+        self.assertIn((map_id, (2, 0)), hazards)
         self.assertEqual(trainer_hazard_locations(replace(trainer, trainer_defeated=True), tiles), frozenset())
+
+    def test_normal_trainer_engagement_uses_current_facing_line(self):
+        map_id = (1, 2)
+        tiles = tuple(
+            TileObservation((map_id, (x, y)), False, frozenset(Direction))
+            for x in range(5)
+            for y in range(5)
+        )
+        trainer = ObjectObservation(
+            1, (map_id, (2, 2)), facing="Down", trainer_type="Normal", trainer_range=3, trainer_defeated=False
+        )
+
+        engagement = trainer_engagement_locations(trainer, tiles)
+
+        self.assertEqual(
+            engagement,
+            frozenset({(map_id, (2, 3)), (map_id, (2, 4))}),
+        )
+        self.assertNotIn((map_id, (0, 2)), engagement)
 
     def test_static_trainer_fallback_covers_unspawned_runtime_object(self):
         map_id = (11, 3)
@@ -102,8 +268,8 @@ class TestOverworldPerception(unittest.TestCase):
         )
         hazards = trainer_hazard_locations(fallback[0], tiles)
         self.assertIn((map_id, (1, 9)), hazards)
-        self.assertIn((map_id, (3, 9)), hazards)
-        self.assertIn((map_id, (2, 8)), hazards)
+        self.assertNotIn((map_id, (3, 9)), hazards)
+        self.assertNotIn((map_id, (2, 8)), hazards)
 
     def test_static_trainer_fallback_does_not_duplicate_runtime_object(self):
         map_id = (11, 3)
@@ -123,6 +289,62 @@ class TestOverworldPerception(unittest.TestCase):
             static_trainer_observations(map_id, SimpleNamespace(objects=(template,)), (runtime,)),
             (),
         )
+
+    def test_unknown_static_defeat_state_retains_trainer_hazard(self):
+        class UnknownDefeatTemplate:
+            kind = "normal"
+            local_id = 8
+            local_coordinates = (2, 9)
+            trainer_type = "Normal"
+            trainer_range = 3
+            flag_id = 0
+            movement_type = "FACE_LEFT"
+            script_symbol = "Route104_EventScript_LadyCindy"
+
+            @property
+            def is_trainer_defeated(self):
+                raise RuntimeError("save block unavailable")
+
+        map_id = (11, 3)
+        fallback = static_trainer_observations(map_id, SimpleNamespace(objects=(UnknownDefeatTemplate(),)), ())
+        self.assertEqual(len(fallback), 1)
+        self.assertIsNone(fallback[0].trainer_defeated)
+        tiles = tuple(
+            TileObservation((map_id, (x, y)), False, frozenset(Direction), elevation=3)
+            for x in range(5)
+            for y in range(7, 12)
+        )
+        self.assertIn((map_id, (1, 9)), trainer_hazard_locations(fallback[0], tiles))
+
+    def test_static_cut_tree_is_a_blocker_until_its_flag_is_set(self):
+        cut_tree = SimpleNamespace(
+            kind="normal",
+            local_coordinates=(21, 6),
+            script_symbol="EventScript_CutTree",
+            flag_id=17,
+        )
+        already_cut = SimpleNamespace(
+            kind="normal",
+            local_coordinates=(24, 9),
+            script_symbol="EventScript_CutTree",
+            flag_id=18,
+        )
+        npc = SimpleNamespace(
+            kind="normal",
+            local_coordinates=(26, 6),
+            script_symbol="Route116_EventScript_Janice",
+            flag_id=0,
+        )
+
+        with patch(
+            "modules.overworld.get_event_flag_by_number",
+            side_effect=lambda flag_id: flag_id == already_cut.flag_id,
+        ):
+            blocked = static_blocked_object_coordinates(
+                (0, 31), SimpleNamespace(objects=(cut_tree, already_cut, npc))
+            )
+
+        self.assertEqual(blocked, frozenset({cut_tree.local_coordinates}))
 
     def test_static_pokemart_clerk_fallback_preserves_counter_activation_geometry(self):
         map_id = (4, 4)

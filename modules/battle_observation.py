@@ -79,9 +79,16 @@ class PokemonObservation:
     held_item: str | None = None
     personality_value: int | None = None
     available_fields: frozenset[str] = frozenset()
+    nickname: str | None = None
 
     @property
     def identity(self) -> tuple[Any, ...]:
+        # Party position is the stable battle-slot identity. Personality can
+        # be refreshed or temporarily read from a neighboring battler while
+        # Emerald is resolving a replacement; using it first turns a same
+        # slot refresh into a fictitious switch.
+        if self.party_index is not None:
+            return (self.side, self.party_index)
         if self.personality_value is not None:
             return (self.side, self.personality_value)
         return (self.side, self.party_index, self.species)
@@ -241,6 +248,18 @@ def _battlers(observation: BattleObservation):
     return (*observation.player_active, *observation.opponent_active)
 
 
+def _matched_battlers(previous: tuple[PokemonObservation, ...], current: tuple[PokemonObservation, ...]):
+    """Yield same-Pokémon observation pairs without crossing switch boundaries."""
+
+    old_by_identity = {}
+    for pokemon in previous:
+        old_by_identity.setdefault(pokemon.identity, []).append(pokemon)
+    for pokemon in current:
+        matches = old_by_identity.get(pokemon.identity)
+        if matches:
+            yield matches.pop(), pokemon
+
+
 def events_between(previous: BattleObservation | None, current: BattleObservation) -> tuple[BattleEventType, ...]:
     """Derive only transitions supported by normalized observations.
 
@@ -269,7 +288,14 @@ def events_between(previous: BattleObservation | None, current: BattleObservatio
         events.append(MoveExecuted(current.frame, current.executed_move[0], current.executed_move[1]))
     if current.move_failed is not None and current.move_failed != previous.move_failed:
         events.append(MoveFailed(current.frame, current.move_failed[0], current.move_failed[1]))
-    for old, new in zip(_battlers(previous), _battlers(current)):
+    # HP, status, stat stages, and faint transitions are meaningful only when
+    # both frames describe the same Pokémon.  ``zip`` compared active-party
+    # positions instead, turning a Treecko -> Wurmple switch into fictitious
+    # damage to Treecko and fictitious healing to Wurmple.
+    for old, new in (
+        *_matched_battlers(previous.player_active, current.player_active),
+        *_matched_battlers(previous.opponent_active, current.opponent_active),
+    ):
         if old.current_hp is not None and new.current_hp is not None and new.current_hp < old.current_hp:
             events.append(
                 DamageOccurred(
@@ -308,10 +334,27 @@ def events_between(previous: BattleObservation | None, current: BattleObservatio
         (previous.player_active, current.player_active, "player"),
         (previous.opponent_active, current.opponent_active, "opponent"),
     ):
-        old_indexes = tuple(p.party_index for p in old_active)
-        new_indexes = tuple(p.party_index for p in new_active)
-        if old_indexes != new_indexes and old_indexes and new_indexes:
-            events.append(PokemonSwitched(current.frame, side, old_indexes[0], new_indexes[0]))
+        for old, new in zip(old_active, new_active):
+            if not old.identity or not new.identity:
+                continue
+            # A same-slot observation refresh is not a switch, even if the
+            # transient species/personality fields changed during a ROM
+            # callback transition. In doubles, preserve each battler's slot
+            # instead of always reporting the left battler.
+            changed_slot = (
+                old.party_index != new.party_index
+                if old.party_index is not None and new.party_index is not None
+                else old.identity != new.identity
+            )
+            if changed_slot:
+                events.append(
+                    PokemonSwitched(
+                        current.frame,
+                        side,
+                        old.party_index,
+                        new.party_index,
+                    )
+                )
     if previous.active and not current.active and current.outcome is not None:
         events.append(BattleEnded(current.frame, current.outcome))
     return tuple(events)
@@ -456,21 +499,53 @@ class BattleKnowledgeRecorder:
         self.policy = policy
         self.knowledge: BattleKnowledge | None = None
         self.last_completed_knowledge: BattleKnowledge | None = None
+        self.selected_actions: list[tuple[str, str]] = []
+        self.last_completed_selected_actions: tuple[tuple[str, str], ...] = ()
+        self._last_active = False
+
+    def begin_battle(self, battle_id: str | None = None) -> None:
+        """Start a new battle observation boundary.
+
+        The emulator can enter a second battle before the recorder observes an
+        inactive frame for the first one.  The handler knows that a new battle
+        is starting, so it must be able to clear the in-progress knowledge
+        explicitly instead of relying on an active rising edge.
+        """
+
+        self.knowledge = BattleKnowledge(battle_id or "battle", self.policy)
+        self.selected_actions = []
         self._last_active = False
 
     def record(self, observation: BattleObservation) -> BattleKnowledge | None:
         if observation.active and not self._last_active:
             self.knowledge = BattleKnowledge(observation.battle_id or "battle", self.policy)
+            self.selected_actions = []
         if self.knowledge is not None:
             self.knowledge = self.knowledge.record(observation)
             if not observation.active and self._last_active:
                 self.last_completed_knowledge = self.knowledge
+                self.last_completed_selected_actions = tuple(self.selected_actions)
         self._last_active = observation.active
         return self.knowledge
+
+    def record_selected_action(self, kind: str, name: str) -> None:
+        """Record an action selected at the battle input boundary.
+
+        The normalized observation layer cannot infer item use, and Emerald's
+        current callback adapter cannot identify a move execution edge from PP
+        changes alone.  The action executor is the authoritative source for
+        these two fields, so it records them here when it publishes the
+        human-facing action panel.
+        """
+
+        if self.knowledge is not None and self._last_active:
+            self.selected_actions.append((str(kind), str(name)))
 
     def reset(self) -> None:
         self.knowledge = None
         self.last_completed_knowledge = None
+        self.selected_actions = []
+        self.last_completed_selected_actions = ()
         self._last_active = False
 
 
@@ -536,8 +611,10 @@ def _pokemon_snapshot(pokemon: Any, side: str) -> PokemonObservation:
                 "effective_stats",
                 "ability",
                 "held_item",
+                "nickname",
             }
         ),
+        _safe(lambda: pokemon.nickname),
     )
 
 
@@ -666,6 +743,30 @@ def capture_battle_observation(action: Any | None = None) -> BattleObservation:
 # strict policy remains available to callers that need observation-only data,
 # while FULL_EMULATOR remains an explicit debugging option.
 default_battle_recorder = BattleKnowledgeRecorder(KnowledgePolicy.HUMAN_KNOWLEDGE)
+
+
+def record_selected_battle_action(kind: str, name: str) -> None:
+    """Publish a selected move/item/switch to the active battle recorder."""
+
+    default_battle_recorder.record_selected_action(kind, name)
+
+
+def get_last_completed_battle_knowledge() -> BattleKnowledge | None:
+    """Return the most recently completed battle's normalized history."""
+
+    return default_battle_recorder.last_completed_knowledge
+
+
+def get_last_completed_battle_actions() -> tuple[tuple[str, str], ...]:
+    """Return selected actions from the most recently completed battle."""
+
+    return default_battle_recorder.last_completed_selected_actions
+
+
+def begin_battle_observation(battle_id: str | None = None) -> None:
+    """Reset the active recorder at the battle handler's ownership boundary."""
+
+    default_battle_recorder.begin_battle(battle_id)
 
 
 def observe_current_battle(action: Any | None = None) -> BattleKnowledge | None:
