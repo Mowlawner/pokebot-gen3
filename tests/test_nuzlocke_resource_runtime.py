@@ -961,6 +961,102 @@ class CampaignCapabilityTests(unittest.TestCase):
             with self.assertRaises(StopIteration):
                 next(execution)
 
+    def _drive_encounter(self, observe, *, goal_result, limit=200, **patches):
+        """Run execute_campaign_encounter against fakes; return (steps, finished, logs)."""
+
+        from modules.nuzlocke import resource_runtime as runtime
+
+        logs = []
+
+        def capture(message, *args, **kwargs):
+            logs.append(message() if callable(message) else str(message))
+
+        class FakeLoop:
+            def __init__(self, *args, **kwargs):
+                self.goal = kwargs.get("goal")
+
+            def run(self):
+                return iter(())
+
+        with (
+            patch.object(runtime, "_preparation_training_location",
+                         return_value=(MapRSE.ROUTE102.value, ((1, 1),))),
+            patch.object(runtime, "get_world_map_graph", return_value=SimpleNamespace()),
+            patch.object(runtime, "observe_agent", side_effect=observe),
+            patch.object(runtime, "_preparation_navigation_goal", return_value=goal_result),
+            patch.object(runtime, "AgentControlLoop", side_effect=FakeLoop),
+            patch.object(runtime, "diagnostic_print", side_effect=capture),
+            patch.object(runtime, "_encounter_stage_trainer_mode") as stage_mode,
+            patch.object(runtime, "_rom_backed_encounter_route") as route,
+            patch.object(runtime, "static_map_transitions") as static,
+            patch.object(runtime, "_cached_encounter_stage_plan", return_value=None),
+            patch.object(runtime, "_acquire_campaign_encounter", **patches.get("acquire", {"return_value": iter(())})) as acquire,
+            patch.object(runtime, "_ENCOUNTER_TRAINER_GATE_WAIT_LIMIT", 3),
+            patch.object(runtime, "_ENCOUNTER_POST_TRANSITION_UNSETTLED_LIMIT", 3),
+        ):
+            warp = SimpleNamespace(destination=(MapRSE.ROUTE102.value, (1, 1)), kind="warp")
+            static.return_value = (warp,)
+            route.return_value = SimpleNamespace(maps=(MapRSE.ROUTE104.value, MapRSE.ROUTE102.value))
+            stage_mode.return_value = (warp, TrainerMode.AVOID, "safe")
+            execution = execute_campaign_encounter(MapRSE.ROUTE102.value)
+            steps = 0
+            finished = False
+            try:
+                while steps < limit:
+                    next(execution)
+                    steps += 1
+            except StopIteration:
+                finished = True
+            return steps, finished, logs, acquire
+
+    def test_encounter_resumes_with_a_destination_action_after_the_stage_warp(self):
+        arrived = self._encounter_world(tiles=((1, 1), (2, 1)))
+        origin = replace(arrived, map_id=MapRSE.ROUTE104.value)
+        controllable = lambda world: AgentObservation(
+            InteractionObservation(GameState.OVERWORLD, controllable=True), world
+        )
+        observations = iter((controllable(origin),))
+
+        def observe(*_args, **_kwargs):
+            return next(observations, controllable(arrived))
+
+        goal = NavigationGoal(
+            ReachLocation((MapRSE.ROUTE102.value, (2, 1))),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+        )
+        steps, finished, logs, acquire = self._drive_encounter(observe, goal_result=(goal, None))
+
+        self.assertTrue(finished)
+        acquire.assert_called_once_with(MapRSE.ROUTE102.value)
+
+    def test_encounter_trainer_gate_wait_is_visible_and_bounded(self):
+        world = self._encounter_world(tiles=((1, 1),))
+        observation = AgentObservation(InteractionObservation(GameState.OVERWORLD, controllable=True), world)
+
+        steps, finished, logs, acquire = self._drive_encounter(
+            lambda *_a, **_k: observation,
+            goal_result=(None, "trainer:(0, 17):2: mandatory trainer is absent from the hazard observation"),
+        )
+
+        self.assertTrue(finished, "capability must hand back to the frontier instead of waiting forever")
+        acquire.assert_not_called()
+        gate_logs = [line for line in logs if "CAMPAIGN_ENCOUNTER_TRAINER_GATE" in line]
+        self.assertTrue(any("action='reobserve'" in line for line in gate_logs))
+        self.assertTrue(any("action='return_to_frontier'" in line for line in gate_logs))
+
+    def test_encounter_unsettled_destination_observation_is_visible_and_bounded(self):
+        arrived = self._encounter_world(tiles=((1, 1),))
+        elsewhere = replace(arrived, map_id=MapRSE.ROUTE104.value)
+        good = AgentObservation(InteractionObservation(GameState.OVERWORLD, controllable=True), arrived)
+        bad = AgentObservation(InteractionObservation(GameState.OVERWORLD, controllable=True), elsewhere)
+        calls = iter((good,))
+
+        def observe(*_args, **_kwargs):
+            return next(calls, bad)
+
+        with self.assertRaisesRegex(Exception, "did not settle"):
+            self._drive_encounter(observe, goal_result=(None, "unused"))
+
     def test_encounter_navigation_waits_for_mandatory_trainer_geometry(self):
         overworld = self._encounter_world(tiles=((1, 1),))
 

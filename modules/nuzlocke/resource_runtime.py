@@ -2687,6 +2687,19 @@ def _acquire_campaign_encounter(encounter_map) -> Iterator[object]:
         yield
 
 
+# After the staged map route completes, the encounter capability waits for a
+# settled destination observation and for ROM-backed trainer geometry.  Those
+# waits fail closed, but they must not be silent or unbounded: a post-warp
+# stall otherwise looks like "no action was issued" with nothing in the log.
+_ENCOUNTER_POST_TRANSITION_UNSETTLED_LIMIT = 900
+_ENCOUNTER_TRAINER_GATE_WAIT_LIMIT = 600
+_ENCOUNTER_WAIT_LOG_INTERVAL = 120
+
+
+def _encounter_wait_should_log(waits: int) -> bool:
+    return waits == 1 or waits % _ENCOUNTER_WAIT_LOG_INTERVAL == 0
+
+
 def execute_campaign_encounter(
     encounter_map, *, encounter_method: EncounterMethod = EncounterMethod.LAND
 ) -> Iterator[object]:
@@ -2871,12 +2884,33 @@ def execute_campaign_encounter(
         )
 
     attempts = 0
+    unsettled_observations = 0
+    trainer_gate_waits = 0
     while True:
         observation = observe_agent()
         overworld = getattr(observation, "overworld", None)
         if overworld is None or getattr(overworld, "map_id", None) != map_id:
+            unsettled_observations += 1
+            if _encounter_wait_should_log(unsettled_observations):
+                diagnostic_print(
+                    lambda: (
+                        "CAMPAIGN_ENCOUNTER_STAGE: event=awaiting_destination_observation "
+                        f"expected_map={map_id!r} "
+                        f"observed_map={getattr(overworld, 'map_id', None)!r} "
+                        f"overworld_available={overworld is not None} "
+                        f"waits={unsettled_observations}"
+                    ),
+                    trace=False,
+                    prefix="CAMPAIGN_ENCOUNTER_STAGE",
+                )
+            if unsettled_observations > _ENCOUNTER_POST_TRANSITION_UNSETTLED_LIMIT:
+                raise BotModeError(
+                    f"encounter map transition did not settle on {map_id!r} "
+                    f"after {unsettled_observations} observations"
+                )
             yield
             continue
+        unsettled_observations = 0
         navigation_goal, error = _preparation_navigation_goal(
             overworld,
             map_id,
@@ -2886,17 +2920,27 @@ def execute_campaign_encounter(
         )
         if navigation_goal is None:
             if error and "mandatory trainer" in error:
-                diagnostic_print(
-                    lambda: (
-                        "CAMPAIGN_ENCOUNTER_TRAINER_GATE: "
-                        f"map={map_id!r} action='reobserve' reason={error!r}"
-                    ),
-                    trace=True,
-                    prefix="CAMPAIGN_ENCOUNTER_TRAINER_GATE",
-                )
+                trainer_gate_waits += 1
+                exhausted = trainer_gate_waits > _ENCOUNTER_TRAINER_GATE_WAIT_LIMIT
+                if exhausted or _encounter_wait_should_log(trainer_gate_waits):
+                    diagnostic_print(
+                        lambda: (
+                            "CAMPAIGN_ENCOUNTER_TRAINER_GATE: "
+                            f"map={map_id!r} "
+                            f"action={'return_to_frontier' if exhausted else 'reobserve'!r} "
+                            f"reason={error!r} waits={trainer_gate_waits}"
+                        ),
+                        trace=False,
+                        prefix="CAMPAIGN_ENCOUNTER_TRAINER_GATE",
+                    )
+                if exhausted:
+                    # The geometry never resolved.  Fail closed by handing the
+                    # objective back to the frontier instead of waiting forever.
+                    return
                 yield
                 continue
             raise BotModeError(f"no reachable encounter tile on map {map_id!r}: {error}")
+        trainer_gate_waits = 0
         attempts += 1
         diagnostic_print(
             lambda: (
