@@ -640,6 +640,76 @@ def _post_pokedex_campaign_boundary(state: CampaignState) -> bool:
     return getattr(pokedex, "status", None) is FactStatus.KNOWN and getattr(pokedex, "value", None) is True
 
 
+class _ControllerExceptionReporter:
+    """Report swallowed controller exceptions in the normal log, rate limited.
+
+    The controller deliberately turns capability exceptions into a retry.  The
+    decisive error used to be written only with ``--debug-trace``, so an
+    ordinary run showed "failed; retrying" with no cause.  Identical errors are
+    reported on their 1st, 2nd, 3rd, 10th, 100th, and every 500th occurrence.
+    """
+
+    _REPORT_AT = frozenset({1, 2, 3, 10, 100})
+
+    def __init__(self) -> None:
+        self._counts: dict[tuple, int] = {}
+
+    def should_report(self, kind: str, error: BaseException) -> tuple[bool, int]:
+        key = (kind, type(error).__name__, str(error)[:200])
+        count = self._counts.get(key, 0) + 1
+        self._counts[key] = count
+        return (count in self._REPORT_AT or count % 500 == 0), count
+
+
+class _ControllerIdleWatchdog:
+    """Detect a controller that sits in one state without a mounted capability."""
+
+    def __init__(self, *, first_report_after: int = 600, repeat_every: int = 3600) -> None:
+        self._first = first_report_after
+        self._repeat = repeat_every
+        self._signature: object = None
+        self._count = 0
+
+    def observe(self, signature: object, *, idle: bool) -> int | None:
+        """Return the idle frame count when it should be reported, else None."""
+
+        if not idle:
+            self._signature = None
+            self._count = 0
+            return None
+        if signature != self._signature:
+            self._signature = signature
+            self._count = 0
+        self._count += 1
+        if self._count == self._first or (
+            self._count > self._first and (self._count - self._first) % self._repeat == 0
+        ):
+            return self._count
+        return None
+
+
+_CONTROLLER_EXCEPTIONS = _ControllerExceptionReporter()
+
+
+def _report_controller_exception(kind: str, error: BaseException, **fields) -> None:
+    """Write a compact, rate-limited exception record to the normal log."""
+
+    should, count = _CONTROLLER_EXCEPTIONS.should_report(kind, error)
+    if not should:
+        return
+    frames = traceback.extract_tb(error.__traceback__)[-3:] if error.__traceback__ else []
+    where = " <- ".join(f"{frame.name}:{frame.lineno}" for frame in reversed(frames)) or "unknown"
+    extra = " ".join(f"{name}={value!r}" for name, value in fields.items())
+    diagnostic_print(
+        lambda: (
+            f"CAMPAIGN_CONTROLLER_EXCEPTION: kind={kind!r} occurrence={count} "
+            f"error_type={type(error).__name__!r} error={str(error)[:300]!r} where={where!r} {extra}"
+        ),
+        trace=False,
+        prefix="CAMPAIGN_CONTROLLER_EXCEPTION",
+    )
+
+
 class CampaignController:
     """Select and mount one tactical goal, reevaluating at event boundaries."""
 
@@ -4187,6 +4257,31 @@ class CampaignController:
             trace=True,
         )
         result = self._step_impl()
+        watchdog = getattr(self, "_idle_watchdog", None)
+        if watchdog is None:
+            watchdog = self._idle_watchdog = _ControllerIdleWatchdog()
+        idle_frames = watchdog.observe(
+            (
+                self._execution_phase,
+                result.status.value,
+                self.transition_reason,
+                self.current_objective_id,
+            ),
+            idle=self._tactical_loop is None,
+        )
+        if idle_frames is not None:
+            diagnostic_print(
+                lambda: (
+                    "CAMPAIGN_CONTROLLER_IDLE: no capability mounted and state unchanged "
+                    f"for {idle_frames} controller steps phase={self._execution_phase!r} "
+                    f"status={result.status.value!r} objective={self.current_objective_id!r} "
+                    f"refresh_required={self._refresh_required!r} "
+                    f"refresh_reason={self._refresh_required_reason!r} "
+                    f"reason={self.transition_reason!r}"
+                ),
+                trace=False,
+                prefix="CAMPAIGN_CONTROLLER_IDLE",
+            )
         diagnostic_print(
             lambda: (
                 "CAMPAIGN_CONTROLLER_STEP_EXIT: "
@@ -4310,6 +4405,11 @@ class CampaignController:
                     self.current_tactical_goal,
                 )
                 self.transition_reason = f"trainer preparation failed; retrying: {error}"
+                _report_controller_exception(
+                    "trainer_preparation",
+                    error,
+                    objective=self.current_objective_id,
+                )
                 diagnostic_print(
                     lambda: (
                         "CAMPAIGN_TRAINER_PREPARATION_EXCEPTION: "
@@ -4502,6 +4602,7 @@ class CampaignController:
             self._refresh_required_reason = "refresh_exception"
             self.status = CampaignControllerStatus.UNKNOWN
             self.transition_reason = f"campaign refresh failed; will re-evaluate: {type(error).__name__}: {error!r}"
+            _report_controller_exception("refresh", error, objective=self.current_objective_id)
             diagnostic_print(
                 lambda: (
                     "CAMPAIGN_REFRESH_EXCEPTION: "

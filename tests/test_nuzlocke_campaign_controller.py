@@ -3489,3 +3489,58 @@ from modules.map_data import MapRSE
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ControllerDiagnosticsTests(unittest.TestCase):
+    def test_repeated_identical_exceptions_are_rate_limited(self):
+        from modules.nuzlocke.campaign_controller import _ControllerExceptionReporter
+
+        reporter = _ControllerExceptionReporter()
+        error = RuntimeError("stale route")
+        reported = [reporter.should_report("trainer_preparation", error)[0] for _ in range(12)]
+
+        self.assertEqual([index + 1 for index, value in enumerate(reported) if value], [1, 2, 3, 10])
+        # A different kind or message is counted independently.
+        self.assertTrue(reporter.should_report("refresh", error)[0])
+        self.assertTrue(reporter.should_report("trainer_preparation", RuntimeError("other"))[0])
+
+    def test_exception_report_goes_to_the_normal_log_with_a_location(self):
+        from unittest.mock import patch
+
+        from modules.nuzlocke import campaign_controller as controller
+
+        logs = []
+        flags = []
+
+        def capture(message, *args, **kwargs):
+            logs.append(message())
+            flags.append(kwargs.get("trace"))
+
+        def boom():
+            raise ValueError("no executable capability")
+
+        try:
+            boom()
+        except ValueError as error:
+            with patch.object(controller, "diagnostic_print", side_effect=capture), patch.object(
+                controller, "_CONTROLLER_EXCEPTIONS", controller._ControllerExceptionReporter()
+            ):
+                controller._report_controller_exception("trainer_preparation", error, objective="x")
+
+        self.assertEqual(flags, [False])
+        self.assertIn("CAMPAIGN_CONTROLLER_EXCEPTION", logs[0])
+        self.assertIn("no executable capability", logs[0])
+        self.assertIn("boom:", logs[0])
+
+    def test_idle_watchdog_reports_once_per_period_and_resets_on_change(self):
+        from modules.nuzlocke.campaign_controller import _ControllerIdleWatchdog
+
+        watchdog = _ControllerIdleWatchdog(first_report_after=3, repeat_every=5)
+        state = ("CAMPAIGN", "unknown", "waiting", "obj")
+        results = [watchdog.observe(state, idle=True) for _ in range(9)]
+
+        self.assertEqual(results, [None, None, 3, None, None, None, None, 8, None])
+        # A mounted capability, or a changed state, restarts the count.
+        self.assertIsNone(watchdog.observe(state, idle=False))
+        self.assertEqual([watchdog.observe(state, idle=True) for _ in range(3)], [None, None, 3])
+        self.assertIsNone(watchdog.observe(("CAMPAIGN", "ready", "other", "obj"), idle=True))
