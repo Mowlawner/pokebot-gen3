@@ -704,3 +704,81 @@ unavailable. `tests/test_overworld.py` now covers the `FACE_UP_AND_RIGHT` /
 unknown-facing case. The focused overworld and world-navigation tier passes
 104 tests; a fresh live rerun is still required to confirm the emulator's
 runtime object state takes this path.
+
+## 2026-11-05 audit of the five outstanding Route 104 issues
+
+This section records an independent re-audit of the 2026-09-22 claims. Code
+audits were read-only; the fixes below are committed separately on
+`improved-leveling`. Live-run results are recorded at the end and are kept
+separate from code-level findings.
+
+### Evidence base
+
+- Latest requested log: `profiles/test_ng/run.log` (18,875 lines, 4,341,913
+  bytes, modified 2026-09-22 20:23). It differs from the 09:29 log cited above.
+  It reached Route 104, took a Wingull encounter, routed to the Woods warp at
+  `(10,38)` with Cindy's hazards logged as directional ROM-envelope tiles, and
+  ended at `cached goal position reached` (`index=9; remaining=0`) with no
+  destination observation. It therefore neither confirms nor refutes post-warp
+  resumption. A backup is at `/tmp/nuzbot-diag/test_ng_run_20_23_backup.log`.
+- The full suite at the start of the audit was 2 failed / 2125 passed; the two
+  Woods tests were order dependent (see issue 1).
+
+### Issue 1: Route 104 trainer-free corridor
+
+- `trainer_hazard_locations` ROM-envelope fix is real and on the live
+  encounter-staging path.
+- Fixed: `test_woods_coordinate_scene_geometry_releases_encounter_gate` and
+  `test_woods_encounter_route_avoids_coordinate_scene_triggers` did not patch
+  `get_map_metadata`, so their result depended on whether real map metadata was
+  loaded by an earlier test. They are now hermetic, and a new test asserts both
+  researcher scene events are avoided when only one is observed.
+- Not done: a real-map Route 104 corridor test. Tile layouts come from ROM
+  memory and offline tests have no ROM, so this needs a live run.
+- Open decision: `_encounter_stage_route_cut_hazards` promotes a trainer common
+  to every usable permissive exit to a mandatory hazard whenever the safe probe
+  found nothing, if the trainer resolves to a ROM checkpoint. Live readiness
+  resolved Billy as `rom:BPEE0:319`. A hazard-model false negative therefore
+  still converts into permitted exposure. This is the mechanism of the original
+  Billy incident. It was not changed because AGENTS.md forbids trainer-specific
+  registry entries and requires route analysis to enumerate local alternatives.
+
+### Issue 2: recovery and preparation exposure
+
+- `_preparation_navigation_goal` defaulted to `TrainerMode.IGNORE`, and the map
+  route into the training map had no trainer constraint. Both now default to
+  `AVOID`.
+- `_recovery_trainer_safety_error` only checked the one trainer named by a
+  `prepare` readiness result. It now rejects a route that crosses any
+  undefeated trainer hazard in the diagnostic, still naming an explicitly
+  unready trainer when applicable.
+- Regression found only by the live run: wrapping the grass goal in a
+  `NavigationGoal` made `describe_preparation_target` return `None`, so no
+  preparation target was published, wild battles got intent `avoid`, and the bot
+  fled hundreds of encounters on Route 103 without earning XP. Fixed by
+  unwrapping the goal, and an undescribable goal now logs
+  `CAMPAIGN_PREPARATION_TARGET_UNDESCRIBED` instead of failing silently.
+
+### Issue 3: Bide-aware tactical evaluation
+
+- State plumbing and release modelling were already correct. Two gaps fixed:
+  a Bide-locked opponent whose Bide was never revealed produced no opponent
+  response (the release looked harmless), and an unreadable `gBideDmg` became 0.
+  The search now injects Bide for an observed lock; an unreadable value on the
+  release turn is assumed lethal and logged as `BATTLE_BIDE_DAMAGE_UNKNOWN`.
+- New `BATTLE_BIDE_OBSERVED` log line records turns, stored and release damage.
+- Not covered: `CampaignStrategy` acceptance with real `BattlePokemon` bytes, a
+  switch-in absorbing the release, and non-campaign strategies that bypass the
+  search.
+
+### Issue 4: post-warp resumption
+
+- The `AgentControlLoop` fix is real. A mutation check (making the invalidation
+  unconditional) fails `test_warp_route_survives_non_overworld_boundary_before_destination_action`.
+- An implicit step-on warp ending a route with `MOVE` already resumes correctly.
+- A candidate mechanism for a post-warp stall, not attributable to the original
+  run: `execute_campaign_encounter` waited without bound, and with trace-only
+  diagnostics, for a settled destination observation and for mandatory-trainer
+  geometry. Both waits are now logged in the normal log and bounded (unsettled
+  observation raises `BotModeError`; an unresolved trainer gate returns to the
+  frontier).
