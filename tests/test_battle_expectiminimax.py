@@ -2298,3 +2298,109 @@ def test_search_root_preserves_bide_state_observed_before_planner_call():
         and branch.damage == 8
         for branch in result.immediate_projection.opponent_responses
     )
+
+
+def _billy_seedot_context(**changes):
+    """Torchic with a healthy Mudkip in the party against a Bide-locked Seedot."""
+
+    from modules.battle_planner import PlannerSwitch
+
+    values = dict(
+        active_name="Torchic",
+        active_hp=20,
+        active_max_hp=20,
+        opponent_name="Seedot",
+        opponent_hp=30,
+        opponent_max_hp=30,
+        moves=(PlannerMove(0, "Scratch", 5, 6),),
+        switches=(
+            PlannerSwitch(
+                1,
+                "Mudkip",
+                40,
+                40,
+                incoming_damage_max=3,
+                offensive_damage_max=6,
+                moves=(PlannerMove(0, "Tackle", 4, 5),),
+                speed=15,
+            ),
+        ),
+        opponent_moves=(
+            PlannerOpponentMove("Bide", 0, 0, effect="BIDE", response_facts_complete=True),
+        ),
+        active_speed=20,
+        opponent_speed=10,
+        is_trainer=True,
+        can_switch=True,
+        campaign_owned=True,
+        opponent_response_facts_complete=True,
+        opponent_bide_turns=1,
+        opponent_bide_damage=12,
+    )
+    values.update(changes)
+    return PlannerContext(**values)
+
+
+def test_planner_switches_instead_of_attacking_into_a_lethal_bide_release():
+    from modules.battle_planner import BattlePlanner, PlannerAction
+
+    decision = BattlePlanner().plan(_billy_seedot_context())
+
+    assert decision.action is PlannerAction.SwitchPokemon
+    assert decision.target == 1
+
+
+def test_planner_takes_a_survivable_fast_knockout_over_waiting_out_bide():
+    from modules.battle_planner import BattlePlanner, PlannerAction
+
+    decision = BattlePlanner().plan(_billy_seedot_context(opponent_hp=5))
+
+    assert decision.action is PlannerAction.UseMove
+    assert decision.target == 0
+
+
+def test_observed_opponent_bide_lock_is_modeled_when_bide_was_never_revealed():
+    from modules.battle_planner import BattlePlanner, PlannerAction
+
+    context = _billy_seedot_context(
+        opponent_moves=(PlannerOpponentMove("Tackle", 3, 4),),
+    )
+
+    result = search_planner_context(context, config=SearchConfig(max_turns=3, max_duration_seconds=None))
+
+    assert result is not None
+    assert result.immediate_projection is not None
+    assert any(
+        branch.action_name == "Bide"
+        and branch.result == "BIDE_RELEASE"
+        and branch.damage == 24
+        for branch in result.immediate_projection.opponent_responses
+    )
+    decision = BattlePlanner().plan(context)
+    assert decision.action is PlannerAction.SwitchPokemon
+
+
+def test_observed_opponent_bide_lock_is_modeled_with_no_known_opponent_moves():
+    context = _billy_seedot_context(opponent_moves=())
+
+    result = search_planner_context(context, config=SearchConfig(max_turns=3, max_duration_seconds=None))
+
+    assert result is not None
+    assert result.immediate_projection is not None
+    assert any(
+        branch.result == "BIDE_RELEASE" and branch.damage == 24
+        for branch in result.immediate_projection.opponent_responses
+    )
+
+
+def test_opponent_bide_charge_turn_stores_damage_before_the_release():
+    context = _billy_seedot_context(opponent_bide_turns=2, opponent_bide_damage=0)
+
+    result = search_planner_context(context, config=SearchConfig(max_turns=1, max_duration_seconds=None))
+
+    assert result is not None
+    assert result.immediate_projection is not None
+    assert all(
+        branch.result != "BIDE_RELEASE"
+        for branch in result.immediate_projection.opponent_responses
+    )

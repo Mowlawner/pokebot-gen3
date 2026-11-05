@@ -3834,6 +3834,22 @@ def search_planner_context(planner_context, *, config: SearchConfig | None = Non
         for index, move in enumerate(raw_opponent_moves)
         if getattr(move, "mechanics_supported", True)
     )
+    if int(getattr(planner_context, "opponent_bide_turns", 0) or 0) > 0 and not any(
+        _is_bide_move(move) for move in opponent_moves
+    ):
+        # A Bide-locked battler can only continue Bide, whether or not the
+        # move was ever revealed or enumerated.  Without it the search offers
+        # the opponent no response and models the release as harmless.
+        opponent_moves = (
+            *opponent_moves,
+            SearchMove(
+                max((move.index for move in opponent_moves), default=-1) + 1,
+                "Bide",
+                0,
+                0,
+                secondary_effect="BIDE",
+            ),
+        )
     if not opponent_moves and getattr(planner_context, "opponent_damage_max", None) is not None:
         # Some offline and readiness callers provide only a bounded response
         # ceiling. Preserve that fact as a conservative synthetic response so
