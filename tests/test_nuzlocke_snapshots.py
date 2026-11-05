@@ -523,3 +523,60 @@ class TestNuzlockeSnapshots(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MetLocationTests(unittest.TestCase):
+    def _fake_pokemon(self, **overrides):
+        values = dict(
+            species=types.SimpleNamespace(name="Marill"),
+            nickname="David",
+            level=5,
+            current_hp=23,
+            total_hp=23,
+            status_condition=types.SimpleNamespace(value="none"),
+            personality_value=1,
+            original_trainer=types.SimpleNamespace(id=1, secret_id=2, name="Ash"),
+            moves=(),
+            held_item=None,
+            is_egg=False,
+            location_met="Route 104",
+        )
+        values.update(overrides)
+        return types.SimpleNamespace(**values)
+
+    def test_snapshot_records_the_games_met_location(self):
+        from unittest.mock import patch
+
+        from modules.nuzlocke import snapshots
+
+        with patch.object(snapshots.PokemonIdentity, "from_pokemon", return_value=None):
+            snapshot = snapshots._pokemon(self._fake_pokemon())
+
+        self.assertEqual(snapshot.met_location, "Route 104")
+
+    def test_met_location_does_not_affect_snapshot_equality(self):
+        from unittest.mock import patch
+
+        from modules.nuzlocke import snapshots
+
+        with patch.object(snapshots.PokemonIdentity, "from_pokemon", return_value=None):
+            first = snapshots._pokemon(self._fake_pokemon(location_met="Route 104"))
+            second = snapshots._pokemon(self._fake_pokemon(location_met="Route 101"))
+
+        self.assertEqual(first, second)
+
+    def test_unreadable_met_location_is_unknown_not_an_error(self):
+        from unittest.mock import patch
+
+        from modules.nuzlocke import snapshots
+
+        class Unreadable(types.SimpleNamespace):
+            @property
+            def location_met(self):
+                raise IndexError("decrypted data unavailable")
+
+        fake = Unreadable(**{k: v for k, v in vars(self._fake_pokemon()).items() if k != "location_met"})
+        with patch.object(snapshots.PokemonIdentity, "from_pokemon", return_value=None):
+            snapshot = snapshots._pokemon(fake)
+
+        self.assertIsNone(snapshot.met_location)

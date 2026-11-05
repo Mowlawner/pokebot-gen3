@@ -130,6 +130,35 @@ class TestDiagnosticPrint(unittest.TestCase):
         self.assertIn("WALK_SEQUENCE_DOWN_RIGHT_UP_LEFT", rendered)
         self.assertIn("movement_range", rendered)
 
+    def test_campaign_snapshot_party_rows_show_where_each_pokemon_was_met(self):
+        from modules.console import print_campaign_snapshot
+
+        output = StringIO()
+        sink = Console(file=output, color_system=None, width=160)
+        member = lambda species, nickname, met: types.SimpleNamespace(
+            species=species,
+            nickname=nickname,
+            level=5,
+            current_hp=20,
+            max_hp=20,
+            fainted=False,
+            status="healthy",
+            met_location=met,
+        )
+        snapshot = types.SimpleNamespace(
+            frame=12,
+            player=types.SimpleNamespace(name="May", map_name="Route 104"),
+            party=(member("Marill", "David", "Route 104"), member("Mudkip", "William", None)),
+        )
+        with patch("modules.console.console", sink):
+            print_campaign_snapshot(snapshot=snapshot)
+
+        rendered = " ".join(output.getvalue().split())
+        self.assertIn('Marill "David" Lv5 HP 20/20 (healthy) [met: Route 104]', rendered)
+        # An unknown origin is simply omitted rather than shown as a guess.
+        self.assertIn('Mudkip "William" Lv5 HP 20/20 (healthy)', rendered)
+        self.assertNotIn('Mudkip "William" Lv5 HP 20/20 (healthy) [met', rendered)
+
     def test_campaign_snapshot_reports_party_cap_boss_and_exp_budget(self):
         from modules.console import print_campaign_snapshot
 

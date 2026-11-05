@@ -56,6 +56,10 @@ class PokemonSnapshot:
     fainted: bool
     egg: bool
     identity: PokemonIdentity | None = dataclass_field(default=None, kw_only=True)
+    # Where the game says this Pokémon was met.  Display-only provenance: it is
+    # excluded from equality so a transient unreadable value can never look
+    # like a change to the Pokémon, and ``None`` means unknown, not "traded".
+    met_location: str | None = dataclass_field(default=None, kw_only=True, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +256,10 @@ def _pokemon(pokemon) -> PokemonSnapshot:
     """Normalize a party or storage Pokémon without mutating the source."""
 
     trainer = pokemon.original_trainer
+    try:
+        met_location = pokemon.location_met
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        met_location = None
     return PokemonSnapshot(
         species=pokemon.species.name,
         nickname=pokemon.nickname,
@@ -268,6 +276,7 @@ def _pokemon(pokemon) -> PokemonSnapshot:
         fainted=pokemon.current_hp == 0,
         egg=pokemon.is_egg,
         identity=PokemonIdentity.from_pokemon(pokemon),
+        met_location=met_location,
     )
 
 

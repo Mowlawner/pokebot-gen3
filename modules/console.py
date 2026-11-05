@@ -1151,11 +1151,13 @@ def print_campaign_snapshot(
             if nickname and str(nickname).casefold() != str(species).casefold()
             else str(species)
         )
+        met_location = getattr(pokemon, "met_location", None)
         party_rows.append(
             f"{identity} "
             f"Lv{getattr(pokemon, 'level', '?')} "
             f"HP {getattr(pokemon, 'current_hp', '?')}/{getattr(pokemon, 'max_hp', '?')} "
             f"({state})"
+            + (f" [met: {met_location}]" if met_location else "")
         )
     party_text = ", ".join(party_rows) if party_rows else "unknown"
 
