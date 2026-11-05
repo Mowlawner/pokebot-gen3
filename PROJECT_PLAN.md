@@ -229,7 +229,9 @@ state.
 4. Integrate campaign risk budgets and boss policies with the existing battle
    planner and strategies.
 5. Add type coverage, move quality, matchup, uncertainty, switching, PP, and
-   consumable decisions.
+   consumable decisions. The solver-per-battle-kind design (a battle-kind
+   classifier, a dedicated bounded capture planner, and the shared battle model)
+   is described in [battle-decision-architecture.md](docs/battle-decision-architecture.md).
 6. Add shopping, PC, status, PP, and party-management objectives.
 7. Persist preparation decisions, seeds, rationale, and battle policies.
 
