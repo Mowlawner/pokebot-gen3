@@ -3088,6 +3088,78 @@ class AgentExecutionTests(TestCase):
             [call("Right", run=False, fresh=False), call("Right", run=False, fresh=True)],
         )
 
+    def test_implicit_step_on_warp_resumes_after_change_map_boundary(self):
+        """A route that ends on a step-on warp tile has no owned WARP dispatch."""
+
+        source_map = (0, 0)
+        target_map = (0, 1)
+        destination = (target_map, (0, 0))
+        warp = WarpObservation((source_map, (1, 0)), destination, required_facing=None)
+        goal = ReachWarp(destination_map=target_map, destination=destination, warp=warp)
+        plan = NavigationPlan(
+            (
+                NavigationAction(
+                    NavigationActionType.MOVE,
+                    Direction.East,
+                    (source_map, (0, 0)),
+                    (source_map, (1, 0)),
+                ),
+            ),
+            destination,
+        )
+
+        def source_world(coordinates):
+            return OverworldObservation(
+                map_id=source_map,
+                player_coordinates=coordinates,
+                facing=Direction.East,
+                controllable=True,
+                movement_state=MovementState.STANDING,
+                tiles=tuple(
+                    TileObservation((source_map, coordinate), False, frozenset(Direction))
+                    for coordinate in ((0, 0), (1, 0))
+                ),
+                warps=(warp,),
+                objects=(),
+                triggers=(),
+            )
+
+        def destination_world(controllable):
+            return OverworldObservation(
+                map_id=target_map,
+                player_coordinates=(0, 0),
+                facing=Direction.East,
+                controllable=controllable,
+                movement_state=MovementState.STANDING,
+                tiles=(TileObservation(destination, False, frozenset(Direction)),),
+                warps=(),
+                objects=(),
+                triggers=(),
+            )
+
+        observations = iter(
+            (
+                observation(GameState.OVERWORLD, world=source_world((0, 0)), goal=goal),
+                observation(GameState.CHANGE_MAP, world=None, goal=goal, controllable=False),
+                observation(GameState.CHANGE_MAP, world=destination_world(False), goal=goal, controllable=False),
+                observation(GameState.OVERWORLD, world=destination_world(True), goal=goal),
+            )
+        )
+        emulator = Mock()
+        loop = AgentControlLoop(lambda: next(observations), goal=goal, navigation_plan=plan)
+
+        with patch("modules.agent_control.context.emulator", emulator):
+            movement = loop.step()
+            source_boundary = loop.step()
+            destination_boundary = loop.step()
+            resumed = loop.step()
+
+        self.assertEqual(movement[1].action.navigation.action_type, NavigationActionType.MOVE)
+        self.assertEqual(source_boundary[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(destination_boundary[1].action.action_type, AgentActionType.WAIT_REOBSERVE)
+        self.assertEqual(resumed[2].result_type, ActionResultType.GOAL_COMPLETE)
+        self.assertFalse(loop.navigation_transition_active)
+
     def test_warp_route_survives_non_overworld_boundary_before_destination_action(self):
         """A script boundary after warp activation must preserve resumption."""
 
