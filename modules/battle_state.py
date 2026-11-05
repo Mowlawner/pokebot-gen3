@@ -823,6 +823,15 @@ class BattlePokemon:
         return (unpack_uint32(self._data[0x50:0x54]) >> 8) & 0b11
 
     @property
+    def bide_damage_known(self) -> bool:
+        """Whether ``gBideDmg`` was readable for this battler.
+
+        An unreadable value is unknown, not zero damage.
+        """
+
+        return len(self._bide_damage) >= 4
+
+    @property
     def bide_damage(self) -> int:
         """Return the direct HP damage accumulated by this Bide user."""
 

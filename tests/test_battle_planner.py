@@ -787,6 +787,103 @@ class BattlePlannerTests(unittest.TestCase):
         self.assertEqual(dict(planner_context.active_stat_stages)["defense"], -2)
         self.assertEqual(dict(planner_context.opponent_stat_stages)["defense"], -6)
 
+    def _planner_context_for_bide_opponent(self, **opponent_bide):
+        move = SimpleNamespace(
+            name="Pound",
+            base_power=40,
+            accuracy=1.0,
+            priority=0,
+            effect="HIT",
+            type=SimpleNamespace(kind="Physical"),
+        )
+        learned = SimpleNamespace(move=move, pp=5)
+        modifiers = SimpleNamespace(
+            attack=0, defence=0, speed=0, special_attack=0, special_defence=0, accuracy=0, evasion=0
+        )
+        active = SimpleNamespace(
+            party_index=0,
+            species=SimpleNamespace(name="Torchic"),
+            current_hp=20,
+            total_hp=20,
+            moves=(learned,),
+            disabled_move=None,
+            stats=SimpleNamespace(speed=10),
+            stats_modifiers=modifiers,
+            status_permanent=None,
+        )
+        opponent = SimpleNamespace(
+            party_index=0,
+            species=SimpleNamespace(name="Seedot"),
+            current_hp=30,
+            total_hp=30,
+            moves=(),
+            stats=SimpleNamespace(speed=8),
+            stats_modifiers=modifiers,
+            **opponent_bide,
+        )
+        battle_state = SimpleNamespace(
+            own_side=SimpleNamespace(active_battler=active),
+            opponent=SimpleNamespace(active_battler=opponent),
+            is_trainer_battle=True,
+        )
+        party_member = SimpleNamespace(
+            is_egg=False,
+            current_hp=20,
+            total_hp=20,
+            name="Torchic",
+            moves=(learned,),
+            status_condition=None,
+        )
+        util = SimpleNamespace(
+            calculate_move_damage_range=lambda *args, **kwargs: SimpleNamespace(min=2, max=3),
+            can_switch=lambda: False,
+        )
+        captured = {}
+
+        def capture_plan(_planner, planner_context):
+            captured["context"] = planner_context
+            return PlannerDecision(PlannerAction.AbortForSafety)
+
+        with (
+            patch("modules.pokemon_party.get_party", return_value=(party_member,)),
+            patch("modules.battle_strategies._util.BattleStrategyUtil", return_value=util),
+            patch("modules.battle_planner.opponent_response_move_names", return_value=("Tackle",)),
+            patch("modules.pokemon.get_move_by_name", return_value=move),
+            patch("modules.items.get_item_bag", return_value=SimpleNamespace(items=(), poke_balls=())),
+            patch.object(BattlePlanner, "plan", autospec=True, side_effect=capture_plan),
+        ):
+            plan_battle_state(battle_state, BattleKnowledge("battle", KnowledgePolicy.HUMAN_KNOWLEDGE))
+        return captured["context"]
+
+    def test_unreadable_bide_damage_on_release_turn_is_assumed_lethal_not_zero(self):
+        planner_context = self._planner_context_for_bide_opponent(
+            bide_turns_remaining=1,
+            bide_damage=0,
+            bide_damage_known=False,
+        )
+
+        self.assertEqual(planner_context.opponent_bide_turns, 1)
+        # Twice the stored damage must be able to faint the 20 HP active Pokemon.
+        self.assertGreaterEqual(planner_context.opponent_bide_damage * 2, planner_context.active_hp)
+
+    def test_readable_zero_bide_damage_is_not_inflated(self):
+        planner_context = self._planner_context_for_bide_opponent(
+            bide_turns_remaining=1,
+            bide_damage=0,
+            bide_damage_known=True,
+        )
+
+        self.assertEqual(planner_context.opponent_bide_damage, 0)
+
+    def test_unreadable_bide_damage_while_storing_is_not_inflated(self):
+        planner_context = self._planner_context_for_bide_opponent(
+            bide_turns_remaining=2,
+            bide_damage=0,
+            bide_damage_known=False,
+        )
+
+        self.assertEqual(planner_context.opponent_bide_damage, 0)
+
     def test_safe_attack_is_high_confidence(self):
         decision = BattlePlanner().plan(context())
         self.assertEqual(decision.action, PlannerAction.UseMove)

@@ -16,6 +16,16 @@ class TestBattleStateNuzlockeBoundary(unittest.TestCase):
 
         self.assertEqual(battler.bide_turns_remaining, 2)
         self.assertEqual(battler.bide_damage, 7)
+        self.assertTrue(battler.bide_damage_known)
+
+    def test_unreadable_bide_damage_is_unknown_not_zero(self):
+        data = bytearray(0x58)
+        data[0x50:0x54] = (1 << 8).to_bytes(4, "little")
+        battler = BattlePokemon(bytes(data), b"\x00" * 4, b"\x00" * 0x1C, 0, b"")
+
+        self.assertEqual(battler.bide_turns_remaining, 1)
+        self.assertEqual(battler.bide_damage, 0)
+        self.assertFalse(battler.bide_damage_known)
 
     def test_route_101_pending_wild_encounter_is_capture_target(self):
         runtime = NuzlockeRuntime()

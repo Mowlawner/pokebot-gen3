@@ -3208,6 +3208,30 @@ def plan_battle_state(
     active_moves = _battle_moves(active, player_party)
     player_bide_turns, player_bide_damage = _bide_facts(active)
     opponent_bide_turns, opponent_bide_damage = _bide_facts(opponent)
+    if opponent_bide_turns == 1 and getattr(opponent, "bide_damage_known", True) is False:
+        # The release is next but its stored damage could not be read.  Zero
+        # would make the release look harmless, so assume the worst case: a
+        # release (twice the stored damage) that can faint the active Pokémon.
+        opponent_bide_damage = max(opponent_bide_damage, (int(active_hp) + 1) // 2)
+        diagnostic_print(
+            lambda: (
+                "BATTLE_BIDE_DAMAGE_UNKNOWN: opponent Bide release is next but gBideDmg is "
+                f"unreadable; assuming stored_damage={opponent_bide_damage!r}"
+            ),
+            trace=False,
+            prefix="BATTLE_BIDE_DAMAGE_UNKNOWN:",
+        )
+    if opponent_bide_turns > 0:
+        diagnostic_print(
+            lambda: (
+                "BATTLE_BIDE_OBSERVED: "
+                f"opponent={getattr(getattr(opponent, 'species', None), 'name', None)!r} "
+                f"turns_remaining={opponent_bide_turns!r} stored_damage={opponent_bide_damage!r} "
+                f"release_damage={opponent_bide_damage * 2!r} active_hp={active_hp!r}"
+            ),
+            trace=False,
+            prefix="BATTLE_BIDE_OBSERVED:",
+        )
     util = BattleStrategyUtil(battle_state)
     visible = knowledge_for_planner(knowledge)
     revealed = {name for _, name in visible.revealed_opponent_moves} if visible is not None else set()
