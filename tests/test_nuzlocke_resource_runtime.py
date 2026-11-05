@@ -1013,11 +1013,56 @@ class CampaignCapabilityTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(
-            _mandatory_checkpoint_trigger_ids(overworld, map_id),
-            frozenset({"coord:0:152:0"}),
+        # Hermetic: without this patch the helper also reconstructs the ROM's
+        # right-hand scene event whenever real map metadata happens to be loaded,
+        # making the result depend on test order.
+        from modules.nuzlocke import resource_runtime as runtime
+
+        with patch.object(runtime, "get_map_metadata", return_value=SimpleNamespace(coord_events=())):
+            self.assertEqual(
+                _mandatory_checkpoint_trigger_ids(overworld, map_id),
+                frozenset({"coord:0:152:0"}),
+            )
+            self.assertIsNone(_mandatory_trainer_hazard_state(overworld, map_id))
+
+    def test_woods_both_researcher_scene_events_are_avoided_when_only_one_is_observed(self):
+        from modules.nuzlocke import resource_runtime as runtime
+
+        map_id = MapRSE.PETALBURG_WOODS.value
+        events = tuple(
+            SimpleNamespace(
+                type="script",
+                local_coordinates=coordinates,
+                elevation=3,
+                trigger_var_number=152,
+                trigger_value=0,
+                script_symbol=symbol,
+            )
+            for coordinates, symbol in (
+                ((26, 23), "PetalburgWoods_EventScript_DevonResearcherLeft"),
+                ((27, 23), "PetalburgWoods_EventScript_DevonResearcherRight"),
+            )
         )
-        self.assertIsNone(_mandatory_trainer_hazard_state(overworld, map_id))
+        overworld = SimpleNamespace(
+            map_id=map_id,
+            player_coordinates=(17, 38),
+            objects=(),
+            triggers=(
+                TriggerObservation(
+                    trigger_id="coord:0:152:0",
+                    locations=frozenset({(map_id, (26, 23))}),
+                    activation_locations=frozenset({(map_id, (26, 23))}),
+                    script_symbol="PetalburgWoods_EventScript_DevonResearcherLeft",
+                    affordance_id="PetalburgWoods_EventScript_DevonResearcherLeft",
+                    kind="trigger",
+                ),
+            ),
+        )
+        with patch.object(runtime, "get_map_metadata", return_value=SimpleNamespace(coord_events=events)):
+            self.assertEqual(
+                _mandatory_checkpoint_trigger_ids(overworld, map_id),
+                frozenset({"coord:0:152:0", "coord:1:152:0"}),
+            )
 
     def test_woods_coordinate_scene_is_reconstructed_from_static_map_metadata(self):
         from modules.nuzlocke import resource_runtime as runtime
@@ -1064,6 +1109,7 @@ class CampaignCapabilityTests(unittest.TestCase):
         )
         planned = SimpleNamespace(forced_trainer_exposure=False)
         with (
+            patch.object(runtime, "get_map_metadata", return_value=SimpleNamespace(coord_events=())),
             patch.object(runtime.NavigationWorld, "from_overworld", return_value=object()),
             patch.object(runtime, "_reachable_local_positions", return_value=frozenset({(18, 38)})),
             patch.object(runtime, "plan_with_world_navigation", return_value=(planned, None)) as plan,
