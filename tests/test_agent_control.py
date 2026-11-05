@@ -3529,3 +3529,77 @@ class SlowSearchDumpTests(TestCase):
             "modules.agent_control.diagnostic_print"
         ):
             _dump_slow_navigation_search(lambda: None, (0, 0), None, 99999.0)  # unpicklable
+
+
+class TrainerHazardValidatorTests(TestCase):
+    """The final input gate must agree with the planner's trainer-hazard model."""
+
+    MAP = (0, 19)
+
+    def _cindy(self, *, hazards, activation):
+        return SimpleNamespace(
+            hazard_kind="trainer",
+            kind="trainer_hazard",
+            hazard_locations=frozenset((self.MAP, tile) for tile in hazards),
+            activation_locations=frozenset((self.MAP, tile) for tile in activation),
+        )
+
+    def test_adjacent_interaction_tile_is_not_a_hazard_when_sight_lines_are_known(self):
+        # Cindy at (11, 44) faces Up/Right: the tile behind her, (11, 45), is
+        # only an interaction position and must not close the corridor.
+        world = SimpleNamespace(
+            map_id=self.MAP,
+            triggers=(
+                self._cindy(
+                    hazards=((11, 41), (11, 42), (11, 43), (12, 44), (13, 44), (14, 44)),
+                    activation=((10, 44), (11, 43), (11, 45), (12, 44)),
+                ),
+            ),
+        )
+
+        hazards = agent_control.AgentControlLoop._trainer_hazard_coordinates(world)
+
+        self.assertNotIn((self.MAP, (11, 45)), hazards)
+        self.assertNotIn((self.MAP, (10, 44)), hazards)
+        self.assertIn((self.MAP, (11, 43)), hazards)
+        self.assertIn((self.MAP, (12, 44)), hazards)
+
+    def test_activation_tiles_stay_hazardous_when_sight_line_geometry_is_unknown(self):
+        world = SimpleNamespace(
+            map_id=self.MAP,
+            triggers=(self._cindy(hazards=(), activation=((11, 45), (10, 44))),),
+        )
+
+        hazards = agent_control.AgentControlLoop._trainer_hazard_coordinates(world)
+
+        self.assertEqual(hazards, {(self.MAP, (11, 45)), (self.MAP, (10, 44))})
+
+    def test_planned_step_onto_an_interaction_tile_is_not_blocked_under_avoid(self):
+        world = SimpleNamespace(
+            map_id=self.MAP,
+            triggers=(
+                self._cindy(
+                    hazards=((11, 41), (11, 42), (11, 43), (12, 44), (13, 44), (14, 44)),
+                    activation=((10, 44), (11, 43), (11, 45), (12, 44)),
+                ),
+            ),
+        )
+        action = NavigationAction(
+            NavigationActionType.MOVE,
+            Direction.West,
+            (self.MAP, (12, 45)),
+            (self.MAP, (11, 45)),
+        )
+        goal = NavigationGoal(
+            ReachLocation((self.MAP, (10, 38))),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
+        )
+        loop = agent_control.AgentControlLoop(lambda: None, goal=goal)
+        observation = SimpleNamespace(overworld=world)
+
+        with patch.object(
+            agent_control.AgentControlLoop, "_blocked_cached_action", return_value=None
+        ):
+            blocked = loop._blocked_action(observation, action)
+
+        self.assertIsNone(blocked)

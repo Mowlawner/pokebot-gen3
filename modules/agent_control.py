@@ -2469,13 +2469,23 @@ class AgentControlLoop:
             trigger_kind = getattr(trigger, "kind", None)
             if hazard_kind != "trainer" and trigger_kind not in {"trainer", "trainer_hazard"}:
                 continue
-            hazards.update(location for location in getattr(trigger, "hazard_locations", ()) if location[0] == map_id)
-            # Some older/injected observations expose trainer activation
-            # positions without a computed sight line.  They are still unsafe
-            # under AVOID and must be fail-closed at the input boundary.
-            hazards.update(
-                location for location in getattr(trigger, "activation_locations", ()) if location[0] == map_id
+            sight_line = frozenset(
+                location for location in getattr(trigger, "hazard_locations", ()) if location[0] == map_id
             )
+            hazards.update(sight_line)
+            # Some older/injected observations expose trainer activation
+            # positions without a computed sight line.  Those are still unsafe
+            # under AVOID and must be fail-closed at the input boundary.  Once
+            # a positive sight-line envelope exists, an adjacent interaction
+            # tile is only reached by pressing A, so it is not a movement
+            # hazard.  This must match the planner's own model
+            # (NavigationWorld hazard test): validating more strictly than the
+            # planner rejects the planner's only trainer-free corridor and
+            # leaves the control loop replanning the same route forever.
+            if not sight_line:
+                hazards.update(
+                    location for location in getattr(trigger, "activation_locations", ()) if location[0] == map_id
+                )
         return hazards
 
     @staticmethod
