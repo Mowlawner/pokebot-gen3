@@ -1902,7 +1902,7 @@ def _preparation_navigation_goal(
     *,
     allow_wild: bool = True,
     target_level: int | None = None,
-    trainer_mode: TrainerMode = TrainerMode.IGNORE,
+    trainer_mode: TrainerMode = TrainerMode.AVOID,
 ):
     """Select a reachable grass target, or a trainer that blocks the route.
 
@@ -3112,8 +3112,11 @@ def execute_campaign_preparation(training_map, *, target_level: int) -> Iterator
     map_navigation_attempts = 0
     while True:
         preferred_map_route = _preparation_map_route(training_map)
+        # Preparation travel is optional work, so the route into the training
+        # map must keep known trainer sight lines as a hard safety boundary.
         map_goal = NavigationGoal(
             SemanticTarget.map(training_map),
+            constraints=GoalConstraints(trainer_mode=TrainerMode.AVOID),
             encounter_mode=EncounterMode.AVOID,
             preferred_map_route=preferred_map_route,
         )
@@ -3218,7 +3221,11 @@ def execute_campaign_preparation(training_map, *, target_level: int) -> Iterator
             continue
         break
 
-    training_location = navigation_goal.location
+    # A trainer-safe grass goal is a NavigationGoal wrapping the ReachLocation.
+    selected_target = (
+        navigation_goal.target if isinstance(navigation_goal, NavigationGoal) else navigation_goal
+    )
+    training_location = getattr(selected_target, "location", None)
     if training_location is not None:
         diagnostic_print(
             lambda: (

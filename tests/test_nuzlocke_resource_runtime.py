@@ -1640,10 +1640,10 @@ class CampaignCapabilityTests(unittest.TestCase):
         pokecenter_loop = FakePokecenterLoop()
         with patch("modules.nuzlocke.resource_runtime.get_party", return_value=party), patch(
             "modules.nuzlocke.resource_runtime._preparation_training_location",
-            return_value=((0, 18), ((1, 1),)),
+            return_value=((0, 16), ((1, 1),)),
         ), patch("modules.nuzlocke.resource_runtime.AgentControlLoop", return_value=FakeNavigationLoop()), patch(
             "modules.nuzlocke.resource_runtime.observe_agent",
-            return_value=SimpleNamespace(overworld=SimpleNamespace(map_id=(0, 18), player_coordinates=(1, 1))),
+            return_value=SimpleNamespace(overworld=SimpleNamespace(map_id=(0, 16), player_coordinates=(1, 1))),
         ), patch(
             "modules.nuzlocke.resource_runtime.NavigationWorld.from_overworld",
             return_value=object(),
@@ -1656,17 +1656,115 @@ class CampaignCapabilityTests(unittest.TestCase):
         ), patch(
             "modules.nuzlocke.resource_runtime.CampaignPreparationLoopController", return_value=pokecenter_loop
         ):
-            self.assertEqual(list(execute_campaign_preparation((0, 18), target_level=14)), [])
+            self.assertEqual(list(execute_campaign_preparation((0, 16), target_level=14)), [])
 
         pokecenter_loop.verify_on_start.assert_called_once_with()
         pokecenter_loop.on_battle_ended.assert_called_once_with()
+
+    def test_preparation_grass_goal_defaults_to_trainer_avoidance(self):
+        from modules.goals import ReachLocation, TrainerMode
+
+        training_map = (0, 16)
+        overworld = SimpleNamespace(map_id=training_map, player_coordinates=(1, 1), objects=(), triggers=())
+        with patch(
+            "modules.nuzlocke.resource_runtime.NavigationWorld.from_overworld", return_value=object()
+        ), patch(
+            "modules.nuzlocke.resource_runtime.plan_with_world_navigation",
+            return_value=(SimpleNamespace(forced_trainer_exposure=False), None),
+        ):
+            selected, error = _preparation_navigation_goal(overworld, training_map, ((8, 8),))
+
+        self.assertIsNone(error)
+        self.assertIsInstance(selected, NavigationGoal)
+        self.assertIsInstance(selected.target, ReachLocation)
+        self.assertEqual(selected.constraints.trainer_mode, TrainerMode.AVOID)
+        self.assertFalse(selected.constraints.allow_forced_trainer_exposure)
+
+    def test_preparation_safe_route_failure_does_not_fall_back_to_permissive_grass(self):
+        from modules.navigation import NavigationError
+
+        training_map = (0, 16)
+        overworld = SimpleNamespace(map_id=training_map, player_coordinates=(1, 1), objects=(), triggers=())
+        with patch(
+            "modules.nuzlocke.resource_runtime.NavigationWorld.from_overworld", return_value=object()
+        ), patch(
+            "modules.nuzlocke.resource_runtime.plan_with_world_navigation",
+            side_effect=NavigationError("trainer-safe route not found"),
+        ):
+            selected, error = _preparation_navigation_goal(overworld, training_map, ((8, 8),))
+
+        self.assertIsNone(selected)
+        self.assertIsNotNone(error)
+
+    def test_preparation_rejects_grass_route_that_requires_trainer_exposure(self):
+        training_map = (0, 16)
+        overworld = SimpleNamespace(map_id=training_map, player_coordinates=(1, 1), objects=(), triggers=())
+        with patch(
+            "modules.nuzlocke.resource_runtime.NavigationWorld.from_overworld", return_value=object()
+        ), patch(
+            "modules.nuzlocke.resource_runtime.plan_with_world_navigation",
+            return_value=(SimpleNamespace(forced_trainer_exposure=True), None),
+        ):
+            selected, error = _preparation_navigation_goal(overworld, training_map, ((8, 8),))
+
+        self.assertIsNone(selected)
+        self.assertIsNotNone(error)
+
+    def test_preparation_map_route_keeps_trainer_avoidance(self):
+        from modules.goals import TrainerMode
+
+        party = (SimpleNamespace(is_egg=False, level=1),)
+        goals = []
+
+        class FakeNavigationLoop:
+            def run(self):
+                return iter(())
+
+        class FakePokecenterLoop:
+            def __init__(self, **_kwargs):
+                self.battle_strategy = None
+
+            def on_battle_ended(self):
+                return None
+
+            def verify_on_start(self):
+                return None
+
+            def run(self, *, stop_condition):
+                stop_condition()
+                return iter(())
+
+        def make_loop(_observe, goal=None, **_kwargs):
+            goals.append(goal)
+            return FakeNavigationLoop()
+
+        with patch("modules.nuzlocke.resource_runtime.get_party", return_value=party), patch(
+            "modules.nuzlocke.resource_runtime._preparation_training_location",
+            return_value=((0, 16), ((1, 1),)),
+        ), patch("modules.nuzlocke.resource_runtime.AgentControlLoop", side_effect=make_loop), patch(
+            "modules.nuzlocke.resource_runtime.observe_agent",
+            return_value=SimpleNamespace(overworld=SimpleNamespace(map_id=(0, 16), player_coordinates=(1, 1))),
+        ), patch(
+            "modules.nuzlocke.resource_runtime.NavigationWorld.from_overworld", return_value=object()
+        ), patch(
+            "modules.nuzlocke.resource_runtime.plan_with_world_navigation",
+            return_value=(SimpleNamespace(forced_trainer_exposure=False), None),
+        ), patch(
+            "modules.nuzlocke.resource_runtime.CampaignPreparationLoopController",
+            return_value=FakePokecenterLoop(),
+        ):
+            list(execute_campaign_preparation((0, 16), target_level=14))
+
+        self.assertGreaterEqual(len(goals), 2)
+        for goal in goals[:2]:
+            self.assertEqual(goal.constraints.trainer_mode, TrainerMode.AVOID)
 
     def test_preparation_can_select_a_reachable_trainer_when_grass_is_blocked(self):
         from modules.goals import EngageTrainer, ReachLocation, TrainerMode
         from modules.navigation import NavigationError
         from modules.overworld import ObjectObservation
 
-        training_map = (0, 18)
+        training_map = (0, 16)
         trainer = ObjectObservation(
             local_id=3,
             location=(training_map, (5, 5)),
@@ -1681,7 +1779,9 @@ class CampaignCapabilityTests(unittest.TestCase):
         )
 
         def plan(_world, _start, goal):
-            if isinstance(goal, ReachLocation):
+            # The trainer-safe grass probe wraps its ReachLocation in an AVOID
+            # NavigationGoal; the blocked-grass fixture rejects either shape.
+            if isinstance(getattr(goal, "target", goal), ReachLocation):
                 raise NavigationError("grass component is blocked")
             self.assertIsInstance(goal.target, EngageTrainer)
             return object(), None
@@ -1760,7 +1860,9 @@ class CampaignCapabilityTests(unittest.TestCase):
         )
 
         def plan(_world, _start, goal):
-            if isinstance(goal, ReachLocation):
+            # The trainer-safe grass probe wraps its ReachLocation in an AVOID
+            # NavigationGoal; the blocked-grass fixture rejects either shape.
+            if isinstance(getattr(goal, "target", goal), ReachLocation):
                 raise NavigationError("grass component is blocked")
             self.assertIsInstance(goal.target, EngageTrainer)
             return object(), None
@@ -1892,13 +1994,13 @@ class CampaignCapabilityTests(unittest.TestCase):
                 return iter(())
 
         observations = [
-            SimpleNamespace(overworld=SimpleNamespace(map_id=(0, 18), player_coordinates=(1, 1))),
-            SimpleNamespace(overworld=SimpleNamespace(map_id=(0, 18), player_coordinates=(2, 2))),
+            SimpleNamespace(overworld=SimpleNamespace(map_id=(0, 16), player_coordinates=(1, 1))),
+            SimpleNamespace(overworld=SimpleNamespace(map_id=(0, 16), player_coordinates=(2, 2))),
         ]
         loops = iter((FakeNavigationLoop(failure=False), FakeNavigationLoop(failure=True), FakeNavigationLoop()))
         with patch("modules.nuzlocke.resource_runtime.get_party", return_value=party), patch(
             "modules.nuzlocke.resource_runtime._preparation_training_location",
-            return_value=((0, 18), ((3, 3),)),
+            return_value=((0, 16), ((3, 3),)),
         ), patch(
             "modules.nuzlocke.resource_runtime.AgentControlLoop", side_effect=lambda *_args, **_kwargs: next(loops)
         ), patch(
@@ -1910,7 +2012,7 @@ class CampaignCapabilityTests(unittest.TestCase):
         ), patch(
             "modules.nuzlocke.resource_runtime.CampaignPreparationLoopController", return_value=FakePokecenterLoop()
         ):
-            self.assertEqual(list(execute_campaign_preparation((0, 18), target_level=14)), [])
+            self.assertEqual(list(execute_campaign_preparation((0, 16), target_level=14)), [])
 
         self.assertEqual(observe.call_count, 2)
 
