@@ -3,6 +3,7 @@ import atexit
 import io
 from pathlib import Path
 import re
+import sys
 from threading import RLock
 from time import perf_counter_ns
 from typing import TYPE_CHECKING, Iterable
@@ -244,6 +245,28 @@ def print_stats(stats: "GlobalStats", encounter: "EncounterInfo") -> None:
     )
 
 
+def _tolerate_unencodable_output(*streams) -> None:
+    """Make text streams replace characters their encoding cannot represent.
+
+    When stdout is redirected (a file, a pipe, a CI runner) Python uses the
+    locale code page, which is cp1252 on Windows.  A Pokemon name or a gender
+    symbol outside that code page would then raise ``UnicodeEncodeError`` from
+    inside the main loop.  A lossy glyph on the terminal is acceptable; a crash
+    is not.  Streams without ``reconfigure`` (already replaced, or not text
+    wrappers) are left alone.
+    """
+
+    for stream in streams:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (OSError, TypeError, ValueError):
+            pass
+
+
+_tolerate_unencodable_output(sys.stdout, sys.stderr)
 console = Console(theme=theme)
 
 
@@ -266,7 +289,11 @@ class _ConsoleLogTee(io.TextIOBase):
 
     def write(self, text: str) -> int:
         with self._lock:
-            written = self.terminal.write(text)
+            try:
+                written = self.terminal.write(text)
+            except UnicodeEncodeError:
+                encoding = self.encoding
+                written = self.terminal.write(text.encode(encoding, "replace").decode(encoding, "replace"))
             self._log.write(_ANSI_ESCAPE.sub("", text))
             self.flush()
             return len(text) if written is None else written

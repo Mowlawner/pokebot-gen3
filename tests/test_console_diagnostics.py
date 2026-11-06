@@ -990,3 +990,47 @@ class TestDiagnosticPrint(unittest.TestCase):
 
         message.assert_not_called()
         sink.print.assert_not_called()
+
+
+MALE_SIGN = chr(0x2642)  # not representable in cp1252
+
+
+class TestUnencodableOutput(unittest.TestCase):
+    """A character the terminal code page cannot encode must not crash the bot."""
+
+    @staticmethod
+    def _cp1252_stream():
+        import io
+
+        raw = io.BytesIO()
+        return raw, io.TextIOWrapper(raw, encoding="cp1252", write_through=True)
+
+    def test_tee_survives_a_character_the_terminal_cannot_encode(self):
+        from modules.console import _ConsoleLogTee
+
+        raw, terminal = self._cp1252_stream()
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "run.log"
+            tee = _ConsoleLogTee(terminal, log_path)
+            try:
+                tee.write("Nidoran" + MALE_SIGN + "\n")
+            finally:
+                tee.close()
+            # The log file is UTF-8 and keeps the exact text.
+            self.assertIn("Nidoran" + MALE_SIGN, log_path.read_text(encoding="utf-8"))
+        self.assertIn(b"Nidoran", raw.getvalue())
+
+    def test_reconfigure_makes_a_cp1252_stream_replace_instead_of_raising(self):
+        from modules.console import _tolerate_unencodable_output
+
+        raw, terminal = self._cp1252_stream()
+        with self.assertRaises(UnicodeEncodeError):
+            terminal.write(MALE_SIGN)
+        _tolerate_unencodable_output(terminal)
+        terminal.write(MALE_SIGN)
+        self.assertEqual(raw.getvalue()[-1:], b"?")
+
+    def test_streams_without_reconfigure_are_left_alone(self):
+        from modules.console import _tolerate_unencodable_output
+
+        _tolerate_unencodable_output(object(), None, StringIO())
