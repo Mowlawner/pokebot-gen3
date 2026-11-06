@@ -52,6 +52,14 @@ _PRE_BATTLE_SEARCH_NODES = 16_000
 # A bounded line must nevertheless include explicit immediate progress and
 # survival evidence; unresolved terminal counters are not treated as zero.
 _PRE_BATTLE_MAX_ACTIVE_FAINT_PROBABILITY = 0.05
+# A line whose moves can miss can never reach a terminal-complete result: some
+# branch always lets the exchange continue past any finite horizon, even for a
+# lead that wins 100% of the time.  Such a line is still sufficient evidence
+# when the probability mass that has not reached a terminal outcome by the
+# horizon is itself measured, small, and the finished branches meet the same
+# win, loss, and faint thresholds.  The unresolved mass is bounded explicitly,
+# never treated as zero.
+_PRE_BATTLE_MAX_UNRESOLVED_PROBABILITY = 0.02
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,19 +154,55 @@ def _lead_assessment(
 def _preparation_line_is_sufficient(result: SearchResult) -> bool:
     """Return whether a bounded trainer line is sufficient to stop grinding.
 
-    Mandatory trainer readiness requires the battle engine's terminal safety
-    contract. A horizon projection may be executable once the live battle
-    planner owns the encounter, but its unresolved terminal counters are not
-    evidence that preparation is complete.
+    A terminal-complete line must satisfy the battle engine's safety contract.
+    A horizon projection is accepted only on explicit numbers (see
+    :func:`_horizon_line_is_sufficient`); its category is not relabeled, and its
+    unresolved terminal mass is never treated as zero.
     """
 
     category = getattr(result, "category", None)
     # A few compatibility adapters expose the older SearchResult shape.  The
     # live evaluator always supplies ``category``; preserve the older test and
-    # integration boundary without weakening the live terminal-complete gate.
+    # integration boundary without weakening the terminal-complete gate.
+    if category is None or category is SearchResultCategory.TERMINAL_COMPLETE:
+        return bool(result.is_safe)
+    if category is SearchResultCategory.HORIZON_PROJECTION:
+        return _horizon_line_is_sufficient(result)
+    return False
+
+
+def _horizon_line_is_sufficient(result: SearchResult) -> bool:
+    """Accept a horizon projection whose unresolved probability mass is small.
+
+    Requires a result that was not cut off by a budget, an unresolved terminal
+    probability (``1 - win - loss``) within
+    ``_PRE_BATTLE_MAX_UNRESOLVED_PROBABILITY``, and the result's own win, loss,
+    and catastrophic thresholds on the branches that did finish.
+    """
+
+    if not getattr(result, "complete", True) or getattr(result, "budget_exhaustion", None):
+        return False
+    fields = tuple(
+        getattr(result, name, None)
+        for name in (
+            "win_probability",
+            "loss_probability",
+            "catastrophic_probability",
+            "minimum_safe_win_probability",
+            "maximum_safe_loss_probability",
+            "maximum_safe_catastrophic_probability",
+        )
+    )
+    # A projection with no probability evidence can never claim readiness.
+    if any(value is None for value in fields):
+        return False
+    win, loss, catastrophic, min_win, max_loss, max_catastrophic = (float(value) for value in fields)
+    unresolved = 1.0 - win - loss
     return bool(
-        result.is_safe
-        and (category is None or category is SearchResultCategory.TERMINAL_COMPLETE)
+        unresolved <= _PRE_BATTLE_MAX_UNRESOLVED_PROBABILITY
+        and win >= min_win
+        and loss <= max_loss
+        and catastrophic <= max_catastrophic
     )
 
 

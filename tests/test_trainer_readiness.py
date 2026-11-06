@@ -308,3 +308,94 @@ def test_forced_route_exposure_resolves_only_the_trainer_on_the_selected_path():
     goal = SimpleNamespace(constraints=SimpleNamespace(trainer_mode=SimpleNamespace(name="AVOID")))
 
     assert _known_trainer_checkpoint_on_route(overworld, goal, analysis) == trainer_id
+
+
+def _engine_line(lead_hp, damage, accuracy, opponent_hp, opponent_damage, opponent_accuracy):
+    """A real bounded readiness line, built exactly like the pre-battle adapter's."""
+
+    from modules.battle_expectiminimax import (
+        Expectiminimax,
+        OpponentPolicy,
+        SearchConfig,
+        SearchMove,
+        SearchState,
+    )
+    from modules.trainer_readiness import _PRE_BATTLE_SEARCH_NODES, _PRE_BATTLE_SEARCH_TURNS
+
+    player = (SearchMove(0, "Scratch", damage[0], damage[1], accuracy),)
+    opponent = (
+        SearchMove(
+            0, "Tackle", opponent_damage[0], opponent_damage[1], opponent_accuracy,
+            critical_damage_max=opponent_damage[1] * 2,
+        ),
+    )
+    return Expectiminimax(
+        SearchConfig(
+            opponent_policy=OpponentPolicy.CONSERVATIVE,
+            max_turns=_PRE_BATTLE_SEARCH_TURNS,
+            max_nodes=_PRE_BATTLE_SEARCH_NODES,
+            max_duration_seconds=None,
+        )
+    ).evaluate(
+        SearchState(
+            lead_hp, lead_hp, opponent_hp, opponent_hp, player, opponent, 20, 18,
+            battle_objective="defeat", campaign_owned=True,
+        )
+    )
+
+
+def test_a_strong_lead_with_a_sub_100_accuracy_move_is_ready_despite_the_horizon_label():
+    # A move that can miss can never close every branch, so the engine labels
+    # even a lead that wins 99.6% of the time a horizon projection.  Readiness
+    # must decide on the measured numbers instead.
+    line = _engine_line(32, (8, 10), 0.95, 28, (4, 6), 0.95)
+
+    assert line.win_probability > 0.95
+    assert _preparation_line_is_sufficient(line) is True
+
+
+def test_a_lv9_lead_is_ready_and_a_lv8_lead_is_not_against_the_same_trainer():
+    ready = _engine_line(29, (7, 9), 0.95, 28, (4, 6), 0.95)
+    not_ready = _engine_line(26, (5, 7), 0.95, 28, (4, 6), 0.95)
+
+    assert _preparation_line_is_sufficient(ready) is True
+    assert _preparation_line_is_sufficient(not_ready) is False  # about 70% win, 30% faint
+
+
+def test_a_line_whose_battle_has_not_resolved_by_the_horizon_is_not_ready():
+    # Needs more than five turns to finish: almost nothing has resolved.
+    unresolved = _engine_line(26, (5, 7), 1.0, 28, (4, 6), 0.95)
+
+    assert _preparation_line_is_sufficient(unresolved) is False
+
+
+def test_horizon_acceptance_requires_small_unresolved_mass_and_unexhausted_budget():
+    def line(**changes):
+        values = dict(
+            is_safe=False,
+            category=SearchResultCategory.HORIZON_PROJECTION,
+            complete=True,
+            budget_exhaustion=None,
+            win_probability=0.97,
+            loss_probability=0.02,
+            catastrophic_probability=0.02,
+            minimum_safe_win_probability=0.90,
+            maximum_safe_loss_probability=0.05,
+            maximum_safe_catastrophic_probability=0.05,
+        )
+        values.update(changes)
+        return SimpleNamespace(**values)
+
+    assert _preparation_line_is_sufficient(line()) is True  # 1% unresolved
+    assert _preparation_line_is_sufficient(line(win_probability=0.90, loss_probability=0.02)) is False  # 8%
+    assert _preparation_line_is_sufficient(line(budget_exhaustion="nodes")) is False
+    assert _preparation_line_is_sufficient(line(complete=False)) is False
+    assert _preparation_line_is_sufficient(line(win_probability=0.88, loss_probability=0.11)) is False
+    assert _preparation_line_is_sufficient(line(loss_probability=0.06, win_probability=0.94)) is False
+    assert _preparation_line_is_sufficient(line(catastrophic_probability=0.06)) is False
+
+
+def test_other_search_categories_are_never_sufficient():
+    for category in (SearchResultCategory.INCOMPLETE,):
+        result = SimpleNamespace(is_safe=True, category=category, win_probability=1.0, loss_probability=0.0)
+        assert _preparation_line_is_sufficient(result) is False
