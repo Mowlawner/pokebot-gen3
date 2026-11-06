@@ -74,17 +74,18 @@ criteria). Proposed identifiers:
 | `shiny_clause` | A shiny may be caught outside the first-encounter limit and is not released on faint |
 | `no_resets` | Forbid voluntary soft resets and save-state loads that undo progress; process-restart resume from a save state stays allowed |
 | `hm_helper` | Allow a catch-and-release helper for a required field move, outside the one-per-area limit |
-| `species_clause_cap` | Limit how many duplicate re-rolls apply in one area before the next encounter must be accepted |
+| `species_clause_cap` | **Implemented** as the config option `species_clause_max_duplicates_per_area` (default `null` = unlimited). After that many skipped duplicates in one area, the next encounter in the area counts even if it is a duplicate. The per-area count is recorded on the battle-start event so it survives replay and restart. |
 | `no_revives` | Forbid Revive items and equivalent effects |
 | `gift_static_separate` | Count gift and static encounters separately from wild ones |
 | `mandatory_nicknames` | Make the existing nickname behavior an explicit, configurable rule |
 | `no_heal_items`, `no_items`, `no_held_items` | Item restrictions |
 | `no_evolving`, `no_exp_share`, `no_rare_candy`, `no_daycare` | Leveling restrictions |
 
-The two decisions that need design before implementation are `no_resets`
-(the bot resumes from save states, which must be distinguished from undoing
-progress) and `species_clause_cap` (without it a run can flee duplicate
-encounters for a long time, as seen in live validation).
+`no_resets` is deferred: the bot resumes from save states, which must be
+distinguished from undoing progress. When built, it should start as a warning,
+not a block: the bot never rewinds itself in campaign mode, and on resume it
+can compare the game against its own event history (a game that is *behind*
+the history was rewound).
 
 ## Not tied to any rule
 

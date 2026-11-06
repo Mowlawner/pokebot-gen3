@@ -16,3 +16,10 @@ enabled_rules:
 # individual Poké Ball use.
 pokeball_lower_threshold: 5
 pokeball_upper_target: 10
+
+# Species Clause re-rolls. With the species_clause rule enabled, an encounter of
+# a species you already own is skipped and does not use up the area's encounter.
+# Leave this null for no limit. A number caps how many duplicates may be skipped
+# in one area; after that the next encounter in the area counts even if it is a
+# duplicate.
+species_clause_max_duplicates_per_area: null

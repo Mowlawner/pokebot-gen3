@@ -102,6 +102,9 @@ def main_loop() -> None:
             potion_lower_threshold=context.config.nuzlocke_rules.potion_lower_threshold,
             potion_target=context.config.nuzlocke_rules.potion_target,
             recovery_cash_floor=context.config.nuzlocke_rules.recovery_cash_floor,
+            species_clause_max_duplicates_per_area=(
+                context.config.nuzlocke_rules.species_clause_max_duplicates_per_area
+            ),
         )
         context.nuzlocke_runtime = NuzlockeRuntime(
             event_sink=nuzlocke_event_store,

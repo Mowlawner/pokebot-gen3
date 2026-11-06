@@ -106,6 +106,8 @@ class NuzlockeRules(BaseConfig):
     potion_lower_threshold: Annotated[int, Field(ge=0)] = 2
     potion_target: Annotated[int, Field(gt=0)] = 5
     recovery_cash_floor: Annotated[int, Field(ge=0)] = 200
+    # ``None`` (null) means unlimited Species Clause re-rolls per area.
+    species_clause_max_duplicates_per_area: Annotated[int | None, Field(ge=1)] = None
 
     @model_validator(mode="after")
     def validate_pokeball_thresholds(self):

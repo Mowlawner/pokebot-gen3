@@ -50,6 +50,11 @@ class CampaignRulesConfig:
     enabled_rules: frozenset[CampaignRuleId] = DEFAULT_NUZLOCKE_RULES
     pokeball_policy: PokeballRestockPolicy = field(default_factory=PokeballRestockPolicy)
     recovery_supply_policy: RecoverySupplyPolicy = field(default_factory=RecoverySupplyPolicy)
+    # Species Clause re-rolls: ``None`` means unlimited (the default).  A number
+    # caps how many duplicate species may be skipped in one area; after that the
+    # next encounter in the area is accepted as the area's encounter even if it
+    # is a duplicate.
+    species_clause_max_duplicates_per_area: int | None = None
 
     def __post_init__(self) -> None:
         """Keep direct callers subject to the same policy validation as config files."""
@@ -58,6 +63,9 @@ class CampaignRulesConfig:
             raise ValueError("pokeball_policy must be a PokeballRestockPolicy")
         if not isinstance(self.recovery_supply_policy, RecoverySupplyPolicy):
             raise ValueError("recovery_supply_policy must be a RecoverySupplyPolicy")
+        cap = self.species_clause_max_duplicates_per_area
+        if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or cap < 1):
+            raise ValueError("species_clause_max_duplicates_per_area must be a positive integer or None")
 
     @classmethod
     def from_names(
@@ -71,6 +79,7 @@ class CampaignRulesConfig:
         potion_lower_threshold: int = 2,
         potion_target: int = 5,
         recovery_cash_floor: int = 200,
+        species_clause_max_duplicates_per_area: int | None = None,
     ) -> "CampaignRulesConfig":
         """Build configuration from serialized rule identifier names."""
 
@@ -84,6 +93,7 @@ class CampaignRulesConfig:
                 potion_target,
                 recovery_cash_floor,
             ),
+            species_clause_max_duplicates_per_area,
         )
 
     @classmethod

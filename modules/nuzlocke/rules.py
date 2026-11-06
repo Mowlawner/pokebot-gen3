@@ -84,6 +84,9 @@ class NuzlockeCampaignState:
     # species tuple remains the public compatibility view; this parallel tuple
     # records the branch known at capture time, e.g. ("wurmple", "cascoon").
     captured_evolution_branches: tuple[tuple[str, str], ...] = ()
+    # Per-area count of wild battles skipped only because the species was
+    # already captured.  Used by the optional Species Clause duplicate cap.
+    duplicate_encounters: tuple[tuple[tuple[int, int], int], ...] = ()
 
     @property
     def legal(self) -> bool:
@@ -120,6 +123,11 @@ class NuzlockeCampaignState:
         return tuple(
             e.pokemon_identity for e in self.first_encounters if e.status == CAPTURED and e.pokemon_identity is not None
         )
+
+    def duplicates_at(self, location: tuple[int, int] | None) -> int:
+        """Return how many duplicate-species encounters were skipped at a location."""
+
+        return dict(self.duplicate_encounters).get(location, 0)
 
     def encounter_for(self, location: tuple[int, int]) -> LocationEncounter:
         """Return the first encounter at a location, or an explicit empty view."""
@@ -420,10 +428,23 @@ def _species_clause_conflict(state: NuzlockeCampaignState, species: tuple[str, .
     return None
 
 
-def species_clause_conflict_reason(state: NuzlockeCampaignState, species: tuple[str, ...]) -> str | None:
-    """Return a user-facing Species Clause explanation, if one applies."""
+def species_clause_conflict_reason(
+    state: NuzlockeCampaignState,
+    species: tuple[str, ...],
+    *,
+    location: tuple[int, int] | None = None,
+    max_duplicates: int | None = None,
+) -> str | None:
+    """Return a user-facing Species Clause explanation, if one applies.
+
+    ``max_duplicates`` is the optional per-area cap on skipped duplicates.  Once
+    an area has skipped that many, the clause is waived there so the next
+    encounter counts even if it is a duplicate.  ``None`` means unlimited.
+    """
 
     captured = _species_clause_conflict(state, species)
+    if captured and max_duplicates is not None and state.duplicates_at(location) >= max_duplicates:
+        return None
     return f"previous encounter was already obtained species/evolution line: {captured}" if captured else None
 
 
@@ -446,8 +467,14 @@ class SpeciesClauseRule:
         encounter_eligible: bool,
         active_wild: dict[tuple[int, int], tuple[PokemonIdentity, ...]],
     ) -> NuzlockeCampaignState:
-        """Record only species captured from a pending eligible encounter."""
+        """Record species captured from a pending eligible encounter, and skipped duplicates."""
 
+        if isinstance(event, BattleStarted):
+            if getattr(event, "species_clause_duplicate", False) and event.location is not None:
+                counts = dict(state.duplicate_encounters)
+                counts[event.location] = counts.get(event.location, 0) + 1
+                return replace(state, duplicate_encounters=tuple(sorted(counts.items())))
+            return state
         if not isinstance(event, PokemonCaptured):
             return state
 

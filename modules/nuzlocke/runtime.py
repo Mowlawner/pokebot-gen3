@@ -356,7 +356,12 @@ class NuzlockeRuntime:
             return result(False, "one-encounter-per-area rule is disabled")
 
         if projection.rule_config.is_enabled(CampaignRuleId.SPECIES_CLAUSE) and species:
-            conflict = species_clause_conflict_reason(projection.state, species)
+            conflict = species_clause_conflict_reason(
+                projection.state,
+                species,
+                location=location,
+                max_duplicates=projection.rule_config.species_clause_max_duplicates_per_area,
+            )
             if conflict is not None:
                 return result(False, conflict, duplicate=True)
 
@@ -471,6 +476,7 @@ class NuzlockeRuntime:
                 # is a fact of the battle-start frame, not a replay-time
                 # inference from a later snapshot.
                 event_encounter_eligible = encounter_eligible
+                duplicate_skipped = False
                 if event_encounter_eligible and event.is_wild and not event.is_trainer and event.location is not None:
                     # The global Pokédex boundary enables encounter rules,
                     # but it does not make a second encounter in an already
@@ -485,13 +491,21 @@ class NuzlockeRuntime:
                     and not event.is_trainer
                     and self._rule_config.is_enabled(CampaignRuleId.SPECIES_CLAUSE)
                     and species_clause_conflict_reason(
-                        self._rules_projection.state, event.opponent_species
+                        self._rules_projection.state,
+                        event.opponent_species,
+                        location=event.location,
+                        max_duplicates=self._rule_config.species_clause_max_duplicates_per_area,
                     ) is not None
                 ):
                     # A duplicate species is still a real battle, but it is
                     # not the route's eligible encounter under Species Clause.
                     event_encounter_eligible = False
-                event = replace(event, encounter_eligible=event_encounter_eligible)
+                    duplicate_skipped = True
+                event = replace(
+                    event,
+                    encounter_eligible=event_encounter_eligible,
+                    species_clause_duplicate=duplicate_skipped,
+                )
                 encounter_eligible_for_event = event_encounter_eligible
             else:
                 encounter_eligible_for_event = encounter_eligible
@@ -527,7 +541,12 @@ class NuzlockeRuntime:
                     None,
                 )
                 species_clause_reason = (
-                    species_clause_conflict_reason(self._rules_projection.state, event.opponent_species)
+                    species_clause_conflict_reason(
+                        self._rules_projection.state,
+                        event.opponent_species,
+                        location=event.location,
+                        max_duplicates=self._rule_config.species_clause_max_duplicates_per_area,
+                    )
                     if event.is_wild
                     and not event.is_trainer
                     and self._rule_config.is_enabled(CampaignRuleId.SPECIES_CLAUSE)

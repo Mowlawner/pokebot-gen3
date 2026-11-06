@@ -51,6 +51,10 @@ class BattleStarted:
     # battler's identity is not necessarily the identity of the Pokémon that
     # is eventually added to the party.
     opponent_species: tuple[str, ...] = ()
+    # True when this wild battle was skipped as the area's encounter only
+    # because its species was already captured (Species Clause).  Recorded on
+    # the event so the per-area duplicate count survives replay and restart.
+    species_clause_duplicate: bool = False
 
 
 @dataclass(frozen=True, slots=True)
