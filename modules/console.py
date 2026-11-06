@@ -246,14 +246,15 @@ def print_stats(stats: "GlobalStats", encounter: "EncounterInfo") -> None:
 
 
 def _tolerate_unencodable_output(*streams) -> None:
-    """Make text streams replace characters their encoding cannot represent.
+    """Keep non-ASCII output from crashing, and keep its glyphs where possible.
 
     When stdout is redirected (a file, a pipe, a CI runner) Python uses the
     locale code page, which is cp1252 on Windows.  A Pokemon name or a gender
     symbol outside that code page would then raise ``UnicodeEncodeError`` from
-    inside the main loop.  A lossy glyph on the terminal is acceptable; a crash
-    is not.  Streams without ``reconfigure`` (already replaced, or not text
-    wrappers) are left alone.
+    inside the main loop.  Redirected streams are therefore switched to UTF-8,
+    which can represent every glyph; real terminals keep their own encoding
+    (Python writes Unicode to a Windows console directly) but replace anything
+    they still cannot encode.  Streams without ``reconfigure`` are left alone.
     """
 
     for stream in streams:
@@ -261,7 +262,14 @@ def _tolerate_unencodable_output(*streams) -> None:
         if reconfigure is None:
             continue
         try:
-            reconfigure(errors="replace")
+            interactive = bool(stream.isatty())
+        except (AttributeError, OSError, ValueError):
+            interactive = False
+        try:
+            if interactive:
+                reconfigure(errors="replace")
+            else:
+                reconfigure(encoding="utf-8", errors="replace")
         except (OSError, TypeError, ValueError):
             pass
 

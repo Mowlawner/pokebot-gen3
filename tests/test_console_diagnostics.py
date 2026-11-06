@@ -1020,7 +1020,7 @@ class TestUnencodableOutput(unittest.TestCase):
             self.assertIn("Nidoran" + MALE_SIGN, log_path.read_text(encoding="utf-8"))
         self.assertIn(b"Nidoran", raw.getvalue())
 
-    def test_reconfigure_makes_a_cp1252_stream_replace_instead_of_raising(self):
+    def test_a_redirected_stream_is_switched_to_utf_8_so_the_glyph_survives(self):
         from modules.console import _tolerate_unencodable_output
 
         raw, terminal = self._cp1252_stream()
@@ -1028,6 +1028,22 @@ class TestUnencodableOutput(unittest.TestCase):
             terminal.write(MALE_SIGN)
         _tolerate_unencodable_output(terminal)
         terminal.write(MALE_SIGN)
+        self.assertEqual(raw.getvalue()[-3:].decode("utf-8"), MALE_SIGN)
+
+    def test_a_terminal_keeps_its_encoding_but_replaces_what_it_cannot_encode(self):
+        import io
+
+        from modules.console import _tolerate_unencodable_output
+
+        class Terminal(io.TextIOWrapper):
+            def isatty(self):
+                return True
+
+        raw = io.BytesIO()
+        terminal = Terminal(raw, encoding="cp1252", write_through=True)
+        _tolerate_unencodable_output(terminal)
+        terminal.write(MALE_SIGN)
+        self.assertEqual(terminal.encoding, "cp1252")
         self.assertEqual(raw.getvalue()[-1:], b"?")
 
     def test_streams_without_reconfigure_are_left_alone(self):
