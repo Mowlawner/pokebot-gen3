@@ -3038,12 +3038,37 @@ def _execute_preparation_recovery(center: PokemonCenter) -> Iterator[object]:
     yield from navigate_to(source.interior_map, (7, 8))
 
 
-def execute_campaign_preparation(training_map, *, target_level: int) -> Iterator[object]:
+def trainer_checkpoint_ready_check(checkpoint):
+    """Return a zero-argument check: does the live party have a ready line for this trainer?
+
+    Uses the same pre-battle assessment the campaign readiness gate uses, so
+    preparation stops exactly when that gate would stop asking for more.
+    """
+
+    def check() -> bool:
+        readiness = assess_live_trainer_checkpoint(checkpoint, get_party())
+        return getattr(getattr(readiness, "status", None), "value", None) == "ready"
+
+    return check
+
+
+def execute_campaign_preparation(
+    training_map,
+    *,
+    target_level: int,
+    ready_check=None,
+) -> Iterator[object]:
     """Train the current living party to a bounded target before a boss.
 
     The target is checked from the live party on every loop boundary. The
     Center loop owns healing and encounter-area movement, while the campaign
     mode supplies the Nuzlocke-aware battle strategy at battle entry.
+
+    ``target_level`` is a hint, not the only way to finish: when ``ready_check``
+    is given and reports that the live party already has a ready line against
+    the trainer, preparation ends without waiting for every member to reach the
+    target.  The check is re-run only when the party's readiness-relevant facts
+    change (species, level, max HP, or whether a member is at least half HP).
     """
     if target_level < 1:
         raise ValueError("preparation target must be positive")
@@ -3163,7 +3188,41 @@ def execute_campaign_preparation(training_map, *, target_level: int) -> Iterator
                 or ((identity := PokemonIdentity.from_pokemon(pokemon)) is not None and identity not in dead)
             )
         )
-        return bool(living) and all(pokemon.level >= target_level for pokemon in living)
+        if bool(living) and all(pokemon.level >= target_level for pokemon in living):
+            return True
+        return trainer_line_ready(living)
+
+    ready_state = {"signature": None, "ready": False}
+
+    def trainer_line_ready(living) -> bool:
+        """Whether the live party already has a ready line against the trainer."""
+
+        if ready_check is None or not living:
+            return False
+        signature = tuple(
+            (
+                getattr(getattr(pokemon, "species", None), "name", None),
+                getattr(pokemon, "level", None),
+                getattr(pokemon, "total_hp", None),
+                getattr(pokemon, "current_hp", 0) * 2 >= (getattr(pokemon, "total_hp", 0) or 0),
+            )
+            for pokemon in living
+        )
+        if signature != ready_state["signature"]:
+            ready_state["signature"] = signature
+            try:
+                ready_state["ready"] = bool(ready_check())
+            except (AttributeError, IndexError, KeyError, RuntimeError, TypeError, ValueError):
+                ready_state["ready"] = False
+            if ready_state["ready"]:
+                print_always(
+                    lambda: (
+                        "CAMPAIGN_PREPARATION_READY: the party already has a ready line against the trainer; "
+                        f"ending preparation before every member reaches target_level={target_level} "
+                        f"levels={[getattr(pokemon, 'level', None) for pokemon in living]!r}"
+                    )
+                )
+        return ready_state["ready"]
 
     if target_reached():
         return

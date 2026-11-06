@@ -798,3 +798,38 @@ with `print_always` (`modules/console.py`), which prints unconditionally:
 that can repeat is rate limited. Opt-in tools for silent stalls:
 `POKEBOT_DUMP_SLOW_SEARCH=<dir>` (pickle a slow failed search) and
 `POKEBOT_STALL_DUMP=<file>` (periodic Python stack dumps).
+
+### Why trainer preparation ground so long (offline findings, 2026-11-05)
+
+Live runs spent 45 minutes in the Petalburg Woods without reaching the Aqua Grunt
+(a Lv9 Poochyena) because readiness could never become true for most leads. Two
+causes, both measured offline with the real search engine (no emulator):
+
+1. **A lead with any move under 100% accuracy could never be ready.** The
+   pre-battle readiness search (5 turns, per member per roster Pokémon) accepted
+   only `terminal_complete` results. A move that can miss lets a battle continue
+   past any finite horizon, so the engine labels even a dominant lead a
+   `horizon_projection`: a 40 HP lead that wins 100% of the time, with 0.0000
+   unresolved probability, was still rejected. The controller then raised the
+   target level by one each round and finally blocked the objective at the level
+   cap. Fix: a horizon projection now counts when it was not budget-cut, its
+   unresolved mass (`1 - win - loss`) is at most 2%, and the finished branches
+   meet the win, loss, and catastrophic thresholds. The category is not
+   relabeled, and a projection without probability evidence never claims
+   readiness. Verdicts after the fix, against a 28 HP Poochyena (Tackle 4-6):
+   a Lv10 lead (32 HP) wins 98.8% and is ready, a Lv9 lead (29 HP) wins 96.7%
+   with 1.6% faint and is ready, and a Lv8 lead (26 HP) wins about 70% with about
+   30% faint and is correctly not ready.
+2. **Preparation only ended when every living member reached the target
+   level.** It now also ends as soon as the live party has a ready line
+   (`CAMPAIGN_PREPARATION_READY`), re-evaluated only when a member's species,
+   level, max HP, or half-HP eligibility changes. `target_level` is a hint; the
+   level cap is unaffected.
+
+Related measured finding (not fixed): the generic search cannot finish when the
+party has bench members. A Lv8 lead against a Lv9 trainer completes in 33 ms
+(118 nodes) with no switch options, but stays incomplete after 3 s and after 30 s
+(159,000 nodes) with four bench members as switch options. That is why nearly
+every campaign battle turn spends its full 3 s budget and returns
+`BEST_AVAILABLE`. It needs pruning or iterative deepening; it is the largest
+remaining battle-performance item.

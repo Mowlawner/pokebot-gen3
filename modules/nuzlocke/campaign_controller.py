@@ -3733,13 +3733,22 @@ class CampaignController:
                     return self.state
                 self._trainer_preparation_checkpoint_key = checkpoint_key
                 self._trainer_preparation_last_target = target_level
-                from .resource_runtime import execute_campaign_preparation
+                from .resource_runtime import (
+                    execute_campaign_preparation,
+                    trainer_checkpoint_ready_check,
+                )
 
                 self._campaign_plan = plan
                 self.interrupted_objective_id = objective_id
+                trainer_checkpoint = getattr(evaluated, "trainer_checkpoint", None)
                 self._tactical_loop = execute_campaign_preparation(
                     training_map,
                     target_level=target_level,
+                    ready_check=(
+                        trainer_checkpoint_ready_check(trainer_checkpoint)
+                        if trainer_checkpoint is not None
+                        else None
+                    ),
                 )
                 self._execution_phase = "PREPARATION"
                 self._recovery_status = None

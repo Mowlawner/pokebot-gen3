@@ -3076,5 +3076,148 @@ class CampaignCapabilityTests(unittest.TestCase):
         assess.assert_not_called()
 
 
+
+class PreparationEarlyStopTests(unittest.TestCase):
+    """Preparation ends once the trainer line is ready, without a full-party level target."""
+
+    @staticmethod
+    def _member(level, hp=26, max_hp=26, name="Torchic"):
+        return SimpleNamespace(
+            is_egg=False,
+            level=level,
+            species=SimpleNamespace(name=name),
+            total_hp=max_hp,
+            current_hp=hp,
+        )
+
+    def _run(self, party, ready_check, *, on_run=None):
+        from modules.nuzlocke import resource_runtime as runtime
+
+        stop_results = []
+        logs = []
+
+        class FakeNavigationLoop:
+            def run(self):
+                return iter(())
+
+        class FakePokecenterLoop:
+            def __init__(self, **_kwargs):
+                self.battle_strategy = None
+
+            def on_battle_ended(self):
+                return None
+
+            def verify_on_start(self):
+                return None
+
+            def run(self, *, stop_condition):
+                if on_run is not None:
+                    on_run(stop_condition, stop_results)
+                else:
+                    stop_results.append(stop_condition())
+                return iter(())
+
+        with patch.object(runtime, "get_party", side_effect=lambda: party), patch.object(
+            runtime, "_preparation_training_location", return_value=((0, 16), ((1, 1),))
+        ), patch.object(runtime, "AgentControlLoop", side_effect=lambda *a, **k: FakeNavigationLoop()), patch.object(
+            runtime,
+            "observe_agent",
+            return_value=SimpleNamespace(overworld=SimpleNamespace(map_id=(0, 16), player_coordinates=(1, 1))),
+        ), patch.object(runtime.NavigationWorld, "from_overworld", return_value=object()), patch.object(
+            runtime,
+            "plan_with_world_navigation",
+            return_value=(SimpleNamespace(forced_trainer_exposure=False), None),
+        ), patch.object(
+            runtime, "CampaignPreparationLoopController", return_value=FakePokecenterLoop()
+        ), patch.object(
+            runtime, "print_always", side_effect=lambda message: logs.append(message())
+        ):
+            list(execute_campaign_preparation((0, 16), target_level=9, ready_check=ready_check))
+        return stop_results, logs
+
+    def test_a_ready_line_ends_preparation_before_the_whole_party_reaches_the_target(self):
+        party = [self._member(8), self._member(3, name="Wurmple"), self._member(3, name="Wingull")]
+        ready_check = Mock(return_value=True)
+
+        stop_results, logs = self._run(party, ready_check)
+
+        # The very first check already ends the capability: nothing was trained.
+        self.assertEqual(stop_results, [])
+        ready_check.assert_called_once_with()
+        self.assertTrue(any("CAMPAIGN_PREPARATION_READY" in line for line in logs))
+
+    def test_without_a_ready_check_the_full_party_target_still_applies(self):
+        party = [self._member(8), self._member(3, name="Wurmple")]
+
+        stop_results, logs = self._run(party, None)
+
+        self.assertEqual(stop_results, [False])
+        self.assertEqual(logs, [])
+
+    def test_a_line_that_is_not_ready_keeps_training(self):
+        party = [self._member(8), self._member(3, name="Wurmple")]
+
+        stop_results, _ = self._run(party, Mock(return_value=False))
+
+        self.assertEqual(stop_results, [False])
+
+    def test_readiness_is_only_rechecked_when_the_party_changes(self):
+        party = [self._member(8), self._member(3, name="Wurmple")]
+        ready_check = Mock(return_value=False)
+
+        def on_run(stop_condition, results):
+            results.extend(stop_condition() for _ in range(5))  # nothing changed
+            party[1].level = 4  # a level-up changes the readiness-relevant facts
+            results.extend(stop_condition() for _ in range(5))
+
+        self._run(party, ready_check, on_run=on_run)
+
+        # Once at the start, once after the level-up; not on every call.
+        self.assertEqual(ready_check.call_count, 2)
+
+    def test_dropping_below_half_hp_and_healing_each_trigger_a_recheck(self):
+        party = [self._member(8, hp=26), self._member(3, name="Wurmple")]
+        ready_check = Mock(side_effect=[False, False, True])
+
+        def on_run(stop_condition, results):
+            results.append(stop_condition())  # unchanged since the opening check
+            party[0].current_hp = 10  # below half: not eligible
+            results.append(stop_condition())
+            party[0].current_hp = 26  # healed: eligible again
+            results.append(stop_condition())
+
+        stop_results, _ = self._run(party, ready_check, on_run=on_run)
+
+        self.assertEqual(ready_check.call_count, 3)
+        self.assertEqual(stop_results, [False, False, True])
+
+    def test_a_failing_readiness_check_never_ends_preparation(self):
+        party = [self._member(8), self._member(3, name="Wurmple")]
+
+        stop_results, _ = self._run(party, Mock(side_effect=RuntimeError("stats unavailable")))
+
+        self.assertEqual(stop_results, [False])
+
+
+class TrainerCheckpointReadyCheckTests(unittest.TestCase):
+    def _check(self, status):
+        from modules.nuzlocke import resource_runtime as runtime
+
+        readiness = SimpleNamespace(status=SimpleNamespace(value=status))
+        with patch.object(runtime, "assess_live_trainer_checkpoint", return_value=readiness) as assess, patch.object(
+            runtime, "get_party", return_value=["party"]
+        ):
+            return runtime.trainer_checkpoint_ready_check("checkpoint")(), assess
+
+    def test_only_a_ready_status_counts(self):
+        ready, assess = self._check("ready")
+
+        self.assertTrue(ready)
+        assess.assert_called_once_with("checkpoint", ["party"])
+        for status in ("prepare", "unknown", None):
+            with self.subTest(status=status):
+                self.assertFalse(self._check(status)[0])
+
+
 if __name__ == "__main__":
     unittest.main()

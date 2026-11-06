@@ -1,7 +1,7 @@
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import ANY, call, patch
 
 from modules.context import context
 from modules.map_data import MapRSE
@@ -573,7 +573,10 @@ class CampaignControllerTests(unittest.TestCase):
 
             mounted = controller.step()
             self.assertEqual(mounted.execution_phase, "PREPARATION", mounted.reason)
-            prepare.assert_called_once_with((0, 17), target_level=5)
+            prepare.assert_called_once_with((0, 17), target_level=5, ready_check=ANY)
+            # Preparation may end early once the trainer line is ready, so the
+            # controller must hand it a callable readiness check.
+            self.assertTrue(callable(prepare.call_args.kwargs["ready_check"]))
             completed = controller.step()
             self.assertEqual(completed.execution_phase, "CAMPAIGN")
             self.assertEqual(completed.status, CampaignControllerStatus.READY)
@@ -581,8 +584,8 @@ class CampaignControllerTests(unittest.TestCase):
             self.assertEqual(escalated.execution_phase, "PREPARATION")
             prepare.assert_has_calls(
                 [
-                    call((0, 17), target_level=5),
-                    call((0, 17), target_level=6),
+                    call((0, 17), target_level=5, ready_check=ANY),
+                    call((0, 17), target_level=6, ready_check=ANY),
                 ]
             )
             completed = controller.step()
@@ -655,7 +658,7 @@ class CampaignControllerTests(unittest.TestCase):
 
         self.assertEqual(completed.execution_phase, "CAMPAIGN")
         self.assertIs(controller.last_execution.capability, scripted_capability)
-        prepare.assert_called_once_with(MapRSE.PETALBURG_WOODS.value, target_level=5)
+        prepare.assert_called_once_with(MapRSE.PETALBURG_WOODS.value, target_level=5, ready_check=ANY)
 
     def test_trainer_preparation_defers_when_active_cap_is_unavailable(self):
         objective = self.fixture.objective("route102_trainer", self.fixture.predicate("complete", False))
