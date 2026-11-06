@@ -68,9 +68,12 @@ If the lead has no plan within the faint bound, the planner considers switching
 to another party member, but only one who can survive two worst-case opponent
 attacks (a critical hit counts as an attack), only when switching is legal, and
 only once per stretch of battle so the lead cannot ping-pong. If still no plan is
-within the bound, it chooses the least risky plan overall (lowest faint
-probability, then highest capture probability) and marks the decision as risk
-accepted: it is classified best-available, never safe, and carries a result that
+within the bound, the planner flees when running is legal and its confidence is
+high or medium (owner decision 2026-11-05: flee only when no safe switch can continue
+the capture). A future refinement may weigh the wild Pokémon's value against the party
+member at risk. If fleeing is not legal, it chooses the least risky plan overall
+(lowest faint probability, then highest capture probability) and marks the decision as
+risk accepted: it is classified best-available, never safe, and carries a result that
 lets the campaign proceed for one turn without claiming safety.
 
 It returns nothing, and the generic search decides, only when the battle cannot
@@ -145,5 +148,6 @@ captures.
 - Moving the damage and outcome model out of the expectiminimax module.
 - Bounding the capture rollout inside the generic search so it respects its
   time budget.
-- When even the least risky capture plan is very likely to lose the Pokémon in play,
-  whether to flee instead (an open question for the owner).
+- Opportunity-cost weighing: whether the target is worth risking the Pokémon in play
+  (today the bot flees whenever no plan is within the faint bound and escape is legal).
+- Live validation of the flee path.

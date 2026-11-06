@@ -11,6 +11,7 @@ from modules.battle_capture_planner import (
 from modules.battle_planner import (
     BattlePlanner,
     PlannerAction,
+    PlannerConfidence,
     PlannerContext,
     PlannerDecisionClass,
     PlannerMove,
@@ -427,3 +428,51 @@ class CaptureSwitchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CaptureFleeTests(unittest.TestCase):
+    """Abandon the encounter only when neither the lead nor a safe switch can continue."""
+
+    def hopeless(self, **changes):
+        values = dict(
+            active_hp=5,
+            active_max_hp=5,
+            opponent_moves=(PlannerOpponentMove("Tackle", 6, 7),),
+            can_run=True,
+            escape_confidence=PlannerConfidence.HIGH,
+        )
+        values.update(changes)
+        return capture_context(**values)
+
+    def test_a_hopeless_capture_flees_when_escape_is_legal(self):
+        decision = BattlePlanner().plan(self.hopeless())
+
+        self.assertIs(decision.action, PlannerAction.RunAway)
+        self.assertEqual(decision.evaluation_method, "capture_planner")
+        self.assertTrue(decision.is_safe_to_execute)
+        self.assertIn("abandoned", decision.rationale)
+
+    def test_it_still_takes_the_least_risky_plan_when_escape_is_not_legal(self):
+        decision = BattlePlanner().plan(self.hopeless(can_run=False))
+
+        self.assertIsNot(decision.action, PlannerAction.RunAway)
+        self.assertIn("RISK ACCEPTED", decision.rationale)
+
+    def test_it_does_not_flee_on_an_unknown_escape_chance(self):
+        decision = BattlePlanner().plan(self.hopeless(escape_confidence=PlannerConfidence.INSUFFICIENT))
+
+        self.assertIsNot(decision.action, PlannerAction.RunAway)
+
+    def test_a_safe_switch_is_preferred_to_fleeing(self):
+        decision = BattlePlanner().plan(
+            fragile_context(can_run=True, escape_confidence=PlannerConfidence.HIGH)
+        )
+
+        self.assertIs(decision.action, PlannerAction.SwitchPokemon)
+
+    def test_a_healthy_lead_captures_rather_than_flees(self):
+        decision = BattlePlanner().plan(
+            capture_context(can_run=True, escape_confidence=PlannerConfidence.HIGH)
+        )
+
+        self.assertIsNot(decision.action, PlannerAction.RunAway)

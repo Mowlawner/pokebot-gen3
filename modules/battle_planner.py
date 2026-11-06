@@ -1137,6 +1137,34 @@ class BattlePlanner:
         if choice is None:
             return None
         plan = choice.plan
+        if choice.risk_accepted and context.can_run and context.escape_confidence in (
+            PlannerConfidence.HIGH,
+            PlannerConfidence.MEDIUM,
+        ):
+            # Neither the lead nor any switch keeps the Pokemon in play within the
+            # faint bound, and escape is legal: give up the encounter instead of
+            # gambling a party member.  (Weighing the target's value against the
+            # member at risk is a possible future refinement.)
+            rejected = (plan.summary(),) + tuple(alternative.summary() for alternative in choice.alternatives)
+            return PlannerDecision(
+                PlannerAction.RunAway,
+                None,
+                context.escape_confidence,
+                "capture planner: no plan, including switching, keeps the active Pokemon within the "
+                f"faint bound (least risky was {plan.summary()} at "
+                f"{plan.active_faint_probability:.1%} faint risk), so the encounter is abandoned.",
+                PlannerSafety.SAFE,
+                (
+                    PlannerEvidence(
+                        PlannerEvidenceKind.DERIVED,
+                        "no lead or switch capture plan is within the active-faint bound; escape is legal",
+                    ),
+                ),
+                rejected_candidates=rejected,
+                classification=PlannerDecisionClass.SAFE,
+                risk=PlannerRisk.LOW,
+                evaluation_method="capture_planner",
+            )
         rationale = (
             f"capture planner (bounded exact plan comparison): chose {plan.summary()}. "
             + (
