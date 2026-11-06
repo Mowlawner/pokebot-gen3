@@ -1915,6 +1915,35 @@ def _mandatory_trainer_hazard_state(overworld, training_map):
 _last_preparation_no_line_signature: tuple | None = None
 
 
+def _describe_trainer_readiness(item) -> str:
+    """Summarize the readiness verdict behind one trainer's rejection.
+
+    ``BattleReadiness.win_probability`` is ``None`` when no search established
+    the outcome, so it is not shown as a number.  The per-lead assessments carry
+    the evidence that explains a "not proven safe" verdict: how many roster slots
+    each party member's lines cover, and its worst win and faint probabilities.
+    """
+
+    readiness = getattr(item, "readiness", None)
+    if readiness is None:
+        return "readiness unavailable"
+    status = getattr(getattr(readiness, "status", None), "value", getattr(readiness, "status", None))
+    roster = len(getattr(getattr(item.source, "checkpoint", None), "party", ()) or ())
+    leads = sorted(
+        getattr(readiness, "lead_assessments", ()) or (),
+        key=lambda lead: getattr(lead, "rank", ()),
+        reverse=True,
+    )[:3]
+    lead_text = "; ".join(
+        f"{lead.name} covers {len(lead.lines)}/{roster} slots, "
+        f"min win {lead.minimum_win_probability:.0%}, max faint {lead.maximum_faint_probability:.0%}, "
+        f"{'safe' if lead.safe else 'not safe'}"
+        for lead in leads
+    )
+    reason = getattr(readiness, "reason", "") or "no reason given"
+    return f"status={status}, {reason}" + (f" [{lead_text}]" if lead_text else " [no party member assessed]")
+
+
 def _describe_preparation_failure(
     *,
     allow_wild: bool,
@@ -1947,12 +1976,9 @@ def _describe_preparation_failure(
     else:
         parts = []
         for item in evaluations:
-            numbers = (
-                f"win={item.win_probability:.0%} catastrophic={item.catastrophic_probability:.0%} "
-                f"exp={item.projected_exp} headroom={item.recipient_headroom} cap_safe={item.cap_safe}"
-            )
+            numbers = f"exp={item.projected_exp} headroom={item.recipient_headroom} cap_safe={item.cap_safe}"
             verdict = "selected" if item.selected else f"rejected: {item.rejection_reason or 'unspecified'}"
-            parts.append(f"{item.source.trainer_id} ({numbers}) {verdict}")
+            parts.append(f"{item.source.trainer_id} ({numbers}) {verdict} ({_describe_trainer_readiness(item)})")
         if trainers_without_checkpoint:
             parts.append(f"no ROM checkpoint, not evaluated: {', '.join(trainers_without_checkpoint)}")
         trainers = f"trainers: {trainers_observed} observed; " + "; ".join(parts)

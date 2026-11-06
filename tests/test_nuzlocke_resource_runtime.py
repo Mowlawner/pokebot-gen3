@@ -3327,11 +3327,24 @@ class PreparationFailureExplanationTests(unittest.TestCase):
     """A failed preparation must say which stage failed and why."""
 
     @staticmethod
-    def _evaluation(trainer_id, *, selected=False, reason="win probability below threshold"):
+    def _evaluation(trainer_id, *, selected=False, reason="battle line is not proven safe", leads=True):
+        lead = SimpleNamespace(
+            name="Albert",
+            lines=(object(), object()),
+            minimum_win_probability=0.71,
+            maximum_faint_probability=0.28,
+            safe=False,
+            rank=(False, False, 0.71, -0.28, -1),
+        )
+        readiness = SimpleNamespace(
+            status=SimpleNamespace(value="prepare"),
+            reason="no available lead has a robust line through the known trainer roster",
+            lead_assessments=(lead,) if leads else (),
+            win_probability=None,
+        )
         return SimpleNamespace(
-            source=SimpleNamespace(trainer_id=trainer_id),
-            win_probability=0.5,
-            catastrophic_probability=0.2,
+            source=SimpleNamespace(trainer_id=trainer_id, checkpoint=SimpleNamespace(party=(1, 2, 3))),
+            readiness=readiness,
             projected_exp=120,
             recipient_headroom=3,
             cap_safe=False,
@@ -3381,10 +3394,33 @@ class PreparationFailureExplanationTests(unittest.TestCase):
             trainers_observed=3,
         )
 
-        self.assertIn("trainer:A (win=50% catastrophic=20% exp=120 headroom=3 cap_safe=False)", text)
+        self.assertIn("trainer:A (exp=120 headroom=3 cap_safe=False)", text)
         self.assertIn("rejected: catastrophic probability above limit", text)
         self.assertIn("rejected: no recipient has cap headroom", text)
         self.assertIn("no ROM checkpoint, not evaluated: trainer:C", text)
+
+    def test_the_readiness_verdict_is_explained_with_per_member_evidence(self):
+        text = self._describe()
+
+        self.assertIn("status=prepare", text)
+        self.assertIn("no available lead has a robust line through the known trainer roster", text)
+        self.assertIn("Albert covers 2/3 slots, min win 71%, max faint 28%, not safe", text)
+
+    def test_an_unestablished_win_probability_is_never_shown_as_zero_percent(self):
+        text = self._describe()
+
+        self.assertNotIn("win=0%", text)
+
+    def test_a_readiness_with_no_assessed_member_says_so(self):
+        text = self._describe(evaluations=(self._evaluation("trainer:A", leads=False),))
+
+        self.assertIn("[no party member assessed]", text)
+
+    def test_missing_readiness_is_reported_as_unavailable(self):
+        evaluation = self._evaluation("trainer:A")
+        evaluation.readiness = None
+
+        self.assertIn("readiness unavailable", self._describe(evaluations=(evaluation,)))
 
     def test_no_observed_trainer_is_stated(self):
         text = self._describe(trainers_observed=0, evaluations=())
