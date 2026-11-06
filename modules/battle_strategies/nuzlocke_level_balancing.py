@@ -28,7 +28,7 @@ from modules.battle_strategies.switch_evaluator import (
     relative_training_score,
 )
 from modules.context import context
-from modules.console import diagnostic_print
+from modules.console import diagnostic_print, print_always
 from modules.items import ItemBattleUse, get_item_bag
 from modules.nuzlocke.identity import PokemonIdentity
 from modules.nuzlocke.field_lead import CampaignFieldLeadContext, CampaignFieldLeadDecision
@@ -73,6 +73,48 @@ def _campaign_progression_is_active() -> bool:
     """Return whether this battle belongs to the strict campaign mode."""
 
     return getattr(context, "bot_mode", None) == "Campaign Progression"
+
+
+_last_field_lead_signature: tuple | None = None
+
+
+def _party_lead_summary() -> str:
+    """Compact ``slot:species:level:hp/max`` list so a lead choice can be audited."""
+
+    try:
+        return " ".join(
+            f"{slot}:{getattr(getattr(member, 'species', None), 'name', '?')}:L{getattr(member, 'level', '?')}"
+            f":{getattr(member, 'current_hp', '?')}/{getattr(member, 'total_hp', '?')}"
+            for slot, member in enumerate(get_party())
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+        return "unavailable"
+
+
+def _log_field_lead_decision(field_context, *, index, current_lead, selected, reason) -> None:
+    """Write the lead choice to the normal log, once per distinct decision.
+
+    The chooser runs repeatedly while the controller owns the field, so the
+    record is emitted only when the candidate, lead, selection, reason, or
+    objective changes.
+    """
+
+    global _last_field_lead_signature
+    signature = (field_context.objective_id, index, current_lead, selected, reason)
+    if signature == _last_field_lead_signature:
+        return
+    _last_field_lead_signature = signature
+    print_always(
+        lambda: (
+            "NUZLOCKE_CAMPAIGN_FIELD_LEAD: "
+            f"objective={field_context.objective_id!r} current_map={field_context.current_map!r} "
+            f"objective_map={field_context.objective_map!r} route_maps={field_context.route_maps!r} "
+            f"envelope_source={field_context.source!r} candidate={index!r} "
+            f"current_lead={current_lead!r} selected={selected!r} reason={reason!r} "
+            f"party=[{_party_lead_summary()}]"
+        )
+    )
+
 
 
 class _NuzlockeBattleDispatch:
@@ -1278,15 +1320,8 @@ class NuzlockeLevelBalancingBattleStrategy(_NuzlockeBattleDispatch, CampaignExpe
         except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
             current_lead = 0
         selected = index if index is not None and index != current_lead else None
-        diagnostic_print(
-            lambda: (
-                "NUZLOCKE_CAMPAIGN_FIELD_LEAD: "
-                f"objective={field_context.objective_id!r} current_map={field_context.current_map!r} "
-                f"objective_map={field_context.objective_map!r} route_maps={field_context.route_maps!r} "
-                f"envelope_source={field_context.source!r} candidate={index!r} "
-                f"current_lead={current_lead!r} selected={selected!r} reason={reason!r}"
-            ),
-            trace=True,
+        _log_field_lead_decision(
+            field_context, index=index, current_lead=current_lead, selected=selected, reason=reason
         )
         if selected is not None:
             context.battle_decision_source = "NUZLOCKE CAMPAIGN FIELD LEAD"
