@@ -113,7 +113,14 @@ Do not start live runs without the owner's permission; the owner has asked for t
 
 ## Open questions (need the owner's decision)
 
-1. **Route-cut rule.** When the safe search finds no route, a trainer common to every
+1. **Route-cut rule. Decided and implemented 2026-11-05, not yet validated live.** The
+   AVOID search already uses the ROM's facing envelope and walk loops, so a separate
+   "narrow search" would add nothing. The gap was that a failed search promoted a trainer
+   even when its hazard area was partly a guess. `_encounter_stage_route_cut_hazards` now
+   promotes a trainer only if it resolves to a ROM checkpoint **and** its geometry is exact
+   (`trainer_hazard_geometry_is_exact` in `modules/overworld.py`); an unknown facing, an
+   over-covered fixed-axis walker, or unobserved geometry stays unresolved. Exact and
+   unavoidable trainers still lead to preparation. Original question: when the safe search finds no route, a trainer common to every
    permissive route can be promoted to a mandatory hazard, which allows exposure.
    That is how Billy was exposed originally. Recommendation: promote a trainer to
    must-fight only if no path exists even under the *narrow* model (the ROM's real
@@ -121,17 +128,15 @@ Do not start live runs without the owner's permission; the owner has asked for t
    pessimistic, so take that path (or, for a walking trainer, wait until the loop
    moves away). A failed cautious search alone is never proof. Needs approval, then
    implementation in `_encounter_stage_route_cut_hazards`.
-2. **Hopeless captures.** When even the least risky capture plan has a high chance of
-   losing a Pokémon (for example a 5 HP lead facing 6 to 7 damage hits, about 67%),
-   should the bot flee and give up the encounter, or take the gamble? Today it takes
-   the least risky plan and marks it "risk accepted".
-3. **Cleanup.** The development machine holds throwaway profiles
-   `profiles/diag_postfix*_20261105` and logs in `/tmp/nuzbot-diag`. The owner said
-   "sure" to deleting them but the agent promised to ask again before deleting. They
-   are machine-local and not in the repository.
-4. **Lead-selection logging.** The lead-selection record `NUZLOCKE_CAMPAIGN_FIELD_LEAD`
-   is trace-only. Making it visible in ordinary runs would show why weak members are
-   skipped as training leads. Approve?
+2. **Hopeless captures. Decided 2026-11-05 and implemented, not yet live-validated.**
+   Flee only if no safe switch can continue the capture (and escape is legal); otherwise
+   keep the least risky "risk accepted" plan. A future state may weigh the target's value
+   against the member at risk.
+3. **Cleanup. Closed.** The throwaway profiles and `/tmp/nuzbot-diag` were on the other
+   machine; nothing exists here. Profiles and save states are never committed.
+4. **Lead-selection logging. Done 2026-11-05.** `NUZLOCKE_CAMPAIGN_FIELD_LEAD` is now
+   always on, logged once per distinct decision, with the whole party (slot, species,
+   level, HP).
 5. **`no_resets` (deferred).** The bot resumes from save states, which must be
    distinguished from undoing progress. Sketch: the bot never rewinds itself in
    campaign mode, and on resume compares the game against its own event history (a
