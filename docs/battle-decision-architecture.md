@@ -64,10 +64,18 @@ Decision rule:
 3. Among plans within 0.5% of the best capture probability, prefer lower faint
    probability, then fewer expected balls, then fewer turns.
 
-It returns nothing, and the generic search decides, when: the battle is not a
-legal capture, there is no usable ball or no catch-probability model, the
-opponent's moves are unknown or unsupported, or no plan keeps the lead within
-the faint bound.
+If the lead has no plan within the faint bound, the planner considers switching
+to another party member, but only one who can survive two worst-case opponent
+attacks (a critical hit counts as an attack), only when switching is legal, and
+only once per stretch of battle so the lead cannot ping-pong. If still no plan is
+within the bound, it chooses the least risky plan overall (lowest faint
+probability, then highest capture probability) and marks the decision as risk
+accepted: it is classified best-available, never safe, and carries a result that
+lets the campaign proceed for one turn without claiming safety.
+
+It returns nothing, and the generic search decides, only when the battle cannot
+be modeled: it is not a legal capture, there is no usable ball or no
+catch-probability model, or the opponent's moves are unknown or unsupported.
 
 ### Approximations
 
@@ -80,8 +88,8 @@ the faint bound.
 - Only plain damaging moves are used to weaken; two-turn, self-destructing,
   Bide, counter, and unsupported moves are excluded. False Swipe is modeled as
   never knocking the target out.
-- Switching to a sturdier Pokémon before capturing is not modeled; a fragile
-  lead is deferred to the generic search.
+- A switch costs one opponent action (the incoming Pokémon takes a hit), and the
+  incoming Pokémon's own moves are used for weakening.
 
 ### Worked example
 
@@ -94,7 +102,7 @@ weakens twice and captures at about 99% with no knockout risk.
 
 - A live capture run exercising the planner (it was validated by unit tests and
   offline scenarios; live runs so far predate it).
-- Status moves and switching as capture aids.
+- Status moves as capture aids.
 - Moving the damage and outcome model out of the expectiminimax module.
 - Bounding the capture rollout inside the generic search so it respects its
   time budget.

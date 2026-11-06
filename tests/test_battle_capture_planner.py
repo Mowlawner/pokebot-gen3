@@ -16,6 +16,7 @@ from modules.battle_planner import (
     PlannerMove,
     PlannerOpponentMove,
     PlannerSafety,
+    PlannerSwitch,
     RecoveryItem,
 )
 
@@ -110,17 +111,24 @@ class CapturePlanChoiceTests(unittest.TestCase):
         self.assertGreaterEqual(one_ball.weaken_turns, many.weaken_turns)
         self.assertGreater(one_ball.weaken_turns, 0)
 
-    def test_it_defers_when_no_plan_keeps_the_lead_safe(self):
+    def test_when_no_plan_is_safe_the_least_risky_one_is_chosen_and_marked(self):
         # A 5 HP lead against 6-7 damage cannot be kept safe by any plan.
         context = capture_context(
             active_hp=5,
             active_max_hp=5,
             opponent_moves=(PlannerOpponentMove("Tackle", 6, 7),),
         )
+        plans, _ = evaluate_capture_plans(context)
 
-        self.assertIsNone(choose_capture_plan(context))
+        choice = choose_capture_plan(context)
 
-    def test_a_fragile_lead_is_deferred_rather_than_gambled_with(self):
+        self.assertTrue(choice.risk_accepted)
+        self.assertEqual(
+            choice.plan.active_faint_probability,
+            min(plan.active_faint_probability for plan in plans),
+        )
+
+    def test_a_fragile_lead_with_no_one_to_switch_to_takes_the_least_risky_plan(self):
         # The live Woods case: a 13 HP lead against a Tackle that can crit for 14.
         context = capture_context(
             active_hp=13,
@@ -128,9 +136,15 @@ class CapturePlanChoiceTests(unittest.TestCase):
             opponent_moves=(PlannerOpponentMove("Tackle", 5, 7, accuracy=0.95, critical_damage_max=14),),
         )
         plans, _ = evaluate_capture_plans(context)
+        choice = choose_capture_plan(context)
 
         self.assertTrue(all(plan.active_faint_probability > 0.03 for plan in plans))
-        self.assertIsNone(choose_capture_plan(context))
+        self.assertTrue(choice.risk_accepted)
+        # Throwing now exposes the lead to the fewest opponent actions.
+        self.assertEqual(choice.plan.weaken_turns, 0)
+
+    def test_a_safe_choice_is_not_marked_as_risk_accepted(self):
+        self.assertFalse(choose_capture_plan(capture_context()).risk_accepted)
 
     def test_probabilities_are_consistent(self):
         plans, _ = evaluate_capture_plans(capture_context(active_hp=14, active_max_hp=14))
@@ -286,7 +300,7 @@ class CapturePlannerIntegrationTests(unittest.TestCase):
                 decision = BattlePlanner().plan(capture_context(**changes))
                 self.assertNotEqual(decision.evaluation_method, "capture_planner")
 
-    def test_a_deferred_capture_falls_back_to_the_generic_search(self):
+    def test_a_risk_accepted_capture_is_not_labeled_safe_but_the_campaign_may_proceed(self):
         context = capture_context(
             active_hp=5,
             active_max_hp=5,
@@ -294,7 +308,121 @@ class CapturePlannerIntegrationTests(unittest.TestCase):
         )
         decision = BattlePlanner().plan(context)
 
+        self.assertEqual(decision.evaluation_method, "capture_planner")
+        self.assertIs(decision.safety, PlannerSafety.UNSAFE_OR_UNCERTAIN)
+        self.assertIs(decision.classification, PlannerDecisionClass.BEST_AVAILABLE)
+        self.assertFalse(decision.is_safe_to_execute)
+        self.assertIn("RISK ACCEPTED", decision.rationale)
+        # The campaign gate proceeds only for a result that declares itself an
+        # autonomous root; it must not claim the line is safe.
+        self.assertTrue(decision.stochastic_result.is_autonomous_root)
+        self.assertFalse(decision.stochastic_result.is_safe)
+
+    def test_an_unmodelable_capture_still_falls_back_to_the_generic_search(self):
+        decision = BattlePlanner().plan(capture_context(opponent_response_facts_complete=False))
+
         self.assertNotEqual(decision.evaluation_method, "capture_planner")
+
+
+def switch_candidate(party_index=1, name="Sturdy", hp=60, moves=(PlannerMove(0, "Tackle", 3, 4),)):
+    return PlannerSwitch(party_index, name, hp, hp, 5, moves=moves, speed=15)
+
+
+def fragile_context(**changes):
+    values = dict(
+        active_hp=13,
+        active_max_hp=13,
+        opponent_moves=(PlannerOpponentMove("Tackle", 5, 7, accuracy=0.95, critical_damage_max=14),),
+        can_switch=True,
+        switches=(switch_candidate(),),
+    )
+    values.update(changes)
+    return capture_context(**values)
+
+
+class CaptureSwitchTests(unittest.TestCase):
+    def test_a_fragile_lead_switches_to_a_member_who_can_take_two_hits(self):
+        choice = choose_capture_plan(fragile_context())
+
+        self.assertIsNotNone(choice.plan.switch_party_index)
+        self.assertEqual(choice.plan.switch_party_index, 1)
+        self.assertFalse(choice.risk_accepted)
+        self.assertLessEqual(choice.plan.active_faint_probability, 0.03)
+
+    def test_a_merely_sturdier_member_is_chosen_but_the_risk_is_still_flagged(self):
+        # 40 HP is far safer than the 13 HP lead (about 4% against about 36%
+        # chance of fainting) but not within the 3% bound, so the switch is the
+        # least risky plan and is labeled as risk accepted rather than safe.
+        choice = choose_capture_plan(fragile_context(switches=(switch_candidate(hp=40),)))
+        lead_plans, _ = evaluate_capture_plans(fragile_context())
+
+        self.assertEqual(choice.plan.switch_party_index, 1)
+        self.assertTrue(choice.risk_accepted)
+        self.assertLess(
+            choice.plan.active_faint_probability,
+            min(plan.active_faint_probability for plan in lead_plans) / 4,
+        )
+
+    def test_the_switch_becomes_a_planner_switch_decision(self):
+        decision = BattlePlanner().plan(fragile_context())
+
+        self.assertEqual(decision.evaluation_method, "capture_planner")
+        self.assertIs(decision.action, PlannerAction.SwitchPokemon)
+        self.assertEqual(decision.target, 1)
+        self.assertIs(decision.safety, PlannerSafety.SAFE)
+
+    def test_a_member_who_cannot_take_two_worst_case_hits_is_not_eligible(self):
+        # The worst single attack is a 14 damage critical, so two need > 28 HP.
+        marginal = switch_candidate(hp=27)
+        choice = choose_capture_plan(fragile_context(switches=(marginal,)))
+
+        self.assertIsNone(choice.plan.switch_party_index)
+        self.assertTrue(choice.risk_accepted)
+
+    def test_a_member_exactly_at_the_threshold_is_eligible(self):
+        choice = choose_capture_plan(fragile_context(switches=(switch_candidate(hp=29),)))
+
+        self.assertEqual(choice.plan.switch_party_index, 1)
+
+    def test_no_switch_when_switching_is_not_legal(self):
+        choice = choose_capture_plan(fragile_context(can_switch=False))
+
+        self.assertIsNone(choice.plan.switch_party_index)
+
+    def test_no_second_switch_in_the_same_stretch_of_battle(self):
+        choice = choose_capture_plan(fragile_context(switch_streak=1))
+
+        self.assertIsNone(choice.plan.switch_party_index)
+
+    def test_a_member_just_switched_out_is_not_switched_back_in(self):
+        choice = choose_capture_plan(fragile_context(switch_history=(1,)))
+
+        self.assertIsNone(choice.plan.switch_party_index)
+
+    def test_a_healthy_lead_never_considers_switching(self):
+        choice = choose_capture_plan(capture_context(can_switch=True, switches=(switch_candidate(),)))
+
+        self.assertIsNone(choice.plan.switch_party_index)
+        self.assertFalse(choice.risk_accepted)
+
+    def test_a_switch_costs_an_opponent_action(self):
+        context = fragile_context()
+        lead_plans, balls = evaluate_capture_plans(context)
+        from modules.battle_capture_planner import CaptureConfig as Config, evaluate_switch_plans
+
+        switch_plans = evaluate_switch_plans(context, Config(), balls)
+        throw_after_switch = next(
+            plan for plan in switch_plans if plan.weaken_turns == 0 and plan.switch_party_index == 1
+        )
+        # The same sturdy member in the lead faces one fewer opponent action.
+        hp = switch_candidate().hp
+        sturdy_lead = capture_context(active_hp=hp, active_max_hp=hp, opponent_moves=context.opponent_moves)
+        direct, _ = evaluate_capture_plans(sturdy_lead)
+        throw_now = next(plan for plan in direct if plan.weaken_turns == 0)
+
+        self.assertGreaterEqual(
+            throw_after_switch.active_faint_probability, throw_now.active_faint_probability
+        )
 
 
 if __name__ == "__main__":

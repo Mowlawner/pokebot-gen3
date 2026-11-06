@@ -1139,7 +1139,13 @@ class BattlePlanner:
         plan = choice.plan
         rationale = (
             f"capture planner (bounded exact plan comparison): chose {plan.summary()}. "
-            "Alternatives: "
+            + (
+                "RISK ACCEPTED: no plan kept the active Pokemon within the faint bound, "
+                "so this is the least risky one. "
+                if choice.risk_accepted
+                else ""
+            )
+            + "Alternatives: "
             + (" | ".join(alternative.summary() for alternative in choice.alternatives) or "none")
         )
         evidence = (
@@ -1157,16 +1163,31 @@ class BattlePlanner:
             ),
             PlannerEvidence(PlannerEvidenceKind.DERIVED, rationale),
         )
+        accepted = choice.risk_accepted
         common = dict(
-            confidence=PlannerConfidence.HIGH,
+            confidence=PlannerConfidence.MEDIUM if accepted else PlannerConfidence.HIGH,
             rationale=rationale,
-            safety=PlannerSafety.SAFE,
+            safety=PlannerSafety.UNSAFE_OR_UNCERTAIN if accepted else PlannerSafety.SAFE,
             evidence=evidence,
             rejected_candidates=tuple(alternative.summary() for alternative in choice.alternatives),
-            classification=PlannerDecisionClass.SAFE,
-            risk=PlannerRisk.LOW,
+            classification=PlannerDecisionClass.BEST_AVAILABLE if accepted else PlannerDecisionClass.SAFE,
+            risk=(
+                (PlannerRisk.CRITICAL if plan.active_faint_probability >= 0.05 else PlannerRisk.HIGH)
+                if accepted
+                else PlannerRisk.LOW
+            ),
             evaluation_method="capture_planner",
         )
+        if accepted:
+            from modules.battle_capture_planner import CaptureSolverResult
+
+            # Not proven safe, but a concrete legal action the campaign gate may
+            # accept for one turn; the result object declares exactly that.
+            common["stochastic_result"] = CaptureSolverResult(
+                plan.active_faint_probability, plan.capture_probability
+            )
+        if plan.switch_party_index is not None:
+            return PlannerDecision(PlannerAction.SwitchPokemon, plan.switch_party_index, **common)
         if plan.weaken_turns == 0:
             return PlannerDecision(
                 PlannerAction.UseItem,

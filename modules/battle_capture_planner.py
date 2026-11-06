@@ -23,9 +23,15 @@ Decision rule, in order:
 3. Among plans within ``tie_epsilon`` of the best capture probability, prefer
    the lower faint probability, then fewer expected balls, then fewer turns.
 
-When no plan meets the faint bound, or the facts needed to model the battle are
-not available, ``plan_capture`` returns ``None`` and the caller falls back to
-the generic search.  It never invents safety it cannot establish.
+If the lead has no plan within that bound, a switch to another party member is
+considered, but only to a member who can survive two worst-case opponent attacks
+(a critical hit counts as an attack), only when switching is legal, and only
+once per stretch of battle so it cannot ping-pong.  If still no plan is within
+the bound, the least risky plan is chosen (lowest faint probability, then
+highest capture probability) and is explicitly marked as risk accepted rather
+than safe.  The facts needed to model the battle being unavailable still returns
+``None``, and the caller falls back to the generic search.  It never invents
+safety it cannot establish.
 
 Known approximations (all documented because they affect probabilities):
 
@@ -40,7 +46,7 @@ Known approximations (all documented because they affect probabilities):
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -71,13 +77,21 @@ class CapturePlan:
     active_faint_probability: float
     target_ko_probability: float
     expected_balls: float
+    switch_party_index: int | None = None
+    switch_name: str | None = None
 
     @property
     def first_action(self) -> str:
+        if self.switch_party_index is not None:
+            return f"switch to {self.switch_name}"
         return "throw" if self.weaken_turns == 0 else f"use {self.move_name}"
 
     def summary(self) -> str:
         label = "throw ball now" if self.weaken_turns == 0 else f"{self.move_name} x{self.weaken_turns} then throw"
+        if self.switch_party_index is not None:
+            label = f"switch to {self.switch_name}, then " + (
+                "throw" if self.weaken_turns == 0 else f"{self.move_name} x{self.weaken_turns} then throw"
+            )
         return (
             f"{label}: capture={self.capture_probability:.1%} "
             f"active_faint={self.active_faint_probability:.1%} "
@@ -91,6 +105,28 @@ class CaptureChoice:
     plan: CapturePlan
     ball_item: Any
     alternatives: tuple[CapturePlan, ...] = field(default_factory=tuple)
+    # True when no plan met the faint bound and this is the least risky one.
+    risk_accepted: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureSolverResult:
+    """Minimal result for a risk-accepted decision.
+
+    The campaign acceptance gate lets a decision that is not proven safe proceed
+    only when its result declares itself an autonomous root.  This object is that
+    declaration; it never claims the line is safe.
+    """
+
+    active_faint_probability: float
+    capture_probability: float
+    objective: str = "capture"
+    complete: bool = True
+    projection_safe: bool = False
+    is_safe: bool = False
+    objective_failed: bool = False
+    is_autonomous_root: bool = True
+    category: Any = None
 
 
 def _is_plain_damaging_move(move: Any) -> bool:
@@ -189,7 +225,11 @@ def _evaluate_plan(
     faint: list[float],
     move: Any | None,
     weaken_turns: int,
+    pre_actions: int = 0,
 ) -> CapturePlan:
+    """Evaluate one plan.  ``pre_actions`` counts opponent actions taken before it
+    starts (one, when the plan begins by switching: the incoming Pokémon takes a hit)."""
+
     opponent_hp = int(context.opponent_hp)
 
     # Weakening phase: a distribution over the target's HP after ``weaken_turns``.
@@ -222,7 +262,7 @@ def _evaluate_plan(
         throws = _throw_probabilities(context, balls, hp, config.max_throws)
         fail_before = 1.0  # probability every earlier throw failed
         for index, throw_probability in enumerate(throws, start=1):
-            actions_before_throw = weaken_turns + index - 1
+            actions_before_throw = pre_actions + weaken_turns + index - 1
             alive = 1.0 - faint[min(actions_before_throw, len(faint) - 1)]
             reach = fail_before * alive
             expected_balls += probability * reach
@@ -232,11 +272,11 @@ def _evaluate_plan(
         # Faint risk: the opponent acts after each weakening move and after
         # each failed throw; fainting only matters while the attempt is alive.
         survive_throws = 1.0
-        previous = faint[min(weaken_turns, len(faint) - 1)]
-        faint_total += probability * previous  # during the weakening turns
+        previous = faint[min(pre_actions + weaken_turns, len(faint) - 1)]
+        faint_total += probability * previous  # during the switch and weakening turns
         for index, throw_probability in enumerate(throws, start=1):
             survive_throws *= 1.0 - throw_probability
-            actions = weaken_turns + index
+            actions = pre_actions + weaken_turns + index
             current = faint[min(actions, len(faint) - 1)]
             faint_total += probability * survive_throws * max(0.0, current - previous)
             previous = current
@@ -246,7 +286,7 @@ def _evaluate_plan(
     # first.  Counting both would make the probabilities sum past one.
     target_ko = 0.0
     for turn, mass in ko_by_turn.items():
-        fainted_first = faint[min(turn - 1, len(faint) - 1)]
+        fainted_first = faint[min(pre_actions + turn - 1, len(faint) - 1)]
         target_ko += mass * (1.0 - fainted_first)
         faint_total += mass * fainted_first
 
@@ -308,23 +348,67 @@ def evaluate_capture_plans(context: Any, config: CaptureConfig = CaptureConfig()
     return plans, balls
 
 
-def choose_capture_plan(context: Any, config: CaptureConfig = CaptureConfig()) -> CaptureChoice | None:
-    """Pick the plan to act on, or ``None`` to defer to the generic search."""
+def _worst_case_hit(context: Any, config: CaptureConfig) -> int:
+    """Largest single opponent attack, counting a critical hit as an attack."""
 
-    evaluated = evaluate_capture_plans(context, config)
-    if evaluated is None:
-        return None
-    plans, balls = evaluated
-    admissible = [
-        plan for plan in plans if plan.active_faint_probability <= config.max_active_faint_probability
+    damage = _opponent_turn_outcomes(context, config)
+    return max((outcome.damage for outcome in damage), default=0) if damage else 0
+
+
+def _eligible_switches(context: Any, config: CaptureConfig) -> list[Any]:
+    """Party members the planner may switch to for a capture.
+
+    A candidate must be able to survive two worst-case opponent attacks, the
+    switch must be legal, and no switch may already have happened in this
+    stretch of battle (so the lead cannot ping-pong).
+    """
+
+    if not getattr(context, "can_switch", False):
+        return []
+    if int(getattr(context, "switch_streak", 0) or 0) > 0:
+        return []
+    recent = set(getattr(context, "switch_history", ()) or ())
+    ceiling = _worst_case_hit(context, config)
+    return [
+        candidate
+        for candidate in getattr(context, "switches", ())
+        if int(getattr(candidate, "hp", 0) or 0) > 2 * ceiling
+        and getattr(candidate, "party_index", None) not in recent
+        and getattr(candidate, "party_index", None) != getattr(context, "active_party_index", None)
     ]
-    if not admissible:
-        return None
-    best_capture = max(plan.capture_probability for plan in admissible)
-    contenders = [
-        plan for plan in admissible if best_capture - plan.capture_probability <= config.tie_epsilon
-    ]
-    chosen = min(
+
+
+def evaluate_switch_plans(context: Any, config: CaptureConfig, balls: list[Any]) -> list[CapturePlan]:
+    """Plans that begin by switching: the incoming Pokémon takes one opponent action first."""
+
+    damage = _opponent_turn_outcomes(context, config)
+    if damage is None:
+        return []
+    plans: list[CapturePlan] = []
+    for candidate in _eligible_switches(context, config):
+        faint = _faint_table(
+            int(candidate.hp), damage, config.max_weaken_turns + config.max_throws + 2
+        )
+        options: list[tuple[Any | None, int]] = [(None, 0)]
+        for move in getattr(candidate, "moves", ()):
+            if _is_plain_damaging_move(move):
+                options.extend((move, turns) for turns in range(1, config.max_weaken_turns + 1))
+        for move, turns in options:
+            plan = _evaluate_plan(context, config, balls, faint, move, turns, pre_actions=1)
+            plans.append(
+                replace(
+                    plan,
+                    switch_party_index=int(candidate.party_index),
+                    switch_name=str(candidate.name),
+                )
+            )
+    return plans
+
+
+def _best(plans: list[CapturePlan], config: CaptureConfig) -> CapturePlan:
+    best_capture = max(plan.capture_probability for plan in plans)
+    contenders = [plan for plan in plans if best_capture - plan.capture_probability <= config.tie_epsilon]
+    return min(
         contenders,
         key=lambda plan: (
             plan.active_faint_probability,
@@ -333,21 +417,64 @@ def choose_capture_plan(context: Any, config: CaptureConfig = CaptureConfig()) -
             -plan.capture_probability,
         ),
     )
+
+
+def choose_capture_plan(context: Any, config: CaptureConfig = CaptureConfig()) -> CaptureChoice | None:
+    """Pick the plan to act on, or ``None`` to defer to the generic search.
+
+    In order: the best lead plan within the faint bound; otherwise the best
+    plan that starts by switching to a member who can take two hits; otherwise
+    the least risky plan overall, marked as risk accepted.
+    """
+
+    evaluated = evaluate_capture_plans(context, config)
+    if evaluated is None:
+        return None
+    lead_plans, balls = evaluated
     # The first action of a "throw" plan is the ball with the best odds now.
     ball = max(balls, key=lambda item: _catch_probability(context, item, int(context.opponent_hp)))
-    others = tuple(
-        sorted(
-            (plan for plan in plans if plan is not chosen),
-            key=lambda plan: (-plan.capture_probability, plan.active_faint_probability),
-        )[:4]
+
+    def within_bound(plans: list[CapturePlan]) -> list[CapturePlan]:
+        return [plan for plan in plans if plan.active_faint_probability <= config.max_active_faint_probability]
+
+    def others_of(chosen: CapturePlan, plans: list[CapturePlan]) -> tuple[CapturePlan, ...]:
+        return tuple(
+            sorted(
+                (plan for plan in plans if plan is not chosen),
+                key=lambda plan: (-plan.capture_probability, plan.active_faint_probability),
+            )[:4]
+        )
+
+    admissible = within_bound(lead_plans)
+    if admissible:
+        chosen = _best(admissible, config)
+        return CaptureChoice(chosen, ball, others_of(chosen, lead_plans))
+
+    switch_plans = evaluate_switch_plans(context, config, balls)
+    admissible_switches = within_bound(switch_plans)
+    everything = lead_plans + switch_plans
+    if admissible_switches:
+        chosen = _best(admissible_switches, config)
+        return CaptureChoice(chosen, ball, others_of(chosen, everything))
+
+    # Nothing meets the bound: take the least risky plan, and say so.
+    chosen = min(
+        everything,
+        key=lambda plan: (
+            plan.active_faint_probability,
+            -plan.capture_probability,
+            plan.expected_balls,
+        ),
     )
-    return CaptureChoice(chosen, ball, others)
+    return CaptureChoice(chosen, ball, others_of(chosen, everything), risk_accepted=True)
 
 
 __all__ = [
     "CaptureChoice",
     "CaptureConfig",
     "CapturePlan",
+    "CaptureSolverResult",
     "choose_capture_plan",
     "evaluate_capture_plans",
+    "evaluate_switch_plans",
 ]
