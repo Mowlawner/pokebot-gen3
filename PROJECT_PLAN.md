@@ -22,6 +22,27 @@ recursive goal resolution, resource policy, and adaptive navigation work are
 valuable foundations, but they do not yet constitute a complete whole-game
 autonomous bot.
 
+## Status snapshot (2026-11-05)
+
+Live runs on branch `improved-leveling` now get from a fresh game through the
+opening, the starter, the intro rival on Route 103, the first captures on Routes 101
+to 104, Wally's tutorial, Route 104 past Cindy and Billy, the Petalburg Woods warp, and
+a Woods capture, and into trainer preparation for the Aqua Grunt. No live run has
+reached the grunt fight or the first badge. Since the last live run the following were
+implemented and unit-tested but not yet validated live: readiness that accepts a
+horizon projection with small unresolved mass, preparation that ends as soon as the
+party has a ready line, capture planner v2 (switching and the least-risky fallback),
+and an optional Species Clause duplicate cap.
+
+New design pieces: a battle-kind classifier and a dedicated bounded capture planner
+([battle-decision-architecture.md](docs/battle-decision-architecture.md)), and the
+Nuzlocke rule coverage review and optional-rule backlog
+([nuzlocke-rules-coverage.md](docs/nuzlocke-rules-coverage.md)).
+
+How to resume, what is validated, and the questions awaiting an owner decision are in
+[handoff-and-open-questions.md](docs/handoff-and-open-questions.md). The audit trail is
+in [campaign-progression-audit-followup.md](docs/campaign-progression-audit-followup.md).
+
 ## Definition of done
 
 Nuzbot is complete when, for each supported Gen 3 game:
@@ -176,6 +197,13 @@ otherwise defaults to fighting. It does not yet choose a legal party, prepare
 a boss-specific strategy, model uncertainty, conserve PP, or integrate
 opponent/team knowledge with campaign risk.
 
+Update (2026-11-05): wild captures now use a dedicated bounded planner (weaken with
+a damaging move, switch to a member who can take two hits, or throw; least risky plan
+when none is safe), and pre-battle readiness accepts a measured horizon projection.
+The largest open battle problem is that the generic search cannot finish when the
+party has bench members, so nearly every campaign turn spends its full 3 s budget; see
+[battle-decision-architecture.md](docs/battle-decision-architecture.md).
+
 Resource policy currently focuses primarily on HP, healing items, Pokémon
 Centers, and limited PC withdrawal. Autonomous progression also needs
 Poké Ball and item purchasing, money, PP, status cures, repels, key items,
@@ -218,6 +246,10 @@ preparation path but have not produced the authoritative
 fresh/fixture-backed run through the first badge and a ROM-backed process
 restart that resumes the same run without losing encounter, death, or history
 state.
+
+Update (2026-11-05): live runs now continue past Petalburg through Route 104 and the
+Petalburg Woods warp to the Aqua Grunt preparation; see the status snapshot above.
+The first-badge exit and the restart/resume demonstration remain open.
 
 ### P1 — Mount autonomous preparation and tactical battle control
 
@@ -586,6 +618,20 @@ than a Route 103 speed setting. A working audio device or a more precise
 fallback limiter is the appropriate performance follow-up.
 
 ## Immediate next actions
+
+Current (2026-11-05), in order; the reasoning and open questions are in
+[handoff-and-open-questions.md](docs/handoff-and-open-questions.md):
+
+1. Re-run a live diagnostic (with permission) to confirm the Woods preparation now ends
+   through `CAMPAIGN_PREPARATION_READY` and that the grunt fight happens.
+2. Prune or iteratively deepen the generic expectiminimax search so it finishes with
+   bench members.
+3. Add the narrow-model check before a trainer is promoted to must-fight (awaiting
+   owner approval).
+4. Add controller retry backoff and escalation for swallowed failures.
+5. Resolve the experience-spreading question with lead-selection evidence.
+
+Earlier items, still valid once the Woods grunt is passed:
 
 1. Drive the same clean profile through Devon Goods, Rustboro, and Roxanne;
    assert the authoritative `DEFEATED_RUSTBORO_GYM` flag and

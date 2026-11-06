@@ -6,6 +6,14 @@ This document records the campaign progression audit decisions, the current
 implementation status, and the remaining work. It replaces the earlier
 planning-only version now that implementation and live validation have begun.
 
+**Latest status (2026-11-05):** see the sections at the end of this document
+(the 2026-11-05 audit, the diagnostic-visibility correction, the preparation
+findings, and the live-run summary), and
+[handoff-and-open-questions.md](handoff-and-open-questions.md) for what to do
+next and the questions that need an owner decision. Earlier sections are
+historical; where they say a live rerun is "still required", the 2026-11-05 live
+runs have since covered Route 104 and the Petalburg Woods.
+
 ## Decisions and approvals
 
 The following directions are approved:
@@ -833,3 +841,25 @@ party has bench members. A Lv8 lead against a Lv9 trainer completes in 33 ms
 every campaign battle turn spends its full 3 s budget and returns
 `BEST_AVAILABLE`. It needs pruning or iterative deepening; it is the largest
 remaining battle-performance item.
+
+### Live-run summary (2026-11-05)
+
+Nine headless diagnostic runs from a fresh profile (`-m "Campaign Progression" -hl -nv
+-na -s 0 --no-save-state`, a new throwaway profile each). Run 1 used `--debug-trace`
+and is much slower; the rest did not. Numbers are the order the runs were made.
+
+| Run | What it showed | Cause and resolution |
+| --- | --- | --- |
+| 1 | Stalled on Route 103: 630 wild battles fled, no XP | The trainer-avoiding preparation goal was wrapped in a `NavigationGoal`, so no preparation target was published and wild battles got intent `avoid`. Fixed in `describe_preparation_target`. |
+| 2 | Reached the Woods and captured; then recovery from the Woods failed three times (10 s search budget) and the controller idled | Recovery search timeout, **cause not established**; did not recur in runs 4 to 9. The post-escalation idle is an open item. |
+| 3 | Same recovery failure, second reproduction | As run 2. |
+| 4 | Route 104 replan loop: the same route found 1,247 times, never executed | The final input gate counted a trainer's adjacent interaction tiles as hazards although the planner does not. Fixed in `_trainer_hazard_coordinates`. |
+| 5 | Woods trainer preparation failed silently and the run went quiet | The exception was logged only under `--debug-trace`, and `diagnostic_print` is silent without `--debug`. Fixed by `print_always`. |
+| 6 | Clean to the Woods; long quiet stretches | Background searches and a 3 s battle search per turn; not a stall. |
+| 7 | The hidden exception appeared: `preferred map route is currently unreachable` (100+ repeats) | The global trainer-avoiding map route plans the maps ahead from static data and called Route 104 unreachable. Fixed with the staged trainer-safe fallback. |
+| 8 | Fallback validated; 45 min of Woods training; lead reached only Lv8; never reached the grunt | Readiness could never become true (see the preparation findings); fixed afterwards, **not yet re-run**. |
+| 9 | Capture planner live: 5 capture battles, 8 planner decisions, first capture took 1 ball; one deferral to the generic search (a Taillow with a 9 HP lead) | As designed; the deferral led to the v2 least-risky and switching work. |
+
+Tools added during this work: `print_always`, the controller exception reporter and
+idle watchdog, `POKEBOT_DUMP_SLOW_SEARCH`, and `POKEBOT_STALL_DUMP` (see the
+handoff document).

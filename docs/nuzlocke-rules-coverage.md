@@ -44,7 +44,7 @@ Scope decisions from the project owner:
 | --- | --- | --- |
 | Set Mode Clause | **Gap** (config template documents it) | `set_battle_style`, optional |
 | Level Cap | Yes (Roxanne now; all gyms in P2) | `level_cap` |
-| Species/Dupes Clause | Was stale; corrected in the plan | `species_clause`, including evolutionary branches; no per-area duplicate cap |
+| Species/Dupes Clause | Yes (corrected in the plan) | `species_clause`, including evolutionary branches, with an optional per-area duplicate cap (`species_clause_max_duplicates_per_area`, default unlimited) |
 | Slow Start | Yes (activation boundary and pre-ball encounters) | Default boundary is Pokédex receipt |
 | Shiny Clause, Shiny Replacement | Listed as missing | No |
 | HM Helper | **Gap** | No |
