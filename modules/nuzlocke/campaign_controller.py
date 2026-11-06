@@ -689,6 +689,27 @@ class _ControllerIdleWatchdog:
         return None
 
 
+# A mounted capability that issues no input leaves the idle watchdog silent (it
+# only counts steps with nothing mounted).  This one counts steps in which a
+# capability is mounted but the phase, objective, goal, status, and the player's
+# map position are all unchanged.  About thirty seconds of game frames.
+_STALL_FIRST_REPORT_AFTER = 1800
+_STALL_REPEAT_EVERY = 7200
+_PLAYER_SAMPLE_EVERY = 60
+
+
+def _sample_player_location():
+    """Return ``(map, coordinates)`` or ``None`` when the avatar is not readable."""
+
+    try:
+        from modules.player import get_player_location
+
+        location = get_player_location()
+        return (str(location[0]), tuple(location[1]))
+    except Exception:  # an unreadable avatar is "unknown", never a controller failure
+        return None
+
+
 _CONTROLLER_EXCEPTIONS = _ControllerExceptionReporter()
 
 
@@ -4253,6 +4274,51 @@ class CampaignController:
         )
         return True
 
+    def _observe_mounted_stall(self, result) -> None:
+        """Report a mounted capability that makes no visible progress for a long time.
+
+        The idle watchdog only fires with nothing mounted.  A mounted capability
+        can also wait forever, for example on a goal whose search failed, and
+        until now that was completely silent.  This is a log record only; it
+        changes no behavior.
+        """
+
+        watchdog = getattr(self, "_stall_watchdog", None)
+        if watchdog is None:
+            watchdog = self._stall_watchdog = _ControllerIdleWatchdog(
+                first_report_after=_STALL_FIRST_REPORT_AFTER, repeat_every=_STALL_REPEAT_EVERY
+            )
+            self._player_sample = None
+            self._player_sample_age = _PLAYER_SAMPLE_EVERY
+        mounted = self._tactical_loop is not None
+        if mounted:
+            self._player_sample_age += 1
+            if self._player_sample_age >= _PLAYER_SAMPLE_EVERY:
+                self._player_sample_age = 0
+                self._player_sample = _sample_player_location()
+        stalled_steps = watchdog.observe(
+            (
+                self._execution_phase,
+                result.status.value,
+                self.transition_reason,
+                self.current_objective_id,
+                repr(self.current_tactical_goal),
+                self._player_sample,
+            ),
+            idle=mounted,
+        )
+        if stalled_steps is None:
+            return
+        print_always(
+            lambda: (
+                "CAMPAIGN_CONTROLLER_STALLED: a capability is mounted but nothing has changed "
+                f"for {stalled_steps} controller steps phase={self._execution_phase!r} "
+                f"status={result.status.value!r} objective={self.current_objective_id!r} "
+                f"goal={self.current_tactical_goal!r} player={self._player_sample!r} "
+                f"reason={self.transition_reason!r}"
+            ),
+        )
+
     def step(self) -> CampaignControllerState:
         """Advance one mounted capability and return its current status."""
 
@@ -4277,6 +4343,7 @@ class CampaignController:
             ),
             idle=self._tactical_loop is None,
         )
+        self._observe_mounted_stall(result)
         if idle_frames is not None:
             print_always(
                 lambda: (

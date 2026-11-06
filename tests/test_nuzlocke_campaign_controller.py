@@ -3543,3 +3543,83 @@ class ControllerDiagnosticsTests(unittest.TestCase):
         self.assertIsNone(watchdog.observe(state, idle=False))
         self.assertEqual([watchdog.observe(state, idle=True) for _ in range(3)], [None, None, 3])
         self.assertIsNone(watchdog.observe(("CAMPAIGN", "ready", "other", "obj"), idle=True))
+
+
+class MountedStallWatchdogTests(unittest.TestCase):
+    """A mounted capability that makes no visible progress must not be silent."""
+
+    @staticmethod
+    def _controller(*, mounted=True):
+        from types import SimpleNamespace
+        from modules.nuzlocke.campaign_controller import CampaignController
+
+        controller = CampaignController.__new__(CampaignController)
+        controller._tactical_loop = iter(()) if mounted else None
+        controller._execution_phase = "CAMPAIGN"
+        controller.transition_reason = "waiting"
+        controller.current_objective_id = "complete_petalburg_woods"
+        controller.current_tactical_goal = "ActivateTrigger('devon_goods_researcher')"
+        return controller, SimpleNamespace(status=SimpleNamespace(value="running"))
+
+    def _run(self, controller, result, steps, *, sample=lambda: ("woods", (16, 38))):
+        from modules.nuzlocke import campaign_controller as module
+
+        logs = []
+        with (
+            patch.object(module, "_STALL_FIRST_REPORT_AFTER", 5),
+            patch.object(module, "_STALL_REPEAT_EVERY", 10),
+            patch.object(module, "_PLAYER_SAMPLE_EVERY", 1),
+            patch.object(module, "_sample_player_location", side_effect=lambda: sample()),
+            patch.object(module, "print_always", side_effect=lambda message: logs.append(message())),
+        ):
+            for _ in range(steps):
+                controller._observe_mounted_stall(result)
+        return logs
+
+    def test_a_mounted_capability_with_no_change_is_reported_with_its_context(self):
+        controller, result = self._controller()
+
+        logs = self._run(controller, result, 5)
+
+        self.assertEqual(len(logs), 1)
+        self.assertIn("CAMPAIGN_CONTROLLER_STALLED", logs[0])
+        self.assertIn("complete_petalburg_woods", logs[0])
+        self.assertIn("devon_goods_researcher", logs[0])
+        self.assertIn("('woods', (16, 38))", logs[0])
+
+    def test_it_repeats_only_every_period(self):
+        controller, result = self._controller()
+
+        logs = self._run(controller, result, 16)
+
+        self.assertEqual(len(logs), 2)
+
+    def test_player_movement_is_progress(self):
+        controller, result = self._controller()
+        position = iter(range(1000))
+
+        logs = self._run(controller, result, 30, sample=lambda: ("woods", (next(position), 0)))
+
+        self.assertEqual(logs, [])
+
+    def test_nothing_is_reported_when_no_capability_is_mounted(self):
+        controller, result = self._controller(mounted=False)
+
+        self.assertEqual(self._run(controller, result, 30), [])
+
+    def test_an_unreadable_player_does_not_raise_and_still_reports(self):
+        from modules.nuzlocke import campaign_controller as module
+
+        controller, result = self._controller()
+        logs = []
+        with (
+            patch.object(module, "_STALL_FIRST_REPORT_AFTER", 3),
+            patch.object(module, "_PLAYER_SAMPLE_EVERY", 1),
+            patch("modules.player.get_player_location", side_effect=RuntimeError("no avatar")),
+            patch.object(module, "print_always", side_effect=lambda message: logs.append(message())),
+        ):
+            for _ in range(3):
+                controller._observe_mounted_stall(result)
+
+        self.assertEqual(len(logs), 1)
+        self.assertIn("player=None", logs[0])
