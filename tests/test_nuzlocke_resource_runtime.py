@@ -58,10 +58,33 @@ class CampaignCapabilityTests(unittest.TestCase):
     def _stage_candidate(*trainer_ids, status="found"):
         return SimpleNamespace(status=status, trainer_ids=tuple(trainer_ids))
 
+    @staticmethod
+    def _trainer_object(trainer_id, **changes):
+        values = dict(
+            trainer_id=trainer_id,
+            local_id=1,
+            location=((0, 19), (5, 5)),
+            trainer_type="Normal",
+            trainer_range=3,
+            facing="Up",
+            movement_type="FACE_UP_AND_RIGHT",
+            movement_range=(0, 0),
+            movement_origin=((0, 19), (5, 5)),
+            trainer_defeated=False,
+        )
+        values.update(changes)
+        return SimpleNamespace(**values)
+
+    def _exact_overworld(self, *trainer_ids, **changes):
+        return SimpleNamespace(
+            objects=tuple(self._trainer_object(trainer_id, **changes) for trainer_id in trainer_ids),
+            triggers=(),
+        )
+
     def test_route_cut_promotes_trainers_common_to_all_permissive_exits(self):
         from modules.nuzlocke import resource_runtime as runtime
 
-        overworld = SimpleNamespace(objects=(), triggers=())
+        overworld = self._exact_overworld("trainer:cindy", "trainer:billy")
         candidates = (
             self._stage_candidate("trainer:cindy", "trainer:billy"),
             self._stage_candidate("trainer:cindy", "trainer:billy"),
@@ -79,6 +102,75 @@ class CampaignCapabilityTests(unittest.TestCase):
             )
 
         self.assertEqual(known, ("trainer:billy", "trainer:cindy"))
+        self.assertEqual(unresolved, ())
+
+    def _route_cut(self, overworld, *trainer_ids):
+        from modules.nuzlocke import resource_runtime as runtime
+
+        candidates = (self._stage_candidate(*trainer_ids), self._stage_candidate(*trainer_ids))
+        with patch.object(
+            runtime,
+            "trainer_checkpoint_for_source",
+            side_effect=lambda trainer_id, **_: SimpleNamespace(trainer_affordance_id=trainer_id),
+        ):
+            return _encounter_stage_route_cut_hazards(
+                overworld, safe_candidates=(), permissive_candidates=candidates
+            )
+
+    def test_route_cut_does_not_promote_a_trainer_whose_facing_is_a_guess(self):
+        # No FACE_* template and no readable facing: the hazard area is all four
+        # directions, so a failed search proves nothing about this trainer.
+        overworld = self._exact_overworld("trainer:billy", movement_type="NONE", facing=None)
+
+        known, unresolved = self._route_cut(overworld, "trainer:billy")
+
+        self.assertEqual(known, ())
+        self.assertEqual(unresolved, ("trainer:billy",))
+
+    def test_route_cut_does_not_promote_a_fixed_axis_walker_with_an_over_covered_hazard(self):
+        overworld = self._exact_overworld("trainer:walker", movement_type="WALK_UP_AND_DOWN")
+
+        known, unresolved = self._route_cut(overworld, "trainer:walker")
+
+        self.assertEqual(known, ())
+        self.assertEqual(unresolved, ("trainer:walker",))
+
+    def test_route_cut_promotes_a_walk_sequence_trainer_with_exact_geometry(self):
+        overworld = self._exact_overworld(
+            "trainer:billy", movement_type="WALK_SEQUENCE_DOWN_RIGHT_UP_LEFT", movement_range=(6, 5)
+        )
+
+        known, unresolved = self._route_cut(overworld, "trainer:billy")
+
+        self.assertEqual(known, ("trainer:billy",))
+        self.assertEqual(unresolved, ())
+
+    def test_route_cut_does_not_promote_a_trainer_with_no_observed_geometry(self):
+        known, unresolved = self._route_cut(SimpleNamespace(objects=(), triggers=()), "trainer:ghost")
+
+        self.assertEqual(known, ())
+        self.assertEqual(unresolved, ("trainer:ghost",))
+
+    def test_route_cut_keeps_only_the_exact_trainer_when_the_cut_is_mixed(self):
+        overworld = SimpleNamespace(
+            objects=(
+                self._trainer_object("trainer:cindy"),
+                self._trainer_object("trainer:blind", movement_type="NONE", facing=None),
+            ),
+            triggers=(),
+        )
+
+        known, unresolved = self._route_cut(overworld, "trainer:cindy", "trainer:blind")
+
+        self.assertEqual(known, ("trainer:cindy",))
+        self.assertEqual(unresolved, ("trainer:blind",))
+
+    def test_route_cut_promotes_a_trainer_whose_live_facing_is_known(self):
+        overworld = self._exact_overworld("trainer:sam", movement_type="NONE", facing="Down")
+
+        known, unresolved = self._route_cut(overworld, "trainer:sam")
+
+        self.assertEqual(known, ("trainer:sam",))
         self.assertEqual(unresolved, ())
 
     def test_encounter_stage_prefers_fewer_grass_opportunities_before_route_cost(self):
@@ -113,7 +205,7 @@ class CampaignCapabilityTests(unittest.TestCase):
     def test_route_cut_does_not_promote_a_trainer_present_on_one_exit(self):
         from modules.nuzlocke import resource_runtime as runtime
 
-        overworld = SimpleNamespace(objects=(), triggers=())
+        overworld = self._exact_overworld("trainer:cindy", "trainer:billy")
         candidates = (
             self._stage_candidate("trainer:cindy", "trainer:billy"),
             self._stage_candidate("trainer:billy"),
@@ -154,7 +246,11 @@ class CampaignCapabilityTests(unittest.TestCase):
     def test_route_cut_known_checkpoint_enters_mandatory_hazards(self):
         from modules.nuzlocke import resource_runtime as runtime
 
-        overworld = SimpleNamespace(map_id=(0, 19), triggers=(), objects=())
+        overworld = SimpleNamespace(
+            map_id=(0, 19),
+            triggers=(),
+            objects=(self._trainer_object("trainer:cindy"),),
+        )
         candidates = (
             self._stage_candidate("trainer:cindy"),
             self._stage_candidate("trainer:cindy"),
@@ -189,7 +285,11 @@ class CampaignCapabilityTests(unittest.TestCase):
             patch.object(runtime, "trainer_checkpoint_for_source", return_value=checkpoint),
         ):
             evidence = runtime._publish_encounter_stage_evidence(
-                SimpleNamespace(map_id=(0, 19), triggers=(), objects=()),
+                SimpleNamespace(
+                    map_id=(0, 19),
+                    triggers=(),
+                    objects=(self._trainer_object("trainer:cindy"),),
+                ),
                 (24, 11),
                 SimpleNamespace(signature=("safe",), shared_search=False),
                 SimpleNamespace(signature=("permissive",), shared_search=False),

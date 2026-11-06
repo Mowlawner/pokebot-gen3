@@ -766,3 +766,18 @@ class TestOverworldPerception(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TrainerHazardGeometryExactnessTests(unittest.TestCase):
+    def test_exact_and_guessed_geometry(self):
+        from modules.overworld import trainer_hazard_geometry_is_exact as exact
+
+        self.assertTrue(exact("Normal", "FACE_UP_AND_RIGHT", None))
+        self.assertTrue(exact("Normal", "WALK_SEQUENCE_DOWN_RIGHT_UP_LEFT", None))
+        self.assertTrue(exact("Normal", "NONE", "Down"))
+        self.assertTrue(exact("Normal", "WANDER_AROUND", None))
+        self.assertTrue(exact("See All Directions", "NONE", None))
+        self.assertFalse(exact("Normal", "NONE", None))
+        self.assertFalse(exact("Normal", "NONE", "sideways"))
+        self.assertFalse(exact("Normal", "WALK_UP_AND_DOWN", "Up"))
+        self.assertFalse(exact(None, "FACE_UP", "Up"))

@@ -456,6 +456,51 @@ def _movement_type_facing_directions(movement_type: str) -> tuple[Direction, ...
     )
 
 
+_APPROXIMATED_WALK_MOVEMENT_TYPES = frozenset(
+    {
+        "WALK_UP_AND_DOWN",
+        "WALK_DOWN_AND_UP",
+        "WALK_LEFT_AND_RIGHT",
+        "WALK_RIGHT_AND_LEFT",
+    }
+)
+
+
+def trainer_hazard_geometry_is_exact(trainer_type, movement_type, facing) -> bool:
+    """Say whether a trainer's hazard area is ROM-derived or partly a guess.
+
+    ``trainer_hazard_locations`` falls back to all four sight directions when
+    neither the ROM movement template nor the live facing identifies one, and it
+    also over-covers fixed-axis walkers.  Those areas are deliberately cautious,
+    but a route blocked only by such an area is not proof that the trainer
+    cannot be avoided.  Everything else (a facing envelope from a ``FACE_*``
+    template, a known live facing, a walk sequence with per-segment facing,
+    wanderers and rotators, and trainers that see all directions) is exact.
+    """
+
+    if trainer_type == "See All Directions":
+        return True
+    if trainer_type != "Normal":
+        return False
+    movement_type = str(movement_type or "")
+    if movement_type.startswith("WALK_SEQUENCE_"):
+        return True
+    if movement_type in _APPROXIMATED_WALK_MOVEMENT_TYPES:
+        return False
+    if movement_type.startswith(("WANDER_", "WALK_")) or movement_type in {
+        "ROTATE_CLOCKWISE",
+        "ROTATE_COUNTERCLOCKWISE",
+    }:
+        return True
+    if _movement_type_facing_directions(movement_type):
+        return True
+    try:
+        Direction.from_string(facing) if not isinstance(facing, Direction) else facing
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+    return True
+
+
 def _trainer_hazard_locations_for_centers(
     trainer: ObjectObservation,
     tiles: tuple["TileObservation", ...] | list["TileObservation"],

@@ -60,6 +60,7 @@ from modules.overworld import (
     prewarm_static_map_observation,
     static_map_transitions,
     static_trainer_observations,
+    trainer_hazard_geometry_is_exact,
     WorldTransition,
 )
 from modules.world_navigation import WorldRoute, get_world_map_graph, route_with_edge_filter
@@ -975,6 +976,12 @@ def _encounter_stage_route_cut_hazards(
     intersection of all usable IGNORE exits is a route cut for this stage.
     Source resolution is kept here so an unresolved common trainer remains an
     explicit unknown instead of becoming an invented mandatory checkpoint.
+
+    A failed AVOID search is proof of a route cut only when every hazard that
+    could have blocked it is exact.  A trainer whose hazard area is partly a
+    guess (unknown facing, over-covered walker) or whose geometry is not
+    observed at all stays unresolved, so a pessimistic model cannot promote an
+    avoidable trainer into a mandatory fight.
     """
 
     evidence = getattr(context, "campaign_encounter_stage", None)
@@ -1006,12 +1013,21 @@ def _encounter_stage_route_cut_hazards(
     common.discard(None)
     known = []
     unresolved = []
+    exact_geometry = {
+        record.trainer_id: trainer_hazard_geometry_is_exact(
+            record.trainer_type, record.movement_type, record.facing
+        )
+        for record in (_encounter_stage_trainer_evidence(overworld) if common else ())
+    }
     for trainer_id in sorted(common, key=repr):
         checkpoint = trainer_checkpoint_for_source(
             trainer_id,
             script_symbol=_encounter_stage_trainer_script(overworld, trainer_id),
         )
-        (known if checkpoint is not None else unresolved).append(trainer_id)
+        if checkpoint is not None and exact_geometry.get(trainer_id, False):
+            known.append(trainer_id)
+        else:
+            unresolved.append(trainer_id)
     return tuple(known), tuple(unresolved)
 
 
