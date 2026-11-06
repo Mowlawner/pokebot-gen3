@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from modules.battle_capture_planner import (
     CaptureConfig,
     choose_capture_plan,
+    describe_switch_candidates,
     evaluate_capture_plans,
 )
 from modules.battle_planner import (
@@ -476,3 +477,53 @@ class CaptureFleeTests(unittest.TestCase):
         )
 
         self.assertIsNot(decision.action, PlannerAction.RunAway)
+
+
+class SwitchCandidateDescriptionTests(unittest.TestCase):
+    """The rationale must show what the switch rule saw, not only what it chose."""
+
+    def test_no_bench_members(self):
+        self.assertEqual(describe_switch_candidates(fragile_context(switches=())), ("no bench members",))
+
+    def test_switching_not_legal(self):
+        lines = describe_switch_candidates(fragile_context(can_switch=False))
+
+        self.assertEqual(lines, ("switching is not legal now",))
+
+    def test_a_member_below_the_two_hit_threshold_is_rejected_with_the_numbers(self):
+        # The worst single attack is a 14 damage critical, so two need > 28 HP.
+        (line,) = describe_switch_candidates(fragile_context(switches=(switch_candidate(hp=22),)))
+
+        self.assertIn("Sturdy (slot 1) HP 22", line)
+        self.assertIn("rejected", line)
+        self.assertIn("HP > 28", line)
+        self.assertIn("worst hit 14", line)
+
+    def test_a_sturdy_member_is_reported_eligible(self):
+        (line,) = describe_switch_candidates(fragile_context(switches=(switch_candidate(hp=60),)))
+
+        self.assertIn("eligible", line)
+
+    def test_a_member_just_switched_out_is_named(self):
+        (line,) = describe_switch_candidates(fragile_context(switch_history=(1,)))
+
+        self.assertIn("just switched out", line)
+
+    def test_the_active_member_is_not_listed(self):
+        context = fragile_context(switches=(switch_candidate(party_index=0, name="Lead"),), active_party_index=0)
+
+        self.assertEqual(describe_switch_candidates(context), ("no bench members",))
+
+    def test_the_bench_appears_in_the_flee_and_the_chosen_plan_rationale(self):
+        flee = BattlePlanner().plan(
+            fragile_context(
+                switches=(switch_candidate(hp=22),),
+                can_run=True,
+                escape_confidence=PlannerConfidence.HIGH,
+            )
+        )
+        chosen = BattlePlanner().plan(capture_context(can_switch=True, switches=(switch_candidate(hp=60),)))
+
+        self.assertIs(flee.action, PlannerAction.RunAway)
+        self.assertIn("Bench: Sturdy (slot 1) HP 22: rejected", flee.rationale)
+        self.assertIn("Bench: Sturdy (slot 1) HP 60: eligible", chosen.rationale)

@@ -378,6 +378,41 @@ def _eligible_switches(context: Any, config: CaptureConfig) -> list[Any]:
     ]
 
 
+def describe_switch_candidates(context: Any, config: CaptureConfig = CaptureConfig()) -> tuple[str, ...]:
+    """One line per bench member saying why it can or cannot be switched to.
+
+    The decision rationale uses this so a log shows what the switch rule saw
+    (HP against the worst-case hit) and not only the plan that was chosen.
+    """
+
+    members = [
+        candidate
+        for candidate in getattr(context, "switches", ())
+        if getattr(candidate, "party_index", None) != getattr(context, "active_party_index", None)
+    ]
+    if not members:
+        return ("no bench members",)
+    if not getattr(context, "can_switch", False):
+        return ("switching is not legal now",)
+    if int(getattr(context, "switch_streak", 0) or 0) > 0:
+        return ("a switch already happened in this stretch of battle",)
+    ceiling = _worst_case_hit(context, config)
+    recent = set(getattr(context, "switch_history", ()) or ())
+    lines = []
+    for candidate in members:
+        hp = int(getattr(candidate, "hp", 0) or 0)
+        label = f"{getattr(candidate, 'name', '?')} (slot {getattr(candidate, 'party_index', '?')}) HP {hp}"
+        if getattr(candidate, "party_index", None) in recent:
+            lines.append(f"{label}: rejected, was just switched out")
+        elif hp > 2 * ceiling:
+            lines.append(f"{label}: eligible, survives two worst-case hits (worst hit {ceiling})")
+        else:
+            lines.append(
+                f"{label}: rejected, needs HP > {2 * ceiling} to survive two worst-case hits (worst hit {ceiling})"
+            )
+    return tuple(lines)
+
+
 def evaluate_switch_plans(context: Any, config: CaptureConfig, balls: list[Any]) -> list[CapturePlan]:
     """Plans that begin by switching: the incoming Pokémon takes one opponent action first."""
 
@@ -476,5 +511,6 @@ __all__ = [
     "CaptureSolverResult",
     "choose_capture_plan",
     "evaluate_capture_plans",
+    "describe_switch_candidates",
     "evaluate_switch_plans",
 ]

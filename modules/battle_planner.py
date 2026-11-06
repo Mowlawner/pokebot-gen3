@@ -1128,7 +1128,7 @@ class BattlePlanner:
     def _capture_decision(self, context: PlannerContext) -> PlannerDecision | None:
         """Decide a wild capture with the dedicated solver, or return ``None``."""
 
-        from modules.battle_capture_planner import choose_capture_plan
+        from modules.battle_capture_planner import choose_capture_plan, describe_switch_candidates
 
         try:
             choice = choose_capture_plan(context)
@@ -1137,6 +1137,10 @@ class BattlePlanner:
         if choice is None:
             return None
         plan = choice.plan
+        try:
+            bench = "Bench: " + "; ".join(describe_switch_candidates(context)) + ". "
+        except (AttributeError, IndexError, KeyError, RuntimeError, TypeError, ValueError, ZeroDivisionError):
+            bench = ""
         if choice.risk_accepted and context.can_run and context.escape_confidence in (
             PlannerConfidence.HIGH,
             PlannerConfidence.MEDIUM,
@@ -1152,7 +1156,7 @@ class BattlePlanner:
                 context.escape_confidence,
                 "capture planner: no plan, including switching, keeps the active Pokemon within the "
                 f"faint bound (least risky was {plan.summary()} at "
-                f"{plan.active_faint_probability:.1%} faint risk), so the encounter is abandoned.",
+                f"{plan.active_faint_probability:.1%} faint risk), so the encounter is abandoned. {bench}".rstrip(),
                 PlannerSafety.SAFE,
                 (
                     PlannerEvidence(
@@ -1173,6 +1177,7 @@ class BattlePlanner:
                 if choice.risk_accepted
                 else ""
             )
+            + bench
             + "Alternatives: "
             + (" | ".join(alternative.summary() for alternative in choice.alternatives) or "none")
         )
