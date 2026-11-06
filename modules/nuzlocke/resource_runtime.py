@@ -1,6 +1,6 @@
 """Runtime adapters for the pure campaign resource policy."""
 
-from collections import deque, OrderedDict
+from collections import Counter, deque, OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -1912,6 +1912,64 @@ def _mandatory_trainer_hazard_state(overworld, training_map):
     return None
 
 
+_last_preparation_no_line_signature: tuple | None = None
+
+
+def _describe_preparation_failure(
+    *,
+    allow_wild: bool,
+    grass_candidates: int,
+    grass_reachable: int | None,
+    grass_rejections: Counter,
+    trainers_observed: int,
+    trainers_without_checkpoint: tuple[str, ...],
+    evaluations,
+    level_cap,
+    target_level,
+) -> str:
+    """Explain, stage by stage, why preparation found nothing to train on.
+
+    Grass training and trainer clearing are tried in that order; a bare "no
+    safe line" hides which stage failed and why.  This names each stage, and
+    for every trainer the roster-versus-party numbers and the rejection reason.
+    """
+
+    if not allow_wild:
+        grass = "grass: not used, the first encounter of this area is already resolved"
+    elif grass_candidates == 0:
+        grass = "grass: no encounter tiles known on this map"
+    else:
+        rejected = ", ".join(f"{reason}={count}" for reason, count in sorted(grass_rejections.items())) or "none"
+        reachable = "unknown" if grass_reachable is None else str(grass_reachable)
+        grass = f"grass: {grass_candidates} tiles, {reachable} reachable, rejected [{rejected}]"
+    if trainers_observed == 0:
+        trainers = "trainers: no undefeated trainer observed on this map"
+    else:
+        parts = []
+        for item in evaluations:
+            numbers = (
+                f"win={item.win_probability:.0%} catastrophic={item.catastrophic_probability:.0%} "
+                f"exp={item.projected_exp} headroom={item.recipient_headroom} cap_safe={item.cap_safe}"
+            )
+            verdict = "selected" if item.selected else f"rejected: {item.rejection_reason or 'unspecified'}"
+            parts.append(f"{item.source.trainer_id} ({numbers}) {verdict}")
+        if trainers_without_checkpoint:
+            parts.append(f"no ROM checkpoint, not evaluated: {', '.join(trainers_without_checkpoint)}")
+        trainers = f"trainers: {trainers_observed} observed; " + "; ".join(parts)
+    return f"{grass}; {trainers}; target_level={target_level} level_cap={level_cap}"
+
+
+def _report_preparation_no_line(map_id, diagnosis: str) -> None:
+    """Write the failure explanation to the normal log, once per distinct explanation."""
+
+    global _last_preparation_no_line_signature
+    signature = (map_id, diagnosis)
+    if signature == _last_preparation_no_line_signature:
+        return
+    _last_preparation_no_line_signature = signature
+    print_always(lambda: f"CAMPAIGN_PREPARATION_NO_LINE: map={map_id!r} {diagnosis}")
+
+
 def _preparation_navigation_goal(
     overworld,
     training_map,
@@ -1964,9 +2022,12 @@ def _preparation_navigation_goal(
             position[1],
         ),
     )
+    grass_rejections: Counter = Counter()
+    grass_reachable: int | None = None
     if allow_wild:
         reachable_positions = _reachable_local_positions(world, start, training_map)
         if reachable_positions is not None:
+            grass_reachable = sum(coordinates in reachable_positions for coordinates in candidates)
             for coordinates in candidates:
                 if coordinates not in reachable_positions:
                     continue
@@ -2002,6 +2063,7 @@ def _preparation_navigation_goal(
                     ValueError,
                 ) as error:
                     last_error = error
+                    grass_rejections["trainer_safe_route_unavailable"] += 1
                     diagnostic_print(
                         lambda: (
                             "CAMPAIGN_PREPARATION_CANDIDATE_REJECTED: "
@@ -2012,6 +2074,7 @@ def _preparation_navigation_goal(
                     )
                     continue
                 if getattr(planned, "forced_trainer_exposure", False):
+                    grass_rejections["forced_trainer_exposure"] += 1
                     last_error = NavigationError("trainer-safe route required trainer exposure")
                     diagnostic_print(
                         lambda: (
@@ -2053,6 +2116,7 @@ def _preparation_navigation_goal(
                     ValueError,
                 ) as error:
                     last_error = error
+                    grass_rejections[type(error).__name__] += 1
                     diagnostic_print(
                         lambda: (
                             "CAMPAIGN_PREPARATION_CANDIDATE_REJECTED: "
@@ -2168,6 +2232,8 @@ def _preparation_navigation_goal(
             )
         )
 
+    evaluations = ()
+    level_cap = None
     if catalog_sources:
         level_cap = _active_preparation_level_cap_for_runtime()
         party = get_party()
@@ -2207,7 +2273,24 @@ def _preparation_navigation_goal(
                 prefix="CAMPAIGN_TRAINER_SOURCE_EVALUATION",
             )
             if selected is None:
-                return None, RuntimeError("no available trainer has a proven safe, cap-compatible preparation line")
+                evaluated_ids = {item.source.trainer_id for item in evaluations}
+                diagnosis = _describe_preparation_failure(
+                    allow_wild=allow_wild,
+                    grass_candidates=len(candidates),
+                    grass_reachable=grass_reachable,
+                    grass_rejections=grass_rejections,
+                    trainers_observed=len(trainers),
+                    trainers_without_checkpoint=tuple(
+                        trainer_id for trainer_id, _positions in trainers if trainer_id not in evaluated_ids
+                    ),
+                    evaluations=evaluations,
+                    level_cap=level_cap,
+                    target_level=target_level,
+                )
+                _report_preparation_no_line(training_map, diagnosis)
+                return None, RuntimeError(
+                    f"no available trainer has a proven safe, cap-compatible preparation line ({diagnosis})"
+                )
             selected_trainer_ids = [selected.source.trainer_id]
         elif catalog_sources:
             diagnostic_print(
@@ -2290,6 +2373,23 @@ def _preparation_navigation_goal(
             context.campaign_trainer_readiness = None
         return trainer_goal, None
 
+    evaluated_ids = {item.source.trainer_id for item in evaluations}
+    diagnosis = _describe_preparation_failure(
+        allow_wild=allow_wild,
+        grass_candidates=len(candidates),
+        grass_reachable=grass_reachable,
+        grass_rejections=grass_rejections,
+        trainers_observed=len(trainers),
+        trainers_without_checkpoint=tuple(
+            trainer_id for trainer_id, _positions in trainers if trainer_id not in evaluated_ids
+        ),
+        evaluations=evaluations,
+        level_cap=level_cap,
+        target_level=target_level,
+    )
+    _report_preparation_no_line(training_map, diagnosis)
+    if last_error is None:
+        last_error = RuntimeError(f"no preparation line ({diagnosis})")
     return None, last_error
 
 

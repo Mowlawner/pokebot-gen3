@@ -3321,3 +3321,106 @@ class TrainerCheckpointReadyCheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreparationFailureExplanationTests(unittest.TestCase):
+    """A failed preparation must say which stage failed and why."""
+
+    @staticmethod
+    def _evaluation(trainer_id, *, selected=False, reason="win probability below threshold"):
+        return SimpleNamespace(
+            source=SimpleNamespace(trainer_id=trainer_id),
+            win_probability=0.5,
+            catastrophic_probability=0.2,
+            projected_exp=120,
+            recipient_headroom=3,
+            cap_safe=False,
+            selected=selected,
+            rejection_reason=None if selected else reason,
+        )
+
+    def _describe(self, **changes):
+        from collections import Counter
+        from modules.nuzlocke.resource_runtime import _describe_preparation_failure
+
+        values = dict(
+            allow_wild=True,
+            grass_candidates=12,
+            grass_reachable=7,
+            grass_rejections=Counter(trainer_safe_route_unavailable=7),
+            trainers_observed=2,
+            trainers_without_checkpoint=(),
+            evaluations=(self._evaluation("trainer:A"),),
+            level_cap=15,
+            target_level=10,
+        )
+        values.update(changes)
+        return _describe_preparation_failure(**values)
+
+    def test_grass_stage_names_the_counts_and_rejection_reasons(self):
+        text = self._describe()
+
+        self.assertIn("grass: 12 tiles, 7 reachable, rejected [trainer_safe_route_unavailable=7]", text)
+        self.assertIn("target_level=10 level_cap=15", text)
+
+    def test_grass_stage_says_when_the_area_encounter_disables_wild_training(self):
+        text = self._describe(allow_wild=False)
+
+        self.assertIn("grass: not used, the first encounter of this area is already resolved", text)
+
+    def test_grass_stage_says_when_no_tiles_are_known(self):
+        self.assertIn("no encounter tiles known", self._describe(grass_candidates=0))
+
+    def test_each_trainer_reports_its_numbers_and_rejection_reason(self):
+        text = self._describe(
+            evaluations=(
+                self._evaluation("trainer:A", reason="catastrophic probability above limit"),
+                self._evaluation("trainer:B", reason="no recipient has cap headroom"),
+            ),
+            trainers_without_checkpoint=("trainer:C",),
+            trainers_observed=3,
+        )
+
+        self.assertIn("trainer:A (win=50% catastrophic=20% exp=120 headroom=3 cap_safe=False)", text)
+        self.assertIn("rejected: catastrophic probability above limit", text)
+        self.assertIn("rejected: no recipient has cap headroom", text)
+        self.assertIn("no ROM checkpoint, not evaluated: trainer:C", text)
+
+    def test_no_observed_trainer_is_stated(self):
+        text = self._describe(trainers_observed=0, evaluations=())
+
+        self.assertIn("no undefeated trainer observed on this map", text)
+
+    def test_the_explanation_is_logged_once_per_distinct_text(self):
+        from modules.nuzlocke import resource_runtime as runtime
+
+        runtime._last_preparation_no_line_signature = None
+        with patch.object(runtime, "print_always") as printed:
+            runtime._report_preparation_no_line((0, 19), "same")
+            runtime._report_preparation_no_line((0, 19), "same")
+            runtime._report_preparation_no_line((0, 19), "different")
+
+        self.assertEqual(printed.call_count, 2)
+
+    def test_a_resolved_area_with_no_trainers_explains_itself_instead_of_returning_none(self):
+        from modules.nuzlocke import resource_runtime as runtime
+
+        map_id = MapRSE.PETALBURG_WOODS.value
+        overworld = SimpleNamespace(
+            map_id=map_id,
+            player_coordinates=(7, 35),
+            objects=(),
+            triggers=(),
+        )
+        runtime._last_preparation_no_line_signature = None
+        with (
+            patch.object(runtime.NavigationWorld, "from_overworld", return_value=object()),
+            patch.object(runtime, "print_always") as printed,
+        ):
+            goal, error = _preparation_navigation_goal(overworld, map_id, ((18, 38),), allow_wild=False)
+
+        self.assertIsNone(goal)
+        self.assertIn("first encounter of this area is already resolved", str(error))
+        self.assertIn("no undefeated trainer observed", str(error))
+        printed.assert_called_once()
+        self.assertIn("CAMPAIGN_PREPARATION_NO_LINE", printed.call_args.args[0]())
