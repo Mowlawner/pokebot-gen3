@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Callable, Generator, Iterator, Any
 import json
 import traceback
+from time import monotonic
 from functools import lru_cache
 
 from modules.agent_control import AgentControlLoop, observe_agent
@@ -690,12 +691,44 @@ class _ControllerIdleWatchdog:
 
 
 # A mounted capability that issues no input leaves the idle watchdog silent (it
-# only counts steps with nothing mounted).  This one counts steps in which a
-# capability is mounted but the phase, objective, goal, status, and the player's
-# map position are all unchanged.  About thirty seconds of game frames.
-_STALL_FIRST_REPORT_AFTER = 1800
-_STALL_REPEAT_EVERY = 7200
+# only counts steps with nothing mounted).  This one watches real elapsed time
+# while a capability is mounted but the phase, objective, goal, status, and the
+# player's map position are all unchanged.  It is wall-clock time, not frames: an
+# unthrottled emulator runs thousands of frames per second, and a long intro,
+# menu, or cutscene legitimately leaves the position unchanged for a while.
+_STALL_FIRST_REPORT_AFTER_SECONDS = 180.0
+_STALL_REPEAT_EVERY_SECONDS = 600.0
 _PLAYER_SAMPLE_EVERY = 60
+
+
+class _ProgressWatchdog:
+    """Report when a signature has not changed for a long stretch of real time."""
+
+    def __init__(self, *, first_report_after: float, repeat_every: float, clock=monotonic) -> None:
+        self._first = first_report_after
+        self._repeat = repeat_every
+        self._clock = clock
+        self._signature: object = None
+        self._since: float | None = None
+        self._next_report = 0.0
+
+    def observe(self, signature: object, *, active: bool) -> float | None:
+        """Return the seconds without change when it should be reported, else None."""
+
+        if not active:
+            self._signature = None
+            self._since = None
+            return None
+        now = self._clock()
+        if self._since is None or signature != self._signature:
+            self._signature = signature
+            self._since = now
+            self._next_report = now + self._first
+            return None
+        if now < self._next_report:
+            return None
+        self._next_report = now + self._repeat
+        return now - self._since
 
 
 def _sample_player_location():
@@ -4285,8 +4318,9 @@ class CampaignController:
 
         watchdog = getattr(self, "_stall_watchdog", None)
         if watchdog is None:
-            watchdog = self._stall_watchdog = _ControllerIdleWatchdog(
-                first_report_after=_STALL_FIRST_REPORT_AFTER, repeat_every=_STALL_REPEAT_EVERY
+            watchdog = self._stall_watchdog = _ProgressWatchdog(
+                first_report_after=_STALL_FIRST_REPORT_AFTER_SECONDS,
+                repeat_every=_STALL_REPEAT_EVERY_SECONDS,
             )
             self._player_sample = None
             self._player_sample_age = _PLAYER_SAMPLE_EVERY
@@ -4296,7 +4330,7 @@ class CampaignController:
             if self._player_sample_age >= _PLAYER_SAMPLE_EVERY:
                 self._player_sample_age = 0
                 self._player_sample = _sample_player_location()
-        stalled_steps = watchdog.observe(
+        stalled_seconds = watchdog.observe(
             (
                 self._execution_phase,
                 result.status.value,
@@ -4305,14 +4339,14 @@ class CampaignController:
                 repr(self.current_tactical_goal),
                 self._player_sample,
             ),
-            idle=mounted,
+            active=mounted,
         )
-        if stalled_steps is None:
+        if stalled_seconds is None:
             return
         print_always(
             lambda: (
                 "CAMPAIGN_CONTROLLER_STALLED: a capability is mounted but nothing has changed "
-                f"for {stalled_steps} controller steps phase={self._execution_phase!r} "
+                f"for {stalled_seconds:.0f} seconds phase={self._execution_phase!r} "
                 f"status={result.status.value!r} objective={self.current_objective_id!r} "
                 f"goal={self.current_tactical_goal!r} player={self._player_sample!r} "
                 f"reason={self.transition_reason!r}"

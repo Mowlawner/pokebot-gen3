@@ -3545,13 +3545,71 @@ class ControllerDiagnosticsTests(unittest.TestCase):
         self.assertIsNone(watchdog.observe(("CAMPAIGN", "ready", "other", "obj"), idle=True))
 
 
+class FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+class ProgressWatchdogTests(unittest.TestCase):
+    def _watchdog(self, clock):
+        from modules.nuzlocke.campaign_controller import _ProgressWatchdog
+
+        return _ProgressWatchdog(first_report_after=5.0, repeat_every=10.0, clock=clock)
+
+    def test_reports_after_the_window_and_then_only_every_period(self):
+        clock = FakeClock()
+        watchdog = self._watchdog(clock)
+        seen = []
+        for _ in range(40):
+            seen.append(watchdog.observe("same", active=True))
+            clock.now += 1.0
+
+        reported = [(index, value) for index, value in enumerate(seen) if value is not None]
+        self.assertEqual([index for index, _ in reported], [5, 15, 25, 35])
+        self.assertEqual(reported[0][1], 5.0)
+
+    def test_a_changed_signature_restarts_the_window(self):
+        clock = FakeClock()
+        watchdog = self._watchdog(clock)
+        watchdog.observe("a", active=True)
+        clock.now += 4.0
+        self.assertIsNone(watchdog.observe("b", active=True))
+        clock.now += 4.0
+        self.assertIsNone(watchdog.observe("b", active=True))
+        clock.now += 2.0
+        self.assertIsNotNone(watchdog.observe("b", active=True))
+
+    def test_inactive_resets_and_never_reports(self):
+        clock = FakeClock()
+        watchdog = self._watchdog(clock)
+        watchdog.observe("a", active=True)
+        clock.now += 100.0
+        self.assertIsNone(watchdog.observe("a", active=False))
+        self.assertIsNone(watchdog.observe("a", active=True))
+
+    def test_many_steps_in_almost_no_real_time_do_not_report(self):
+        # An unthrottled emulator runs thousands of frames a second; the intro and
+        # menus legitimately leave the position unchanged for that many steps.
+        clock = FakeClock()
+        watchdog = self._watchdog(clock)
+        results = []
+        for _ in range(5000):
+            results.append(watchdog.observe("intro", active=True))
+            clock.now += 0.0001
+
+        self.assertEqual([item for item in results if item is not None], [])
+
+
 class MountedStallWatchdogTests(unittest.TestCase):
     """A mounted capability that makes no visible progress must not be silent."""
 
     @staticmethod
-    def _controller(*, mounted=True):
+    def _controller(clock, *, mounted=True):
         from types import SimpleNamespace
-        from modules.nuzlocke.campaign_controller import CampaignController
+        from modules.nuzlocke.campaign_controller import CampaignController, _ProgressWatchdog
 
         controller = CampaignController.__new__(CampaignController)
         controller._tactical_loop = iter(()) if mounted else None
@@ -3559,67 +3617,67 @@ class MountedStallWatchdogTests(unittest.TestCase):
         controller.transition_reason = "waiting"
         controller.current_objective_id = "complete_petalburg_woods"
         controller.current_tactical_goal = "ActivateTrigger('devon_goods_researcher')"
+        controller._stall_watchdog = _ProgressWatchdog(first_report_after=5.0, repeat_every=10.0, clock=clock)
+        controller._player_sample = None
+        controller._player_sample_age = 1000
         return controller, SimpleNamespace(status=SimpleNamespace(value="running"))
 
-    def _run(self, controller, result, steps, *, sample=lambda: ("woods", (16, 38))):
+    def _run(self, controller, result, steps, clock, *, sample=lambda: ("woods", (16, 38))):
         from modules.nuzlocke import campaign_controller as module
 
         logs = []
         with (
-            patch.object(module, "_STALL_FIRST_REPORT_AFTER", 5),
-            patch.object(module, "_STALL_REPEAT_EVERY", 10),
             patch.object(module, "_PLAYER_SAMPLE_EVERY", 1),
             patch.object(module, "_sample_player_location", side_effect=lambda: sample()),
             patch.object(module, "print_always", side_effect=lambda message: logs.append(message())),
         ):
             for _ in range(steps):
                 controller._observe_mounted_stall(result)
+                clock.now += 1.0
         return logs
 
     def test_a_mounted_capability_with_no_change_is_reported_with_its_context(self):
-        controller, result = self._controller()
+        clock = FakeClock()
+        controller, result = self._controller(clock)
 
-        logs = self._run(controller, result, 5)
+        logs = self._run(controller, result, 6, clock)
 
         self.assertEqual(len(logs), 1)
         self.assertIn("CAMPAIGN_CONTROLLER_STALLED", logs[0])
+        self.assertIn("for 5 seconds", logs[0])
         self.assertIn("complete_petalburg_woods", logs[0])
         self.assertIn("devon_goods_researcher", logs[0])
         self.assertIn("('woods', (16, 38))", logs[0])
 
-    def test_it_repeats_only_every_period(self):
-        controller, result = self._controller()
-
-        logs = self._run(controller, result, 16)
-
-        self.assertEqual(len(logs), 2)
-
     def test_player_movement_is_progress(self):
-        controller, result = self._controller()
+        clock = FakeClock()
+        controller, result = self._controller(clock)
         position = iter(range(1000))
 
-        logs = self._run(controller, result, 30, sample=lambda: ("woods", (next(position), 0)))
+        logs = self._run(controller, result, 30, clock, sample=lambda: ("woods", (next(position), 0)))
 
         self.assertEqual(logs, [])
 
     def test_nothing_is_reported_when_no_capability_is_mounted(self):
-        controller, result = self._controller(mounted=False)
+        clock = FakeClock()
+        controller, result = self._controller(clock, mounted=False)
 
-        self.assertEqual(self._run(controller, result, 30), [])
+        self.assertEqual(self._run(controller, result, 30, clock), [])
 
     def test_an_unreadable_player_does_not_raise_and_still_reports(self):
         from modules.nuzlocke import campaign_controller as module
 
-        controller, result = self._controller()
+        clock = FakeClock()
+        controller, result = self._controller(clock)
         logs = []
         with (
-            patch.object(module, "_STALL_FIRST_REPORT_AFTER", 3),
             patch.object(module, "_PLAYER_SAMPLE_EVERY", 1),
             patch("modules.player.get_player_location", side_effect=RuntimeError("no avatar")),
             patch.object(module, "print_always", side_effect=lambda message: logs.append(message())),
         ):
-            for _ in range(3):
+            for _ in range(6):
                 controller._observe_mounted_stall(result)
+                clock.now += 1.0
 
         self.assertEqual(len(logs), 1)
         self.assertIn("player=None", logs[0])
