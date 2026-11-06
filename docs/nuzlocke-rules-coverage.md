@@ -25,7 +25,7 @@ Scope decisions from the project owner:
 
 | Page rule | Specified | Implemented |
 | --- | --- | --- |
-| Limited encounters (first wild Pokémon per area) | Yes | `one_encounter_per_area` |
+| Limited encounters (first wild Pokémon per area) | Yes | `one_encounter_per_area`. Open: whether fleeing a first encounter uses up the area. The campaign re-selected the area after a capture-planner flee, so it treats the encounter as still open. |
 | Double battle or horde: choose one | No | Not needed; Gen 3 has no wild double battles |
 | Dying: fainted Pokémon are dead | Yes | `fainting` |
 | Revival items and abilities forbidden | **Gap** | No prohibition found |

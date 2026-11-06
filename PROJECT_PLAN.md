@@ -22,17 +22,20 @@ recursive goal resolution, resource policy, and adaptive navigation work are
 valuable foundations, but they do not yet constitute a complete whole-game
 autonomous bot.
 
-## Status snapshot (2026-11-05)
+## Status snapshot (2026-11-05, second checkpoint)
 
-Live runs on branch `improved-leveling` now get from a fresh game through the
-opening, the starter, the intro rival on Route 103, the first captures on Routes 101
-to 104, Wally's tutorial, Route 104 past Cindy and Billy, the Petalburg Woods warp, and
-a Woods capture, and into trainer preparation for the Aqua Grunt. No live run has
-reached the grunt fight or the first badge. Since the last live run the following were
-implemented and unit-tested but not yet validated live: readiness that accepts a
-horizon projection with small unresolved mass, preparation that ends as soon as the
-party has a ready line, capture planner v2 (switching and the least-risky fallback),
-and an optional Species Clause duplicate cap.
+Live runs on branch `improved-leveling` get from a fresh game through the opening, the
+starter, the intro rival on Route 103, captures on Routes 101 to 104, Wally's tutorial,
+Route 104 past Cindy and Billy and the Petalburg Woods warp, and into trainer preparation
+for the Aqua Grunt. **No live run has reached the grunt fight or the first badge.**
+Preparation fails in the Woods: grass training is skipped once the area's first encounter
+counts as resolved, every Woods trainer is rejected as "battle line is not proven safe",
+and the controller then retries identically forever. Seen live this checkpoint: the capture
+planner's switch to a bench member (using that member's own damage figures) and its flee,
+the Windows console fix, and the stall dump. Implemented and unit-tested but not yet seen
+live: the route-cut guard, readiness that accepts a horizon projection, early end of
+preparation, the risk-accepted capture fallback, the Species Clause cap, and the time-based
+stall watchdog. These commits were not pushed to `origin` when this was written; see the handoff.
 
 New design pieces: a battle-kind classifier and a dedicated bounded capture planner
 ([battle-decision-architecture.md](docs/battle-decision-architecture.md)), and the
@@ -619,17 +622,24 @@ fallback limiter is the appropriate performance follow-up.
 
 ## Immediate next actions
 
-Current (2026-11-05), in order; the reasoning and open questions are in
+Current (2026-11-05, second checkpoint), in order; the evidence and the open questions are in
 [handoff-and-open-questions.md](docs/handoff-and-open-questions.md):
 
-1. Re-run a live diagnostic (with permission) to confirm the Woods preparation now ends
-   through `CAMPAIGN_PREPARATION_READY` and that the grunt fight happens.
-2. Prune or iteratively deepen the generic expectiminimax search so it finishes with
+1. Decide whether preparation may train on wild grass after the area's first encounter is
+   resolved (the code disables it; its docstring says it is legal). Then run live to the Woods
+   (with permission) and read the full `CAMPAIGN_PREPARATION_NO_LINE` record.
+2. Add preparation retry backoff and escalation; a failed preparation must not retry
+   identically forever.
+3. Promote the Woods scene trigger to `EngageTrainer` when the party is ready, or stop planning
+   it under AVOID when it is the goal itself.
+4. Decide the capture switch filter (hard two-hit rule versus the exact faint bound).
+5. Prune or iteratively deepen the generic expectiminimax search so it finishes with
    bench members.
-3. Add the narrow-model check before a trainer is promoted to must-fight (awaiting
-   owner approval).
-4. Add controller retry backoff and escalation for swallowed failures.
-5. Resolve the experience-spreading question with lead-selection evidence.
+6. Resolve the 14 order-dependent test failures seen on the Windows machine.
+7. Resolve the experience-spreading question with the now-visible lead-selection log.
+
+The route-cut guard is implemented (a trainer is promoted to must-fight only when its hazard
+geometry is exact) and awaits live confirmation.
 
 Earlier items, still valid once the Woods grunt is passed:
 

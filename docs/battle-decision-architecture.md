@@ -76,6 +76,20 @@ member at risk. If fleeing is not legal, it chooses the least risky plan overall
 risk accepted: it is classified best-available, never safe, and carries a result that
 lets the campaign proceed for one turn without claiming safety.
 
+A bench member is judged against the damage the opponent does to **it**, not to the
+Pokémon in play. Each `PlannerSwitch` carries its own `incoming_damage_max` and
+critical ceiling; the switch check and the faint table use them, scaling the lead's
+damage spread to match, and fall back to the lead's numbers only when a member has no
+figure. (Before 2026-11-05 every member used the lead's numbers, which rejected a
+Lv9 Treecko at 28/28 HP against a Wurmple because a critical on a Lv2 Poochyena did 14
+and 2 x 14 = 28, and the planner fled three live captures.)
+
+Every decision's rationale ends with `Bench:` lines (`describe_switch_candidates`): each
+bench member, its HP, its own worst-case hit, and whether it was eligible or why it was
+rejected (needs HP above twice the worst hit, just switched out, switching illegal, a
+switch already happened, or no bench). Read these first when a capture decision looks
+wrong.
+
 It returns nothing, and the generic search decides, only when the battle cannot
 be modeled: it is not a legal capture, there is no usable ball or no
 catch-probability model, or the opponent's moves are unknown or unsupported.
@@ -141,8 +155,14 @@ captures.
 
 ## Not yet done
 
-- Live validation of capture planner v2 (switching and the risk-accepted path), the
-  readiness change, and the early stop. None has been run live.
+- Live validation of the risk-accepted path (escape not legal), the readiness change,
+  and the early stop. Not run live. The switch path and the flee path **were** seen
+  live on 2026-11-05 (W4, W5 in `handoff-and-open-questions.md`).
+- **Open question: the switch eligibility filter.** Requiring a bench member to survive
+  two worst-case hits is stricter than the 3% faint bound it protects. In W5 a Lv8 Mudkip
+  at 23/24 HP was rejected against a Taillow (2 x 12 = 24 > 23) and a 13/13 Lv2 lead fled.
+  Options: keep it as a hard filter, or let the exact faint probability decide within the
+  bound. Owner decision needed.
 - Pruning or iterative deepening for the generic search (above).
 - Status moves as capture aids.
 - Moving the damage and outcome model out of the expectiminimax module.

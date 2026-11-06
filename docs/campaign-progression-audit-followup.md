@@ -863,3 +863,66 @@ and is much slower; the rest did not. Numbers are the order the runs were made.
 Tools added during this work: `print_always`, the controller exception reporter and
 idle watchdog, `POKEBOT_DUMP_SLOW_SEARCH`, and `POKEBOT_STALL_DUMP` (see the
 handoff document).
+
+## Windows live runs W1 to W5 (2026-11-05)
+
+Five fresh-profile runs on a Windows machine (`-m "Campaign Progression" -hl -nv -na -s 0
+--no-save-state`, a new throwaway profile each, logs outside the repository). They follow the nine
+macOS runs above and are named W1 to W5 to avoid clashing with those numbers. The owner permitted these
+runs; no further run was made before the second handoff.
+
+| Run | What it showed | Cause and resolution |
+| --- | --- | --- |
+| W1 | Crashed on Route 101 within two minutes, then hung | Redirected stdout is cp1252 and the encounter panel printed a gender symbol (`UnicodeEncodeError` from the main loop). Fixed: redirected stdout and stderr are written as UTF-8 (`modules/console.py`). |
+| W2 | Reached the Petalburg Mart; after a failed Poké Ball restock ("insufficient money", $180) it logged "searching reachable undefeated trainers" and then went silent for 8 minutes while using about 97% of a core | Not diagnosed: no stack dump was enabled. The funding policy's trainer search is an open question. |
+| W3 | Died silently within a second of its first `faulthandler` stack dump | Most likely `faulthandler` reading frames without the interpreter lock while the main thread was in a native emulator call. The dump is now a Python watchdog thread (`modules/stall_dump.py`); this is a best explanation, not a proven one. |
+| W4 | Reached the Woods in about 12 minutes; won the intro rival, Calvin and Lyle; three capture-planner flees; then preparation failed and the bot stood still | The flees: two were wrong because bench members were judged against the lead's incoming damage (fixed, `5897d074`). The stall: see below. |
+| W5 | Healthy to the Woods with the fixes; the first live switch to a bench member; then Aqua Grunt preparation failed and looped | See below. |
+
+### W4: the silent wait
+
+After preparation raised `BotModeError: no available trainer has a proven safe, cap-compatible
+preparation line`, recovery healed the party and the bot returned to the Woods with goal
+`ActivateTrigger devon_goods_researcher` under AVOID. The scene trigger is registered as a trainer hazard
+(`hazard_kind="trainer"`, `modules/trigger_bindings.py`), so the AVOID hazard list contained
+`devon_goods_researcher:8` while it was also the goal and the search returned not found. Nothing was
+re-issued and the log stopped for 8 minutes. Both route workers were idle and the main thread was only
+running emulator frames. `CAMPAIGN_CONTROLLER_IDLE` never fired because its watchdog counts steps only when
+no capability is mounted. The generic `ActivateTrigger` should be promoted to `EngageTrainer` by route-aware
+readiness once the party is ready; that did not happen.
+
+### W5: the preparation failure, in the bot's own words
+
+```
+CAMPAIGN_PREPARATION_NO_LINE: map=Petalburg Woods (24, 11) grass: not used, the first encounter of this
+area is already resolved; trainers: 3 observed; trainer:Petalburg Woods (24, 11):9 (exp=136 headroom=4087
+cap_safe=True) rejected: battle line is not proven safe; devon_goods_researcher (exp=105 ...) rejected:
+battle line is not proven safe; trainer:Petalburg Woods (24, 11):10 (exp=164 ...) rejected: battle line
+is not proven safe; target_level=9 level_cap=15
+```
+
+(The first form of this record also printed `win=0% catastrophic=0%`; those were `None` displayed as zero
+and were removed in `a64051ff`.) The party was Poochyena Lv2, Mudkip Lv8 26/26, Wurmple Lv2, Lotad Lv4.
+Preparation then raised and the controller retried with the party unchanged and the gate at
+`PREPARE: TRAINER_BATTLE_UNREADY`. Findings:
+
+- Grass is skipped when the area's first encounter counts as resolved (`allow_wild=False`), although the
+  docstring of `_preparation_encounter_resolved` says later wild battles remain legal training.
+- Why each trainer's line is "not proven safe" is not yet established; the improved record (status, reason and
+  per-member roster coverage) has not been seen live.
+- There is no retry backoff or escalation.
+
+### W5: a capture switch and a flee, from the log
+
+- Switch: Poochyena "James" (8 HP) against a Wurmple; the planner switched to Mudkip "Albert" (18/24, worst hit
+  6), Mud-slap, then a ball: about 98% capture, 1.8% faint risk. Afterwards `Bench: James (slot 0) HP 8:
+  rejected, was just switched out`.
+- Flee: Poochyena "James" 13/13 against a Taillow; best plan 46.9% capture, 53.1% faint; `Bench: Albert (slot 1)
+  HP 23: rejected, needs HP > 24 to survive two`. This is the strict two-hit filter, not a bug; it is open
+  question 2 in the handoff.
+
+### Tools and records added by this work
+
+`CAMPAIGN_PREPARATION_NO_LINE`, `CAMPAIGN_CONTROLLER_STALLED` (real-time, 3 minutes), the `Bench:` capture
+rationale, always-on `NUZLOCKE_CAMPAIGN_FIELD_LEAD`, a Python-thread stall dump, and UTF-8 redirected output. Details
+are in `handoff-and-open-questions.md`.
