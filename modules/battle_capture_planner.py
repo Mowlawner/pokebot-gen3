@@ -145,22 +145,61 @@ def _is_plain_damaging_move(move: Any) -> bool:
     return effect in _PLAIN_DAMAGE_EFFECTS or str(effect).endswith("_HIT")
 
 
-def _opponent_turn_outcomes(context: Any, config: CaptureConfig) -> tuple[DamageOutcome, ...] | None:
-    """Return the per-turn damage distribution of the opponent's strongest move."""
+def _strongest_opponent_move(context: Any):
+    """The opponent's highest-damage supported move against the Pokémon in play, or ``None``."""
 
     moves = [
         move
         for move in getattr(context, "opponent_moves", ())
         if getattr(move, "mechanics_supported", True)
     ]
-    if moves:
-        strongest = max(
-            moves,
-            key=lambda move: (
-                int(getattr(move, "damage_max", 0) or 0),
-                float(getattr(move, "accuracy", 1.0) or 0.0),
-            ),
-        )
+    if not moves:
+        return None
+    return max(
+        moves,
+        key=lambda move: (
+            int(getattr(move, "damage_max", 0) or 0),
+            float(getattr(move, "accuracy", 1.0) or 0.0),
+        ),
+    )
+
+
+def _candidate_turn_outcomes(context: Any, config: CaptureConfig, candidate: Any) -> tuple[DamageOutcome, ...] | None:
+    """Per-turn damage distribution against one bench member.
+
+    The opponent's move numbers describe the Pokémon in play.  A bench member
+    can be far bulkier or frailer, so its own ``incoming_damage_max`` (and
+    critical ceiling) replace the lead's numbers, with the lead's damage spread
+    scaled to match.  A member with no incoming figure uses the lead's numbers.
+    """
+
+    strongest = _strongest_opponent_move(context)
+    own_max = getattr(candidate, "incoming_damage_max", None)
+    lead_max = int(getattr(strongest, "damage_max", 0) or 0) if strongest is not None else 0
+    if strongest is None or own_max is None or lead_max <= 0:
+        return _opponent_turn_outcomes(context, config)
+    own_max = max(0, int(own_max))
+    ratio = own_max / lead_max
+    own_min = min(own_max, round(int(getattr(strongest, "damage_min", 0) or 0) * ratio))
+    own_critical = getattr(candidate, "incoming_critical_damage_max", None)
+    if own_critical is None:
+        lead_critical = getattr(strongest, "critical_damage_max", None)
+        own_critical = None if lead_critical is None else round(int(lead_critical) * ratio)
+    return move_outcomes(
+        own_min,
+        own_max,
+        float(getattr(strongest, "accuracy", 1.0)),
+        critical_chance=float(getattr(strongest, "critical_hit_chance", 1 / 16)),
+        critical_damage=own_critical,
+        points=config.damage_points,
+    )
+
+
+def _opponent_turn_outcomes(context: Any, config: CaptureConfig) -> tuple[DamageOutcome, ...] | None:
+    """Return the per-turn damage distribution of the opponent's strongest move."""
+
+    strongest = _strongest_opponent_move(context)
+    if strongest is not None:
         critical = getattr(strongest, "critical_damage_max", None)
         return move_outcomes(
             int(getattr(strongest, "damage_min", 0) or 0),
@@ -355,6 +394,13 @@ def _worst_case_hit(context: Any, config: CaptureConfig) -> int:
     return max((outcome.damage for outcome in damage), default=0) if damage else 0
 
 
+def _candidate_worst_case_hit(context: Any, config: CaptureConfig, candidate: Any) -> int:
+    """Largest single opponent attack against one bench member (a critical counts as an attack)."""
+
+    damage = _candidate_turn_outcomes(context, config, candidate)
+    return max((outcome.damage for outcome in damage), default=0) if damage else 0
+
+
 def _eligible_switches(context: Any, config: CaptureConfig) -> list[Any]:
     """Party members the planner may switch to for a capture.
 
@@ -368,11 +414,10 @@ def _eligible_switches(context: Any, config: CaptureConfig) -> list[Any]:
     if int(getattr(context, "switch_streak", 0) or 0) > 0:
         return []
     recent = set(getattr(context, "switch_history", ()) or ())
-    ceiling = _worst_case_hit(context, config)
     return [
         candidate
         for candidate in getattr(context, "switches", ())
-        if int(getattr(candidate, "hp", 0) or 0) > 2 * ceiling
+        if int(getattr(candidate, "hp", 0) or 0) > 2 * _candidate_worst_case_hit(context, config, candidate)
         and getattr(candidate, "party_index", None) not in recent
         and getattr(candidate, "party_index", None) != getattr(context, "active_party_index", None)
     ]
@@ -396,11 +441,11 @@ def describe_switch_candidates(context: Any, config: CaptureConfig = CaptureConf
         return ("switching is not legal now",)
     if int(getattr(context, "switch_streak", 0) or 0) > 0:
         return ("a switch already happened in this stretch of battle",)
-    ceiling = _worst_case_hit(context, config)
     recent = set(getattr(context, "switch_history", ()) or ())
     lines = []
     for candidate in members:
         hp = int(getattr(candidate, "hp", 0) or 0)
+        ceiling = _candidate_worst_case_hit(context, config, candidate)
         label = f"{getattr(candidate, 'name', '?')} (slot {getattr(candidate, 'party_index', '?')}) HP {hp}"
         if getattr(candidate, "party_index", None) in recent:
             lines.append(f"{label}: rejected, was just switched out")
@@ -422,7 +467,9 @@ def evaluate_switch_plans(context: Any, config: CaptureConfig, balls: list[Any])
     plans: list[CapturePlan] = []
     for candidate in _eligible_switches(context, config):
         faint = _faint_table(
-            int(candidate.hp), damage, config.max_weaken_turns + config.max_throws + 2
+            int(candidate.hp),
+            _candidate_turn_outcomes(context, config, candidate) or damage,
+            config.max_weaken_turns + config.max_throws + 2,
         )
         options: list[tuple[Any | None, int]] = [(None, 0)]
         for move in getattr(candidate, "moves", ()):

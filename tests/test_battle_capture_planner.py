@@ -326,8 +326,26 @@ class CapturePlannerIntegrationTests(unittest.TestCase):
         self.assertNotEqual(decision.evaluation_method, "capture_planner")
 
 
-def switch_candidate(party_index=1, name="Sturdy", hp=60, moves=(PlannerMove(0, "Tackle", 3, 4),)):
-    return PlannerSwitch(party_index, name, hp, hp, 5, moves=moves, speed=15)
+def switch_candidate(
+    party_index=1,
+    name="Sturdy",
+    hp=60,
+    moves=(PlannerMove(0, "Tackle", 3, 4),),
+    incoming=None,
+    incoming_critical=None,
+):
+    """A bench member.  ``incoming=None`` means no figure of its own, so the lead's numbers apply."""
+
+    return PlannerSwitch(
+        party_index,
+        name,
+        hp,
+        hp,
+        incoming,
+        incoming_critical_damage_max=incoming_critical,
+        moves=moves,
+        speed=15,
+    )
 
 
 def fragile_context(**changes):
@@ -527,3 +545,65 @@ class SwitchCandidateDescriptionTests(unittest.TestCase):
         self.assertIs(flee.action, PlannerAction.RunAway)
         self.assertIn("Bench: Sturdy (slot 1) HP 22: rejected", flee.rationale)
         self.assertIn("Bench: Sturdy (slot 1) HP 60: eligible", chosen.rationale)
+
+
+class PerMemberIncomingDamageTests(unittest.TestCase):
+    """A bench member is judged against the damage the opponent does to it, not to the lead."""
+
+    def live_case(self, **member):
+        # Live Woods case: a Lv2 lead with 13 HP against a Wurmple whose Tackle does
+        # 5-7 and can critically hit for 14, with a Lv9 Treecko (28 HP) on the bench.
+        return fragile_context(
+            switches=(switch_candidate(name="Treecko", hp=28, **member),),
+        )
+
+    def test_with_the_leads_numbers_a_28_hp_member_is_not_enough(self):
+        # 28 is not above two 14-damage critical hits, so without its own figure it is rejected.
+        choice = choose_capture_plan(self.live_case())
+
+        self.assertIsNone(choice.plan.switch_party_index)
+
+    def test_a_bulkier_member_uses_its_own_smaller_incoming_damage(self):
+        # The same Wurmple does only 3-4 (critical 8) to the sturdier Treecko.
+        choice = choose_capture_plan(self.live_case(incoming=4, incoming_critical=8))
+
+        self.assertEqual(choice.plan.switch_party_index, 1)
+        self.assertFalse(choice.risk_accepted)
+
+    def test_the_planner_switches_instead_of_fleeing_in_the_live_case(self):
+        decision = BattlePlanner().plan(
+            replace(
+                self.live_case(incoming=4, incoming_critical=8),
+                can_run=True,
+                escape_confidence=PlannerConfidence.HIGH,
+            )
+        )
+
+        self.assertIs(decision.action, PlannerAction.SwitchPokemon)
+
+    def test_a_frailer_member_is_judged_against_the_larger_hit_it_would_take(self):
+        # The lead barely notices the Tackle; a frail member would take 20 per hit.
+        context = capture_context(
+            opponent_moves=(PlannerOpponentMove("Tackle", 2, 3, accuracy=1.0, critical_damage_max=6),),
+            can_switch=True,
+            switches=(switch_candidate(hp=30, incoming=20, incoming_critical=40),),
+        )
+
+        (line,) = describe_switch_candidates(context)
+
+        self.assertIn("rejected", line)
+        self.assertIn("worst hit 40", line)
+
+    def test_a_missing_critical_figure_scales_the_leads_critical(self):
+        # incoming=14 is double the lead's 7, so the lead's critical of 14 becomes 28.
+        (line,) = describe_switch_candidates(
+            fragile_context(switches=(switch_candidate(hp=100, incoming=14),))
+        )
+
+        self.assertIn("worst hit 28", line)
+
+    def test_the_description_reports_the_members_own_worst_hit(self):
+        (line,) = describe_switch_candidates(self.live_case(incoming=4, incoming_critical=8))
+
+        self.assertIn("eligible", line)
+        self.assertIn("worst hit 8", line)
