@@ -40,6 +40,35 @@ These were written after the last live run, or exercise paths no run reached:
 - Recovery from the Woods: it timed out on a 10 s search in runs 2 and 3 and did not
   recur in runs 4 to 9; the cause is unexplained (see Open items).
 
+## Live runs 1 to 4 on Windows (2026-11-05, after the decisions above)
+
+Four fresh-profile runs on a Windows machine, all `--no-save-state`, logs outside the repo.
+
+- **Run 1** crashed on Route 101: redirected stdout is cp1252 and the encounter panel
+  printed a gender symbol. Fixed (`modules/console.py` writes redirected output as UTF-8).
+- **Run 2** stalled silently at the Petalburg Mart; **run 3** died within a second of its
+  first `faulthandler` stack dump. The stall dump is now a Python watchdog thread
+  (`modules/stall_dump.py`); run 4 survived four dumps.
+- **Run 4** reached the Woods in about 12 minutes: intro rival, Calvin, and Lyle (an optional
+  Woods trainer, fought through an `EngageTrainer` goal) were won. It never reached the grunt.
+- **Capture-flee bug found and fixed.** The new flee rule fired three times. Two were wrong:
+  a Lv2 lead at 13/13 HP fled a Marill and a Wurmple while a Lv9 Treecko at 28/28 sat on the
+  bench. The capture planner used the lead's incoming damage for every bench member, ignoring
+  `PlannerSwitch.incoming_damage_max`. Each member now uses its own figures. Not yet re-run live.
+- **Silent permanent wait (open).** After preparation raised `BotModeError: no available trainer
+  has a proven safe, cap-compatible preparation line`, recovery healed the party and the bot
+  returned to the Woods with goal `ActivateTrigger devon_goods_researcher` under AVOID. That
+  search always returns not found (the scene trigger is itself a trainer hazard), nothing is
+  re-issued, and the log stops. `CAMPAIGN_CONTROLLER_IDLE` never fires because its watchdog only
+  counts steps when no capability is mounted (`idle=self._tactical_loop is None` in
+  `campaign_controller.step`). Two things to resolve: the idle watchdog must cover a mounted loop
+  whose goal has a cached search failure, and the goal should be promoted to `EngageTrainer`
+  once the party is ready (or preparation should find a line).
+- **Unconfirmed:** `_preparation_navigation_goal` skips every grass candidate when
+  `allow_wild=False` (area encounter resolved), which contradicts the docstring of
+  `_preparation_encounter_resolved`. Whether that applied in run 4 is not established; its
+  diagnostic (`CAMPAIGN_PREPARATION_WILD_DISABLED`) only prints under `--debug`.
+
 ## Resuming on a new computer
 
 1. **ROM.** `roms/` is gitignored. You need Pokemon Emerald (English), SHA1
